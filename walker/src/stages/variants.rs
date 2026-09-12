@@ -301,7 +301,9 @@ pub fn find_alts(
     path: &GafPath,
     query: &Query,
 ) -> Result<Vec<AltHaplotype>> {
-    if !cfg.emit_alts || path.steps.len() < 2 || subgraph.nodes.is_empty() {
+    // The sites feed both alt_haplotypes.fasta and the VCF, so compute them when either is
+    // wanted. Skipping the work only when neither output will use it.
+    if (!cfg.emit_alts && !cfg.emit_vcf) || path.steps.len() < 2 || subgraph.nodes.is_empty() {
         return Ok(Vec::new());
     }
 

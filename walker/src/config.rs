@@ -185,6 +185,10 @@ pub struct Config {
     /// separate file means the variance is recovered and auditable while using it in an
     /// analysis stays a deliberate act. See `stages::variants`.
     pub emit_alts: bool,
+    /// Also write a per-accession VCF of intra-host SNPs (the on-path biallelic sites), each
+    /// carrying its k-mer-coverage frequency, in query coordinates. Off by default; the
+    /// primary FASTA is unaffected. See `io::output::write_vcfs`.
+    pub emit_vcf: bool,
     /// Hard cap on alternative haplotypes per accession.
     ///
     /// Measured site counts are 4, 4 and 0 on the accessions looked at, so this is a
@@ -311,6 +315,7 @@ impl Default for Config {
             max_alt_indel: 30,
             allow_frameshift_alts: false,
             emit_alts: true,
+            emit_vcf: false,
             max_alts: 32,
             alt_max_detour: 100,
             haplotypes: HaplotypeMode::Many,

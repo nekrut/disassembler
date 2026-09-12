@@ -83,6 +83,8 @@ SWITCHING OFF (applies to --alt-engine=variants):
         --no-prefer-majority      Leave the primary on the reference-matching allele at
                                   two-allele sites, instead of the more abundant one
         --no-emit-alts            Do not write alt_haplotypes.fasta
+        --emit-vcf                Also write <out-dir>/<acc>.vcf: intra-host SNPs with their
+                                  ka:f frequency, in query coordinates [default: off]
         --no-indel-alts           Substitution alleles only; refuse any that change length
         --allow-frameshift-alts   Also accept indel alleles whose length change is not a
                                   multiple of 3. These reframe the CDS; off by default
@@ -218,6 +220,11 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
                 i += 1;
                 continue;
             }
+            "--emit-vcf" | "--no-emit-vcf" => {
+                args.cfg.emit_vcf = flag == "--emit-vcf";
+                i += 1;
+                continue;
+            }
             "--min-abund-frac" => {
                 let raw = value()?;
                 let v: f64 = raw.parse().map_err(|_| {
@@ -300,6 +307,9 @@ fn real_main(args: Args) -> error::Result<()> {
     std::fs::create_dir_all(&args.out_dir)?;
     io::output::write_fasta(&summary, &args.out_fasta)?;
     io::output::write_bubbles(&summary, &args.out_dir.join("bubbles.json"))?;
+    if args.cfg.emit_vcf {
+        io::output::write_vcfs(&summary, &query, &args.out_dir)?;
+    }
     if args.cfg.emit_alts {
         io::output::write_alts(&summary, &args.out_dir.join("alt_haplotypes.fasta"))?;
     }

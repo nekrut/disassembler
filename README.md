@@ -69,3 +69,12 @@ reference-matching-minority-allele bias, its measurement, and the fix.
 ## Credits
 
 The Rust walker and intra-host haplotype-recovery method originate from `logan-hypyaeon` PR #4, authored by Andrew ([@as042](https://github.com/as042)), building on the PR #3 Rust port. See `NOTICE` and `docs/` for full provenance.
+
+## Intra-host SNP VCF
+
+`--emit-vcf` writes `<out-dir>/<accession>.vcf` alongside the primary: the on-path
+biallelic sites (intra-host SNPs) with their k-mer-coverage frequency, in query
+coordinates (`CHROM` = gene, `POS` = 1-based position in the CDS). The primary FASTA is
+unchanged. Because every accession is called against the same gene, the VCFs share a
+coordinate frame and `bcftools merge` yields a sites x samples frequency matrix. Frequencies
+are `ka:f` ratios, a proxy for allele frequency, and are per-site, not phased.

@@ -13,7 +13,7 @@
 
 use crate::error::Result;
 use crate::pipeline::Summary;
-use crate::types::{AccessionResult, Outcome, Strand};
+use crate::types::{AccessionResult, Outcome, Query, Strand};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -249,4 +249,271 @@ pub fn write_summary(summary: &Summary, path: &Path) -> Result<()> {
     writeln!(w, "}}")?;
     w.flush()?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// VCF: intra-host SNPs with frequency, in query coordinates
+// ---------------------------------------------------------------------------
+
+/// Write one VCF per accession listing its intra-host single-nucleotide polymorphisms.
+///
+/// The sites are the on-path biallelic forks recovered by `stages::variants` (the same set
+/// that produces `alt_haplotypes.fasta`), NOT the `phase` stage's `bubbles.json`, most of
+/// which sit off the walked path and are not alleles of the gene.
+///
+/// Coordinates are relative to the query gene, 1-based: `CHROM` is the query record id and
+/// `POS` a position within the query CDS, so VCFs for the same gene across accessions share a
+/// coordinate frame and `bcftools merge` yields a sites x samples frequency matrix.
+///
+/// Only substitutions are emitted here; indel alleles are left to `alt_haplotypes.fasta`.
+/// Frequencies (`AF`) are ratios of k-mer coverage (`ka:f`) at the fork, a proxy for allele
+/// frequency, not read counts, and they are per-site, not phased. Both caveats are stated in
+/// the file header.
+///
+/// One file `<out_dir>/<accession>.vcf` per accession that has at least one recovered SNP.
+pub fn write_vcfs(summary: &Summary, query: &Query, out_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let chrom = if query.record_id.is_empty() { query.name.as_str() } else { query.record_id.as_str() };
+
+    for r in &summary.results {
+        let Some(primary) = &r.haplotype else { continue };
+        if r.alts.is_empty() {
+            continue;
+        }
+        // Guard: full DP is O(n*m); genes are short. Skip pathological inputs loudly.
+        if primary.seq.len() > 20_000 || query.seq.len() > 20_000 {
+            eprintln!(
+                "[{}] VCF skipped: sequence longer than 20 kb (primary {}, query {})",
+                r.accession, primary.seq.len(), query.seq.len()
+            );
+            continue;
+        }
+
+        // Map each primary base to a query position (None where the primary base aligns to a
+        // gap in the query, i.e. an insertion relative to the gene).
+        let map = align_primary_to_query(&primary.seq, &query.seq);
+
+        let mut rows: Vec<VcfRow> = Vec::new();
+        for a in &r.alts {
+            // Substitutions only: same length, exactly one differing base.
+            let alt_seq = &a.haplotype.seq;
+            if alt_seq.len() != primary.seq.len() {
+                continue;
+            }
+            let mut diff: Option<usize> = None;
+            let mut multiple = false;
+            for (i, (x, y)) in primary.seq.iter().zip(alt_seq.iter()).enumerate() {
+                if x != y {
+                    if diff.is_some() {
+                        multiple = true;
+                        break;
+                    }
+                    diff = Some(i);
+                }
+            }
+            let (Some(i), false) = (diff, multiple) else { continue };
+            let Some(qpos) = map[i] else { continue }; // primary base has no query coordinate
+
+            let ref_base = query.seq[qpos];
+            let major = primary.seq[i]; // the primary carries the majority allele
+            let minor = alt_seq[i];
+            // Frequencies and k-mer coverage per allele at this fork.
+            let major_af = a.taken_vaf;
+            let minor_af = a.alt_vaf;
+            let major_ka = a.taken_abundance;
+            let minor_ka = a.alt_abundance;
+
+            // Report every sample allele that differs from the query base as an ALT. At most
+            // one of {major, minor} can equal REF (they differ from each other), so this is
+            // one ALT in the common case and two only when the gene base is a third allele.
+            let mut alts: Vec<(u8, f64, f32)> = Vec::new();
+            if minor != ref_base {
+                alts.push((minor, minor_af, minor_ka));
+            }
+            if major != ref_base {
+                alts.push((major, major_af, major_ka));
+            }
+            if alts.is_empty() {
+                continue; // neither allele differs from the gene base: nothing to call
+            }
+            // k-mer coverage of the reference allele, if the sample carries it.
+            let ref_ka = if ref_base == major {
+                major_ka
+            } else if ref_base == minor {
+                minor_ka
+            } else {
+                0.0
+            };
+            rows.push(VcfRow {
+                pos: qpos + 1,
+                ref_base,
+                alts,
+                ref_ka,
+                fork: a.fork,
+            });
+        }
+
+        if rows.is_empty() {
+            continue;
+        }
+        rows.sort_by_key(|r| (r.pos, r.fork));
+
+        let path = out_dir.join(format!("{}.vcf", r.accession));
+        let mut w = BufWriter::new(std::fs::File::create(&path)?);
+        write_vcf_header(&mut w, chrom, query.seq.len(), &r.accession)?;
+        for row in &rows {
+            let alt_bases: Vec<String> =
+                row.alts.iter().map(|&(b, _, _)| (b as char).to_string()).collect();
+            let afs: Vec<String> = row.alts.iter().map(|&(_, af, _)| format!("{af:.4}")).collect();
+            let aos: Vec<String> = row.alts.iter().map(|&(_, _, ka)| format!("{ka:.1}")).collect();
+            writeln!(
+                w,
+                "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={};AO={};RO={:.1};FORK={}\tGT:AF:AO:RO\t.:{}:{}:{:.1}",
+                chrom,
+                row.pos,
+                row.ref_base as char,
+                alt_bases.join(","),
+                afs.join(","),
+                aos.join(","),
+                row.ref_ka,
+                row.fork,
+                afs.join(","),
+                aos.join(","),
+                row.ref_ka,
+            )?;
+        }
+        w.flush()?;
+    }
+    Ok(())
+}
+
+struct VcfRow {
+    pos: usize,
+    ref_base: u8,
+    /// (allele base, frequency, ka:f) for each sample allele that differs from the gene base.
+    alts: Vec<(u8, f64, f32)>,
+    ref_ka: f32,
+    fork: crate::types::UnitigId,
+}
+
+fn write_vcf_header<W: Write>(w: &mut W, chrom: &str, len: usize, sample: &str) -> Result<()> {
+    writeln!(w, "##fileformat=VCFv4.2")?;
+    writeln!(
+        w,
+        "##source=logan-walker intra-host SNPs. Frequencies are k-mer coverage (ka:f) ratios \
+         at a graph fork, a proxy for allele frequency, not read counts. Sites are per-locus \
+         and NOT phased: two rows do not assert co-occurrence on one molecule."
+    )?;
+    writeln!(w, "##contig=<ID={chrom},length={len}>")?;
+    writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency, ka:f ratio at the fork\">")?;
+    writeln!(w, "##INFO=<ID=AO,Number=A,Type=Float,Description=\"Alternate allele k-mer coverage (ka:f)\">")?;
+    writeln!(w, "##INFO=<ID=RO,Number=1,Type=Float,Description=\"Reference allele k-mer coverage (ka:f); 0 if the gene base is not observed\">")?;
+    writeln!(w, "##INFO=<ID=FORK,Number=1,Type=Integer,Description=\"Unitig id of the fork on the walked path\">")?;
+    writeln!(w, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype (missing: this is a frequency call, not a diploid genotype)\">")?;
+    writeln!(w, "##FORMAT=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency\">")?;
+    writeln!(w, "##FORMAT=<ID=AO,Number=A,Type=Float,Description=\"Alternate allele k-mer coverage\">")?;
+    writeln!(w, "##FORMAT=<ID=RO,Number=1,Type=Float,Description=\"Reference allele k-mer coverage\">")?;
+    writeln!(w, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{sample}")?;
+    Ok(())
+}
+
+/// Global (Needleman-Wunsch) alignment of the primary against the query, returning for each
+/// primary base the query position it aligns to, or `None` if it aligns to a gap (an
+/// insertion relative to the gene).
+///
+/// Linear gap penalty; match +1, mismatch -1, gap -2. The two sequences are the same gene at
+/// high identity, so the alignment is near-diagonal and the exact scoring barely matters; what
+/// matters is that a rare indel shifts coordinates correctly rather than being ignored.
+fn align_primary_to_query(primary: &[u8], query: &[u8]) -> Vec<Option<usize>> {
+    let n = primary.len();
+    let m = query.len();
+    // Direction matrix: 0 diag, 1 up (gap in query / primary insertion), 2 left (gap in primary).
+    let mut dir = vec![0u8; (n + 1) * (m + 1)];
+    let mut prev = vec![0i32; m + 1];
+    let mut curr = vec![0i32; m + 1];
+    const GAP: i32 = -2;
+    for j in 0..=m {
+        prev[j] = GAP * j as i32;
+        dir[j] = 2; // top row: all left
+    }
+    for i in 1..=n {
+        curr[0] = GAP * i as i32;
+        dir[i * (m + 1)] = 1; // first column: all up
+        for j in 1..=m {
+            let s = if primary[i - 1] == query[j - 1] { 1 } else { -1 };
+            let diag = prev[j - 1] + s;
+            let up = prev[j] + GAP;
+            let left = curr[j - 1] + GAP;
+            let (mut best, mut d) = (diag, 0u8);
+            if up > best {
+                best = up;
+                d = 1;
+            }
+            if left > best {
+                best = left;
+                d = 2;
+            }
+            curr[j] = best;
+            dir[i * (m + 1) + j] = d;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    // Traceback from (n, m).
+    let mut map = vec![None; n];
+    let (mut i, mut j) = (n, m);
+    while i > 0 || j > 0 {
+        let d = dir[i * (m + 1) + j];
+        if i > 0 && j > 0 && d == 0 {
+            map[i - 1] = Some(j - 1);
+            i -= 1;
+            j -= 1;
+        } else if i > 0 && d == 1 {
+            // primary base i-1 aligns to a gap in the query
+            map[i - 1] = None;
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    map
+}
+
+#[cfg(test)]
+mod vcf_tests {
+    use super::align_primary_to_query;
+
+    #[test]
+    fn identical_sequences_map_one_to_one() {
+        let s = b"ACGTACGTAC";
+        let map = align_primary_to_query(s, s);
+        assert_eq!(map, (0..s.len()).map(Some).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_substitution_keeps_coordinates_aligned() {
+        let map = align_primary_to_query(b"ACGTACGT", b"ACGTTCGT");
+        assert_eq!(map, (0..8).map(Some).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn an_insertion_in_the_primary_has_no_query_coordinate() {
+        // primary "ACGTGACGT" has one extra G at index 4 relative to query "ACGTACGT"
+        let map = align_primary_to_query(b"ACGTGACGT", b"ACGTACGT");
+        assert_eq!(map.len(), 9);
+        assert_eq!(map[0], Some(0));
+        assert_eq!(map[4], None, "the inserted base maps to no query position");
+        assert_eq!(map[8], Some(7), "bases after the insertion still map correctly");
+    }
+
+    #[test]
+    fn a_deletion_in_the_primary_skips_a_query_position() {
+        // primary "ACGACGT" is query "ACGTACGT" missing the T at query index 3
+        let map = align_primary_to_query(b"ACGACGT", b"ACGTACGT");
+        assert_eq!(map.len(), 7);
+        assert_eq!(map[0], Some(0));
+        assert_eq!(map[2], Some(2));
+        assert_eq!(map[3], Some(4), "query position 3 (the deleted T) is skipped");
+        assert_eq!(map[6], Some(7));
+    }
 }

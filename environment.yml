@@ -1,0 +1,29 @@
+# Toolchain for the walker's external binaries and the downstream codon MSA / tree step.
+# Rust itself is not here — install via rustup (https://rustup.rs) and build walker/ with cargo.
+#
+#   conda env create -f environment.yml    # or: mamba env create -f environment.yml
+#   conda activate disassembler
+#
+# Pins match the versions the golden fixtures and benchmarks were captured against.
+name: disassembler
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # Graph alignment: the walker shells out to `GraphAligner -x dbg`.
+  - graphaligner=1.0.20
+  # Codon MSA + phylogeny (python/build_walker_codon_msa.py).
+  - mafft=7.526
+  - fasttree=2.2.0
+  # BLAST: needed only by the Python reference walker and bench/measure_fork_loss.py;
+  # the Rust walker replaces it with in-memory k-mer anchoring.
+  - blast=2.17.0
+  - zstd=1.5.7
+  - python=3.13
+  # Python deps for the reference walker, codon builder, and benchmark harness.
+  - biopython
+  - requests
+  - zstandard
+  - numpy
+  - pandas
+  - matplotlib
