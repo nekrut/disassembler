@@ -189,6 +189,12 @@ pub struct Config {
     /// carrying its k-mer-coverage frequency, in query coordinates. Off by default; the
     /// primary FASTA is unaffected. See `io::output::write_vcfs`.
     pub emit_vcf: bool,
+    /// Also write one long ("tidy") table of every intra-host SNP across the whole run, one row
+    /// per (accession, site, allele), to `<out-dir>/snvs.tsv`. This is the cohort output that
+    /// scales: a merged multi-sample VCF needs one column per accession, so a gene matched by
+    /// millions of runs would be a million-column near-empty matrix; the long form is
+    /// sparse-native and concatenates across cluster shards. See `io::output::write_snv_table`.
+    pub emit_snv_table: bool,
     /// Hard cap on alternative haplotypes per accession.
     ///
     /// Measured site counts are 4, 4 and 0 on the accessions looked at, so this is a
@@ -316,6 +322,7 @@ impl Default for Config {
             allow_frameshift_alts: false,
             emit_alts: true,
             emit_vcf: false,
+            emit_snv_table: false,
             max_alts: 32,
             alt_max_detour: 100,
             haplotypes: HaplotypeMode::Many,

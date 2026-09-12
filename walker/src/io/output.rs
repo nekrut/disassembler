@@ -273,90 +273,13 @@ pub fn write_summary(summary: &Summary, path: &Path) -> Result<()> {
 /// One file `<out_dir>/<accession>.vcf` per accession that has at least one recovered SNP.
 pub fn write_vcfs(summary: &Summary, query: &Query, out_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
-    let chrom = if query.record_id.is_empty() { query.name.as_str() } else { query.record_id.as_str() };
+    let chrom = chrom_of(query);
 
     for r in &summary.results {
-        let Some(primary) = &r.haplotype else { continue };
-        if r.alts.is_empty() {
-            continue;
-        }
-        // Guard: full DP is O(n*m); genes are short. Skip pathological inputs loudly.
-        if primary.seq.len() > 20_000 || query.seq.len() > 20_000 {
-            eprintln!(
-                "[{}] VCF skipped: sequence longer than 20 kb (primary {}, query {})",
-                r.accession, primary.seq.len(), query.seq.len()
-            );
-            continue;
-        }
-
-        // Map each primary base to a query position (None where the primary base aligns to a
-        // gap in the query, i.e. an insertion relative to the gene).
-        let map = align_primary_to_query(&primary.seq, &query.seq);
-
-        let mut rows: Vec<VcfRow> = Vec::new();
-        for a in &r.alts {
-            // Substitutions only: same length, exactly one differing base.
-            let alt_seq = &a.haplotype.seq;
-            if alt_seq.len() != primary.seq.len() {
-                continue;
-            }
-            let mut diff: Option<usize> = None;
-            let mut multiple = false;
-            for (i, (x, y)) in primary.seq.iter().zip(alt_seq.iter()).enumerate() {
-                if x != y {
-                    if diff.is_some() {
-                        multiple = true;
-                        break;
-                    }
-                    diff = Some(i);
-                }
-            }
-            let (Some(i), false) = (diff, multiple) else { continue };
-            let Some(qpos) = map[i] else { continue }; // primary base has no query coordinate
-
-            let ref_base = query.seq[qpos];
-            let major = primary.seq[i]; // the primary carries the majority allele
-            let minor = alt_seq[i];
-            // Frequencies and k-mer coverage per allele at this fork.
-            let major_af = a.taken_vaf;
-            let minor_af = a.alt_vaf;
-            let major_ka = a.taken_abundance;
-            let minor_ka = a.alt_abundance;
-
-            // Report every sample allele that differs from the query base as an ALT. At most
-            // one of {major, minor} can equal REF (they differ from each other), so this is
-            // one ALT in the common case and two only when the gene base is a third allele.
-            let mut alts: Vec<(u8, f64, f32)> = Vec::new();
-            if minor != ref_base {
-                alts.push((minor, minor_af, minor_ka));
-            }
-            if major != ref_base {
-                alts.push((major, major_af, major_ka));
-            }
-            if alts.is_empty() {
-                continue; // neither allele differs from the gene base: nothing to call
-            }
-            // k-mer coverage of the reference allele, if the sample carries it.
-            let ref_ka = if ref_base == major {
-                major_ka
-            } else if ref_base == minor {
-                minor_ka
-            } else {
-                0.0
-            };
-            rows.push(VcfRow {
-                pos: qpos + 1,
-                ref_base,
-                alts,
-                ref_ka,
-                fork: a.fork,
-            });
-        }
-
+        let rows = snv_sites(r, query);
         if rows.is_empty() {
             continue;
         }
-        rows.sort_by_key(|r| (r.pos, r.fork));
 
         let path = out_dir.join(format!("{}.vcf", r.accession));
         let mut w = BufWriter::new(std::fs::File::create(&path)?);
@@ -385,6 +308,136 @@ pub fn write_vcfs(summary: &Summary, query: &Query, out_dir: &Path) -> Result<()
         w.flush()?;
     }
     Ok(())
+}
+
+/// One append-only long ("tidy") table of every intra-host SNP across the whole run, one row
+/// per (accession, site, ALT allele).
+///
+/// This is the cohort output that scales. A merged multi-sample VCF carries one field per
+/// sample on every line, so a gene matched by millions of accessions would need millions of
+/// columns of an almost-entirely-empty matrix. The long form is sparse-native: total rows are
+/// the sum of SNPs across accessions, a few per accession, and it concatenates trivially across
+/// cluster shards (each shard writes its own file; `cat` them, or point DuckDB at the glob).
+/// Per-site summaries and cross-sample frequency structure are then `GROUP BY` / self-join
+/// queries over this table, never a dense matrix.
+///
+/// Columns: `gene pos ref alt accession af ka_alt ka_ref fork`. Frequencies are `ka:f` ratios,
+/// the same values the VCF carries.
+pub fn write_snv_table(summary: &Summary, query: &Query, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let chrom = chrom_of(query);
+    let mut w = BufWriter::new(std::fs::File::create(path)?);
+    writeln!(w, "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork")?;
+    for r in &summary.results {
+        for row in snv_sites(r, query) {
+            for &(alt, af, ka_alt) in &row.alts {
+                writeln!(
+                    w,
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.1}\t{:.1}\t{}",
+                    chrom,
+                    row.pos,
+                    row.ref_base as char,
+                    alt as char,
+                    r.accession,
+                    af,
+                    ka_alt,
+                    row.ref_ka,
+                    row.fork,
+                )?;
+            }
+        }
+    }
+    w.flush()?;
+    Ok(())
+}
+
+fn chrom_of(query: &Query) -> &str {
+    if query.record_id.is_empty() {
+        query.name.as_str()
+    } else {
+        query.record_id.as_str()
+    }
+}
+
+/// The intra-host SNP sites for one accession, in query coordinates, sorted by position.
+///
+/// Shared by the per-accession VCF and the long table so the two cannot disagree. Substitutions
+/// only; an alt whose length differs from the primary, or that differs at more than one base, is
+/// an indel or a multi-substitution block and stays in `alt_haplotypes.fasta`.
+fn snv_sites(r: &AccessionResult, query: &Query) -> Vec<VcfRow> {
+    let Some(primary) = &r.haplotype else { return Vec::new() };
+    if r.alts.is_empty() {
+        return Vec::new();
+    }
+    // Guard: full DP is O(n*m); genes are short. Skip pathological inputs loudly.
+    if primary.seq.len() > 20_000 || query.seq.len() > 20_000 {
+        eprintln!(
+            "[{}] SNP sites skipped: sequence longer than 20 kb (primary {}, query {})",
+            r.accession,
+            primary.seq.len(),
+            query.seq.len()
+        );
+        return Vec::new();
+    }
+
+    // Map each primary base to a query position (None where the primary base aligns to a gap in
+    // the query, i.e. an insertion relative to the gene).
+    let map = align_primary_to_query(&primary.seq, &query.seq);
+
+    let mut rows: Vec<VcfRow> = Vec::new();
+    for a in &r.alts {
+        let alt_seq = &a.haplotype.seq;
+        if alt_seq.len() != primary.seq.len() {
+            continue;
+        }
+        let mut diff: Option<usize> = None;
+        let mut multiple = false;
+        for (i, (x, y)) in primary.seq.iter().zip(alt_seq.iter()).enumerate() {
+            if x != y {
+                if diff.is_some() {
+                    multiple = true;
+                    break;
+                }
+                diff = Some(i);
+            }
+        }
+        let (Some(i), false) = (diff, multiple) else { continue };
+        let Some(qpos) = map[i] else { continue }; // primary base has no query coordinate
+
+        let ref_base = query.seq[qpos];
+        let major = primary.seq[i]; // the primary carries the majority allele
+        let minor = alt_seq[i];
+        let major_ka = a.taken_abundance;
+        let minor_ka = a.alt_abundance;
+
+        // Report every sample allele that differs from the query base as an ALT. At most one of
+        // {major, minor} can equal REF (they differ from each other), so this is one ALT in the
+        // common case and two only when the gene base is a third allele.
+        let mut alts: Vec<(u8, f64, f32)> = Vec::new();
+        if minor != ref_base {
+            alts.push((minor, a.alt_vaf, minor_ka));
+        }
+        if major != ref_base {
+            alts.push((major, a.taken_vaf, major_ka));
+        }
+        if alts.is_empty() {
+            continue; // neither allele differs from the gene base: nothing to call
+        }
+        let ref_ka = if ref_base == major {
+            major_ka
+        } else if ref_base == minor {
+            minor_ka
+        } else {
+            0.0
+        };
+        rows.push(VcfRow { pos: qpos + 1, ref_base, alts, ref_ka, fork: a.fork });
+    }
+    rows.sort_by_key(|r| (r.pos, r.fork));
+    rows
 }
 
 struct VcfRow {

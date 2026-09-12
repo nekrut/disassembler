@@ -85,6 +85,10 @@ SWITCHING OFF (applies to --alt-engine=variants):
         --no-emit-alts            Do not write alt_haplotypes.fasta
         --emit-vcf                Also write <out-dir>/<acc>.vcf: intra-host SNPs with their
                                   ka:f frequency, in query coordinates [default: off]
+        --emit-snv-table          Also write <out-dir>/snvs.tsv: one long table of every
+                                  intra-host SNP across the run, one row per (accession, site,
+                                  allele). The cohort output that scales; load into DuckDB
+                                  [default: off]
         --no-indel-alts           Substitution alleles only; refuse any that change length
         --allow-frameshift-alts   Also accept indel alleles whose length change is not a
                                   multiple of 3. These reframe the CDS; off by default
@@ -225,6 +229,11 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
                 i += 1;
                 continue;
             }
+            "--emit-snv-table" | "--no-emit-snv-table" => {
+                args.cfg.emit_snv_table = flag == "--emit-snv-table";
+                i += 1;
+                continue;
+            }
             "--min-abund-frac" => {
                 let raw = value()?;
                 let v: f64 = raw.parse().map_err(|_| {
@@ -309,6 +318,9 @@ fn real_main(args: Args) -> error::Result<()> {
     io::output::write_bubbles(&summary, &args.out_dir.join("bubbles.json"))?;
     if args.cfg.emit_vcf {
         io::output::write_vcfs(&summary, &query, &args.out_dir)?;
+    }
+    if args.cfg.emit_snv_table {
+        io::output::write_snv_table(&summary, &query, &args.out_dir.join("snvs.tsv"))?;
     }
     if args.cfg.emit_alts {
         io::output::write_alts(&summary, &args.out_dir.join("alt_haplotypes.fasta"))?;

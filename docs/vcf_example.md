@@ -27,22 +27,82 @@ zika_ns5  517  .   G    A    .     PASS    AF=0.1564;AO=4800.0;RO=25000.0;FORK=.
 two alleles' `ka:f` coverage, `FORK` the unitig id of the fork. `POS` is 1-based within the
 query CDS.
 
-## The cohort, merged
+## The cohort, at scale: the long table
 
-Because every accession is called against the same gene, the coordinate frames match and the
-files merge with no reconciliation:
+A gene can be matched by millions of SRA runs. A merged multi-sample VCF carries one field per
+sample on every line, so at that scale it is a million-column, almost-entirely-empty matrix,
+and it does not work. The data is sparse (each accession has a handful of SNP sites) and its two
+axes are asymmetric: the site axis is bounded by gene length, the sample axis is unbounded. So
+the cohort output is a **long ("tidy") table**, one row per `(accession, site, allele)`, not a
+wide matrix.
+
+```bash
+logan-walker -l accessions.txt -q queries/markers/zika_ns5.fasta \
+  -o out -f out/primary.fasta --emit-snv-table   # writes out/snvs.tsv
+```
+
+[`zika_ns5.snvs.tsv`](examples/zika_ns5/zika_ns5.snvs.tsv):
+
+```
+gene      pos   ref  alt  accession    af      ka_alt   ka_ref   fork
+zika_ns5  1296  C    T    SRR6251979   0.2188  7000.0   25000.0  875541
+zika_ns5  2064  A    G    SRR6251979   0.2308  7500.0   25000.0  1315085
+...
+```
+
+Total rows are the sum of SNPs across accessions, a few per accession, so a million-run gene is
+tens of millions of rows, a sub-GB columnar file. Each cluster shard writes its own file; point
+DuckDB at the glob (`read_csv_auto('shard_*/snvs.tsv')`) and never materialise a dense matrix.
+The two things you actually want are queries over it.
+
+**Per-site summary** (this is what replaces the wide matrix, and it stays compact at any sample
+count):
+
+```sql
+SELECT pos, ref, alt, count(*) AS n_samples,
+       round(avg(af),3) AS mean_af, round(min(af),3) AS min_af, round(max(af),3) AS max_af
+FROM read_csv_auto('snvs.tsv', sep='\t')
+GROUP BY pos, ref, alt HAVING count(*) >= 2 ORDER BY n_samples DESC;
+```
+
+```
+ pos  change  n_samples  mean_af
+ 2225 T>G     6          0.128
+ 2525 G>A     6          0.173
+ 2064 A>G     4          0.288
+ 517  G>A     3          0.140
+ ...
+```
+
+**Cross-sample co-occurrence** of two sites, the input to frequency-covariation phasing, is a
+site-filtered self-join, not a scan of a matrix:
+
+```sql
+WITH a AS (SELECT accession FROM snv WHERE pos=2225),
+     b AS (SELECT accession FROM snv WHERE pos=2525)
+SELECT (SELECT count(*) FROM a JOIN b USING(accession)) AS both;   -- 6 of 6
+```
+
+Sites 2225 and 2525 carry a minor allele in the *same* six samples: perfect co-occurrence in
+this cohort, computed without ever touching the sample axis as columns.
+
+## Small cohorts only: merge and heatmap
+
+For a bounded, curated cohort (tens to a few hundred samples) it is convenient to merge into a
+multi-sample VCF and look at the dense matrix directly. **Do not do this at planetary scale** —
+use the long table above. On this 8-sample example:
 
 ```bash
 for f in *.vcf; do bcftools sort $f -Oz -o $f.gz; bcftools index $f.gz; done
 bcftools merge -m none *.vcf.gz -o zika_ns5.cohort.merged.vcf
 ```
 
-That produces the sites x samples frequency table
-([`zika_ns5.af_matrix.tsv`](examples/zika_ns5/zika_ns5.af_matrix.tsv), and the merged VCF
-[`zika_ns5.cohort.merged.vcf`](examples/zika_ns5/zika_ns5.cohort.merged.vcf)): 29 distinct sites
-across 8 samples, of which 12 are seen in two or more samples.
+produces the sites x samples table
+([`zika_ns5.af_matrix.tsv`](examples/zika_ns5/zika_ns5.af_matrix.tsv)) and merged VCF
+([`zika_ns5.cohort.merged.vcf`](examples/zika_ns5/zika_ns5.cohort.merged.vcf)): 29 sites across 8
+samples, 12 seen in two or more.
 
-## The matrix
+## The matrix (small-cohort view)
 
 ![Zika NS5 intra-host SNP frequencies across the cohort](examples/zika_ns5/zika_ns5.af_matrix.png)
 

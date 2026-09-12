@@ -89,8 +89,16 @@ The Rust walker and intra-host haplotype-recovery method originate from `logan-h
 biallelic sites (intra-host SNPs) with their k-mer-coverage frequency, in query
 coordinates (`CHROM` = gene, `POS` = 1-based position in the CDS). The primary FASTA is
 unchanged. Because every accession is called against the same gene, the VCFs share a
-coordinate frame and `bcftools merge` yields a sites x samples frequency matrix. Frequencies
-are `ka:f` ratios, a proxy for allele frequency, and are per-site, not phased.
+coordinate frame. Frequencies are `ka:f` ratios, a proxy for allele frequency, and are
+per-site, not phased.
 
-A worked example on the Zika NS5 cohort, with an example VCF, the merged matrix, and a heatmap
-of it, is in [`docs/vcf_example.md`](docs/vcf_example.md).
+For a cohort, `--emit-snv-table` writes `<out-dir>/snvs.tsv`, one long ("tidy") row per
+`(accession, site, allele)`. This is the output that scales: a gene can be matched by millions
+of runs, and a merged multi-sample VCF would be a million-column near-empty matrix, whereas the
+long table is sparse-native, concatenates across cluster shards, and loads straight into DuckDB
+for per-site summaries and cross-sample queries. Merging the per-accession VCFs into a dense
+matrix is a small-cohort convenience only.
+
+A worked example on the Zika NS5 cohort — an example VCF, the long table with DuckDB queries,
+and (for the small cohort) the merged matrix and a heatmap — is in
+[`docs/vcf_example.md`](docs/vcf_example.md).
