@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.jpg" alt="logan-disassembler" width="640">
+</p>
+
 # disassembler
 
 Stream [Logan](https://github.com/IndexThePlanet/Logan) cDBG unitigs from S3, anchor a
