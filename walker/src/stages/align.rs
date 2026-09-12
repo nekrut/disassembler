@@ -158,7 +158,7 @@ pub fn parse_gaf(gaf_bytes: &[u8]) -> Result<Option<GafPath>> {
     }
 
     let matches_of = |r: &Vec<&str>| r[9].parse::<usize>().unwrap_or(0);
-    rows.sort_by(|a, b| matches_of(b).cmp(&matches_of(a)));
+    rows.sort_by_key(|r| std::cmp::Reverse(matches_of(r)));
     let best = &rows[0];
 
     let num = |i: usize| -> Result<usize> {

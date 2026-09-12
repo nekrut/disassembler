@@ -24,6 +24,14 @@
 
 // Templating stage: unused items are expected until the stages are filled in.
 #![allow(dead_code, unused_variables)]
+// Intentional style, not defects: tab-delimited GFA/VCF examples in doc comments; test setup
+// that builds a Config::default() then tweaks a field; and a couple of wide tuples in tests and
+// in stages::detour (which is slated for removal). None touch the runtime path.
+#![allow(
+    clippy::tabs_in_doc_comments,
+    clippy::field_reassign_with_default,
+    clippy::type_complexity
+)]
 
 mod config;
 mod error;

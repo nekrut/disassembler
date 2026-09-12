@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: clippy + test (offline)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: walker
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            walker/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('walker/Cargo.lock') }}
+      # Offline gate: the network/data tests are #[ignore] and never run here.
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --release -- -D warnings
+      - name: Test
+        run: cargo test --release
+
+  golden:
+    name: golden concordance (manual)
+    # Needs GraphAligner and network access to the Logan S3 bucket, so it is not on the
+    # every-push path. Trigger it from the Actions tab (Run workflow) when the walk changes.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install GraphAligner
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: gaa
+          create-args: >-
+            -c conda-forge -c bioconda graphaligner=1.0.20
+      - name: Build walker
+        run: cargo build --release
+        working-directory: walker
+      - name: Golden concordance
+        shell: bash -el {0}
+        run: bench/check_golden.sh
