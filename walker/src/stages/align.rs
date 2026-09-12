@@ -245,11 +245,9 @@ mod tests {
     /// Best row is the one with the most residue matches (column 10), not the first.
     #[test]
     fn picks_the_row_with_most_matches() {
-        let gaf = format!(
-            "q\t10\t0\t10\t+\t>1\t10\t0\t10\t50\t60\t60\n\
+        let gaf = "q\t10\t0\t10\t+\t>1\t10\t0\t10\t50\t60\t60\n\
              q\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60\n\
-             q\t10\t0\t10\t+\t>3\t10\t0\t10\t100\t120\t60\n"
-        );
+             q\t10\t0\t10\t+\t>3\t10\t0\t10\t100\t120\t60\n".to_string();
         let g = parse_gaf(gaf.as_bytes()).unwrap().unwrap();
         assert_eq!(g.num_matches, 900);
         assert_eq!(g.steps[0].node, 2);
@@ -286,14 +284,14 @@ mod tests {
             graphaligner_bin: "definitely-not-a-real-binary-xyz".into(),
             ..Config::default()
         };
-        let e = resolve_binary(&cfg).err().expect("should fail").to_string();
+        let e = resolve_binary(&cfg).expect_err("should fail").to_string();
         assert!(e.contains("not on PATH"), "{e}");
     }
 
     #[test]
     fn absolute_path_that_does_not_exist_is_reported_as_such() {
         let cfg = Config { graphaligner_bin: "/nope/GraphAligner".into(), ..Config::default() };
-        let e = resolve_binary(&cfg).err().expect("should fail").to_string();
+        let e = resolve_binary(&cfg).expect_err("should fail").to_string();
         assert!(e.contains("not found at"), "{e}");
     }
 

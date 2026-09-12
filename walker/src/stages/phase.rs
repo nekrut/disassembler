@@ -172,7 +172,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
         if kept.len() < 2 {
             continue;
         }
-        kept.sort_by(|a, b| (a.node, a.strand).cmp(&(b.node, b.strand)));
+        kept.sort_by_key(|a| (a.node, a.strand));
 
         let (fork_id, fork_strand) = unlocal(fork as u32);
         let (merge_id, merge_strand) = unlocal(merge);
@@ -185,7 +185,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
         });
     }
 
-    bubbles.sort_by(|a, b| (a.fork, a.fork_strand).cmp(&(b.fork, b.fork_strand)));
+    bubbles.sort_by_key(|a| (a.fork, a.fork_strand));
     Ok(bubbles)
 }
 
@@ -193,7 +193,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
 mod tests {
     use super::*;
     use crate::stages::extract;
-    use crate::types::Anchors;
+    
     use std::path::PathBuf;
 
     fn build(fa: &str) -> UnitigGraph {
@@ -208,8 +208,8 @@ mod tests {
     fn whole(cfg: &Config, g: &UnitigGraph) -> Subgraph {
         let nodes: Vec<UnitigId> = (0..g.n_unitigs as u32).collect();
         let seqs = extract::collect_seqs(g, &nodes).unwrap();
-        let sub = extract::write_gfa(cfg, g, nodes, seqs).unwrap();
-        sub
+        
+        extract::write_gfa(cfg, g, nodes, seqs).unwrap()
     }
     fn cleanup(s: &Subgraph) { std::fs::remove_file(&s.gfa_path).ok(); }
 

@@ -126,7 +126,7 @@ impl UnitigGraph {
     /// Decode unitig `id` into `out`, which is cleared first. Reuse one buffer across calls
     /// rather than allocating per unitig.
     pub fn decode_seq(&self, id: UnitigId, out: &mut Vec<u8>) {
-        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        const BASES: [u8; 4] = *b"ACGT";
         let i = id as usize;
         let (start, end) = (self.seq_offset[i] as usize, self.seq_offset[i + 1] as usize);
         out.clear();

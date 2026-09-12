@@ -132,10 +132,9 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, query: &Query) -> Result<Su
         let mut done = 0usize;
         result_rx
             .into_iter()
-            .map(|r| {
+            .inspect(|r| {
                 done += 1;
-                report(done, total, &r);
-                r
+                report(done, total, r);
             })
             .collect::<Vec<_>>()
     });
@@ -406,10 +405,7 @@ fn run_one(
                 let gaf2 = pruned.gfa_path.with_extension("pass2.gaf");
                 let t = Instant::now();
                 let second = match stages::align::run(cfg, &pruned, query, &gaf2)? {
-                    Some(p) => match stages::stitch::stitch(cfg, &p, &pruned, query)? {
-                        Some(h) => Some((p, h)),
-                        None => None,
-                    },
+                    Some(p) => stages::stitch::stitch(cfg, &p, &pruned, query)?.map(|h| (p, h)),
                     None => None,
                 };
                 timing.align += t.elapsed().as_secs_f64();

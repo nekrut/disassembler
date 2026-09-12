@@ -198,7 +198,7 @@ pub fn prefer_majority(
                 if ab < floor || (ab as f64 / total) < cfg.min_vaf || ab <= taken_ab {
                     continue;
                 }
-                if best.map_or(true, |(_, b)| ab > b) {
+                if best.is_none_or(|(_, b)| ab > b) {
                     best = Some((alt, ab));
                 }
             }
@@ -224,14 +224,13 @@ pub fn prefer_majority(
             // alternatives on `ebola_gp`, every one of them an indel.
             let spliced_len = stitched_len(cfg, &steps, subgraph);
             let delta = spliced_len as i64 - baseline_len as i64;
-            if delta != 0 {
-                if !cfg.allow_indel_alts
+            if delta != 0
+                && (!cfg.allow_indel_alts
                     || delta.unsigned_abs() as usize > cfg.max_alt_indel
-                    || (delta % 3 != 0 && !cfg.allow_frameshift_alts)
+                    || (delta % 3 != 0 && !cfg.allow_frameshift_alts))
                 {
                     continue;
                 }
-            }
             let prefix_len = stitched_len(cfg, &current.steps[..=i], subgraph);
             let replaced_len = tail_contrib(cfg, &current.steps[i + 1..rejoin_at], subgraph);
             let Some((new_start, new_end)) = shifted_window(
@@ -932,7 +931,7 @@ mod tests {
     /// allele. The panel's tail sits at +100, +142 and -282.
     #[test]
     fn a_large_length_change_is_a_rerouting_not_an_allele() {
-        let long: String = std::iter::repeat("ACGT").take(20).collect(); // 80 nt, delta +76
+        let long: String = std::iter::repeat_n("ACGT", 20).collect(); // 80 nt, delta +76
         let fa = format!(
             ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n\
              >T_1 ka:f:60.0   L:-:0:-  L:+:3:+\nCGTA\n\

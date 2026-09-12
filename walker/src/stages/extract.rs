@@ -62,7 +62,7 @@ pub fn expand(cfg: &Config, graph: &UnitigGraph, anchors: &Anchors) -> Result<Ve
 
     // A bitset over unitig ids is the cheap membership test here: one bit each, so 156 KB
     // for a 1.28M-unitig accession, versus a hash set that would allocate per insert.
-    let mut visited = vec![0u64; (graph.n_unitigs + 63) / 64];
+    let mut visited = vec![0u64; graph.n_unitigs.div_ceil(64)];
     let mark = |v: &mut Vec<u64>, id: u32| -> bool {
         let (w, b) = ((id >> 6) as usize, id & 63);
         let bit = 1u64 << b;
@@ -161,7 +161,7 @@ pub fn prune_nodes(
 ) -> (Vec<UnitigId>, Vec<Vec<u8>>) {
     let mut kn = Vec::with_capacity(nodes.len());
     let mut ks = Vec::with_capacity(seqs.len());
-    for (id, seq) in nodes.into_iter().zip(seqs.into_iter()) {
+    for (id, seq) in nodes.into_iter().zip(seqs) {
         if graph.abundance[id as usize] >= floor {
             kn.push(id);
             ks.push(seq);
@@ -267,7 +267,7 @@ pub fn write_gfa(
 
     // Membership test for "is this edge target inside the subgraph". `nodes` is sorted, so a
     // bitset keyed by unitig id is both smaller and faster than a binary search per edge.
-    let mut inside = vec![0u64; (graph.n_unitigs + 63) / 64];
+    let mut inside = vec![0u64; graph.n_unitigs.div_ceil(64)];
     for &id in &nodes {
         inside[(id >> 6) as usize] |= 1u64 << (id & 63);
     }
@@ -290,9 +290,9 @@ pub fn write_gfa(
             if !is_inside(target) {
                 continue;
             }
-            write!(
+            writeln!(
                 w,
-                "L\t{id}\t{}\t{target}\t{}\t{overlap}M\n",
+                "L\t{id}\t{}\t{target}\t{}\t{overlap}M",
                 if src_fwd { '+' } else { '-' },
                 if dst_fwd { '+' } else { '-' },
             )?;
@@ -365,7 +365,7 @@ mod collect_tests {
     #[test]
     fn agrees_with_base_at_for_every_position() {
         let g = graph(">T_0\nACGTACGTA\n>T_1\nTTGCAGGCTA\n");
-        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        const BASES: [u8; 4] = *b"ACGT";
         for id in 0..2u32 {
             let seq = &collect_seqs(&g, &[id]).unwrap()[0];
             for (j, &b) in seq.iter().enumerate() {
