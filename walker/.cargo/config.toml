@@ -1,0 +1,15 @@
+# Convenience aliases. Paths are relative to this crate directory, so run these
+# from walker/.
+[alias]
+# Fixed small batch, same configuration every time. See ../bench/smoke.txt.
+smoke = [
+    "run", "--release", "--",
+    "-l", "../bench/smoke.txt",
+    "-q", "../queries/query_hiv1_pol.fasta",
+    "-o", "/tmp/logan-walker-smoke",
+    "-f", "/tmp/logan-walker-smoke/reconstructed.fasta",
+    "--min-shared-kmers", "3",
+    "--fetch-workers", "2",
+    "-w", "2",
+    "-t", "2",
+]

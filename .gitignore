@@ -1,0 +1,27 @@
+# Rust build artifacts
+/walker/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.condaenv-walker/
+
+# Walker outputs / scratch
+*.gaf
+/dev/shm/logan-walker/
+reconstructed.fasta
+alt_haplotypes.fasta
+bubbles.json
+*_walker_summary.json
+
+# Large streamed data (regenerate from S3)
+*.unitigs.fa
+*.unitigs.fa.zst
+
+# Editor / OS
+.vscode/
+.DS_Store
+*.log
+nohup.out

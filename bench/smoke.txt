@@ -1,0 +1,13 @@
+# Smoke-test batch for the Rust walker. Small on purpose: ~25 MB compressed total,
+# a few seconds end to end once the stages are implemented.
+#
+# All three are HIV-1 pol, so they share one query (work/viral/query_hiv1_pol.fasta).
+# Chosen to exercise more than one code path:
+#
+#   SRR8209082   1.8M   reconstructs (cov 1.00, pident 98.2). Also a golden-truth fixture.
+#                       Pathological subgraph: 26,323 nodes, ~32% of its whole graph.
+#   DRR000252    7.6M   1 anchor -> no_path. Exercises the no-path branch.
+#   DRR000253     16M   third size point for concurrency.
+SRR8209082
+DRR000252
+DRR000253
