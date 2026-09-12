@@ -65,3 +65,7 @@ pass (128); network- and data-dependent tests are `#[ignore]` by default.
 
 See `docs/issue_intra_accession_variance_lost.md` for the central methodological finding: the
 reference-matching-minority-allele bias, its measurement, and the fix.
+
+## Credits
+
+The Rust walker and intra-host haplotype-recovery method originate from `logan-hypyaeon` PR #4, authored by Andrew ([@as042](https://github.com/as042)), building on the PR #3 Rust port. See `NOTICE` and `docs/` for full provenance.

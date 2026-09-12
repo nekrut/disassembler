@@ -1,0 +1,16 @@
+disassembler
+=============
+
+This repository is a decoupled extraction of the Logan cDBG path-walking
+component from https://github.com/nekrut/logan-hypyaeon.
+
+The native Rust walker (walker/) and the intra-accession haplotype-recovery
+work originate from logan-hypyaeon PR #4 ("Haplotype recovery"), authored by
+Andrew (@as042), which built on the PR #3 Rust port. The reference Python
+prototype (python/logan_path_walker.py) and the design/measurement documents
+under docs/ likewise originate from that project.
+
+The upstream history was squashed into a single import commit here. Original
+authorship and the full investigation record are preserved in the upstream
+repository and in docs/ (see docs/upstream_pr4_description.md,
+docs/issue_intra_accession_variance_lost.md, docs/rust_walker_as_built.md).
