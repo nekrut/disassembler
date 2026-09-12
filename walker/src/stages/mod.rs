@@ -16,7 +16,6 @@
 
 pub mod align;
 pub mod anchor;
-pub mod detour;
 pub mod extract;
 pub mod parse;
 pub mod phase;

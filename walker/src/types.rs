@@ -233,49 +233,8 @@ pub struct GafPath {
 }
 
 // ---------------------------------------------------------------------------
-// stage 6 output: stitch & detour
+// stage 6 output: stitch & variants
 // ---------------------------------------------------------------------------
-
-/// Which implementation produces the alternative haplotypes.
-///
-/// Two independent ones landed in this tree: `stages::detour` came from upstream and
-/// `stages::variants` was written here, against the same defect. They differ in three ways
-/// that matter, so only one runs at a time and both are kept intact until they can be
-/// compared properly on the same data.
-///
-/// ```text
-///                         detour (upstream)        variants (local)
-/// gate at a fork          alternative branch only  BOTH branches must be credible
-/// length-changing detour  allowed                  rejected
-/// records go to           the main FASTA           alt_haplotypes.fasta
-/// picks the major allele  ranks candidates by      --prefer-majority rewrites the
-///                         mean ka:f                route per site
-/// ```
-///
-/// The gate is the consequential one. On `SRR8209082` the alternative-only rule admits ~57
-/// sites where the both-credible rule admits 1, because at 54 of them the branch the route
-/// took holds under 10% of local coverage: those are the reference-bias defect, not two
-/// alleles co-existing. Under `Detour` they reach the main FASTA, and
-/// `build_walker_codon_msa.py` turns every record there into an independent taxon.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AltEngine {
-    /// Neither. One haplotype per accession, as before either feature existed.
-    Off,
-    /// Upstream's closed-loop detour splicing, `stages::detour`.
-    Detour,
-    /// The local implementation, `stages::variants`.
-    Variants,
-}
-
-/// Haplotype emission mode for upstream's `stages::detour`, read only when
-/// `AltEngine::Detour` is selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HaplotypeMode {
-    /// Emit only the single highest-coverage (primary/major) haplotype.
-    One,
-    /// Emit all phased branch detours (quasispecies/alleles) clearing abundance & VAF gates.
-    Many,
-}
 
 /// A reconstructed full-length coding haplotype.
 #[derive(Debug, Clone)]

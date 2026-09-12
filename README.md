@@ -69,12 +69,13 @@ Reproduce the old one-haplotype-per-accession behaviour (matches the golden fixt
 
 ## Provenance and status
 
-The walker is `logan-hypyaeon` PR #4 (`Haplotype recovery`), which layered intra-accession
-variant recovery on top of the PR #3 Rust port. Both `stages::variants` (default) and the
-upstream `stages::detour` are present and selectable via `--alt-engine`; `docs/` records why
-`variants` is the default. Concordance: the Rust primary is byte-identical to
-`bench/golden/ERR2028820.pfcrt.primary.fasta` under old-behaviour flags. Offline unit tests
-pass (128); network- and data-dependent tests are `#[ignore]` by default.
+The walker began as `logan-hypyaeon` PR #4 (`Haplotype recovery`), which layered intra-accession
+variant recovery on top of the PR #3 Rust port. Intra-host alleles are recovered by
+`stages::variants`; the parallel upstream `stages::detour` engine has been retired in favour of
+it (`docs/issue_intra_accession_variance_lost.md` section 17 records why). Concordance: the Rust
+primary is byte-identical to `bench/golden/ERR2028820.pfcrt.primary.fasta` under old-behaviour
+flags, checked by `bench/check_golden.sh`. Offline unit tests pass (131); network- and
+data-dependent tests are `#[ignore]` by default.
 
 See `docs/issue_intra_accession_variance_lost.md` for the central methodological finding: the
 reference-matching-minority-allele bias, its measurement, and the fix.

@@ -60,8 +60,7 @@ src/
     extract.rs   5-hop BFS, sequence collection, GFA emit, prune
     align.rs     GraphAligner wrapper
     stitch.rs    path -> haplotype
-    variants.rs  prefer-majority + intra-host alt recovery (the default alt engine)
-    detour.rs    upstream -H many alt engine (slated for removal)
+    variants.rs  prefer-majority + intra-host alt recovery (SNPs -> alts, vcf, snv table)
     phase.rs     bubble detection (bubbles.json)
 ```
 

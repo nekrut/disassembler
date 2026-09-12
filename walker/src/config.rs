@@ -1,6 +1,5 @@
 //! Tunables. Defaults mirror `logan_path_walker.py` so the two agree out of the box.
 
-use crate::types::{AltEngine, HaplotypeMode};
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -213,21 +212,6 @@ pub struct Config {
     /// shortcuts: an alternative that rejoins far downstream changes the sequence length and
     /// is discarded whatever its detour.
     pub alt_max_detour: usize,
-    /// Haplotype emission mode: One (primary/major only) or Many (major + all phased detours).
-    pub haplotypes: HaplotypeMode,
-    /// Maximum hops for forward BFS when searching for detour reconvergence.
-    pub max_detour_hops: usize,
-    /// Which implementation produces the alternative haplotypes. See `types::AltEngine`.
-    ///
-    /// Two independent implementations of the same feature are present, upstream's
-    /// `stages::detour` and the local `stages::variants`. Only one runs. The default is
-    /// `Variants` because it is the conservative choice, not because it has been shown to be
-    /// the better one: it writes to its own file, so nothing downstream changes, whereas
-    /// `Detour` writes every alternative into the main FASTA where
-    /// `build_walker_codon_msa.py` makes each an independent taxon. **This default is
-    /// provisional, pending a like-for-like comparison of the two on the same accessions.**
-    pub alt_engine: AltEngine,
-
 
     // ---- anchoring ----
     /// Minimum shared canonical k-mers for a unitig to be an anchor.
@@ -294,8 +278,9 @@ pub struct Config {
     /// Refuse accessions whose compressed size exceeds this.
     ///
     /// This is a safety valve, not a tuning knob. Compressed size is held in memory per
-    /// in-flight accession, and decompressed size runs 4-5x higher again. Default 350 MB
-    /// drops multi-gigabyte environmental metagenomes in 50 ms via Content-Length.
+    /// in-flight accession, and decompressed size runs 4-5x higher again. Default 1 GB still
+    /// drops multi-gigabyte environmental metagenomes in 50 ms via Content-Length, while
+    /// keeping the deep viral runs the earlier 350 MB cap refused (it cost ~7.5% of the panel).
     pub max_compressed_bytes: u64,
 
     // ---- io ----
@@ -325,9 +310,6 @@ impl Default for Config {
             emit_snv_table: false,
             max_alts: 32,
             alt_max_detour: 100,
-            haplotypes: HaplotypeMode::Many,
-            max_detour_hops: 8,
-            alt_engine: AltEngine::Variants,
             min_shared_kmers: 3,
             subgraph_fraction_guard: 0.01,
             fetch_workers: 8,
@@ -337,7 +319,7 @@ impl Default for Config {
             fetch_timeout_secs: 900,
             fetch_connect_timeout_secs: 15,
             fetch_attempts: 3,
-            max_compressed_bytes: 350 * 1024 * 1024,
+            max_compressed_bytes: 1024 * 1024 * 1024,
             scratch_dir: PathBuf::from("/dev/shm/logan-walker"),
             graphaligner_bin: String::from("GraphAligner"),
         }

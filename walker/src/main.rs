@@ -1,8 +1,5 @@
 //! logan-walker: Logan unitigs to coding haplotypes.
 //!
-//! Skeleton. No algorithms are implemented; every stage returns
-//! `Error::NotImplemented` naming itself, so running the binary shows how far the flow gets.
-//!
 //! ```text
 //!   main.rs        CLI, config, calls pipeline::run
 //!   pipeline.rs    threading structure and stage wiring   <- read this for the flow
@@ -10,23 +7,24 @@
 //!   types.rs       what moves between stages              <- read this for the shapes
 //!   error.rs       error type
 //!   io/input.rs    accession list, reference CDS          <- INTO the pipeline
-//!   io/output.rs   fasta, bubbles, summary                <- OUT of the pipeline
+//!   io/output.rs   fasta, vcf, snv table, bubbles, summary <- OUT of the pipeline
 //!   stages/stream.rs    S3 + zstd
 //!   stages/parse.rs     BCALM2 headers -> CSR
 //!   stages/anchor.rs    canonical k-mers (replaces BLAST)
-//!   stages/extract.rs   5-hop BFS + GFA
+//!   stages/extract.rs   5-hop BFS + GFA + prune
 //!   stages/align.rs     GraphAligner wrapper (external C++ binary)
 //!   stages/stitch.rs    path -> sequence
-//!   stages/phase.rs     forks -> variants
+//!   stages/variants.rs  prefer-majority + intra-host alt recovery
+//!   stages/phase.rs     forks -> bubbles.json
 //! ```
 //!
-//! Plan: `work/plan_rust_path_walker.md`. Concordance gate: `work/benchmark/verify_golden.py`.
+//! Concordance gate: `bench/check_golden.sh`.
 
-// Templating stage: unused items are expected until the stages are filled in.
+// A few items are retained for API symmetry / tests.
 #![allow(dead_code, unused_variables)]
 // Intentional style, not defects: tab-delimited GFA/VCF examples in doc comments; test setup
-// that builds a Config::default() then tweaks a field; and a couple of wide tuples in tests and
-// in stages::detour (which is slated for removal). None touch the runtime path.
+// that builds a Config::default() then tweaks a field; and a couple of wide tuples in tests.
+// None touch the runtime path.
 #![allow(
     clippy::tabs_in_doc_comments,
     clippy::field_reassign_with_default,
@@ -45,7 +43,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-logan-walker (skeleton)
+logan-walker
 
 USAGE:
     logan-walker [OPTIONS]
@@ -61,16 +59,14 @@ OUTPUT:
 
 TUNING:
     -k, --k <N>                   Anchor k-mer size, 1..=32 [default: 21]
-    -H, --haplotypes <one|many>   Haplotype mode: 'one' (primary) or 'many' (all phased detours) [default: many]
         --hops <N>                Hop radius for subgraph expansion [default: 5]
-        --max-detour-hops <N>     Maximum hops for detour reconvergence [default: 8]
         --min-abund <F>           Minimum ka:f for a variant [default: 5.0]
         --min-vaf <F>             Minimum VAF for an alternative branch [default: 0.10]
         --min-abund-frac <F>      Raise the variant floor to this fraction of gene depth,
                                   median ka:f on the walked path [default: 0.0 = off]
         --min-cov <F>             Minimum reference coverage [default: 0.85]
         --min-shared-kmers <N>    Anchor threshold, validated 1..=5 [default: 3]
-        --max-size-mb <N>         Maximum compressed SRA size in MB [default: 350]
+        --max-size-mb <N>         Maximum compressed SRA size in MB [default: 1024]
         --prune-frac <F>          Drop unitigs below this fraction of the gene's depth and
                                   realign, removing the aligner's reference bias. 0.0
                                   disables it [default: 0.01]
@@ -81,13 +77,7 @@ TUNING:
     -w, --workers <N>             Compute workers
         --fetch-workers <N>       Fetch workers [default: 8]
 
-ALTERNATIVE HAPLOTYPES:
-        --alt-engine <E>          Which implementation emits them: variants (local, records
-                                  to alt_haplotypes.fasta), detour (upstream, records into
-                                  the main FASTA), or off [default: variants]
-    -H, --haplotypes <one|many>   Upstream detour mode; only read when --alt-engine=detour
-
-SWITCHING OFF (applies to --alt-engine=variants):
+INTRA-HOST VARIANTS:
         --no-prefer-majority      Leave the primary on the reference-matching allele at
                                   two-allele sites, instead of the more abundant one
         --no-emit-alts            Do not write alt_haplotypes.fasta
@@ -142,32 +132,8 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             "-k" | "--k" => {
                 args.cfg.k = value()?.parse().map_err(|e| error::Error::Usage(format!("--k: {e}")))?;
             }
-            "--alt-engine" => {
-                let raw = value()?;
-                args.cfg.alt_engine = match raw.as_str() {
-                    "variants" => types::AltEngine::Variants,
-                    "detour" => types::AltEngine::Detour,
-                    "off" | "none" => types::AltEngine::Off,
-                    other => {
-                        return Err(error::Error::Usage(format!(
-                            "--alt-engine must be variants, detour or off, got {other:?}"
-                        )))
-                    }
-                };
-            }
-            "-H" | "--haplotypes" => {
-                let v = value()?;
-                match v.to_lowercase().as_str() {
-                    "one" | "single" => args.cfg.haplotypes = types::HaplotypeMode::One,
-                    "many" | "all" | "multi" => args.cfg.haplotypes = types::HaplotypeMode::Many,
-                    other => return Err(error::Error::Usage(format!("--haplotypes must be 'one' or 'many', got '{other}'"))),
-                }
-            }
             "--hops" => {
                 args.cfg.hops = value()?.parse().map_err(|e| error::Error::Usage(format!("--hops: {e}")))?;
-            }
-            "--max-detour-hops" => {
-                args.cfg.max_detour_hops = value()?.parse().map_err(|e| error::Error::Usage(format!("--max-detour-hops: {e}")))?;
             }
             "--min-abund" => {
                 args.cfg.min_abund = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-abund: {e}")))?;

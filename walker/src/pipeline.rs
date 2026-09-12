@@ -448,39 +448,26 @@ fn run_one(
     if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
         let _ = std::fs::remove_file(&subgraph.gfa_path);
     }
-    // The two engines are mutually exclusive. `prune_frac` is not part of either: it cleans
-    // the graph before any of this and applies whichever one is selected.
+    // Intra-host variant recovery. `prune_frac` is not part of this: it cleans the graph
+    // before this runs. `prefer_majority` and the alt/vcf/snv outputs each gate themselves, so
+    // with all of them off this reduces to emitting the single stitched primary.
     let t = Instant::now();
     let mut alts: Vec<crate::types::AltHaplotype> = Vec::new();
-    let haplotypes: Vec<crate::types::Haplotype> = match cfg.alt_engine {
-        crate::types::AltEngine::Detour => match &final_path {
-            // Upstream's stage does its own stitching and returns the major allele first,
-            // so it replaces the haplotype computed above rather than adding to it.
-            Some(path) => {
-                stages::detour::extract_haplotypes(cfg, &graph, &subgraph, query, path)?
+    // Correct the consensus first, so the alternatives that follow are the minority alleles
+    // relative to a corrected route rather than to a reference-biased one.
+    if let (Some(path), Some(_)) = (&final_path, &haplotype) {
+        if let Some(fixed) = stages::variants::prefer_majority(cfg, &graph, &subgraph, path, query)?
+        {
+            if let Some(h) = stages::stitch::stitch(cfg, &fixed, &subgraph, query)? {
+                haplotype = Some(h);
+                final_path = Some(fixed);
             }
-            None => Vec::new(),
-        },
-        crate::types::AltEngine::Variants => {
-            // Correct the consensus first, so the alternatives that follow are the minority
-            // alleles relative to a corrected route rather than to a reference-biased one.
-            if let (Some(path), Some(_)) = (&final_path, &haplotype) {
-                if let Some(fixed) =
-                    stages::variants::prefer_majority(cfg, &graph, &subgraph, path, query)?
-                {
-                    if let Some(h) = stages::stitch::stitch(cfg, &fixed, &subgraph, query)? {
-                        haplotype = Some(h);
-                        final_path = Some(fixed);
-                    }
-                }
-            }
-            if let (Some(path), Some(_)) = (&final_path, &haplotype) {
-                alts = stages::variants::find_alts(cfg, &graph, &subgraph, path, query)?;
-            }
-            haplotype.clone().into_iter().collect()
         }
-        crate::types::AltEngine::Off => haplotype.clone().into_iter().collect(),
-    };
+    }
+    if let (Some(path), Some(_)) = (&final_path, &haplotype) {
+        alts = stages::variants::find_alts(cfg, &graph, &subgraph, path, query)?;
+    }
+    let haplotypes: Vec<crate::types::Haplotype> = haplotype.clone().into_iter().collect();
     timing.stitch += t.elapsed().as_secs_f64();
     timing.total = t_start.elapsed().as_secs_f64();
 
