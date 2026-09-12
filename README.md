@@ -44,7 +44,7 @@ contig, so the difference is intra-host diversity, not a Logan quirk. Full numbe
 
 ```
 walker/     logan-walker: the native Rust engine (the product)
-python/     build_walker_codon_msa.py (downstream reference-guided codon MSA + FastTree)
+python/     disassemble.py (end-to-end driver) + build_walker_codon_msa.py (codon MSA + FastTree)
 queries/    reference coding sequences (pfcrt, hiv1_pol, 25 planetary markers, master panel)
 bench/      golden fixtures, the check_golden.sh concordance gate, k-mer sensitivity sim (archive/ holds retired Python-walker tooling)
 docs/       design plan, as-built notes, the variance-loss investigation, upstream context
@@ -66,6 +66,23 @@ cargo build --release
 
 Reproduce the old one-haplotype-per-accession behaviour (matches the golden fixtures) with
 `--prune-frac 0.0 --no-prefer-majority --no-emit-alts`.
+
+### End to end: accessions to a phylogeny
+
+`python/disassemble.py` chains the walker and the codon-MSA/FastTree step into one command, so
+you go straight from accessions to a tree. It needs `GraphAligner`, `MAFFT`, `FastTree`, and
+biopython — all in the `disassembler` conda env (`environment.yml`).
+
+```bash
+conda env create -f environment.yml && conda activate disassembler
+python/disassemble.py -a SRR6251967 -q queries/markers/zika_ns5.fasta -o out/zika --emit-snv-table
+#   out/zika/reconstructed.fasta       reconstructed coding haplotypes
+#   out/zika/zika_ns5_codon_msa.fasta  in-frame codon alignment (MAFFT --keeplength)
+#   out/zika/zika_ns5_fasttree.nwk     GTR maximum-likelihood tree
+```
+
+Use `-l accessions.txt` for a cohort, `--skip-tree` to stop after reconstruction, and pass any
+extra walker flags after a literal `--`.
 
 ## Provenance and status
 
