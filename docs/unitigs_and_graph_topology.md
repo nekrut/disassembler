@@ -92,6 +92,13 @@ flowchart LR
 
 ### 2.5 Closed-Loop Multi-Haplotype Detour Splicing (`-H many`)
 
+> **Note:** this section describes the retired `detour` engine (`-H many`, `--max-detour-hops`,
+> `_detour_N` records), imported from the upstream README for the reference-bias background it
+> explains. That engine has been removed; intra-host alleles are now recovered by
+> `stages::variants` (writing `alt_haplotypes.fasta` / `--emit-vcf`), which the variance
+> investigation showed wins on gap rate and VAF labelling. The reference-bias problem below is
+> real and still what the current stage addresses.
+
 A critical discovery in graph-based sequence extraction is that **GraphAligner exhibits intrinsic reference bias**. Because GraphAligner scores candidate paths against the reference query sequence, it prefers a low-abundance (e.g. 1%) reference-matching path over a divergent 99% majority allele that contains two true biological substitutions:
 
 ```mermaid

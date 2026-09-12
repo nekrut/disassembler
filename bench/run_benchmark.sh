@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_benchmark.sh: Standardized benchmark for multi-accession path walking.
 set -e
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 
 PYTHON="${PYTHON:-python3}"

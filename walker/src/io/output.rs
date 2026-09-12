@@ -437,7 +437,30 @@ fn snv_sites(r: &AccessionResult, query: &Query) -> Vec<VcfRow> {
         rows.push(VcfRow { pos: qpos + 1, ref_base, alts, ref_ka, fork: a.fork });
     }
     rows.sort_by_key(|r| (r.pos, r.fork));
-    rows
+
+    // Coalesce alts at the same query position into one multiallelic record. A triallelic
+    // on-path fork produces two `AltHaplotype`s that differ from the primary at the SAME
+    // position, so each becomes a row at that pos. Emitting them as separate VCF lines would
+    // duplicate POS (and the major allele) with a contradictory RO, which is a malformed
+    // record and makes `bcftools merge` warn or build a wrong matrix. Merge them: union the
+    // alt alleles by base, and take the reference allele's coverage from whichever row actually
+    // observed it (the others report 0 because the gene base is not their allele).
+    let mut merged: Vec<VcfRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(last) = merged.last_mut() {
+            if last.pos == row.pos {
+                last.ref_ka = last.ref_ka.max(row.ref_ka);
+                for (base, af, ka) in row.alts {
+                    if !last.alts.iter().any(|&(b, _, _)| b == base) {
+                        last.alts.push((base, af, ka));
+                    }
+                }
+                continue;
+            }
+        }
+        merged.push(row);
+    }
+    merged
 }
 
 struct VcfRow {
@@ -534,7 +557,92 @@ fn align_primary_to_query(primary: &[u8], query: &[u8]) -> Vec<Option<usize>> {
 
 #[cfg(test)]
 mod vcf_tests {
-    use super::align_primary_to_query;
+    use super::{align_primary_to_query, snv_sites};
+    use crate::types::{
+        AccessionResult, AltHaplotype, Haplotype, Outcome, Query, Strand, Timing,
+    };
+    use std::path::PathBuf;
+
+    fn hap(seq: &[u8]) -> Haplotype {
+        Haplotype {
+            id: "h".into(),
+            seq: seq.to_vec(),
+            cov: 1.0,
+            pident: 100.0,
+            nodes: 1,
+            mean_ka: 0.0,
+            vaf: 1.0,
+        }
+    }
+
+    fn alt(seq: &[u8], alt_vaf: f64, alt_ka: f32) -> AltHaplotype {
+        AltHaplotype {
+            haplotype: hap(seq),
+            fork: 7,
+            fork_strand: Strand::Forward,
+            alt_node: 9,
+            alt_strand: Strand::Forward,
+            taken_abundance: 100.0,
+            taken_vaf: 0.60,
+            alt_abundance: alt_ka,
+            alt_vaf,
+            detour_nodes: 1,
+            length_delta: 0,
+            replaced_span: 1,
+        }
+    }
+
+    fn result(primary: &[u8], alts: Vec<AltHaplotype>) -> AccessionResult {
+        AccessionResult {
+            accession: "ACC".into(),
+            outcome: Outcome::Success,
+            n_unitigs: 0,
+            n_anchors: 0,
+            subgraph_nodes: 0,
+            haplotype: Some(hap(primary)),
+            haplotypes: vec![hap(primary)],
+            alts,
+            bubbles: Vec::new(),
+            timing: Timing::default(),
+            error: None,
+        }
+    }
+
+    fn query(seq: &[u8]) -> Query {
+        Query { name: "g".into(), record_id: "g".into(), seq: seq.to_vec(), path: PathBuf::from("g.fa") }
+    }
+
+    /// A triallelic on-path fork yields two alt haplotypes that differ from the primary at the
+    /// same position. They must coalesce into ONE multiallelic site, not two records at the same
+    /// POS (which would be a malformed VCF and break `bcftools merge`).
+    #[test]
+    fn triallelic_site_coalesces_into_one_multiallelic_row() {
+        let primary = b"TTTATTT"; // major allele A at index 3 (pos 4)
+        let q = query(b"TTTATTT"); // gene base == major, so REF = A
+        let alts = vec![
+            alt(b"TTTCTTT", 0.25, 25.0), // minor C
+            alt(b"TTTGTTT", 0.15, 15.0), // minor G
+        ];
+        let rows = snv_sites(&result(primary, alts), &q);
+        assert_eq!(rows.len(), 1, "the two same-position alts must merge to one record");
+        assert_eq!(rows[0].pos, 4);
+        let bases: Vec<u8> = rows[0].alts.iter().map(|&(b, _, _)| b).collect();
+        assert_eq!(bases, vec![b'C', b'G'], "both minor alleles present, deduplicated");
+        assert_eq!(rows[0].ref_base, b'A');
+        assert_eq!(rows[0].ref_ka, 100.0, "RO is the major (=REF) coverage, once");
+    }
+
+    /// Two forks at DIFFERENT positions stay two records.
+    #[test]
+    fn distinct_positions_stay_separate() {
+        let primary = b"TTATTAT"; // A at index 2 and index 5
+        let q = query(b"TTATTAT");
+        let alts = vec![alt(b"TTCTTAT", 0.20, 20.0), alt(b"TTATTCT", 0.30, 30.0)];
+        let rows = snv_sites(&result(primary, alts), &q);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].pos, 3);
+        assert_eq!(rows[1].pos, 6);
+    }
 
     #[test]
     fn identical_sequences_map_one_to_one() {

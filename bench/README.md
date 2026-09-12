@@ -15,13 +15,13 @@
 ## Fork-loss measurement
 
 `measure_fork_loss.py` reproduces every figure in
-`work/issue_intra_accession_variance_lost.md`: the haplotypes discarded when the walk takes
+`docs/issue_intra_accession_variance_lost.md`: the haplotypes discarded when the walk takes
 the reference-matching branch at a fork instead of the abundant one.
 
 ```bash
-python3 work/benchmark/measure_fork_loss.py --all
-python3 work/benchmark/measure_fork_loss.py --all --json
-python3 work/benchmark/measure_fork_loss.py -a SRR8209082 -q work/viral/query_hiv1_pol.fasta
+python3 bench/measure_fork_loss.py --all
+python3 bench/measure_fork_loss.py --all --json
+python3 bench/measure_fork_loss.py -a SRR8209082 -q queries/query_hiv1_pol.fasta
 ```
 
 Needs `blastn`, `makeblastdb`, `GraphAligner`, `curl` and `zstd`. Binaries resolve the same way
@@ -34,12 +34,12 @@ first run of an accession streams from S3 and later runs take seconds.
 `logan_path_walker.py` deletes its GFA and GAF in a `finally` block (`:327-330`), so the
 evidence is destroyed on every run. Stages 1 to 5 here are copied from the walker and keep
 those files. Phasing is reimplemented with the orientation fix from
-`rust-walker/src/stages/phase.rs`, which the Python walker does not have.
+`walker/src/stages/phase.rs`, which the Python walker does not have.
 
 Because it is a copy, it can drift:
 
 ```bash
-python3 work/benchmark/measure_fork_loss.py --all --self-check   # exit 1 on drift
+python3 bench/measure_fork_loss.py --all --self-check   # exit 1 on drift
 ```
 
 `--self-check` fails unless the copied stages still reproduce the golden graph shape

@@ -778,6 +778,10 @@ allow_frameshift_alts   false   opt in with --allow-frameshift-alts
 
 ## 19. The 350 MB size cap, measured
 
+> **Update:** the default has since been raised to **1 GB** (`--max-size-mb 1024`) on the
+> strength of this measurement. The numbers below were taken at the old 350 MB default and are
+> left as the record that motivated the change.
+
 Upstream's `8b692ac` lowered `max_compressed_bytes` from 2 GB to 350 MB, so accessions above that
 are refused on Content-Length before anything is downloaded. That is a sound idea for environmental
 metagenomes, but it is not free on this panel.

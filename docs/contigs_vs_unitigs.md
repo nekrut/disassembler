@@ -16,7 +16,7 @@ diverse samples, and it holds even in primary-only mode.
 ## Method
 
 Nine *Zika* NS5 accessions (the curated `zika_ns5.top10.txt` cohort, minus `SRR6252011` which
-the 350 MB size cap refuses at ~1.05 GB compressed) plus two clonal *C. auris* ERG11 controls.
+the 1 GB size cap refuses at ~1.05 GB compressed) plus two clonal *C. auris* ERG11 controls.
 For each:
 
 ```bash

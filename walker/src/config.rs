@@ -155,7 +155,7 @@ pub struct Config {
     /// Length-changing alleles were refused outright until `variants::shifted_window`
     /// existed, because `path_start` and `path_end` are offsets into the stitched sequence
     /// and reusing them after a splice that adds or removes bases slices the wrong window.
-    /// Upstream's `stages::detour` has never had that check, which is most of why it emits
+    /// The retired upstream `detour` engine had no such check, which was most of why it emitted
     /// alternatives carrying gaps at 42% against this stage's 2%.
     pub allow_indel_alts: bool,
     /// Largest length change, in bases, that still counts as an indel allele.

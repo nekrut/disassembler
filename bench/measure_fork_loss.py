@@ -23,7 +23,7 @@ import sys, os, re, json, gzip, argparse, subprocess, collections
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
+ROOT = HERE.parent
 K, MIN_ABUND, MIN_VAF, MIN_COV, HOPS = 31, 5.0, 0.10, 0.85, 5
 
 CASES = [

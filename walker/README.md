@@ -8,7 +8,7 @@ full-length coding haplotypes present in the sample.
 
 ```bash
 cargo build --release            # target/release/logan-walker
-cargo test --release             # 132 offline tests; network/data tests are #[ignore]
+cargo test --release             # offline tests (network/data tests are #[ignore])
 ```
 
 `GraphAligner` must be on `PATH` at run time (bioconda; see [`../environment.yml`](../environment.yml)).

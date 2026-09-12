@@ -229,8 +229,21 @@ fn compute_worker(
         };
         let accession = fetched.accession.clone();
 
-        let result = run_one(cfg, query, query_index, fetched)
-            .unwrap_or_else(|e| AccessionResult::failed(accession, e.to_string()));
+        // A stage returning `Err` is already handled below. A stage that *panics* (e.g. an
+        // index out of bounds on a malformed graph) must not take the worker down with it: the
+        // accession's buffer has already been consumed from the queue, so an uncaught panic
+        // would send no result. That silently drops the accession, and if a systematic bug
+        // kills every compute worker, the fetch pool then blocks forever on a full bounded
+        // channel and the whole run hangs. Catching here turns a panic into one `Failed`
+        // result and keeps the worker alive.
+        let panic_acc = accession.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_one(cfg, query, query_index, fetched)
+                .unwrap_or_else(|e| AccessionResult::failed(accession, e.to_string()))
+        }))
+        .unwrap_or_else(|_| {
+            AccessionResult::failed(panic_acc, "internal error: a stage panicked".to_string())
+        });
         if out.send(result).is_err() {
             break;
         }
@@ -330,10 +343,9 @@ fn run_one(
     timing.align = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
-    // Two implementations of alternative-haplotype recovery live in this tree, upstream's
-    // `detour` and the local `variants`. Exactly one runs, chosen by `cfg.alt_engine`, and
-    // the other is left untouched so the two can be compared on the same accessions later.
-    // See `types::AltEngine` for how they differ and why it matters.
+    // Alternative-haplotype recovery is `stages::variants`: it corrects the consensus to the
+    // majority allele and emits second alleles at biallelic sites. See that module for why it
+    // replaced the upstream `detour` engine (gap rate and VAF labelling).
     let mut final_path = gaf;
     let mut haplotype = match &final_path {
         Some(path) => stages::stitch::stitch(cfg, path, &subgraph, query)?,

@@ -248,8 +248,16 @@ pub fn prefer_majority(
                 path_end: new_end,
                 ..copy_coords(path)
             };
-            if stitch::stitch(cfg, &candidate, subgraph, query)?.is_none() {
+            let Some(restitched) = stitch::stitch(cfg, &candidate, subgraph, query)? else {
                 continue; // would fail the coverage gate; leave the site alone
+            };
+            // Defence in depth on the consensus, mirroring the `expected` check in `find_alts`.
+            // `shifted_window` is proven correct and `stitched_len` predicts the stitch length
+            // exactly, so this cannot fire today; it is a backstop so a future change to overlap
+            // handling (or a `graph_k` larger than the graph's real k) cannot silently reframe
+            // `_primary`, which is the record the codon alignment and selection analysis read.
+            if restitched.seq.len() != spliced_len {
+                continue;
             }
             // A length-changing swap moves the baseline every later swap is measured
             // against, so it has to be updated rather than left at the original route's.

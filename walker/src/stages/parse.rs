@@ -133,7 +133,10 @@ pub fn build(accession: &Accession, reader: Box<dyn Read + '_>) -> Result<Unitig
                 )));
             }
 
-            offsets.push(targets.len() as u32);
+            offsets.push(
+                u32::try_from(targets.len())
+                    .map_err(|_| bad("edge count exceeds u32 addressing".into()))?,
+            );
             seq_offset.push(
                 u32::try_from(total_bases)
                     .map_err(|_| bad("total sequence exceeds u32 addressing".into()))?,
@@ -207,7 +210,9 @@ pub fn build(accession: &Accession, reader: Box<dyn Read + '_>) -> Result<Unitig
         return Err(bad("no unitig records found".into()));
     }
     let n_unitigs = expected_id as usize;
-    offsets.push(targets.len() as u32);
+    offsets.push(
+        u32::try_from(targets.len()).map_err(|_| bad("edge count exceeds u32 addressing".into()))?,
+    );
     seq_offset.push(
         u32::try_from(total_bases).map_err(|_| bad("total sequence exceeds u32 addressing".into()))?,
     );

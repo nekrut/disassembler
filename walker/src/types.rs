@@ -352,12 +352,11 @@ pub struct AccessionResult {
     pub n_anchors: usize,
     pub subgraph_nodes: usize,
     pub haplotype: Option<Haplotype>,
-    /// Everything written to the main FASTA. Under `AltEngine::Detour` this is the major
-    /// allele followed by its phased detours; otherwise it holds the primary alone.
+    /// Everything written to the main FASTA; holds the single primary haplotype.
     pub haplotypes: Vec<Haplotype>,
-    /// Second alleles recovered at biallelic sites, written to their own file. Populated
-    /// only under `AltEngine::Variants`. Never combined with each other: one substitution
-    /// per record.
+    /// Second alleles recovered at biallelic sites by `stages::variants`, written to their own
+    /// file (`alt_haplotypes.fasta`). Never combined with each other: one substitution per
+    /// record.
     pub alts: Vec<AltHaplotype>,
     pub bubbles: Vec<Bubble>,
     pub timing: Timing,

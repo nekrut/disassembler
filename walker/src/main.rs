@@ -149,7 +149,8 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             }
             "--max-size-mb" => {
                 let mb: u64 = value()?.parse().map_err(|e| error::Error::Usage(format!("--max-size-mb: {e}")))?;
-                args.cfg.max_compressed_bytes = mb * 1024 * 1024;
+                // saturate rather than wrap: an absurd value should mean "no cap", not a tiny one.
+                args.cfg.max_compressed_bytes = mb.saturating_mul(1024 * 1024);
             }
             "-t" | "--threads" => {
                 args.cfg.graphaligner_threads = value()?.parse().map_err(|e| error::Error::Usage(format!("--threads: {e}")))?;

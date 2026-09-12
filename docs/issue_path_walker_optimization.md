@@ -1,3 +1,7 @@
+> **Archival import.** This is the original upstream issue (nekrut/logan-hypyaeon #2) that
+> motivated the Rust port. Paths like `work/...` and `rust-walker/...` refer to that repo's
+> layout, not this one; here the pieces live under `walker/`, `queries/`, `bench/`, `python/`.
+
 ## Task: Optimization & Performance Acceleration of Multi-Accession Path Walking (`logan_path_walker.py`)
 
 **Assignee:** Andrew (@as042)  
@@ -7,7 +11,7 @@
 
 ### 1. Context & Architectural Challenge
 
-Path traversal through localized de Bruijn subgraphs is blazingly fast, yet end-to-end multi-accession throughput remains throttled by disk I/O, subshell orchestration, and sequential text parsing. Inside [`work/logan_path_walker.py`](work/logan_path_walker.py), GraphAligner navigates an extracted 5-hop local subgraph GFA in a mere **0.07 to 0.33 seconds per sample**. However, total wall time per accession currently spans **2 to 15 seconds**, dominated by:
+Path traversal through localized de Bruijn subgraphs is blazingly fast, yet end-to-end multi-accession throughput remains throttled by disk I/O, subshell orchestration, and sequential text parsing. Inside [`python/logan_path_walker.py`](python/logan_path_walker.py), GraphAligner navigates an extracted 5-hop local subgraph GFA in a mere **0.07 to 0.33 seconds per sample**. However, total wall time per accession currently spans **2 to 15 seconds**, dominated by:
 1. Writing compressed AWS S3 unitigs to disk and invoking external `curl | zstd` pipelines.
 2. Generating temporary BLAST nucleotide database indices on disk (`makeblastdb`) to identify matching anchor segments.
 3. Parsing large unitig FASTA files line-by-line in pure Python to construct adjacency graphs from BCALM2 `L:` tokens.
@@ -54,9 +58,9 @@ Pre-curated candidate accession lists and benchmark targets are available in the
   - `work/cds/pfcrt_only.fasta` (*P. falciparum* PfCRT; 1,275 nt / 425 codons).
 
 #### Executing the Standardized Baseline Benchmark:
-We have provided an automated benchmark script [`work/benchmark/run_benchmark.sh`](work/benchmark/run_benchmark.sh):
+We have provided an automated benchmark script [`bench/run_benchmark.sh`](bench/run_benchmark.sh):
 ```bash
-./work/benchmark/run_benchmark.sh
+./bench/run_benchmark.sh
 ```
 This script measures wall-clock time, throughput (accessions/second), and successful reconstruction yield across 50 accessions. Use this harness to evaluate the speedup of each optimization iteration.
 

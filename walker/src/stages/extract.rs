@@ -271,7 +271,12 @@ pub fn write_gfa(
     for &id in &nodes {
         inside[(id >> 6) as usize] |= 1u64 << (id & 63);
     }
-    let is_inside = |id: u32| inside[(id >> 6) as usize] & (1u64 << (id & 63)) != 0;
+    // An edge target may point past the graph in a malformed (non-reciprocal) input. Valid
+    // Logan output never does, but every other function here turns that into a clean skip or
+    // error rather than an out-of-bounds panic, so guard the range: an out-of-range target
+    // cannot be one of `nodes` anyway, so it is simply not inside the subgraph.
+    let is_inside =
+        |id: u32| (id as usize) < graph.n_unitigs && inside[(id >> 6) as usize] & (1u64 << (id & 63)) != 0;
 
     w.write_all(b"H\tVN:Z:1.0\n")?;
     for (i, &id) in nodes.iter().enumerate() {

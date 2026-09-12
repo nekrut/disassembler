@@ -1,7 +1,7 @@
 # Golden-truth fixtures
 
 Concordance baselines for the path walker, covering success criteria 2 and 3 of the
-optimization issue (`work/issue_path_walker_optimization.md`).
+optimization issue (`docs/issue_path_walker_optimization.md`).
 
 | Accession | Gene | Query | Unitigs | Anchors | Subgraph | Primary | Bubbles |
 |---|---|---|---|---|---|---|---|
@@ -13,14 +13,14 @@ Captured on the unmodified walker at commit `81fc1fd`, GraphAligner 1.0.20, BLAS
 ## Usage
 
 ```bash
-python3 work/benchmark/verify_golden.py     # exit 0 = concordant, 1 = regression
+python3 bench/verify_golden.py     # exit 0 = concordant, 1 = regression
 ```
 
 Regenerate after an intentional, reviewed behaviour change:
 
 ```bash
-python3 work/benchmark/capture_golden.py --accession ERR2028820 \
-    --query work/cds/pfcrt_only.fasta --workdir /tmp/cap
+python3 bench/capture_golden.py --accession ERR2028820 \
+    --query queries/pfcrt_only.fasta --workdir /tmp/cap
 ```
 
 Both scripts need `blastn`, `makeblastdb`, and `GraphAligner` on `PATH`.
@@ -34,7 +34,7 @@ Every asserted field was verified byte-stable across two `PYTHONHASHSEED` values
 - `n_bubbles`, and every bubble's fork node with its full branch list (node, `ka:f`, VAF)
 
 The bubble `merge` node is deliberately **not** asserted. `phase_superbubbles` picks it with
-`reconverged[0]` (`logan_path_walker.py:259`) from a `Counter` populated by iterating a `set`,
+`reconverged[0]` (`python/logan_path_walker.py:259`) from a `Counter` populated by iterating a `set`,
 so it depends on string hash randomisation. Measured across seeds 1 and 7, it differed on
 10,922 of 11,825 fork/merge pairs for `SRR8209082` and 18 of 202 for `ERR2028820`. The branch
 calls themselves, which carry the biology, were identical in every case.
@@ -62,6 +62,6 @@ The verifier was checked against two deliberate regressions:
    capture exits non-zero and the verifier reports a failure.
 
 Hazard 2 is the one to keep in mind when bounding the subgraph index. In the full walker the
-exception is caught per accession at `logan_path_walker.py:392` and recorded as
+exception is caught per accession at `python/logan_path_walker.py:392` and recorded as
 `status: "error: ..."`, so the process still exits 0 and simply reconstructs nothing. With no
 log redirect in `run_benchmark.sh`, that is easy to mistake for a working run.
