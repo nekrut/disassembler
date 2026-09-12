@@ -29,7 +29,17 @@ For each SRA accession, given a reference CDS:
 6. **Stitch** the walked path into a primary haplotype, optionally **prune** reference-bias
    error branches and re-align, **prefer** the majority allele at biallelic sites, and
    **emit** intra-host alternative haplotypes to a separate file.
-7. Write `reconstructed.fasta`, `alt_haplotypes.fasta`, `bubbles.json`, and a summary JSON.
+7. Write `reconstructed.fasta`, `alt_haplotypes.fasta`, `bubbles.json`, and a summary JSON;
+   optionally the intra-host SNP calls (`--emit-vcf`, `--emit-snv-table`).
+
+Then, optionally, an eighth downstream step turns the reconstructed haplotypes into a
+phylogeny:
+
+8. **Codon-align and build a tree.** Reference-guided in-frame codon MSA (MAFFT `--keeplength`,
+   so reference coordinates and the reading frame are preserved) and a FastTree GTR
+   maximum-likelihood tree. Run it as one command with the walker via `python/disassemble.py`
+   (see below), or on its own with `python/build_walker_codon_msa.py`. See
+   [`docs/codon_msa.md`](docs/codon_msa.md).
 
 ### Why unitigs, not Logan contigs
 
@@ -47,7 +57,7 @@ walker/     logan-walker: the native Rust engine (the product)
 python/     disassemble.py (end-to-end driver) + build_walker_codon_msa.py (codon MSA + FastTree)
 queries/    reference coding sequences (pfcrt, hiv1_pol, 25 planetary markers, master panel)
 bench/      golden fixtures, the check_golden.sh concordance gate, k-mer sensitivity sim (archive/ holds retired Python-walker tooling)
-docs/       design plan, as-built notes, the variance-loss investigation, upstream context
+docs/       codon MSA/phylogeny step, VCF example, contigs-vs-unitigs, the variance-loss investigation, upstream context
 ```
 
 ## Build and run
@@ -82,7 +92,9 @@ python/disassemble.py -a SRR6251967 -q queries/markers/zika_ns5.fasta -o out/zik
 ```
 
 Use `-l accessions.txt` for a cohort, `--skip-tree` to stop after reconstruction, and pass any
-extra walker flags after a literal `--`.
+extra walker flags after a literal `--`. How the codon alignment stays in frame, and what the
+outputs contain, is in [`docs/codon_msa.md`](docs/codon_msa.md).
+
 ## Command-line reference
 
 `logan-walker [OPTIONS]`, one of `-a`/`-l` and `-q` required. Boolean options that are **on by

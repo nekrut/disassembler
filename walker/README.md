@@ -64,5 +64,9 @@ src/
     phase.rs     bubble detection (bubbles.json)
 ```
 
+The walker reconstructs haplotypes; to codon-align them and build a tree, feed
+`reconstructed.fasta` to `../python/build_walker_codon_msa.py`, or run the whole thing in one
+command with `../python/disassemble.py` (see [`../docs/codon_msa.md`](../docs/codon_msa.md)).
+
 See [`../docs/`](../docs/) for the design plan, as-built notes, the variance-loss
-investigation, and the VCF / contig experiments.
+investigation, the codon-MSA step, and the VCF / contig experiments.
