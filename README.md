@@ -83,6 +83,65 @@ python/disassemble.py -a SRR6251967 -q queries/markers/zika_ns5.fasta -o out/zik
 
 Use `-l accessions.txt` for a cohort, `--skip-tree` to stop after reconstruction, and pass any
 extra walker flags after a literal `--`.
+## Command-line reference
+
+`logan-walker [OPTIONS]`, one of `-a`/`-l` and `-q` required. Boolean options that are **on by
+default** are turned off with their `--no-…` form; boolean options that are **off by default**
+are turned on with their bare form (and back off with `--no-…`, e.g. inside a wrapper). Run
+`logan-walker --help` for the same list.
+
+### Input and output
+
+| flag | default | meaning |
+|---|---|---|
+| `-a, --accession <ACC>` | — | a single SRA accession |
+| `-l, --accession-list <FILE>` | — | file with one accession per line (use instead of `-a`) |
+| `-q, --query <FASTA>` | — | reference in-frame CDS FASTA (required) |
+| `-o, --out-dir <DIR>` | `walker_output` | output directory (also holds `bubbles.json`, summary, VCFs, `snvs.tsv`, GFA scratch) |
+| `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | reconstructed primary haplotypes |
+
+### Anchoring and fetch
+
+| flag | default | meaning |
+|---|---|---|
+| `-k, --k <N>` | `21` | anchor k-mer size, 1–32 (the Logan graph k stays 31; this is the query-anchoring k) |
+| `--min-shared-kmers <N>` | `3` | shared canonical k-mers a unitig needs to be an anchor (validated 1–5) |
+| `--hops <N>` | `5` | hop radius of the local-subgraph BFS around the anchors |
+| `--max-size-mb <N>` | `1024` | reject an accession whose compressed size exceeds this, on `Content-Length`, before download |
+| `--fetch-workers <N>` | `8` | parallel S3 fetch streams (bandwidth saturates ~8) |
+| `--scratch-dir <DIR>` | `/dev/shm/logan-walker` | where per-accession GFA/GAF go; should be tmpfs |
+
+### Walk and consensus
+
+| flag | default | meaning |
+|---|---|---|
+| `--min-cov <F>` | `0.85` | minimum fraction of the reference a haplotype must cover to be kept |
+| `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align, removing the aligner's reference bias; `0.0` disables |
+| `--prefer-majority` / `--no-prefer-majority` | on | put the majority allele on the primary at two-allele sites (off = leave the reference-matching allele) |
+| `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
+| `-w, --workers <N>` | `8` | compute workers (size to cores) |
+
+### Intra-host variants and their outputs
+
+| flag | default | meaning |
+|---|---|---|
+| `--min-abund <F>` | `5.0` | minimum `ka:f` for a branch to count as a real allele |
+| `--min-vaf <F>` | `0.10` | minimum variant allele frequency for an alternative branch |
+| `--min-abund-frac <F>` | `0.0` (off) | raise the variant floor to this fraction of gene depth (median `ka:f` on the walked path) |
+| `--alt-max-detour <N>` | `100` | unitigs an alternative allele may traverse before it must rejoin the route |
+| `--no-indel-alts` | (indels on) | substitutions only; refuse alternatives that change length |
+| `--allow-frameshift-alts` | off | also accept indel alleles whose length change is not a multiple of 3 (these reframe the CDS) |
+| `--max-alt-indel <N>` | `30` | largest length change still treated as an indel allele rather than a rerouting |
+| `--emit-alts` / `--no-emit-alts` | on | write intra-host alternative haplotypes to `alt_haplotypes.fasta` |
+| `--emit-vcf` | off | also write `<out-dir>/<acc>.vcf`: intra-host SNPs with `ka:f` frequency, in query coordinates |
+| `--emit-snv-table` | off | also write `<out-dir>/snvs.tsv`: the long cohort table, one row per (accession, site, allele) |
+
+### Misc
+
+| flag | meaning |
+|---|---|
+| `-h, --help` | print help |
+| `-V, --version` | print version |
 
 ## Provenance and status
 
