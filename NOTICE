@@ -7,7 +7,7 @@ component from https://github.com/nekrut/logan-hypyaeon.
 The native Rust walker (walker/) and the intra-accession haplotype-recovery
 work originate from logan-hypyaeon PR #4 ("Haplotype recovery"), authored by
 Andrew (@as042), which built on the PR #3 Rust port. The reference Python
-prototype (python/logan_path_walker.py) and the design/measurement documents
+prototype (the now-removed `logan_path_walker.py`) and the design/measurement documents
 under docs/ likewise originate from that project.
 
 The upstream history was squashed into a single import commit here. Original

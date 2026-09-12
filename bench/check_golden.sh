@@ -9,8 +9,10 @@
 #
 #   bench/check_golden.sh          # exit 0 = concordant, 1 = regression
 #
-# ERR2028820 (PfCRT) is the byte-exact gate: a clonal isolate, a small subgraph, and a
-# deterministic GraphAligner run, so its primary is reproducible byte for byte.
+# ERR2028820 (PfCRT) and SRR12363134 (C. auris ERG11) are the byte-exact gates: clonal
+# isolates with small subgraphs and a deterministic GraphAligner run, so their primaries are
+# reproducible byte for byte. SRR12363134's fixture was cross-validated: the Rust walker and
+# the (now removed) Python walker produced the identical 1,574 nt primary.
 #
 # SRR8209082 (HIV-1 pol) is reported but NOT gated. Its 26k-node subgraph is ~a third of the
 # whole graph; the Rust k-mer anchoring builds a different subgraph than the Python BLAST run
@@ -39,15 +41,23 @@ run_primary() {  # acc query -> writes $WORK/$acc.got (bare sequence)
 
 fails=0
 
-# --- byte-exact gate: ERR2028820 / PfCRT ---
-run_primary ERR2028820 queries/pfcrt_only.fasta
-grep -v '^>' "$ROOT/bench/golden/ERR2028820.pfcrt.primary.fasta" | tr -d '\n ' > "$WORK/exp"
-if [ -s "$WORK/ERR2028820.got" ] && cmp -s "$WORK/ERR2028820.got" "$WORK/exp"; then
-  echo "PASS ERR2028820  ($(wc -c < "$WORK/exp") nt, byte-identical)"
-else
-  echo "FAIL ERR2028820  (got $(wc -c < "$WORK/ERR2028820.got" 2>/dev/null || echo 0) nt vs golden $(wc -c < "$WORK/exp") nt)"
-  fails=$((fails+1))
-fi
+# --- byte-exact gates: clonal, deterministic accessions ---
+#     accession   query                                golden primary
+GATES=(
+  "ERR2028820  queries/pfcrt_only.fasta               bench/golden/ERR2028820.pfcrt.primary.fasta"
+  "SRR12363134 queries/markers/candida_auris_erg11.fasta bench/golden/SRR12363134.candida_auris_erg11.primary.fasta"
+)
+for g in "${GATES[@]}"; do
+  set -- $g; acc="$1"; query="$2"; golden="$3"
+  run_primary "$acc" "$query"
+  grep -v '^>' "$ROOT/$golden" | tr -d '\n ' > "$WORK/$acc.exp"
+  if [ -s "$WORK/$acc.got" ] && cmp -s "$WORK/$acc.got" "$WORK/$acc.exp"; then
+    echo "PASS $acc  ($(wc -c < "$WORK/$acc.exp") nt, byte-identical)"
+  else
+    echo "FAIL $acc  (got $(wc -c < "$WORK/$acc.got" 2>/dev/null || echo 0) nt vs golden $(wc -c < "$WORK/$acc.exp") nt)"
+    fails=$((fails+1))
+  fi
+done
 
 # --- informational: SRR8209082 / HIV-1 pol (not gated) ---
 run_primary SRR8209082 queries/query_hiv1_pol.fasta

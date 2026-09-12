@@ -44,9 +44,9 @@ contig, so the difference is intra-host diversity, not a Logan quirk. Full numbe
 
 ```
 walker/     logan-walker: the native Rust engine (the product)
-python/     logan_path_walker.py (reference prototype) + build_walker_codon_msa.py (downstream codon MSA)
+python/     build_walker_codon_msa.py (downstream reference-guided codon MSA + FastTree)
 queries/    reference coding sequences (pfcrt, hiv1_pol, 25 planetary markers, master panel)
-bench/      golden-truth fixtures, verify/capture harness, fork-loss measurement, k-mer sensitivity sim
+bench/      golden fixtures, the check_golden.sh concordance gate, k-mer sensitivity sim (archive/ holds retired Python-walker tooling)
 docs/       design plan, as-built notes, the variance-loss investigation, upstream context
 ```
 

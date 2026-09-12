@@ -51,11 +51,11 @@ Alternative haplotypes were built by splicing the detour back into the path and 
 scored with `blastn` against the reference CDS, so "valid" means valid by the same test the
 pipeline applies to its own output.
 
-Everything below is reproduced by `work/benchmark/measure_fork_loss.py`:
+Everything below is reproduced by `bench/archive/measure_fork_loss.py`:
 
 ```bash
-python3 work/benchmark/measure_fork_loss.py --all              # both accessions
-python3 work/benchmark/measure_fork_loss.py --all --self-check # guards the copied stages
+python3 bench/archive/measure_fork_loss.py --all              # both accessions
+python3 bench/archive/measure_fork_loss.py --all --self-check # guards the copied stages
 ```
 
 `--self-check` exits non-zero unless the copied stages still reproduce the golden graph shape
@@ -375,7 +375,7 @@ detail unexported.
 
 ## 14. Related
 
-* `work/benchmark/measure_fork_loss.py`, which reproduces every figure in this document.
+* `bench/archive/measure_fork_loss.py`, which reproduces every figure in this document.
 * `work/plan_rust_path_walker.md` and `work/rust_walker_as_built.md`, the speed work this was
   found during.
 * `work/benchmark/golden/`, whose bubble counts pin the pre-fix strandless numbers and will

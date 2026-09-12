@@ -13,17 +13,17 @@ Captured on the unmodified walker at commit `81fc1fd`, GraphAligner 1.0.20, BLAS
 ## Usage
 
 ```bash
-python3 bench/verify_golden.py     # exit 0 = concordant, 1 = regression
+bench/check_golden.sh              # exit 0 = concordant, 1 = regression
 ```
 
-Regenerate after an intentional, reviewed behaviour change:
-
-```bash
-python3 bench/capture_golden.py --accession ERR2028820 \
-    --query queries/pfcrt_only.fasta --workdir /tmp/cap
-```
-
-Both scripts need `blastn`, `makeblastdb`, and `GraphAligner` on `PATH`.
+`check_golden.sh` runs the Rust `logan-walker` under old-behaviour flags and diffs the primary
+byte-for-byte against the `*.primary.fasta` fixtures here (needs `GraphAligner` on `PATH` and S3
+access). The `ERR2028820.pfcrt` and `SRR8209082.hiv1_pol` fixtures below were captured from the
+original Python walker at commit `81fc1fd`; `SRR12363134.candida_auris_erg11` was captured from
+the Rust walker and cross-validated against the Python walker (identical 1,574 nt) before that
+walker was removed. To regenerate a fixture, run the Rust walker with
+`--prune-frac 0.0 --no-prefer-majority --no-emit-alts` and save the primary. The retired
+Python-based `capture_golden.py`/`verify_golden.py` are under `../archive/`.
 
 ## What is asserted, and what is not
 
@@ -34,7 +34,7 @@ Every asserted field was verified byte-stable across two `PYTHONHASHSEED` values
 - `n_bubbles`, and every bubble's fork node with its full branch list (node, `ka:f`, VAF)
 
 The bubble `merge` node is deliberately **not** asserted. `phase_superbubbles` picks it with
-`reconverged[0]` (`python/logan_path_walker.py:259`) from a `Counter` populated by iterating a `set`,
+`reconverged[0]` (in the original Python walker) from a `Counter` populated by iterating a `set`,
 so it depends on string hash randomisation. Measured across seeds 1 and 7, it differed on
 10,922 of 11,825 fork/merge pairs for `SRR8209082` and 18 of 202 for `ERR2028820`. The branch
 calls themselves, which carry the biology, were identical in every case.
@@ -62,6 +62,6 @@ The verifier was checked against two deliberate regressions:
    capture exits non-zero and the verifier reports a failure.
 
 Hazard 2 is the one to keep in mind when bounding the subgraph index. In the full walker the
-exception is caught per accession at `python/logan_path_walker.py:392` and recorded as
+exception was caught per accession in the original Python walker and recorded as
 `status: "error: ..."`, so the process still exits 0 and simply reconstructs nothing. With no
 log redirect in `run_benchmark.sh`, that is easy to mistake for a working run.
