@@ -31,6 +31,15 @@ For each SRA accession, given a reference CDS:
    **emit** intra-host alternative haplotypes to a separate file.
 7. Write `reconstructed.fasta`, `alt_haplotypes.fasta`, `bubbles.json`, and a summary JSON.
 
+### Why unitigs, not Logan contigs
+
+Logan also publishes assembled contigs, which are far smaller. On internally diverse samples,
+though, the assembler shatters the gene: measured on nine deep Zika NS5 accessions, no single
+contig held more than 8% of the gene and it took ~50 fragments to tile it, while the unitig walk
+reconstructed the full 2,708 nt from every one. A clonal control assembled into one clean
+contig, so the difference is intra-host diversity, not a Logan quirk. Full numbers in
+[`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md).
+
 ## Layout
 
 ```
