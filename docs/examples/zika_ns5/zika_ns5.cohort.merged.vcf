@@ -1,0 +1,44 @@
+##fileformat=VCFv4.2
+##FILTER=<ID=PASS,Description="All filters passed">
+##source=logan-walker intra-host SNPs. Frequencies are k-mer coverage (ka:f) ratios at a graph fork, a proxy for allele frequency, not read counts. Sites are per-locus and NOT phased: two rows do not assert co-occurrence on one molecule.
+##contig=<ID=zika_ns5,length=2709>
+##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency, ka:f ratio at the fork">
+##INFO=<ID=AO,Number=A,Type=Float,Description="Alternate allele k-mer coverage (ka:f)">
+##INFO=<ID=RO,Number=1,Type=Float,Description="Reference allele k-mer coverage (ka:f); 0 if the gene base is not observed">
+##INFO=<ID=FORK,Number=1,Type=Integer,Description="Unitig id of the fork on the walked path">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype (missing: this is a frequency call, not a diploid genotype)">
+##FORMAT=<ID=AF,Number=A,Type=Float,Description="Allele frequency">
+##FORMAT=<ID=AO,Number=A,Type=Float,Description="Alternate allele k-mer coverage">
+##FORMAT=<ID=RO,Number=1,Type=Float,Description="Reference allele k-mer coverage">
+##bcftools_mergeVersion=1.24+htslib-1.23.1
+##bcftools_mergeCommand=merge -m none -Ov -o /home/anton/git/disassembler/docs/examples/zika_ns5/zika_ns5.cohort.merged.vcf /tmp/claude-1000/-home-anton-git-disassembler/ec32cf6b-45d9-4204-a70b-6015dca5e2a7/scratchpad/zika_cohort_vcf/SRR6251963.vcf.gz /tmp/claude-1000/-home-anton-git-disassembler/ec32cf6b-45d9-4204-a70b-6015dca5e2a7/scratchpad/zika_cohort_vcf/SRR6251967.vcf.gz /tmp/claude-1000/-home-anton-git-disassembler/ec32cf6b-45d9-4204-a70b-6015dca5e2a7/scratchpad/zika_cohort_vcf/SRR6251969.vcf.gz /tmp/claude-1000/-home-anton-git-disassembler/ec32cf6b-45d9-4204-a70b-6015dca5e2a7/scratchpad/zika_cohort_vcf/SRR6251973.vcf.gz /tmp/claude-1000/-home-anton-git-disassembler/ec32cf6b-45d9-4204-a70b-6015dca5e2a7/scratchpad/zika_cohort_vcf/SRR6251979.vcf.gz /tmp/claude-1000/-home-anton-git-disassembler/ec32cf6b-45d9-4204-a70b-6015dca5e2a7/scratchpad/zika_cohort_vcf/SRR6251984.vcf.gz /tmp/claude-1000/-home-anton-git-disassembler/ec32cf6b-45d9-4204-a70b-6015dca5e2a7/scratchpad/zika_cohort_vcf/SRR6251992.vcf.gz /tmp/claude-1000/-home-anton-git-disassembler/ec32cf6b-45d9-4204-a70b-6015dca5e2a7/scratchpad/zika_cohort_vcf/SRR6251993.vcf.gz; Date=Sat Sep 12 15:27:48 2026
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SRR6251963	SRR6251967	SRR6251969	SRR6251973	SRR6251979	SRR6251984	SRR6251992	SRR6251993
+zika_ns5	246	.	T	G	.	PASS	RO=25000;FORK=1639634;AF=0.1093;AO=4400	GT:AF:AO:RO	.:.:.:.	.:0.1093:4400:25000	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.
+zika_ns5	248	.	G	A	.	PASS	RO=25000;FORK=1465928;AF=0.1085;AO=3200	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1085:3200:25000
+zika_ns5	496	.	T	C	.	PASS	RO=25000;FORK=2257185;AF=0.1155;AO=3300	GT:AF:AO:RO	.:.:.:.	.:0.1155:3300:25000	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.
+zika_ns5	517	.	G	A	.	PASS	RO=25000;FORK=2401149;AF=0.1327;AO=3900	GT:AF:AO:RO	.:.:.:.	.:0.1564:4800:25000	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.132:3900:25000	.:0.1327:3900:25000
+zika_ns5	518	.	A	G	.	PASS	RO=25000;FORK=1472073;AF=0.1319;AO=3800	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1319:3800:25000
+zika_ns5	700	.	T	C	.	PASS	RO=25000;FORK=1125397;AF=0.1141;AO=3300	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1141:3300:25000
+zika_ns5	816	.	T	C	.	PASS	RO=25000;FORK=1098395;AF=0.1067;AO=3100	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1067:3100:25000
+zika_ns5	871	.	G	A	.	PASS	RO=25000;FORK=1228444;AF=0.3056;AO=11000	GT:AF:AO:RO	.:.:.:.	.:0.1071:3000:25000	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.2754:9500:25000	.:0.3056:11000:25000
+zika_ns5	955	.	T	C	.	PASS	RO=25000;FORK=1348371;AF=0.1339;AO=4000	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1129:3300:25000	.:0.1339:4000:25000
+zika_ns5	1077	.	A	G	.	PASS	RO=25000;FORK=1919338;AF=0.375;AO=15000	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.375:15000:25000	.:.:.:.	.:.:.:.
+zika_ns5	1296	.	C	T	.	PASS	RO=25000;FORK=1446196;AF=0.2188;AO=7000	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:0.2308:7500:25000	.:0.2188:7000:25000	.:.:.:.	.:.:.:.	.:.:.:.
+zika_ns5	1453	.	C	T	.	PASS	RO=20500;FORK=1896468;AF=0.18;AO=4500	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.18:4500:20500	.:.:.:.	.:.:.:.
+zika_ns5	1518	.	T	C	.	PASS	RO=25000;FORK=1668286;AF=0.3014;AO=11000	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.3014:11000:25000	.:.:.:.	.:.:.:.
+zika_ns5	1681	.	G	A	.	PASS	RO=25000;FORK=2330302;AF=0.1024;AO=3000	GT:AF:AO:RO	.:.:.:.	.:0.1024:3000:25000	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.
+zika_ns5	1683	.	G	A	.	PASS	RO=25000;FORK=991334;AF=0.1057;AO=3100	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1057:3100:25000
+zika_ns5	1762	.	G	A	.	PASS	RO=25000;FORK=2009960;AF=0.1667;AO=5000	GT:AF:AO:RO	.:.:.:.	.:0.1228:3500:25000	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1497:4400:25000	.:0.1667:5000:25000
+zika_ns5	2039	.	T	C	.	PASS	RO=25000;FORK=1132317;AF=0.1065;AO=3200	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1061:3200:25000	.:0.1065:3200:25000
+zika_ns5	2064	.	A	G	.	PASS	RO=25000;FORK=1517077;AF=0.3506;AO=13500	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:0.2537:8500:25000	.:0.2308:7500:25000	.:.:.:.	.:0.3151:11500:25000	.:0.3506:13500:25000
+zika_ns5	2153	.	T	C	.	PASS	RO=25000;FORK=1631438;AF=0.1567;AO=5000	GT:AF:AO:RO	.:.:.:.	.:0.1111:3300:25000	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1336:4100:25000	.:0.1567:5000:25000
+zika_ns5	2182	.	G	T	.	PASS	RO=25000;FORK=1086768;AF=0.1007;AO=2800	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1135:3200:25000	.:0.1007:2800:25000
+zika_ns5	2192	.	G	A	.	PASS	RO=25000;FORK=1224215;AF=0.1068;AO=3200	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1068:3200:25000
+zika_ns5	2216	.	G	A	.	PASS	RO=25000;FORK=1991235;AF=0.1041;AO=3300	GT:AF:AO:RO	.:.:.:.	.:0.1041:3300:25000	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.
+zika_ns5	2225	.	T	G	.	PASS	RO=25000;FORK=2503128;AF=0.1445;AO=4300	GT:AF:AO:RO	.:0.1027:2900:25000	.:0.1872:6000:25000	.:0.1028:2900:25000	.:0.1288:3800:25000	.:0.1021:2900:25000	.:0.1445:4300:25000	.:.:.:.	.:.:.:.
+zika_ns5	2321	.	T	C	.	PASS	RO=25000;FORK=1281746;AF=0.1179;AO=3500	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1179:3500:25000
+zika_ns5	2368	.	G	T	.	PASS	RO=25000;FORK=1340389;AF=0.1349;AO=3900	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1349:3900:25000
+zika_ns5	2410	.	G	A	.	PASS	RO=25000;FORK=1247294;AF=0.1012;AO=3300	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1012:3300:25000	.:.:.:.
+zika_ns5	2525	.	G	A	.	PASS	RO=25000;FORK=1834061;AF=0.1639;AO=4900	GT:AF:AO:RO	.:0.1438:4200:25000	.:0.2516:8500:25000	.:0.1554:4600:25000	.:0.1667:5000:25000	.:0.1554:4600:25000	.:0.1639:4900:25000	.:.:.:.	.:.:.:.
+zika_ns5	2531	.	G	A	.	PASS	RO=25000;FORK=1556065;AF=0.3506;AO=13500	GT:AF:AO:RO	.:.:.:.	.:0.2857:10000:25000	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.3506:13500:25000
+zika_ns5	2562	.	G	A	.	PASS	RO=25000;FORK=1025461;AF=0.1453;AO=4700	GT:AF:AO:RO	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:.:.:.	.:0.1453:4700:25000

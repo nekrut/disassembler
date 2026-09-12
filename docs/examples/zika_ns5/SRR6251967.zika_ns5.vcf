@@ -1,0 +1,23 @@
+##fileformat=VCFv4.2
+##source=logan-walker intra-host SNPs. Frequencies are k-mer coverage (ka:f) ratios at a graph fork, a proxy for allele frequency, not read counts. Sites are per-locus and NOT phased: two rows do not assert co-occurrence on one molecule.
+##contig=<ID=zika_ns5,length=2709>
+##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency, ka:f ratio at the fork">
+##INFO=<ID=AO,Number=A,Type=Float,Description="Alternate allele k-mer coverage (ka:f)">
+##INFO=<ID=RO,Number=1,Type=Float,Description="Reference allele k-mer coverage (ka:f); 0 if the gene base is not observed">
+##INFO=<ID=FORK,Number=1,Type=Integer,Description="Unitig id of the fork on the walked path">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype (missing: this is a frequency call, not a diploid genotype)">
+##FORMAT=<ID=AF,Number=A,Type=Float,Description="Allele frequency">
+##FORMAT=<ID=AO,Number=A,Type=Float,Description="Alternate allele k-mer coverage">
+##FORMAT=<ID=RO,Number=1,Type=Float,Description="Reference allele k-mer coverage">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SRR6251967
+zika_ns5	246	.	T	G	.	PASS	AF=0.1093;AO=4400.0;RO=25000.0;FORK=1639634	GT:AF:AO:RO	.:0.1093:4400.0:25000.0
+zika_ns5	496	.	T	C	.	PASS	AF=0.1155;AO=3300.0;RO=25000.0;FORK=2257185	GT:AF:AO:RO	.:0.1155:3300.0:25000.0
+zika_ns5	517	.	G	A	.	PASS	AF=0.1564;AO=4800.0;RO=25000.0;FORK=2401149	GT:AF:AO:RO	.:0.1564:4800.0:25000.0
+zika_ns5	871	.	G	A	.	PASS	AF=0.1071;AO=3000.0;RO=25000.0;FORK=1228444	GT:AF:AO:RO	.:0.1071:3000.0:25000.0
+zika_ns5	1681	.	G	A	.	PASS	AF=0.1024;AO=3000.0;RO=25000.0;FORK=2330302	GT:AF:AO:RO	.:0.1024:3000.0:25000.0
+zika_ns5	1762	.	G	A	.	PASS	AF=0.1228;AO=3500.0;RO=25000.0;FORK=2009960	GT:AF:AO:RO	.:0.1228:3500.0:25000.0
+zika_ns5	2153	.	T	C	.	PASS	AF=0.1111;AO=3300.0;RO=25000.0;FORK=1631438	GT:AF:AO:RO	.:0.1111:3300.0:25000.0
+zika_ns5	2216	.	G	A	.	PASS	AF=0.1041;AO=3300.0;RO=25000.0;FORK=1991235	GT:AF:AO:RO	.:0.1041:3300.0:25000.0
+zika_ns5	2225	.	T	G	.	PASS	AF=0.1872;AO=6000.0;RO=25000.0;FORK=1982747	GT:AF:AO:RO	.:0.1872:6000.0:25000.0
+zika_ns5	2525	.	G	A	.	PASS	AF=0.2516;AO=8500.0;RO=25000.0;FORK=1582127	GT:AF:AO:RO	.:0.2516:8500.0:25000.0
+zika_ns5	2531	.	G	A	.	PASS	AF=0.2857;AO=10000.0;RO=25000.0;FORK=1556065	GT:AF:AO:RO	.:0.2857:10000.0:25000.0

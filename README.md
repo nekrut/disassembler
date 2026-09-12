@@ -91,3 +91,6 @@ coordinates (`CHROM` = gene, `POS` = 1-based position in the CDS). The primary F
 unchanged. Because every accession is called against the same gene, the VCFs share a
 coordinate frame and `bcftools merge` yields a sites x samples frequency matrix. Frequencies
 are `ka:f` ratios, a proxy for allele frequency, and are per-site, not phased.
+
+A worked example on the Zika NS5 cohort, with an example VCF, the merged matrix, and a heatmap
+of it, is in [`docs/vcf_example.md`](docs/vcf_example.md).
