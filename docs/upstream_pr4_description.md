@@ -1,3 +1,8 @@
+> **Archival — verbatim text of upstream `nekrut/logan-hypyaeon` PR #4.** Left unedited as a
+> record. It describes a two-engine (`--alt-engine detour|variants|off`) design; in this repo the
+> `detour` engine and that flag have been removed and `variants` is the sole engine. Current
+> behaviour: [`../README.md`](../README.md).
+
 From Claude:
 
 This adds intra-accession haplotype recovery and the fix for what was blocking it. Your detour stage is kept intact and selectable alongside it (--alt-engine detour|variants|off), so both can be compared on the same data.

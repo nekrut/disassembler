@@ -1,5 +1,11 @@
 # Path walking selects the reference-matching minority allele
 
+> **Historical — investigation record.** Paths such as `work/rust-walker/` and
+> `logan_path_walker.py:NNN` refer to the upstream layout at the time of writing; here the crate
+> is `walker/` and the Python walker has been removed. The findings stand; section 17's `detour`
+> vs `variants` comparison is why `detour` was later retired (section 19 notes the 1 GB cap).
+
+
 **Status:** diagnosed, then fixed. Sections 1 to 13 are the diagnosis and stand as written.
 Section 15 records the fix and what it recovers. The Rust walker gained two opt-in flags,
 `--prune-frac` and `--emit-alts`; defaults are unchanged.

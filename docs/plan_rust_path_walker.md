@@ -1,3 +1,7 @@
+> **Historical — original design plan.** Written before the port; paths like `work/rust-walker/`
+> refer to the upstream layout (here the crate is `walker/`). Kept as-is as the record of the
+> plan. For current behaviour see [`../README.md`](../README.md) and [`rust_walker_as_built.md`](rust_walker_as_built.md).
+
 # Plan: a targeted Rust rewrite of the path walker
 
 Status: in progress. Five of seven stages implemented in `work/rust-walker/`; see section 12.

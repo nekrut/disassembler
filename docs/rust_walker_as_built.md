@@ -1,3 +1,7 @@
+> **Historical — as-built snapshot.** Records the state just after the port. Paths and stage
+> lists reflect that moment (e.g. `stages::detour` has since been retired; the crate is `walker/`,
+> not `work/rust-walker/`). Current source of truth: [`../README.md`](../README.md) and [`../walker/README.md`](../walker/README.md).
+
 # The Rust path walker, as built
 
 Companion to [`plan_rust_path_walker.md`](plan_rust_path_walker.md), which is deliberately

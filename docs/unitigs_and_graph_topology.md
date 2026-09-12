@@ -1,3 +1,8 @@
+> **Imported explainer** of unitig graph topology, from the upstream README. The biology is
+> current; some tooling references are historical (e.g. section 2.5's `detour` engine has been
+> retired in favour of `stages::variants`, and paths like `work/benchmark/` refer to the upstream
+> layout). Current behaviour: [`../README.md`](../README.md).
+
 ## 2. Unitig Derivation, Graph Topology & BCALM2 Header Anatomy
 
 ### 2.1 From Raw Reads to Compacted de Bruijn Graph (cDBG) Unitigs
