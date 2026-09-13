@@ -95,6 +95,25 @@ Use `-l accessions.txt` for a cohort, `--skip-tree` to stop after reconstruction
 extra walker flags after a literal `--`. How the codon alignment stays in frame, and what the
 outputs contain, is in [`docs/codon_msa.md`](docs/codon_msa.md).
 
+### Planetary triage: Galaxy kmindex harvest to candidate cohorts
+
+When screening planetary datasets indexed in Logan (e.g. via Galaxy `kmindex query` across thousands of shard databases), `python/harvest_kmindex.py` streams and merges the shard collections in parallel, extracts candidate SRA accessions by containment score, and creates stratified diversity cohorts:
+
+```bash
+# Stream and merge ~2,869 Galaxy shard JSONs across 32 threads
+python/harvest_kmindex.py \
+    --history-id <GALAXY_HISTORY_ID> \
+    --collection-id <GALAXY_COLLECTION_ID> \
+    -o candidates/ --diversity 2500
+
+# Reconstruct a target gene cohort directly with disassemble.py
+python/disassemble.py \
+    -l candidates/query_gene.diversity_2500.txt \
+    -q queries/query_gene.fasta \
+    -o out/query_gene \
+    --emit-vcf --emit-snv-table --no-emit-alts -w 16 --fetch-workers 16
+```
+
 ## Command-line reference
 
 `logan-walker [OPTIONS]`, one of `-a`/`-l` and `-q` required. Boolean options that are **on by

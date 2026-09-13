@@ -58,6 +58,12 @@ def main() -> None:
     ap.add_argument("--min-cov", type=float, default=0.70, help="min coverage for a sequence to enter the MSA (default 0.70)")
     ap.add_argument("--emit-vcf", action="store_true", help="also write per-accession intra-host SNP VCFs")
     ap.add_argument("--emit-snv-table", action="store_true", help="also write the long snvs.tsv cohort table")
+    ap.add_argument("--no-emit-alts", action="store_true", help="do not write alt_haplotypes.fasta")
+    ap.add_argument("--prune-frac", type=float, default=0.01, help="unitig depth prune fraction for reference bias removal (default 0.01)")
+    ap.add_argument("--max-size-mb", type=int, default=1024, help="maximum compressed SRA size in MB (default 1024)")
+    ap.add_argument("--no-prefer-majority", action="store_true", help="leave primary on reference allele instead of majority allele")
+    ap.add_argument("--min-abund", type=float, default=5.0, help="minimum ka:f abundance for a variant (default 5.0)")
+    ap.add_argument("--min-vaf", type=float, default=0.10, help="minimum VAF for an alternative branch (default 0.10)")
     ap.add_argument("--walker-bin", default=str(DEFAULT_WALKER), help="path to the logan-walker binary")
     ap.add_argument("--skip-tree", action="store_true", help="stop after reconstruction; do not build the MSA/tree")
     ap.add_argument("walker_args", nargs=argparse.REMAINDER,
@@ -90,6 +96,18 @@ def main() -> None:
         cmd += ["--emit-vcf"]
     if args.emit_snv_table:
         cmd += ["--emit-snv-table"]
+    if args.no_emit_alts:
+        cmd += ["--no-emit-alts"]
+    if args.prune_frac is not None:
+        cmd += ["--prune-frac", str(args.prune_frac)]
+    if args.max_size_mb is not None:
+        cmd += ["--max-size-mb", str(args.max_size_mb)]
+    if args.no_prefer_majority:
+        cmd += ["--no-prefer-majority"]
+    if args.min_abund is not None:
+        cmd += ["--min-abund", str(args.min_abund)]
+    if args.min_vaf is not None:
+        cmd += ["--min-vaf", str(args.min_vaf)]
     # drop a leading "--" separator that argparse.REMAINDER keeps
     extra = args.walker_args[1:] if args.walker_args[:1] == ["--"] else args.walker_args
     cmd += extra
