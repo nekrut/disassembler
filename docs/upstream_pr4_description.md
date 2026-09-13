@@ -1,7 +1,15 @@
-> **Archival — verbatim text of upstream `nekrut/logan-hypyaeon` PR #4.** Left unedited as a
-> record. It describes a two-engine (`--alt-engine detour|variants|off`) design; in this repo the
-> `detour` engine and that flag have been removed and `variants` is the sole engine. Current
-> behaviour: [`../README.md`](../README.md).
+> **Archival: verbatim text of upstream `nekrut/logan-hypyaeon` PR #4.** The body below is left
+> unedited as a record of what was proposed, so it names flags and paths that no longer exist here.
+> Read none of it as current behaviour; for that see [`../README.md`](../README.md).
+>
+> | named below | status in this repo |
+> |---|---|
+> | `--alt-engine detour\|variants\|off` | Removed. The `detour` engine is retired and `stages::variants` is the sole intra-host alt engine, so there is no longer an engine to select. |
+> | `-H many` | Removed, along with `--haplotypes`. Alternatives are now controlled by `--emit-alts` (on by default) and written to `alt_haplotypes.fasta`, **not** into `reconstructed.fasta`, so they no longer enter the codon MSA as extra taxa. That change is the fix for the problem this PR text describes. |
+> | `work/issue_intra_accession_variance_lost.md` | Now [`issue_intra_accession_variance_lost.md`](issue_intra_accession_variance_lost.md), in this directory. |
+> | `work/benchmark/measure_fork_loss.py` | Now `bench/archive/measure_fork_loss.py`, and no longer runnable: it depends on the Python reference walker, which has been removed. The figures stand as measured; they cannot be reproduced from that script. |
+>
+> The GraphAligner threading result in section 1 still holds, and `-t 1` is still the default.
 
 From Claude:
 
