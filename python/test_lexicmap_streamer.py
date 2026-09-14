@@ -117,5 +117,59 @@ class TestLexicMapStreamer(unittest.TestCase):
         self.assertIn("WT", classes)
         self.assertIn("Missense", classes)
 
+    def test_mean_pident_excludes_gap_positions(self):
+        # A single 90%-identity HSP where the subject deletes one reference position (sc '-').
+        # mean_pident must average only the 5 covered (non-gap) positions, never exceed 100%.
+        merged, cov_bases, mean_pid, _, _ = lms.merge_accession_hsps(
+            [(90.0, 100.0, 1, 6, "ATGGCT", "AT-GCT")], ref_len=6, min_pident=60.0, min_coverage=0.80
+        )
+        self.assertEqual(cov_bases, 5)
+        self.assertLessEqual(mean_pid, 100.0)
+        self.assertAlmostEqual(mean_pid, 90.0)
+
+    def test_ungrouped_input_is_rejected(self):
+        # SRR001's two HSPs are split by an SRR002 row: the stream is not grouped by accession.
+        # This must raise rather than silently double-count SRR001 and undercount its coverage.
+        tsv = (
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            "SRR001\t100.0\t50.0\t1\t6\tATGGCT\tATGGCT\n"
+            "SRR002\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
+            "SRR001\t100.0\t50.0\t7\t12\tGAATAA\tGAATAA\n"
+        )
+        p = self.dir_path / "ungrouped.tsv"
+        p.write_text(tsv)
+        with self.assertRaises(ValueError):
+            lms.stream_lexicmap_to_msa(
+                ref_path=str(self.ref_fasta), file_path=str(p),
+                out_prefix=str(self.dir_path / "ung"),
+            )
+
+    def test_empty_stream_does_not_crash(self):
+        # Header only, no data rows: must return a zeroed summary, not raise ZeroDivisionError.
+        p = self.dir_path / "empty.tsv"
+        p.write_text("sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n")
+        summary = lms.stream_lexicmap_to_msa(
+            ref_path=str(self.ref_fasta), file_path=str(p),
+            out_prefix=str(self.dir_path / "emp"),
+        )
+        self.assertEqual(summary["total_accessions_evaluated"], 0)
+        self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 0)
+
+    def test_full_length_only_requires_complete_coverage(self):
+        # SRR010 covers 100% (clean full), SRR011 covers only 50%. With --full-length-only,
+        # only the 100%-coverage accession is clean full-length.
+        tsv = (
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            "SRR010\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
+            "SRR011\t100.0\t50.0\t1\t6\tATGGCT\tATGGCT\n"
+        )
+        p = self.dir_path / "fl.tsv"
+        p.write_text(tsv)
+        summary = lms.stream_lexicmap_to_msa(
+            ref_path=str(self.ref_fasta), file_path=str(p),
+            out_prefix=str(self.dir_path / "fl"), full_length_only=True,
+        )
+        self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 1)  # only SRR010
+
 if __name__ == "__main__":
     unittest.main()

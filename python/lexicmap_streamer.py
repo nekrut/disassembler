@@ -217,8 +217,12 @@ def merge_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_covera
                         grid[q_pos] = (sc.upper(), pident)
                 q_pos += 1
 
-    covered_bases = sum(1 for x in grid if x is not None and x[0] != '-')
-    mean_pid = (sum(x[1] for x in grid if x is not None) / covered_bases) if covered_bases > 0 else 0.0
+    # Mean identity over the positions that actually carry a subject base. The numerator must
+    # use the same non-gap positions as `covered_bases`; summing pident over gap positions too
+    # (subject deletions, where x[0] == '-') inflates the mean and can push it above 100%.
+    covered = [x for x in grid if x is not None and x[0] != '-']
+    covered_bases = len(covered)
+    mean_pid = (sum(x[1] for x in covered) / covered_bases) if covered_bases > 0 else 0.0
     merged_seq = "".join(grid[i][0] if grid[i] is not None else '-' for i in range(ref_len))
 
     return merged_seq, covered_bases, mean_pid, single_ge_min_cov, single_full
@@ -387,6 +391,11 @@ def stream_lexicmap_to_msa(
 
     curr_acc = None
     curr_hsps = []
+    # The stream is grouped by accession one block at a time, so all of an accession's HSPs must
+    # be contiguous. If they are not, an accession is split into several blocks: it is counted
+    # more than once and its multi-HSP coverage is undercounted, silently. Rather than corrupt
+    # the cohort, detect a reappearance and stop with a clear instruction to sort the input.
+    seen_accessions = set()
 
     def process_accession_block(acc, hsps):
         nonlocal total_accessions, count_clean_full, count_clean_partial
@@ -396,6 +405,15 @@ def stream_lexicmap_to_msa(
 
         if not acc or not hsps:
             return
+
+        if acc in seen_accessions:
+            raise ValueError(
+                f"Accession '{acc}' reappears after its block was already processed, so the "
+                f"input is not grouped by accession. All HSPs of an accession must be "
+                f"contiguous. Sort the LexicMap output by the accession column first, e.g. "
+                f"`sort -k<sgenome_col> -s input.tsv`, then re-run."
+            )
+        seen_accessions.add(acc)
 
         total_accessions += 1
 
@@ -418,8 +436,10 @@ def stream_lexicmap_to_msa(
             if n_stops > 0:
                 cov_ge_50_stops += 1
 
-        # Stratify accession
-        if cov >= min_coverage and (n_stops <= max_internal_stops or allow_frameshifts):
+        # Stratify accession. With --full-length-only, the clean full-length tier requires
+        # complete coverage of the reference (every position tiled), not merely min_coverage.
+        full_cov = 1.0 if full_length_only else min_coverage
+        if cov >= full_cov and (n_stops <= max_internal_stops or allow_frameshifts):
             status = "CLEAN_FULL_LENGTH"
             tier = 1
             count_clean_full += 1
@@ -530,14 +550,19 @@ def stream_lexicmap_to_msa(
     is_divergent = (med_pid < 85.0 or med_cov < 0.60)
     regime = "divergent" if is_divergent else "conserved"
 
+    # A valid stream can carry a header and no data rows; guard every by-total percentage so an
+    # empty cohort reports zeros rather than raising ZeroDivisionError.
+    def pct_of_total(n):
+        return (n / total_accessions * 100.0) if total_accessions > 0 else 0.0
+
     print(f"\n[✓] Stream processing complete in {total_time:.2f} seconds.")
     print(f"    Total rows streamed           : {total_rows:,}")
     print(f"    Total unique SRA accessions   : {total_accessions:,}")
-    print(f"    1. Clean Full-Length Cohort   : {count_clean_full:,} accessions ({count_clean_full/total_accessions*100:.2f}% of total)")
+    print(f"    1. Clean Full-Length Cohort   : {count_clean_full:,} accessions ({pct_of_total(count_clean_full):.2f}% of total)")
     print(f"       - Multi-HSP rescued        : {total_rescued_multihsp:,} accessions")
     print(f"       - Single-HSP full-length   : {total_single_hsp_full:,} accessions")
     print(f"    2. Clean Partials (50%-80% cov): {count_clean_partial:,} accessions")
-    print(f"       --> Combined Clean Cohort  : {count_clean_full + count_clean_partial:,} accessions ({(count_clean_full + count_clean_partial)/total_accessions*100:.2f}%)")
+    print(f"       --> Combined Clean Cohort  : {count_clean_full + count_clean_partial:,} accessions ({pct_of_total(count_clean_full + count_clean_partial):.2f}%)")
     print(f"    3. Flagged for Premature Stops: {count_flagged_stops:,} accessions")
     print(f"    4. Low-Coverage Fragments (<50%): {count_flagged_low_cov:,} accessions")
     print(f"    Coverage Distribution (All)   : p10={cov_stats['p10']:.2f}, median={med_cov:.2f}, p90={cov_stats['p90']:.2f}")
