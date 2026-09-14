@@ -35,6 +35,18 @@ jobs:
       - name: Test
         run: cargo test --release
 
+  python-tests:
+    name: python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run LexicMapStreamer tests
+        run: python3 python/test_lexicmap_streamer.py
+
   golden:
     name: golden concordance (manual)
     # Needs GraphAligner and network access to the Logan S3 bucket, so it is not on the
