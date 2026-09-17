@@ -387,15 +387,22 @@ def stream_lexicmap_to_msa(
     start_time = time.time()
     last_report_time = start_time
 
-    print("\n---> Streaming rows, grouping by accession, and partitioning into Clean & Flagged cohorts...")
+    print("\n---> Reading rows and buffering HSPs by accession (robust to any row order)...")
 
-    curr_acc = None
-    curr_hsps = []
-    # The stream is grouped by accession one block at a time, so all of an accession's HSPs must
-    # be contiguous. If they are not, an accession is split into several blocks: it is counted
-    # more than once and its multi-HSP coverage is undercounted, silently. Rather than corrupt
-    # the cohort, detect a reappearance and stop with a clear instruction to sort the input.
-    seen_accessions = set()
+    # CORRECTNESS FIX: the original implementation assumed LexicMap's own tabular output was
+    # grouped by accession (`sgenome`) throughout the entire stream -- processing one contiguous
+    # "block" at a time and raising if an accession ever reappeared. That assumption held for
+    # small hand-built fixtures but is false for real, production-scale LexicMap search output:
+    # a single query commonly matches many thousands of target genomes ranked globally by score,
+    # and a genome with more than one distinct HSP/cluster can have its rows scattered
+    # non-contiguously throughout the file (confirmed against a real production run: e.g.
+    # accession 'SRR20569132' reappeared tens of thousands of rows after its first occurrence).
+    # Buffer every row by accession as it is read, and only classify/finalize each accession once
+    # the entire input has been consumed -- this is correct regardless of row order and needs no
+    # upstream pre-sorting step. Relies on Python's guaranteed dict insertion-order (3.7+) so
+    # accessions are still classified/emitted in first-seen order, matching prior behavior for the
+    # (still fully supported) case where the input already happens to be grouped.
+    row_buffer = {}  # acc -> list of hsp tuples, in first-seen order
 
     def process_accession_block(acc, hsps):
         nonlocal total_accessions, count_clean_full, count_clean_partial
@@ -405,15 +412,6 @@ def stream_lexicmap_to_msa(
 
         if not acc or not hsps:
             return
-
-        if acc in seen_accessions:
-            raise ValueError(
-                f"Accession '{acc}' reappears after its block was already processed, so the "
-                f"input is not grouped by accession. All HSPs of an accession must be "
-                f"contiguous. Sort the LexicMap output by the accession column first, e.g. "
-                f"`sort -k<sgenome_col> -s input.tsv`, then re-run."
-            )
-        seen_accessions.add(acc)
 
         total_accessions += 1
 
@@ -505,29 +503,39 @@ def stream_lexicmap_to_msa(
 
             hsp = (pident, qcov, qstart, qend, qseq, sseq)
 
-            if acc != curr_acc:
-                if curr_acc is not None:
-                    process_accession_block(curr_acc, curr_hsps)
-                curr_acc = acc
-                curr_hsps = [hsp]
+            if acc not in row_buffer:
+                row_buffer[acc] = [hsp]
             else:
-                curr_hsps.append(hsp)
+                row_buffer[acc].append(hsp)
 
             now = time.time()
             if now - last_report_time >= 5.0 or (max_records and total_rows % 25000 == 0):
                 elapsed = now - start_time
                 rate = total_rows / elapsed if elapsed > 0 else 0
-                print(f"     [Stream] Rows: {total_rows:,} | Accs: {total_accessions:,} | "
-                      f"Clean Full: {count_clean_full:,} | Rescued: {total_rescued_multihsp:,} | "
-                      f"Flagged Stops: {count_flagged_stops:,} | Speed: {rate:,.0f} rows/s")
+                print(f"     [Read] Rows: {total_rows:,} | Distinct accessions buffered: {len(row_buffer):,} | "
+                      f"Speed: {rate:,.0f} rows/s")
                 last_report_time = now
 
             if max_records and total_rows >= max_records:
                 print(f"\n[*] Reached row limit (--max-records {max_records:,}).")
                 break
 
-        if curr_acc is not None:
-            process_accession_block(curr_acc, curr_hsps)
+        # All rows are read (or --max-records was reached): every accession's HSPs are now
+        # complete and grouped in `row_buffer` regardless of their original order in the input.
+        # Classify each accession exactly once, in first-seen order.
+        print(f"\n---> Read complete: {len(row_buffer):,} distinct accessions. Classifying into cohorts...")
+        classify_start = time.time()
+        last_report_time = classify_start
+        for i, (acc, hsps) in enumerate(row_buffer.items(), 1):
+            process_accession_block(acc, hsps)
+            now = time.time()
+            if now - last_report_time >= 5.0:
+                elapsed = now - classify_start
+                rate = i / elapsed if elapsed > 0 else 0
+                print(f"     [Classify] Accs: {i:,}/{len(row_buffer):,} | "
+                      f"Clean Full: {count_clean_full:,} | Rescued: {total_rescued_multihsp:,} | "
+                      f"Flagged Stops: {count_flagged_stops:,} | Speed: {rate:,.0f} accs/s")
+                last_report_time = now
 
     finally:
         if hasattr(stream, "close"):
