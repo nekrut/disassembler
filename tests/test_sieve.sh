@@ -42,6 +42,14 @@ MAX_PROMOTED=3          # intra-host single-SNV alts collapse hard (see header)
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+skip() { echo "SKIP: $*"; exit 0; }
+
+# --- 0. the sieve source lives in a submodule; skip cleanly if it isn't -----
+# checked out (e.g. CI without submodules: true). A missing submodule is not a
+# test failure -- it just means there's nothing to test here.
+[[ -f "$SIEVE_DIR/Makefile" ]] || skip "submodule $SIEVE_DIR not checked out (run: git submodule update --init)"
+command -v cc >/dev/null 2>&1 || skip "no C compiler (cc) available"
+
 # --- 1. build the sieve if the binary is missing ---------------------------
 if [[ ! -x "$SIEVE_BIN" ]]; then
     echo "[test_sieve] binary missing, building: (cd $SIEVE_DIR && make serial)"
