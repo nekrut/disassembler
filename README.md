@@ -72,6 +72,10 @@ contig, so the difference is intra-host diversity, not a Logan quirk. Full numbe
 cd walker
 cargo build --release
 
+# Optional: build the k-mer diversity sieve (single C source, no conda deps, just a C compiler),
+# needed only for --sieve diversity thinning in disassemble.py (see below).
+git submodule update --init && (cd extern/kmer-diversity-sieve && make serial)
+
 ./target/release/logan-walker \
   -a SRR8209082 \
   -q ../queries/query_hiv1_pol.fasta \
@@ -98,6 +102,36 @@ python/disassemble.py -a SRR6251967 -q queries/markers/zika_ns5.fasta -o out/zik
 Use `-l accessions.txt` for a cohort, `--skip-tree` to stop after reconstruction, and pass any
 extra walker flags after a literal `--`. How the codon alignment stays in frame, and what the
 outputs contain, is in [`docs/codon_msa.md`](docs/codon_msa.md).
+
+#### Diversity thinning (optional)
+
+`--sieve` inserts a diversity-thinning pass between reconstruction and the codon MSA/tree,
+collapsing near-duplicate reconstructed lineages with the k-mer diversity sieve
+(`extern/kmer-diversity-sieve`, built above). It is **default OFF**; with the flag off, behavior is
+byte-identical to before. Because the MSA + tree are `O(N^2)`, thinning a large cohort of nearly
+identical lineages first can be a large speedup with negligible loss of phylogenetic signal.
+
+```bash
+python/disassemble.py -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika \
+    --sieve --sieve-threshold 0.15
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--sieve` | off | enable diversity thinning between reconstruction and the MSA/tree |
+| `--sieve-threshold <F>` | `0.15` | LSH promotion threshold tau (lower = more aggressive collapsing) |
+| `--sieve-min-len <N>` | 95% of query CDS length | minimum sequence length; the sieve's own default is genome-scale (`27000`), so gene-scale CDS need this set near the query length. The auto-default takes a 5% haircut because reconstructions are often a few bases shorter than the reference (an exactly-equal cutoff would drop them all) |
+| `--sieve-bin <PATH>` | `extern/kmer-diversity-sieve/l1_pipeline_serial` | path to the sieve binary |
+
+**Tier caveat — read this.** The sieve is a **haplotype/lineage-level** diversity reducer
+(MinHash/LSH). It collapses near-duplicate reconstructed lineages *across a large cross-accession
+cohort* — the intended use, before the `O(N^2)` MSA/tree. It is **not** an intra-host SNV tool:
+sequences differing by a single SNV are below MinHash resolution (Jaccard ≈ 1 for a ~2700 nt
+sequence differing by one base), so they collapse to ~1 representative at any threshold. To
+preserve intra-host single-SNV variation, use the walker's `--emit-vcf` / `--emit-snv-table`
+(`snvs.tsv`) instead. Measured regimes bear this out: a cross-accession cohort of near-duplicate
+lineages thinned **~67 -> 8**, whereas 33 intra-host single-SNV variants of one accession collapsed
+**33 -> 1**.
 
 ### Planetary triage: Galaxy kmindex harvest to candidate cohorts
 
