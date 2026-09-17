@@ -25,3 +25,9 @@ bubbles.json
 .DS_Store
 *.log
 nohup.out
+
+# kmer-diversity-sieve build artifacts (built from the submodule source)
+extern/kmer-diversity-sieve/l1_pipeline_serial
+extern/kmer-diversity-sieve/l1_pipeline_threads
+extern/kmer-diversity-sieve/l1_pipeline
+tests/*.rank*.fasta
