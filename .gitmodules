@@ -1,0 +1,3 @@
+[submodule "extern/kmer-diversity-sieve"]
+	path = extern/kmer-diversity-sieve
+	url = https://github.com/stevenweaver/kmer-diversity-sieve.git
