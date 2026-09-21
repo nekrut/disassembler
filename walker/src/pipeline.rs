@@ -19,17 +19,17 @@
 //!  │   └───┬────┘ └───┬────┘        └───┬────┘                            │
 //!  │       └──────────┴─────────────────┘                                 │
 //!  │                  │                                                   │
-//!  │        sync_channel(cfg.channel_capacity)   ◄── BOUNDED. capacity x  │
-//!  │                  │                              buffer size is the   │
-//!  │                  │                              hard memory ceiling. │
+//!  │        sync_channel(cfg.channel_capacity)   ◄── BOUNDED, but the     │
+//!  │                  │                              ceiling is NOT just  │
+//!  │                  │                              capacity: see below. │
 //!  │                  ▼                                                   │
-//!  │  COMPUTE POOL  cfg.compute_workers (= cores)                         │
+//!  │  COMPUTE POOL  cfg.compute_workers (default 8, NOT auto-sized)       │
 //!  │   ┌────────┐ ┌────────┐        ┌────────┐                            │
 //!  │   │ work 0 │ │ work 1 │  ...   │ work W │   run_one() below          │
 //!  │   └───┬────┘ └───┬────┘        └───┬────┘                            │
 //!  │       │          │                 │                                 │
 //!  │       │   per accession, in order:                                   │
-//!  │       │     stages::parse    -> UnitigGraph (CSR, ~20 MB)            │
+//!  │       │     stages::parse    -> UnitigGraph (CSR, ~43 MB)            │
 //!  │       │     stages::anchor   -> Anchors                              │
 //!  │       │     stages::extract  -> Subgraph + GFA on tmpfs              │
 //!  │       │     stages::align    -> GraphAligner subprocess -> GafPath   │
@@ -50,12 +50,38 @@
 //! them behind a single `--workers`, which is part of why `--workers 16` was so
 //! destructive: it multiplied memory 16x while buying no extra bandwidth.
 //!
-//! # Why the channel is bounded
+//! # Why the channel is bounded, and what the bound actually is
 //!
-//! Capacity times the largest retained buffer is a provable ceiling on resident memory.
 //! Fetch threads block once the queue is full, so a fast network cannot outrun slow compute
-//! and pile up buffers. The Python `ThreadPoolExecutor` had no such limit, which is how a
-//! single run reached 21.3 GB and took the machine down with it.
+//! and pile up buffers without limit. The Python `ThreadPoolExecutor` had no such limit,
+//! which is how a single run reached 21.3 GB and took the machine down with it.
+//!
+//! This file used to claim the ceiling was "capacity times the largest retained buffer".
+//! **That is wrong, by a factor of five at the defaults.** A compressed buffer is resident in
+//! three places at once, not one:
+//!
+//! ```text
+//!   cfg.channel_capacity     queued in the bounded channel             4
+//! + cfg.fetch_workers        held by a worker blocked in send(),       8
+//!                            after read_to_vec has already returned
+//! + cfg.compute_workers      held by run_one for the whole parse,      8
+//!                            dropped only once the CSR graph exists
+//!                            -----------------------------------------
+//!                            peak concurrent buffers                  20
+//! ```
+//!
+//! `Config::peak_compressed_buffers` computes that and
+//! `Config::max_compressed_resident_bytes` multiplies it by `--max-size-mb`. At the 1 GB
+//! default cap the worst case is therefore **about 20 GB**, not 4 GB, and the binary prints
+//! the figure at startup so it is visible before the run rather than after the OOM.
+//!
+//! On top of that sit one `UnitigGraph` per compute worker (~43 MB each) and whatever
+//! `read_to_vec` transiently allocates while its `Vec` grows.
+//!
+//! The bound is worst case, not typical: it assumes every accession sits at the cap, while
+//! `ERR2028820` is 33 MB and the largest of the ERG11 panel is 343 MB. But the cap is what
+//! bounds the run, and raising `--max-size-mb`, `-w` or `--fetch-workers` moves all three
+//! terms at once. That 343 MB panel is already ~6.9 GB in compressed buffers alone.
 //!
 //! # Ordering constraint
 //!
@@ -84,16 +110,42 @@ pub struct Summary {
     pub results: Vec<AccessionResult>,
 }
 
+/// What to do with a depth-based prune, given how many unitigs would survive it.
+///
+/// Three distinct cases. The one that used to be folded in with "nothing to remove" is
+/// `WouldEmpty`: a floor above every unitig in the subgraph removes the entire search space,
+/// which is not a prune but a silent deletion, and it left the accession with no majority
+/// correction, no alts, no VCF rows and no SNV rows under a log line saying nothing happened.
+#[derive(Debug, PartialEq, Eq)]
+enum PruneOutcome {
+    /// Every unitig is below the floor. Skip the prune; an unpruned result beats none.
+    WouldEmpty,
+    /// Every unitig clears the floor. Nothing to do.
+    NothingToRemove,
+    /// A proper subset survives: rewrite the GFA and realign.
+    Prune,
+}
+
+fn prune_outcome(surviving: usize, before: usize) -> PruneOutcome {
+    if surviving == 0 {
+        PruneOutcome::WouldEmpty
+    } else if surviving == before {
+        PruneOutcome::NothingToRemove
+    } else {
+        PruneOutcome::Prune
+    }
+}
+
 /// Fan accessions through the two pools and collect results.
 pub fn run(cfg: &Config, accessions: Vec<Accession>, query: &Query) -> Result<Summary> {
     let total = accessions.len();
     let (fetch_tx, fetch_rx) = sync_channel::<FetchedUnitigs>(cfg.channel_capacity);
     let (result_tx, result_rx) = std::sync::mpsc::channel::<AccessionResult>();
     let fetch_rx: SharedReceiver<FetchedUnitigs> = Arc::new(Mutex::new(fetch_rx));
-    let work: SharedReceiver<Accession> = {
+    let work: SharedReceiver<(usize, Accession)> = {
         let (tx, rx) = std::sync::mpsc::channel();
-        for a in accessions {
-            let _ = tx.send(a);
+        for (i, a) in accessions.into_iter().enumerate() {
+            let _ = tx.send((i, a));
         }
         Arc::new(Mutex::new(rx))
     };
@@ -138,6 +190,13 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, query: &Query) -> Result<Su
             })
             .collect::<Vec<_>>()
     });
+
+    // Progress is reported as each accession lands, which is what the Python walker did and
+    // what makes a stalled run visible. The *stored* order is the input order, so every
+    // output file is byte-reproducible across runs and `--sieve`'s representative is chosen
+    // by the list the user supplied rather than by which S3 fetch happened to win.
+    let mut results = results;
+    results.sort_by_key(|r| r.index);
 
     let success = results
         .iter()
@@ -189,17 +248,17 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
 /// which is the backpressure that bounds memory.
 fn fetch_worker(
     fetcher: &stages::stream::Fetcher,
-    work: SharedReceiver<Accession>,
+    work: SharedReceiver<(usize, Accession)>,
     out: SyncSender<FetchedUnitigs>,
     result_tx: std::sync::mpsc::Sender<AccessionResult>,
 ) {
     loop {
-        let accession = match work.lock().unwrap().recv() {
+        let (index, accession) = match work.lock().unwrap().recv() {
             Ok(a) => a,
             Err(_) => break, // queue drained
         };
         let t = Instant::now();
-        match fetcher.fetch(&accession) {
+        match fetcher.fetch(index, &accession) {
             Ok(mut fetched) => {
                 fetched.fetch_secs = t.elapsed().as_secs_f64();
                 if out.send(fetched).is_err() {
@@ -208,7 +267,7 @@ fn fetch_worker(
             }
             Err(e) => {
                 eprintln!("[{accession}] fetch failed: {e}");
-                let _ = result_tx.send(AccessionResult::failed(accession, e.to_string()));
+                let _ = result_tx.send(AccessionResult::failed(index, accession, e.to_string()));
             }
         }
     }
@@ -228,6 +287,7 @@ fn compute_worker(
             Err(_) => break,
         };
         let accession = fetched.accession.clone();
+        let index = fetched.index;
 
         // A stage returning `Err` is already handled below. A stage that *panics* (e.g. an
         // index out of bounds on a malformed graph) must not take the worker down with it: the
@@ -239,10 +299,14 @@ fn compute_worker(
         let panic_acc = accession.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_one(cfg, query, query_index, fetched)
-                .unwrap_or_else(|e| AccessionResult::failed(accession, e.to_string()))
+                .unwrap_or_else(|e| AccessionResult::failed(index, accession, e.to_string()))
         }))
         .unwrap_or_else(|_| {
-            AccessionResult::failed(panic_acc, "internal error: a stage panicked".to_string())
+            AccessionResult::failed(
+                index,
+                panic_acc,
+                "internal error: a stage panicked".to_string(),
+            )
         });
         if out.send(result).is_err() {
             break;
@@ -261,8 +325,11 @@ fn compute_worker(
 /// worker is one `UnitigGraph` at ~43 MB.
 ///
 /// Peak is therefore roughly `compressed + graph`, about 76 MB for `ERR2028820`, against
-/// ~199 MB for a design that materialises the decompressed buffer. Multiply by
-/// `cfg.compute_workers` for the real ceiling.
+/// ~199 MB for a design that materialises the decompressed buffer.
+///
+/// For the whole-process ceiling, multiplying this by `cfg.compute_workers` is **not**
+/// enough: compressed buffers are also resident in the channel and in blocked fetch workers.
+/// See the module doc and `Config::peak_compressed_buffers`.
 fn run_one(
     cfg: &Config,
     query: &Query,
@@ -271,6 +338,9 @@ fn run_one(
 ) -> Result<AccessionResult> {
     let t_start = Instant::now();
     let accession = fetched.accession.clone();
+    // Captured before `fetched` is dropped below; every result this function returns carries
+    // it so the collector can restore input order.
+    let index = fetched.index;
     let fetch_secs = fetched.fetch_secs;
     let mut timing = Timing::default();
 
@@ -295,6 +365,7 @@ fn run_one(
     if anchors.ids.is_empty() {
         timing.total = t_start.elapsed().as_secs_f64();
         return Ok(AccessionResult {
+            index,
             accession,
             outcome: Outcome::NoAnchors,
             n_unitigs,
@@ -348,7 +419,7 @@ fn run_one(
     // replaced the upstream `detour` engine (gap rate and VAF labelling).
     let mut final_path = gaf;
     let mut haplotype = match &final_path {
-        Some(path) => stages::stitch::stitch(cfg, path, &subgraph, query)?,
+        Some(path) => stages::stitch::stitch(cfg, &graph, path, &subgraph, query)?,
         None => None,
     };
     timing.stitch = t.elapsed().as_secs_f64();
@@ -395,29 +466,56 @@ fn run_one(
             let floor = stages::extract::depth_floor(cfg, depth);
             let before = subgraph.nodes.len();
 
-            // Both subgraphs live at the same scratch path, so the first must be dropped
-            // (which deletes its GFA) before the second is written.
-            let nodes = std::mem::take(&mut subgraph.nodes);
-            let seqs = std::mem::take(&mut subgraph.seqs);
-            let (kept_nodes, kept_seqs) =
-                stages::extract::prune_nodes(&graph, nodes, seqs, floor);
-            let dropped = before - kept_nodes.len();
+            // Count survivors before consuming anything. `prune_nodes` takes ownership of the
+            // node and sequence vectors, so a prune that turns out to be unusable cannot be
+            // undone afterwards.
+            //
+            // Three outcomes, and the old code collapsed two of them. It tested
+            // `dropped == 0 || kept_nodes.is_empty()` and, in the second case, assigned the
+            // EMPTY vectors back while logging "nothing to remove". An accession whose gene
+            // sits entirely below `min_abund` then kept its pass-1 primary but lost its whole
+            // search space: `variants::view` returns None and `find_alts` returns early, so no
+            // majority correction, no alts, no VCF rows and no SNV rows, under a line asserting
+            // nothing had been pruned.
+            //
+            // Predicate must match `prune_nodes` exactly.
+            let surviving = subgraph
+                .nodes
+                .iter()
+                .filter(|&&id| graph.abundance[id as usize] >= floor)
+                .count();
 
-            if dropped == 0 || kept_nodes.is_empty() {
+            match prune_outcome(surviving, before) {
+                PruneOutcome::WouldEmpty => {
+                // Pruning to nothing is not a prune. Keep the unpruned subgraph, which is the
+                // same "never a regression" rule the failed-realign branch below applies.
+                eprintln!(
+                    "[{}] prune: depth {:.0}x, floor {:.1}x would remove all {} unitigs; \
+                     skipping the prune and keeping the unpruned result",
+                    graph.accession, depth, floor, before
+                );
+                }
+                PruneOutcome::NothingToRemove => {
                 eprintln!(
                     "[{}] prune: depth {:.0}x, floor {:.1}x, nothing to remove",
                     graph.accession, depth, floor
                 );
-                subgraph.nodes = kept_nodes;
-                subgraph.seqs = kept_seqs;
-            } else {
+                }
+                PruneOutcome::Prune => {
+                // Both subgraphs live at the same scratch path, so the first must be dropped
+                // (which deletes its GFA) before the second is written.
+                let nodes = std::mem::take(&mut subgraph.nodes);
+                let seqs = std::mem::take(&mut subgraph.seqs);
+                let (kept_nodes, kept_seqs) =
+                    stages::extract::prune_nodes(&graph, nodes, seqs, floor);
+                let dropped = before - kept_nodes.len();
                 drop(subgraph);
                 let pruned =
                     stages::extract::write_gfa(cfg, &graph, kept_nodes, kept_seqs)?;
                 let gaf2 = pruned.gfa_path.with_extension("pass2.gaf");
                 let t = Instant::now();
                 let second = match stages::align::run(cfg, &pruned, query, &gaf2)? {
-                    Some(p) => stages::stitch::stitch(cfg, &p, &pruned, query)?.map(|h| (p, h)),
+                    Some(p) => stages::stitch::stitch(cfg, &graph, &p, &pruned, query)?.map(|h| (p, h)),
                     None => None,
                 };
                 timing.align += t.elapsed().as_secs_f64();
@@ -451,6 +549,7 @@ fn run_one(
                         subgraph = stages::extract::write_gfa(cfg, &graph, nodes, seqs)?;
                     }
                 }
+                }
             }
         }
     }
@@ -470,7 +569,10 @@ fn run_one(
     if let (Some(path), Some(_)) = (&final_path, &haplotype) {
         if let Some(fixed) = stages::variants::prefer_majority(cfg, &graph, &subgraph, path, query)?
         {
-            if let Some(h) = stages::stitch::stitch(cfg, &fixed, &subgraph, query)? {
+            if let Some(mut h) = stages::stitch::stitch(cfg, &graph, &fixed, &subgraph, query)? {
+                // The route was spliced onto the majority allele, so the GAF's identity
+                // describes the sequence we just replaced, not this one.
+                h.pident_inherited = true;
                 haplotype = Some(h);
                 final_path = Some(fixed);
             }
@@ -492,6 +594,7 @@ fn run_one(
     };
 
     Ok(AccessionResult {
+        index,
         accession,
         outcome,
         alts,
@@ -504,4 +607,94 @@ fn run_one(
         timing,
         error: None,
     })
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use crate::types::{AccessionResult, Outcome};
+
+    /// Results arrive in completion order, decided by S3 and by how long each graph takes.
+    /// `run` sorts on `index` before returning so every output file is byte-reproducible and
+    /// `--sieve`'s representative is the first record of the *input*, not of a race.
+    #[test]
+    fn sorting_on_index_restores_input_order() {
+        // The measured completion order from the nine-accession Zika run in the review.
+        let input = [
+            "SRR6251963", "SRR6251966", "SRR6251967", "SRR6251969", "SRR6251973",
+            "SRR6251979", "SRR6251984", "SRR6251992", "SRR6251993",
+        ];
+        let completion = [5usize, 7, 4, 1, 6, 8, 3, 0, 2];
+
+        let mut results: Vec<AccessionResult> = completion
+            .iter()
+            .map(|&i| AccessionResult::failed(i, input[i].to_string(), "x".into()))
+            .collect();
+        assert_ne!(
+            results.iter().map(|r| r.index).collect::<Vec<_>>(),
+            (0..9).collect::<Vec<_>>(),
+            "fixture must start scrambled or it proves nothing"
+        );
+
+        results.sort_by_key(|r| r.index);
+
+        let got: Vec<&str> = results.iter().map(|r| r.accession.as_str()).collect();
+        assert_eq!(got, input, "stored order must be the input order");
+    }
+
+    /// Every failure path constructs its own result, so the index has to survive all of them.
+    #[test]
+    fn a_failed_result_keeps_its_index() {
+        let r = AccessionResult::failed(41, "SRR8209082".into(), "fetch failed".into());
+        assert_eq!(r.index, 41);
+        assert_eq!(r.outcome, Outcome::Failed);
+    }
+}
+
+#[cfg(test)]
+mod prune_outcome_tests {
+    use super::{prune_outcome, PruneOutcome};
+    use crate::config::Config;
+    use crate::stages::extract::{depth_floor, prune_nodes};
+    use crate::stages::parse;
+    use crate::types::UnitigGraph;
+
+    fn graph(fa: &str) -> UnitigGraph {
+        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
+    }
+
+    /// The three cases must stay distinct. Folding `WouldEmpty` back into
+    /// `NothingToRemove` is the defect this replaced.
+    #[test]
+    fn the_three_cases_are_distinct() {
+        assert_eq!(prune_outcome(0, 10), PruneOutcome::WouldEmpty);
+        assert_eq!(prune_outcome(10, 10), PruneOutcome::NothingToRemove);
+        assert_eq!(prune_outcome(3, 10), PruneOutcome::Prune);
+        // A one-node subgraph that survives is "nothing to remove", not a prune.
+        assert_eq!(prune_outcome(1, 1), PruneOutcome::NothingToRemove);
+        // An empty subgraph never reaches a prune, but must not claim one.
+        assert_eq!(prune_outcome(0, 0), PruneOutcome::WouldEmpty);
+    }
+
+    /// The case is reachable on real data: a gene sitting entirely under `min_abund`.
+    /// `prune_nodes` returns nothing, which is exactly why the caller must not apply it.
+    #[test]
+    fn a_gene_below_min_abund_would_empty_the_subgraph() {
+        let g = graph(">T_0 ka:f:2.0\nACGT\n>T_1 ka:f:3.0\nACGT\n>T_2 ka:f:1.0\nACGT\n");
+        let cfg = Config::default(); // min_abund 5.0
+        let floor = depth_floor(&cfg, 2.0);
+        assert!(floor >= 5.0, "floor is clamped to min_abund, got {floor}");
+
+        let nodes = vec![0u32, 1, 2];
+        let surviving = nodes
+            .iter()
+            .filter(|&&id| g.abundance[id as usize] >= floor)
+            .count();
+        assert_eq!(surviving, 0);
+        assert_eq!(prune_outcome(surviving, nodes.len()), PruneOutcome::WouldEmpty);
+
+        // And the predicate above matches what prune_nodes would actually do.
+        let seqs = vec![b"ACGT".to_vec(); 3];
+        let (kept, _) = prune_nodes(&g, nodes, seqs, floor);
+        assert!(kept.is_empty(), "prune_nodes agrees the subgraph would be emptied");
+    }
 }

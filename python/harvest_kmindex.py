@@ -46,18 +46,65 @@ def get_galaxy_api_key(key_file=None):
         return default_tmp.read_text().strip()
     raise RuntimeError("Galaxy API key not found. Provide --api-key-file, set GALAXY_API_KEY, or write /tmp/gxy.txt.")
 
-def fetch_shard(item, base_url, api_key, sess):
+ATTEMPTS = 5
+
+
+def safe_target_name(raw):
+    """First token of a kmindex target name, reduced to something usable as a dict key and a
+    filename. Returns None when nothing usable remains.
+
+    The value comes from the shard JSON, so it is untrusted. `raw.split()[0]` raised
+    IndexError on an empty or whitespace-only name, and since the only try/except in the
+    merge loop wrapped `fut.result()`, that escaped `as_completed`, tore down the executor and
+    killed a multi-hour harvest with nothing written, because merging is in memory and files
+    are written only at the end.
+
+    It is also interpolated straight into `out_dir / f"{target}.accessions.txt"`, so a name
+    containing a path separator wrote outside out_dir and one containing `..` escaped it.
+
+    The empty case is reachable without a malformed shard: the phiX174 strip below turns a
+    target named exactly `phiX174` into an empty string, which then wrote dotfiles.
+    """
+    tokens = str(raw).split()
+    if not tokens:
+        return None
+    name = tokens[0].replace("phiX174_", "").replace("phiX174", "")
+    name = name.replace("/", "_").replace("\\", "_")
+    name = name.strip(". ")
+    if not name or name in (".", ".."):
+        return None
+    return name
+
+
+def fetch_shard(item, base_url, sess):
+    """Fetch one shard's JSON. Returns None when every attempt failed.
+
+    None, not {}: an exhausted retry loop used to be indistinguishable from a shard that
+    legitimately matched nothing, and nothing counted either. An expired API key therefore
+    produced `Harvest complete: 0 unique SRA runs across 0 targets`, a UNION file holding a
+    single newline, and exit 0, which a downstream --diversity or `disassemble.py -l` then
+    ran on as an empty cohort.
+    """
+    # No api_key parameter: authentication rides on `sess`, whose headers are set by
+    # `harvest_collection`. The argument was accepted and never read.
     name, did = item
     url = f"{base_url}/api/datasets/{did}/display"
-    for attempt in range(5):
+    last = "no attempt made"
+    for attempt in range(ATTEMPTS):
         try:
             r = sess.get(url, params={"raw": "true"}, timeout=30)
             if r.status_code == 200 and r.text.strip():
                 return json.loads(r.text)
-        except Exception:
-            pass
-        time.sleep(0.5 + attempt * 0.5)
-    return {}
+            last = f"HTTP {r.status_code}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+        # No backoff after the final attempt: it buys nothing and cost 2.5 s per shard,
+        # which at 10,000 shards over 32 workers is ~40 minutes of pure sleeping on a path
+        # that produces no data.
+        if attempt < ATTEMPTS - 1:
+            time.sleep(0.5 + attempt * 0.5)
+    print(f"    [!] shard {name}: giving up after {ATTEMPTS} attempts ({last})", file=sys.stderr)
+    return None
 
 def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_workers=32):
     """Walks dataset collection via history endpoint and fetches all shard JSONs in parallel."""
@@ -84,6 +131,8 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
     walk(dc.get("elements", []))
     print(f"[*] Total shard datasets in collection: {len(items)}")
 
+    # Closed in the `finally` at the end of this function: the pooled connections outlive the
+    # harvest otherwise, which matters at 32 workers against one host.
     sess = requests.Session()
     adapter = HTTPAdapter(pool_connections=max_workers * 2, pool_maxsize=max_workers * 2, max_retries=3)
     sess.mount("https://", adapter)
@@ -92,38 +141,64 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
 
     per_target = collections.defaultdict(dict)
     n = 0
+    n_failed = 0
+    n_empty = 0
+    n_bad_target = 0
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[*] Streaming and merging shard JSONs across {max_workers} threads...", flush=True)
     start_t = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(fetch_shard, it, base_url, api_key, sess): it for it in items}
-        for fut in concurrent.futures.as_completed(futures):
-            n += 1
-            if n % 250 == 0 or n == len(items):
-                elapsed = time.time() - start_t
-                rate = n / elapsed if elapsed > 0 else 0
-                print(f"    Merged {n}/{len(items)} shards in {elapsed:.1f}s ({rate:.1f} shards/s)...", flush=True)
-            try:
-                d = fut.result()
-            except Exception:
-                continue
-            if not isinstance(d, dict):
-                continue
-            for shard, q in d.items():
-                if not isinstance(q, dict):
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(fetch_shard, it, base_url, sess): it for it in items}
+            for fut in concurrent.futures.as_completed(futures):
+                n += 1
+                if n % 250 == 0 or n == len(items):
+                    elapsed = time.time() - start_t
+                    rate = n / elapsed if elapsed > 0 else 0
+                    print(f"    Merged {n}/{len(items)} shards in {elapsed:.1f}s ({rate:.1f} shards/s)...", flush=True)
+                try:
+                    d = fut.result()
+                except Exception as e:
+                    n_failed += 1
+                    print(f"    [!] shard fetch raised {type(e).__name__}: {e}", file=sys.stderr)
                     continue
-                for target_name, hits in q.items():
-                    if not isinstance(hits, dict):
-                        continue
-                    clean_target = target_name.split()[0].replace("phiX174_", "").replace("phiX174", "")
-                    for acc, score in hits.items():
-                        try:
-                            sc = float(score)
-                        except Exception:
+                if d is None:
+                    n_failed += 1
+                    continue
+                if not isinstance(d, dict):
+                    n_failed += 1
+                    continue
+                if not d:
+                    n_empty += 1
+                    continue
+                # One malformed shard must not tear down the executor and lose the whole run.
+                try:
+                    for shard, q in d.items():
+                        if not isinstance(q, dict):
                             continue
-                        if sc > per_target[clean_target].get(acc, 0.0):
-                            per_target[clean_target][acc] = sc
+                        for target_name, hits in q.items():
+                            if not isinstance(hits, dict):
+                                continue
+                            clean_target = safe_target_name(target_name)
+                            if clean_target is None:
+                                n_bad_target += 1
+                                continue
+                            for acc, score in hits.items():
+                                try:
+                                    sc = float(score)
+                                except Exception:
+                                    continue
+                                if sc > per_target[clean_target].get(acc, 0.0):
+                                    per_target[clean_target][acc] = sc
+                except Exception as e:
+                    n_failed += 1
+                    print(f"    [!] shard payload unusable ({type(e).__name__}: {e})", file=sys.stderr)
+                    continue
+
+    finally:
+        # 32 pooled connections against one host outlive the harvest otherwise.
+        sess.close()
 
     all_union = set()
     summary = {}
@@ -145,11 +220,40 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
     summary["_union"] = {"n": len(all_union)}
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    print(f"\n[✓] Harvest complete: {len(all_union)} unique SRA runs across {len(per_target)} targets.")
+    if n_failed:
+        print(f"[!] {n_failed}/{len(items)} shards failed to fetch after {ATTEMPTS} attempts "
+              f"each; the cohort below is INCOMPLETE.", file=sys.stderr)
+    if n_empty:
+        print(f"[*] {n_empty}/{len(items)} shards were empty (no hits), which is normal.")
+    if n_bad_target:
+        print(f"[!] {n_bad_target} target name(s) were unusable as a key or filename and were "
+              f"skipped.", file=sys.stderr)
+
+    print(f"\n[{'!' if n_failed else '✓'}] Harvest complete: {len(all_union)} unique SRA runs "
+          f"across {len(per_target)} targets"
+          f"{f', {n_failed} shard(s) FAILED' if n_failed else ''}.")
+
+    # A run that fetched nothing has produced no cohort. Saying so is the difference between
+    # a downstream stage refusing to start and one silently analysing an empty accession list.
+    if items and n_failed == len(items):
+        raise RuntimeError(
+            f"all {len(items)} shard fetches failed (last error above); "
+            f"no cohort was harvested. Check the Galaxy API key and the collection id."
+        )
     return per_target
 
 def stratified_sample(items, k):
-    """Evenly samples k items from a list sorted by score."""
+    """Evenly samples k items from a list sorted by score.
+
+    A quota of zero is legitimate: `quota_canon` is `int(total_target * 0.20)`, which is 0 for
+    any --diversity under 5, and `quota_high` is 0 for --diversity 1 or 2. The old guard was
+    `len(items) <= k`, false whenever the bracket was non-empty, so the run reached
+    `len(items) / k` and died with ZeroDivisionError. The bracket contributing nothing is the
+    right answer at that size, and `stratify_diversity`'s top-up then fills the cohort from
+    the pooled remainder.
+    """
+    if k <= 0:
+        return []
     if len(items) <= k:
         return items
     step = len(items) / k

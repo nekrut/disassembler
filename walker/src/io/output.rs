@@ -55,6 +55,10 @@ fn esc(s: &str) -> String {
 ///
 /// Header format is fixed by `logan_path_walker.py:380`:
 /// `>{id} cov={cov:.3f} pident={pident:.1f} nodes={n}`, sequence on a single line.
+///
+/// The identity key is `pident=` when it was measured on this haplotype's own alignment and
+/// `inherited_pident=` when it came from the pre-splice route (see `Haplotype::pident`), so a
+/// consumer reading `pident=` never gets a number about a different sequence.
 pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -66,8 +70,14 @@ pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
         for h in &r.haplotypes {
             writeln!(
                 w,
-                ">{} cov={:.3} pident={:.1} nodes={} ka={:.1} vaf={:.2}",
-                h.id, h.cov, h.pident, h.nodes, h.mean_ka, h.vaf
+                ">{} cov={:.3} {}={:.1} nodes={} ka={:.1} vaf={:.2}",
+                h.id,
+                h.cov,
+                if h.pident_inherited { "inherited_pident" } else { "pident" },
+                h.pident,
+                h.nodes,
+                h.mean_ka,
+                h.vaf
             )?;
             w.write_all(&h.seq)?;
             w.write_all(b"\n")?;
@@ -89,7 +99,11 @@ pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
 /// The header carries the frequencies, so a reader can tell a 50/50 site from a 90/10 one:
 ///
 /// ```text
-/// >ACC_alt1 cov=0.999 pident=98.1 nodes=1281 vaf=0.310 alt_kaf=3600.0 primary_vaf=0.688 fork=49624+
+/// >ACC_alt1 cov=0.999 inherited_pident=98.1 nodes=1281 vaf=0.310 alt_kaf=3600.0 primary_vaf=0.688 fork=49624+
+///
+/// `inherited_pident` is the PRIMARY's alignment identity, not this allele's: an alt is a
+/// spliced path with no alignment of its own. It was published as `pident=` per record, which
+/// read as a measurement of that allele.
 /// ```
 pub fn write_alts(summary: &Summary, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -103,7 +117,7 @@ pub fn write_alts(summary: &Summary, path: &Path) -> Result<()> {
             let h = &a.haplotype;
             writeln!(
                 w,
-                ">{} cov={:.3} pident={:.1} nodes={} vaf={:.3} alt_kaf={:.1} \
+                ">{} cov={:.3} inherited_pident={:.1} nodes={} vaf={:.3} alt_kaf={:.1} \
                  primary_vaf={:.3} fork={}{} alt_node={}{} detour={} dlen={:+} span={}",
                 h.id, h.cov, h.pident, h.nodes,
                 a.alt_vaf, a.alt_abundance, a.taken_vaf,
@@ -184,6 +198,7 @@ fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<(
             writeln!(w, "          \"seq\": \"{}\",", String::from_utf8_lossy(&h.seq))?;
             writeln!(w, "          \"cov\": {},", h.cov)?;
             writeln!(w, "          \"pident\": {},", h.pident)?;
+            writeln!(w, "          \"pident_inherited\": {},", h.pident_inherited)?;
             writeln!(w, "          \"length\": {},", h.seq.len())?;
             writeln!(w, "          \"nodes\": {},", h.nodes)?;
             writeln!(w, "          \"mean_ka\": {:.1},", h.mean_ka)?;
@@ -271,12 +286,47 @@ pub fn write_summary(summary: &Summary, path: &Path) -> Result<()> {
 /// the file header.
 ///
 /// One file `<out_dir>/<accession>.vcf` per accession that has at least one recovered SNP.
-pub fn write_vcfs(summary: &Summary, query: &Query, out_dir: &Path) -> Result<()> {
+/// The intra-host SNP sites for every result, computed once.
+///
+/// `write_vcfs` and `write_snv_table` both need these, and each used to call `snv_sites`
+/// itself, so with both flags on every accession paid for two identical alignments. Measured
+/// at 11.1 ms each for pfcrt and 15.7 ms for hiv1_pol, which is 3.1 s of pure duplication on a
+/// 200-accession hiv1_pol panel.
+pub fn snv_sites_all(summary: &Summary, query: &Query) -> Vec<Vec<VcfRow>> {
+    summary.results.iter().map(|r| snv_sites(r, query)).collect()
+}
+
+pub fn write_vcfs(
+    summary: &Summary,
+    query: &Query,
+    out_dir: &Path,
+    sites: &[Vec<VcfRow>],
+) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
     let chrom = chrom_of(query);
 
-    for r in &summary.results {
-        let rows = snv_sites(r, query);
+    // The filename is the accession, which `docs/vcf_example.md` documents and the committed
+    // examples rely on, so duplicates in the input list land on one path. Their contents are
+    // for the same accession and so should agree, but say it rather than silently overwrite.
+    {
+        let mut seen = std::collections::HashSet::new();
+        let dupes: Vec<&str> = summary
+            .results
+            .iter()
+            .filter(|r| !seen.insert(r.accession.as_str()))
+            .map(|r| r.accession.as_str())
+            .collect();
+        if !dupes.is_empty() {
+            eprintln!(
+                "[warn] {} duplicate accession(s) in the results ({:?}); each writes \
+                 <out-dir>/<acc>.vcf, so only the last of each survives",
+                dupes.len(),
+                dupes
+            );
+        }
+    }
+
+    for (r, rows) in summary.results.iter().zip(sites) {
         if rows.is_empty() {
             continue;
         }
@@ -284,7 +334,7 @@ pub fn write_vcfs(summary: &Summary, query: &Query, out_dir: &Path) -> Result<()
         let path = out_dir.join(format!("{}.vcf", r.accession));
         let mut w = BufWriter::new(std::fs::File::create(&path)?);
         write_vcf_header(&mut w, chrom, query.seq.len(), &r.accession)?;
-        for row in &rows {
+        for row in rows {
             let alt_bases: Vec<String> =
                 row.alts.iter().map(|&(b, _, _)| (b as char).to_string()).collect();
             let afs: Vec<String> = row.alts.iter().map(|&(_, af, _)| format!("{af:.4}")).collect();
@@ -323,7 +373,12 @@ pub fn write_vcfs(summary: &Summary, query: &Query, out_dir: &Path) -> Result<()
 ///
 /// Columns: `gene pos ref alt accession af ka_alt ka_ref fork`. Frequencies are `ka:f` ratios,
 /// the same values the VCF carries.
-pub fn write_snv_table(summary: &Summary, query: &Query, path: &Path) -> Result<()> {
+pub fn write_snv_table(
+    summary: &Summary,
+    query: &Query,
+    path: &Path,
+    sites: &[Vec<VcfRow>],
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -332,8 +387,8 @@ pub fn write_snv_table(summary: &Summary, query: &Query, path: &Path) -> Result<
     let chrom = chrom_of(query);
     let mut w = BufWriter::new(std::fs::File::create(path)?);
     writeln!(w, "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork")?;
-    for r in &summary.results {
-        for row in snv_sites(r, query) {
+    for (r, rows) in summary.results.iter().zip(sites) {
+        for row in rows {
             for &(alt, af, ka_alt) in &row.alts {
                 writeln!(
                     w,
@@ -463,7 +518,7 @@ fn snv_sites(r: &AccessionResult, query: &Query) -> Vec<VcfRow> {
     merged
 }
 
-struct VcfRow {
+pub struct VcfRow {
     pos: usize,
     ref_base: u8,
     /// (allele base, frequency, ka:f) for each sample allele that differs from the gene base.
@@ -497,10 +552,131 @@ fn write_vcf_header<W: Write>(w: &mut W, chrom: &str, len: usize, sample: &str) 
 /// primary base the query position it aligns to, or `None` if it aligns to a gap (an
 /// insertion relative to the gene).
 ///
+/// Map each primary base to its query coordinate, exactly.
+///
+/// The two sequences are the same gene at high identity, so the optimal path hugs the main
+/// diagonal and a band a few dozen cells wide contains it. That matters because the exact
+/// implementation below allocates a full `(n+1)*(m+1)` byte traceback matrix: measured at
+/// 1.6 MB and 11.1 ms for pfcrt, but **381 MB and 978 ms** at the 20 kb the guard permits,
+/// which is a large single allocation on top of the pipeline's compressed-buffer ceiling.
+///
+/// Banding makes that `(n+1)*w` for a band width `w`, so pfcrt drops from 1.6 MB to ~170 KB.
+///
+/// # Why this cannot silently return a worse alignment
+///
+/// A band is only a speedup if the optimum stays inside it. The traceback reports whether it
+/// touched a band edge; if it did, the band may have clipped the true optimum, so the band is
+/// doubled and the alignment redone. When the band reaches full width this calls `align_full`,
+/// so the worst case is exactly the old behaviour and never a wrong answer.
+fn align_primary_to_query(primary: &[u8], query: &[u8]) -> Vec<Option<usize>> {
+    let (n, m) = (primary.len(), query.len());
+    let full = n.max(m);
+    // The band has to span the length difference before it can absorb any drift on top.
+    let mut band = (n.abs_diff(m) + 16).max(32);
+    while band < full {
+        if let Some(map) = align_banded(primary, query, band) {
+            return map;
+        }
+        band = band.saturating_mul(2);
+    }
+    align_full(primary, query)
+}
+
+/// One banded pass. `None` means the traceback reached a band edge, so the result may not be
+/// optimal and the caller must widen.
+///
+/// Cells are addressed by their offset from the diagonal, `d = j - i`, which is bounded by
+/// `d_min..=d_max`. The band must contain `d = 0` (the start) and `d = m - n` (the end), which
+/// is why those two bracket the range before `band` widens it.
+fn align_banded(primary: &[u8], query: &[u8], band: usize) -> Option<Vec<Option<usize>>> {
+    let (n, m) = (primary.len(), query.len());
+    let delta = m as isize - n as isize;
+    let d_min = delta.min(0) - band as isize;
+    let d_max = delta.max(0) + band as isize;
+    let w = (d_max - d_min + 1) as usize;
+
+    const GAP: i32 = -2;
+    const NEG: i32 = i32::MIN / 4; // room to add GAP without overflowing
+
+    let mut dir = vec![0u8; (n + 1) * w];
+    let mut prev = vec![NEG; w];
+    let mut curr = vec![NEG; w];
+
+    let col = |i: usize, j: usize| -> usize { (j as isize - i as isize - d_min) as usize };
+    let j_range = |i: usize| -> (usize, usize) {
+        let lo = (i as isize + d_min).max(0) as usize;
+        let hi = ((i as isize + d_max).min(m as isize)).max(0) as usize;
+        (lo, hi)
+    };
+
+    // Row 0: only left moves are possible.
+    let (lo0, hi0) = j_range(0);
+    for j in lo0..=hi0 {
+        prev[col(0, j)] = GAP * j as i32;
+        dir[col(0, j)] = 2;
+    }
+
+    for i in 1..=n {
+        let (lo, hi) = j_range(i);
+        for c in curr.iter_mut() {
+            *c = NEG;
+        }
+        for j in lo..=hi {
+            let c = col(i, j);
+            if j == 0 {
+                curr[c] = GAP * i as i32;
+                dir[i * w + c] = 1;
+                continue;
+            }
+            // diag (i-1, j-1) keeps d; up (i-1, j) is d+1; left (i, j-1) is d-1.
+            let diag = if prev[c] == NEG { NEG } else { prev[c] + if primary[i - 1] == query[j - 1] { 1 } else { -1 } };
+            let up = if c + 1 < w && prev[c + 1] != NEG { prev[c + 1] + GAP } else { NEG };
+            let left = if c > 0 && curr[c - 1] != NEG { curr[c - 1] + GAP } else { NEG };
+            let (mut best, mut d) = (diag, 0u8);
+            if up > best {
+                best = up;
+                d = 1;
+            }
+            if left > best {
+                best = left;
+                d = 2;
+            }
+            curr[c] = best;
+            dir[i * w + c] = d;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    // Traceback from (n, m), refusing the result if it ever sat on a band edge.
+    let mut map = vec![None; n];
+    let (mut i, mut j) = (n, m);
+    while i > 0 || j > 0 {
+        let d_here = j as isize - i as isize;
+        if d_here <= d_min || d_here >= d_max {
+            return None;
+        }
+        let c = col(i, j);
+        let d = dir[i * w + c];
+        if i > 0 && j > 0 && d == 0 {
+            map[i - 1] = Some(j - 1);
+            i -= 1;
+            j -= 1;
+        } else if i > 0 && d == 1 {
+            map[i - 1] = None;
+            i -= 1;
+        } else if j > 0 {
+            j -= 1;
+        } else {
+            return None; // dir says left but there is nothing left: outside the band
+        }
+    }
+    Some(map)
+}
+
 /// Linear gap penalty; match +1, mismatch -1, gap -2. The two sequences are the same gene at
 /// high identity, so the alignment is near-diagonal and the exact scoring barely matters; what
 /// matters is that a rare indel shifts coordinates correctly rather than being ignored.
-fn align_primary_to_query(primary: &[u8], query: &[u8]) -> Vec<Option<usize>> {
+fn align_full(primary: &[u8], query: &[u8]) -> Vec<Option<usize>> {
     let n = primary.len();
     let m = query.len();
     // Direction matrix: 0 diag, 1 up (gap in query / primary insertion), 2 left (gap in primary).
@@ -556,6 +732,86 @@ fn align_primary_to_query(primary: &[u8], query: &[u8]) -> Vec<Option<usize>> {
 }
 
 #[cfg(test)]
+mod banded_equivalence_tests {
+    use super::{align_full, align_primary_to_query};
+
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    fn seq(n: usize, seed: &mut u64) -> Vec<u8> {
+        (0..n).map(|_| b"ACGT"[(lcg(seed) % 4) as usize]).collect()
+    }
+
+    /// The band is a speedup, never a different answer. If this ever fails, the widening
+    /// loop in `align_primary_to_query` is not detecting a clipped optimum.
+    #[test]
+    fn banded_matches_the_exact_alignment_on_random_pairs() {
+        let mut seed = 0xC0FFEEu64;
+        for case in 0..400 {
+            let n = 20 + (lcg(&mut seed) % 180) as usize;
+            let a = seq(n, &mut seed);
+            let mut b = a.clone();
+
+            // substitutions
+            for _ in 0..(lcg(&mut seed) % 12) {
+                let p = (lcg(&mut seed) as usize) % b.len();
+                b[p] = b"ACGT"[(lcg(&mut seed) % 4) as usize];
+            }
+            // indels, including runs long enough to push the path off the diagonal
+            for _ in 0..(lcg(&mut seed) % 4) {
+                let p = (lcg(&mut seed) as usize) % b.len();
+                let len = 1 + (lcg(&mut seed) % 9) as usize;
+                if lcg(&mut seed).is_multiple_of(2) {
+                    let ins = seq(len, &mut seed);
+                    b.splice(p..p, ins);
+                } else {
+                    let end = (p + len).min(b.len());
+                    b.drain(p..end);
+                }
+            }
+            if b.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                align_primary_to_query(&a, &b),
+                align_full(&a, &b),
+                "case {case}: banded disagreed with the exact DP (n={}, m={})",
+                a.len(),
+                b.len()
+            );
+        }
+    }
+
+    /// A pair that shares almost nothing forces the band all the way open; the fallback must
+    /// still produce the exact answer rather than a clipped one.
+    #[test]
+    fn a_wildly_divergent_pair_falls_back_to_the_exact_dp() {
+        let a = vec![b'A'; 120];
+        let mut b = vec![b'T'; 40];
+        b.extend(std::iter::repeat_n(b'A', 30));
+        assert_eq!(align_primary_to_query(&a, &b), align_full(&a, &b));
+    }
+
+    /// Degenerate shapes the band arithmetic has to survive.
+    #[test]
+    fn edge_shapes_agree() {
+        let a = b"ACGTACGTAC".to_vec();
+        for b in [
+            b"A".to_vec(),
+            b"ACGTACGTAC".to_vec(),
+            b"ACGTACGTACGTACGTACGTACGTACGTAC".to_vec(),
+            vec![b'G'; 1],
+        ] {
+            assert_eq!(align_primary_to_query(&a, &b), align_full(&a, &b), "b len {}", b.len());
+        }
+    }
+}
+
+#[cfg(test)]
 mod vcf_tests {
     use super::{align_primary_to_query, snv_sites};
     use crate::types::{
@@ -569,6 +825,7 @@ mod vcf_tests {
             seq: seq.to_vec(),
             cov: 1.0,
             pident: 100.0,
+            pident_inherited: false,
             nodes: 1,
             mean_ka: 0.0,
             vaf: 1.0,
@@ -594,6 +851,7 @@ mod vcf_tests {
 
     fn result(primary: &[u8], alts: Vec<AltHaplotype>) -> AccessionResult {
         AccessionResult {
+            index: 0,
             accession: "ACC".into(),
             outcome: Outcome::Success,
             n_unitigs: 0,
@@ -609,7 +867,7 @@ mod vcf_tests {
     }
 
     fn query(seq: &[u8]) -> Query {
-        Query { name: "g".into(), record_id: "g".into(), seq: seq.to_vec(), path: PathBuf::from("g.fa") }
+        Query { name: "g".into(), record_id: "g".into(), seq: seq.to_vec(), path: PathBuf::from("g.fa"), n_records: 1 }
     }
 
     /// A triallelic on-path fork yields two alt haplotypes that differ from the primary at the
@@ -676,5 +934,107 @@ mod vcf_tests {
         assert_eq!(map[2], Some(2));
         assert_eq!(map[3], Some(4), "query position 3 (the deleted T) is skipped");
         assert_eq!(map[6], Some(7));
+    }
+}
+
+#[cfg(test)]
+mod identity_label_tests {
+    use super::{write_alts, write_fasta};
+    use crate::pipeline::Summary;
+    use crate::types::{AccessionResult, AltHaplotype, Haplotype, Outcome, Strand, Timing};
+
+    fn hap(id: &str, inherited: bool) -> Haplotype {
+        Haplotype {
+            id: id.into(),
+            seq: b"ACGT".to_vec(),
+            cov: 1.0,
+            pident: 98.1,
+            pident_inherited: inherited,
+            nodes: 1,
+            mean_ka: 12.0,
+            vaf: 1.0,
+        }
+    }
+
+    fn summary(primary: Haplotype, alts: Vec<AltHaplotype>) -> Summary {
+        Summary {
+            total: 1,
+            success: 1,
+            results: vec![AccessionResult {
+                index: 0,
+                accession: "ACC".into(),
+                outcome: Outcome::Success,
+                n_unitigs: 0,
+                n_anchors: 0,
+                subgraph_nodes: 0,
+                haplotype: Some(primary.clone()),
+                haplotypes: vec![primary],
+                alts,
+                bubbles: Vec::new(),
+                timing: Timing::default(),
+                error: None,
+            }],
+        }
+    }
+
+    fn alt_of(h: Haplotype) -> AltHaplotype {
+        AltHaplotype {
+            haplotype: h,
+            fork: 1,
+            fork_strand: Strand::Forward,
+            alt_node: 2,
+            alt_strand: Strand::Forward,
+            taken_abundance: 10.0,
+            taken_vaf: 0.6,
+            alt_abundance: 5.0,
+            alt_vaf: 0.4,
+            detour_nodes: 1,
+            length_delta: 0,
+            replaced_span: 1,
+        }
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("logan_ident_{}_{}", std::process::id(), name));
+        p
+    }
+
+    /// A haplotype whose own alignment produced the number keeps `pident=`; one carrying the
+    /// pre-splice route's number must not, or a consumer reads it as a measurement of this
+    /// sequence.
+    #[test]
+    fn primary_identity_key_says_whether_it_was_measured() {
+        let p = tmp("measured.fasta");
+        write_fasta(&summary(hap("ACC_primary", false), vec![]), &p).unwrap();
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("pident=98.1"), "{s}");
+        assert!(!s.contains("inherited_pident"), "{s}");
+        std::fs::remove_file(&p).ok();
+
+        let p = tmp("inherited.fasta");
+        write_fasta(&summary(hap("ACC_primary", true), vec![]), &p).unwrap();
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("inherited_pident=98.1"), "{s}");
+        assert!(
+            !s.split_whitespace().any(|w| w.starts_with("pident=")),
+            "a spliced haplotype must not publish a bare pident=: {s}"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Every alt is a spliced path, so its identity is always the primary's.
+    #[test]
+    fn alt_identity_is_always_labelled_inherited() {
+        let p = tmp("alts.fasta");
+        let alts = vec![alt_of(hap("ACC_alt1", false))];
+        write_alts(&summary(hap("ACC_primary", false), alts), &p).unwrap();
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(s.contains("inherited_pident=98.1"), "{s}");
+        assert!(
+            !s.split_whitespace().any(|w| w.starts_with("pident=")),
+            "alt records must not publish a bare pident=: {s}"
+        );
+        std::fs::remove_file(&p).ok();
     }
 }

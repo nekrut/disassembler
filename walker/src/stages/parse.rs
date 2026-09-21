@@ -375,6 +375,7 @@ mod real_data {
             return;
         };
         let fetched = FetchedUnitigs {
+            index: 0,
             accession: "ERR2028820".to_string(),
             compressed_len: compressed.len(),
             compressed,

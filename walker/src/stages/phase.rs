@@ -137,55 +137,91 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
         if reconverged.is_empty() {
             continue;
         }
-        // Deterministic choice, unlike Python's `reconverged[0]` out of a hash-ordered Counter.
+        // Sorted for a deterministic emission order, unlike Python's hash-ordered Counter.
+        // NOT to pick a single winner: this used to take `reconverged[0]` and discard the
+        // rest, so a fork with several reconvergence points reported one bubble and silently
+        // lost the others, in every orientation, before the dedup below was even reached.
         reconverged.sort_unstable();
-        let merge = reconverged[0];
 
-        // Every bubble exists twice in a bidirected graph, once per traversal direction:
-        // `(0,+) -> {1,2} -> (3,+)` is the same diamond as `(3,-) -> {1,2} -> (0,-)`.
-        // Flipping an oriented node's strand is `^ 1`, so the mirror of `(fork, merge)` is
-        // `(merge ^ 1, fork ^ 1)`. Emitting only the direction with the smaller fork reports
-        // each bubble exactly once, and `<=` keeps a self-mirrored bubble.
-        if (fork as u32) > (merge ^ 1) {
-            continue;
-        }
-
-        // Coverage share is computed over every branch, then the gates are applied, which
-        // matches the Python ordering: a branch filtered out still contributed to the total.
-        let total: f64 = branches
-            .iter()
-            .map(|&b| graph.abundance[unlocal(b).0 as usize] as f64)
-            .sum();
-        if total <= 0.0 {
-            continue;
-        }
-
-        let mut kept: Vec<Branch> = Vec::new();
-        for &b in branches {
-            let (node, strand) = unlocal(b);
-            let ab = graph.abundance[node as usize];
-            let vaf = ab as f64 / total;
-            if ab >= cfg.min_abund && vaf >= cfg.min_vaf {
-                kept.push(Branch { node, strand, abundance: ab, vaf });
+        for &merge in &reconverged {
+            // Every bubble exists twice in a bidirected graph, once per traversal direction:
+            // `(0,+) -> {1,2} -> (3,+)` is the same diamond as `(3,-) -> {1,2} -> (0,-)`.
+            // Flipping an oriented node's strand is `^ 1`, so the mirror of `(fork, merge)`
+            // is `(merge ^ 1, fork ^ 1)`, and the graph being closed under reversal means
+            // that pair is enumerated too.
+            //
+            // Keep the lexicographically smaller of the two *pairs*: exactly one of
+            // `(f, m)` and `(m^1, f^1)` is smaller, and a self-mirrored bubble (`m == f^1`)
+            // compares equal and is kept once.
+            //
+            // This is EQUIVALENT to the older `fork > merge ^ 1`, which compared only the
+            // forks: given both directions are enumerated with the same merge, `f <= m^1`
+            // and `m^1 <= f` cannot both fail. Checked exhaustively over 300k random
+            // reversal-closed graphs, zero disagreements. The older form was therefore never
+            // the defect here; it only looked wrong because taking `reconverged[0]` meant the
+            // two directions were comparing *different* merges. The pair form is kept because
+            // it does not depend on that invariant, so a future change that again reports one
+            // merge per fork cannot silently turn the dedup into a bubble-loser.
+            let f = fork as u32;
+            if (f, merge) > (merge ^ 1, f ^ 1) {
+                continue;
             }
-        }
-        if kept.len() < 2 {
-            continue;
-        }
-        kept.sort_by_key(|a| (a.node, a.strand));
 
-        let (fork_id, fork_strand) = unlocal(fork as u32);
-        let (merge_id, merge_strand) = unlocal(merge);
-        bubbles.push(Bubble {
-            fork: fork_id,
-            fork_strand,
-            merge: merge_id,
-            merge_strand,
-            branches: kept,
-        });
+            // Only the exits that actually reach THIS merge are alleles of this bubble.
+            // `total` and `kept` used to iterate every exit from the fork, so a third branch
+            // heading somewhere else was published as an allele of a bubble it is not part
+            // of, and its coverage diluted the real branches' VAFs, which can push a true
+            // minority allele under `min_vaf` and suppress the bubble via `kept.len() < 2`.
+            // `out[b]` is sorted and deduped above, so this is a binary search.
+            let in_bubble: Vec<u32> = branches
+                .iter()
+                .copied()
+                .filter(|&b| out[b as usize].binary_search(&merge).is_ok())
+                .collect();
+            if in_bubble.len() < 2 {
+                continue;
+            }
+
+            // Coverage share is computed over every branch of this bubble, then the gates are
+            // applied, which matches the Python ordering: a branch filtered out by a gate
+            // still contributed to the total.
+            let total: f64 = in_bubble
+                .iter()
+                .map(|&b| graph.abundance[unlocal(b).0 as usize] as f64)
+                .sum();
+            if total <= 0.0 {
+                continue;
+            }
+
+            let mut kept: Vec<Branch> = Vec::new();
+            for &b in &in_bubble {
+                let (node, strand) = unlocal(b);
+                let ab = graph.abundance[node as usize];
+                let vaf = ab as f64 / total;
+                if ab >= cfg.min_abund && vaf >= cfg.min_vaf {
+                    kept.push(Branch { node, strand, abundance: ab, vaf });
+                }
+            }
+            if kept.len() < 2 {
+                continue;
+            }
+            kept.sort_by_key(|a| (a.node, a.strand));
+
+            let (fork_id, fork_strand) = unlocal(f);
+            let (merge_id, merge_strand) = unlocal(merge);
+            bubbles.push(Bubble {
+                fork: fork_id,
+                fork_strand,
+                merge: merge_id,
+                merge_strand,
+                branches: kept,
+            });
+        }
     }
 
-    bubbles.sort_by_key(|a| (a.fork, a.fork_strand));
+    // A fork can now contribute more than one bubble, so the merge is part of the key or the
+    // order would depend on discovery.
+    bubbles.sort_by_key(|a| (a.fork, a.fork_strand, a.merge, a.merge_strand));
     Ok(bubbles)
 }
 
@@ -250,6 +286,124 @@ mod tests {
         assert_eq!(nodes, vec![1, 2]);
         assert!((b[0].branches[0].vaf - 0.6).abs() < 1e-9);
         assert!((b[0].branches[1].vaf - 0.4).abs() < 1e-9);
+    }
+
+    /// Every oriented traversal Logan records implies its reverse, because the edge appears
+    /// in both endpoints' headers. A fixture that is not closed under reversal is not a graph
+    /// this stage can be handed, so assert it rather than assume it.
+    fn assert_reversal_closed(g: &UnitigGraph) {
+        use std::collections::HashSet;
+        let mut edges: HashSet<(u32, u32)> = HashSet::new();
+        for i in 0..g.n_unitigs as u32 {
+            for &packed in g.edges(i) {
+                let (target, src_fwd, dst_fwd) = parse::unpack_edge(packed);
+                edges.insert((i * 2 + u32::from(src_fwd), target * 2 + u32::from(dst_fwd)));
+            }
+        }
+        for &(f, to) in &edges {
+            assert!(
+                edges.contains(&(to ^ 1, f ^ 1)),
+                "fixture is not reversal-closed: {f}->{to} has no mirror {}->{}",
+                to ^ 1,
+                f ^ 1
+            );
+        }
+    }
+
+    /// A fork with two reconvergence points must report BOTH bubbles.
+    ///
+    /// The loop used to sort `reconverged` and take element 0, so every reconvergence point
+    /// but the smallest was discarded before the dedup was even reached.
+    #[test]
+    fn a_fork_with_two_merges_reports_both() {
+        let c = cfg();
+        // 0+ forks to 1+ and 2+; both reach 3+ AND both reach 4+. Two genuine diamonds
+        // sharing one fork.
+        let g = build(concat!(
+            ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
+            ">T_1 ka:f:60.0   L:-:0:-  L:+:3:+  L:+:4:+\nTTTT\n",
+            ">T_2 ka:f:40.0   L:-:0:-  L:+:3:+  L:+:4:+\nGGGG\n",
+            ">T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nCCCC\n",
+            ">T_4 ka:f:100.0  L:-:1:-  L:-:2:-\nAAAA\n",
+        ));
+        assert_reversal_closed(&g);
+        let sub = whole(&c, &g);
+        let b = phase(&c, &g, &sub).unwrap();
+        cleanup(&sub);
+
+        let merges: Vec<UnitigId> = b
+            .iter()
+            .filter(|x| x.fork == 0 && x.fork_strand == Strand::Forward)
+            .map(|x| x.merge)
+            .collect();
+        assert_eq!(merges, vec![3, 4], "both reconvergence points, got {merges:?}");
+    }
+
+    /// A bubble whose two traversal directions choose different merges survives.
+    ///
+    /// Fork `(2,-)` reconverges at both `(2,+)` and `(3,-)`; taking only the smallest meant
+    /// `(2,-) -> (3,-)` was never considered, and the mirror direction `(3,+)` picked a
+    /// different merge and was then skipped by the dedup, so the diamond appeared in NEITHER
+    /// direction of `bubbles.json`. Found by brute-force search over reversal-closed graphs;
+    /// see review finding 2.1.
+    #[test]
+    fn a_bubble_whose_directions_disagree_on_the_merge_survives() {
+        let c = cfg();
+        let g = build(concat!(
+            ">T_0 ka:f:50.0  L:-:1:-  L:-:1:+  L:-:2:+  L:-:3:-  L:+:2:-  L:+:2:+\nACGT\n",
+            ">T_1 ka:f:50.0  L:-:0:+  L:-:3:-  L:+:0:+  L:+:2:+\nTTTT\n",
+            ">T_2 ka:f:50.0  L:-:0:-  L:-:0:+  L:-:1:-  L:+:0:-\nGGGG\n",
+            ">T_3 ka:f:50.0  L:+:0:+  L:+:1:+\nCCCC\n",
+        ));
+        assert_reversal_closed(&g);
+        let sub = whole(&c, &g);
+        let b = phase(&c, &g, &sub).unwrap();
+        cleanup(&sub);
+
+        // fork (2,-) reconverges at both (2,+) and (3,-); the mirror direction (3,+) picks
+        // (2,+). The (2,-) -> (3,-) diamond appeared in neither direction before.
+        let found = b.iter().any(|x| {
+            x.fork == 2
+                && x.fork_strand == Strand::Reverse
+                && x.merge == 3
+                && x.merge_strand == Strand::Reverse
+        });
+        let seen: Vec<(UnitigId, Strand, UnitigId, Strand)> =
+            b.iter().map(|x| (x.fork, x.fork_strand, x.merge, x.merge_strand)).collect();
+        assert!(found, "the (2,-) -> (3,-) diamond must be reported; got {seen:?}");
+    }
+
+    /// A branch that leaves the fork but never reaches the chosen merge is not an allele of
+    /// that bubble, and must not dilute the real alleles' VAFs.
+    #[test]
+    fn a_branch_that_misses_the_merge_is_not_an_allele() {
+        let c = cfg();
+        // 0+ exits to 1+, 2+ and 3+. Only 1+ and 2+ reach 4+; 3+ goes to 5+ and carries
+        // enough coverage to push the minority allele under min_vaf if it were counted.
+        let g = build(concat!(
+            ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+  L:+:3:+\nACGT\n",
+            ">T_1 ka:f:80.0   L:-:0:-  L:+:4:+\nTTTT\n",
+            ">T_2 ka:f:20.0   L:-:0:-  L:+:4:+\nGGGG\n",
+            ">T_3 ka:f:400.0  L:-:0:-  L:+:5:+\nCCCC\n",
+            ">T_4 ka:f:100.0  L:-:1:-  L:-:2:-\nAAAA\n",
+            ">T_5 ka:f:400.0  L:-:3:-\nACAC\n",
+        ));
+        assert_reversal_closed(&g);
+        let sub = whole(&c, &g);
+        let b = phase(&c, &g, &sub).unwrap();
+        cleanup(&sub);
+
+        let bubble = b
+            .iter()
+            .find(|x| x.fork == 0 && x.fork_strand == Strand::Forward && x.merge == 4)
+            .expect("the 1/2 diamond must be reported");
+        let nodes: Vec<UnitigId> = bubble.branches.iter().map(|x| x.node).collect();
+        assert_eq!(nodes, vec![1, 2], "unitig 3 does not reach merge 4");
+
+        // VAFs over 80 and 20, not over 80/20/400: with 3 counted, the minority allele is
+        // 20/500 = 0.04, under the 0.10 floor, and `kept.len() < 2` would drop the bubble.
+        assert!((bubble.branches[0].vaf - 0.8).abs() < 1e-9, "got {}", bubble.branches[0].vaf);
+        assert!((bubble.branches[1].vaf - 0.2).abs() < 1e-9, "got {}", bubble.branches[1].vaf);
     }
 
     /// A branch below the coverage floor is a sequencing error, not a variant.
@@ -362,7 +516,7 @@ mod phase_real {
                 eprintln!("SKIP: no data for {acc}");
                 continue;
             };
-            let f = FetchedUnitigs { accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
+            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();
@@ -421,7 +575,7 @@ mod phase_diagnostic {
             ("SRR8209082", "../queries/query_hiv1_pol.fasta"),
         ] {
             let Ok(compressed) = std::fs::read(format!("{dir}/{acc}.unitigs.fa.zst")) else { continue };
-            let f = FetchedUnitigs { accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
+            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();

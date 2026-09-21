@@ -53,12 +53,12 @@ impl Fetcher {
     ///
     /// Returns the compressed bytes only. Decompression is `decoder`'s job, and happens in
     /// the compute pool so the fetch thread can immediately start the next transfer.
-    pub fn fetch(&self, accession: &Accession) -> Result<FetchedUnitigs> {
+    pub fn fetch(&self, index: usize, accession: &Accession) -> Result<FetchedUnitigs> {
         let url = unitigs_url(accession);
         let mut last: String = String::from("no attempt made");
 
         for attempt in 1..=self.attempts {
-            match self.try_once(accession, &url) {
+            match self.try_once(index, accession, &url) {
                 Ok(f) => return Ok(f),
                 Err(FetchAttempt::Permanent(detail)) => {
                     return Err(Error::Fetch {
@@ -82,7 +82,7 @@ impl Fetcher {
         })
     }
 
-    fn try_once(&self, accession: &Accession, url: &str) -> std::result::Result<FetchedUnitigs, FetchAttempt> {
+    fn try_once(&self, index: usize, accession: &Accession, url: &str) -> std::result::Result<FetchedUnitigs, FetchAttempt> {
         let mut resp = self
             .agent
             .get(url)
@@ -126,6 +126,7 @@ impl Fetcher {
         }
 
         Ok(FetchedUnitigs {
+            index,
             accession: accession.clone(),
             compressed_len: compressed.len(),
             compressed,
@@ -208,7 +209,7 @@ mod network_tests {
     #[ignore]
     fn fetches_a_real_accession_and_it_decodes() {
         let f = Fetcher::new(&Config::default());
-        let got = f.fetch(&"SRR8209082".to_string()).expect("fetch");
+        let got = f.fetch(0, &"SRR8209082".to_string()).expect("fetch");
         eprintln!("fetched {} compressed bytes", got.compressed_len);
         assert_eq!(got.compressed_len, 1_861_058, "unexpected compressed size");
         assert_eq!(got.compressed_len, got.compressed.len());
@@ -225,7 +226,7 @@ mod network_tests {
     fn missing_accession_is_a_permanent_404_not_a_retry_storm() {
         let f = Fetcher::new(&Config::default());
         let started = std::time::Instant::now();
-        let err = f.fetch(&"NOTAREALACCESSION999".to_string()).err().expect("should fail");
+        let err = f.fetch(0, &"NOTAREALACCESSION999".to_string()).err().expect("should fail");
         let msg = err.to_string();
         eprintln!("{msg}");
         assert!(msg.contains("404"), "expected a 404, got: {msg}");
@@ -244,7 +245,7 @@ mod network_tests {
         };
         let f = Fetcher::new(&cfg);
         let started = std::time::Instant::now();
-        let err = f.fetch(&"SRR12016917".to_string()).err().expect("should fail");
+        let err = f.fetch(0, &"SRR12016917".to_string()).err().expect("should fail");
         let msg = err.to_string();
         eprintln!("{msg}");
         assert!(msg.contains("exceeds max_compressed_bytes"), "got: {msg}");
@@ -261,6 +262,7 @@ mod tests {
 
     fn fetched(compressed: Vec<u8>) -> FetchedUnitigs {
         FetchedUnitigs {
+            index: 0,
             accession: "TEST0001".to_string(),
             compressed_len: compressed.len(),
             compressed,
@@ -389,6 +391,7 @@ mod real_data_tests {
         };
 
         let f = FetchedUnitigs {
+            index: 0,
             accession: "REAL".to_string(),
             compressed_len: compressed.len(),
             compressed,

@@ -233,7 +233,14 @@ pub struct Config {
     /// Threads streaming from S3. Bandwidth saturates around 8 streams at 17.4 MB/s aggregate,
     /// so raising this past that buys nothing.
     pub fetch_workers: usize,
-    /// Threads running parse through phase. Size to cores.
+    /// Threads running parse through phase.
+    ///
+    /// A fixed default of 8, deliberately **not** `available_parallelism()`, though this and
+    /// `pipeline`'s diagram both used to say "= cores". Auto-sizing would silently raise the
+    /// memory bound on a large machine: each compute worker holds a compressed buffer through
+    /// the whole parse, so 32 cores would mean 4 + 8 + 32 = 44 buffers, 44 GB at the default
+    /// `--max-size-mb`. See `peak_compressed_buffers`. Set it explicitly with `-w` once you
+    /// know the machine can absorb it; the startup line prints what you chose.
     pub compute_workers: usize,
     /// Bounded queue depth between fetch and compute. This times the largest retained buffer
     /// is the hard ceiling on resident memory, and is the whole point of the bounded channel.
@@ -290,6 +297,35 @@ pub struct Config {
     pub graphaligner_bin: String,
 }
 
+impl Config {
+    /// Compressed unitig buffers that can be resident at the same time.
+    ///
+    /// **Not** `channel_capacity`, which is the number this file and `pipeline`'s module doc
+    /// both used to claim. Three places hold one concurrently:
+    ///
+    /// * `channel_capacity` sitting in the bounded queue;
+    /// * one per fetch worker, held from the moment `read_to_vec` returns until the blocking
+    ///   `send` into a full queue completes (`stages::stream`);
+    /// * one per compute worker, because `run_one` keeps `fetched` alive through the whole
+    ///   parse and drops it only once the CSR graph exists (`pipeline::run_one`).
+    ///
+    /// At the defaults that is 4 + 8 + 8 = 20, five times the documented figure.
+    pub fn peak_compressed_buffers(&self) -> usize {
+        self.channel_capacity + self.fetch_workers + self.compute_workers
+    }
+
+    /// Worst-case bytes resident in compressed buffers alone, if every accession is at the
+    /// `--max-size-mb` cap.
+    ///
+    /// This is a bound, not a prediction: real accessions are far below the cap (`ERR2028820`
+    /// is 33 MB, the ERG11 panel reaches 343 MB against a 1 GB default). It excludes the CSR
+    /// graphs, which add roughly 43 MB per compute worker, and any transient growth inside
+    /// `read_to_vec` while the receiving `Vec` reallocates.
+    pub fn max_compressed_resident_bytes(&self) -> u64 {
+        (self.peak_compressed_buffers() as u64).saturating_mul(self.max_compressed_bytes)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -323,5 +359,61 @@ impl Default for Config {
             scratch_dir: PathBuf::from("/dev/shm/logan-walker"),
             graphaligner_bin: String::from("GraphAligner"),
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_bound_tests {
+    use super::Config;
+
+    /// The documented ceiling was `channel_capacity` alone. Three places hold a compressed
+    /// buffer at once, so at the defaults the real figure is 20, not 4.
+    #[test]
+    fn peak_buffers_counts_all_three_holders() {
+        let cfg = Config::default();
+        assert_eq!((cfg.channel_capacity, cfg.fetch_workers, cfg.compute_workers), (4, 8, 8));
+        assert_eq!(cfg.peak_compressed_buffers(), 20);
+        assert_ne!(
+            cfg.peak_compressed_buffers(),
+            cfg.channel_capacity,
+            "the queue depth alone is the claim this check exists to refute"
+        );
+    }
+
+    /// 20 buffers at the 1 GB default cap is ~20 GB, the figure that made this a finding.
+    #[test]
+    fn worst_case_bytes_track_the_size_cap() {
+        let cfg = Config::default();
+        assert_eq!(cfg.max_compressed_bytes, 1024 * 1024 * 1024);
+        assert_eq!(cfg.max_compressed_resident_bytes(), 20 * 1024 * 1024 * 1024);
+
+        // The ERG11 panel's largest accession, the real-data case from the review.
+        let panel = 343u64 * 1024 * 1024;
+        let at_panel_size = cfg.peak_compressed_buffers() as u64 * panel;
+        assert!(
+            (6.5..7.2).contains(&(at_panel_size as f64 / (1024.0 * 1024.0 * 1024.0))),
+            "~6.9 GB expected, got {at_panel_size} bytes"
+        );
+    }
+
+    /// Every term is user-tunable, which is why the binary prints the number rather than
+    /// documenting a constant.
+    #[test]
+    fn every_term_moves_the_bound() {
+        let base = Config::default().peak_compressed_buffers();
+        for cfg in [
+            Config { channel_capacity: 8, ..Config::default() },
+            Config { fetch_workers: 16, ..Config::default() },
+            Config { compute_workers: 16, ..Config::default() },
+        ] {
+            assert!(cfg.peak_compressed_buffers() > base);
+        }
+    }
+
+    /// An absurd `--max-size-mb` must not wrap the bound to a small number.
+    #[test]
+    fn an_absurd_cap_saturates_instead_of_wrapping() {
+        let cfg = Config { max_compressed_bytes: u64::MAX, ..Config::default() };
+        assert_eq!(cfg.max_compressed_resident_bytes(), u64::MAX);
     }
 }

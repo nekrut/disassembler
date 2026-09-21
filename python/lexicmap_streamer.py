@@ -19,9 +19,15 @@ Core capabilities:
      - Tier 3: Flagged Premature Stops (stops > max_stops)
      - Tier 4: Low-Coverage Fragments (coverage < min_coverage_partial)
   4. Online haplotype collapser:
-     Collapses clean full-length sequences in O(1) streaming memory, calls nucleotide and
-     amino acid mutations, classifies mutation impact (WT, Synonymous, Missense, Nonsense),
-     and outputs clean MSAs, mutation frequency tables, and complete cohort ledgers.
+     Collapses clean full-length sequences without holding the input, calls nucleotide and
+     amino acid mutations, classifies mutation impact (WT, WT_partial, Synonymous, Missense,
+     Nonsense), and outputs clean MSAs, mutation frequency tables, and complete cohort ledgers.
+
+     Memory is O(distinct clean full-length haplotypes), NOT O(1): `clean_full_haps`,
+     `clean_full_pident_sum` and `clean_full_samples` are keyed by the full merged sequence,
+     so on a divergent target where few accessions share a haplotype this approaches one
+     entry per accession, each holding a copy of the sequence. It is the ROW count that
+     streams, which is the thing that is unbounded; the haplotype count is not.
   5. Regime diagnostics:
      Calculates coverage and identity quantiles (p10, p25, median, p75, p90), detects
      divergent targets (median pid < 85% or cov < 0.60), and alerts when de novo
@@ -147,26 +153,54 @@ def compute_quantiles(values: list) -> dict:
         "mean": round(sum(s) / n, 4)
     }
 
+# How many malformed rows to name individually before falling back to a count.
+MALFORMED_REPORT_LIMIT = 5
+
+
 def load_reference(fasta_path: str):
-    """Loads reference sequence, length, and header from FASTA file."""
+    """Loads the FIRST record's sequence, length, and header from a FASTA file.
+
+    Records after the first are ignored, with a warning. Concatenating them instead built a
+    pseudo-gene under record 1's name: the 160-record master panel came back as
+    ref_len=313311 called 'h5n1_pb2_reference', which sent every accession to tier 4 at a
+    coverage around 0.009 and discarded the whole cohort at exit 0.
+    """
     path = Path(fasta_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Reference FASTA file not found: {path}")
+    # is_file, not exists: a directory passed `exists()` and then raised IsADirectoryError
+    # from open() instead of the intended FileNotFoundError.
+    if not path.is_file():
+        raise FileNotFoundError(f"Reference FASTA file not found (or not a file): {path}")
 
     header = ""
     seq_parts = []
+    n_records = 0
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             if line.startswith(">"):
-                if not header:
+                n_records += 1
+                if n_records == 1:
                     header = line[1:]
-            else:
+                continue
+            if n_records == 1:
                 seq_parts.append(line)
 
+    if n_records > 1:
+        print(f"[warn] {path}: {n_records} records present, using only the first "
+              f"({header.split()[0] if header else path.stem!r}). One gene per reference.",
+              file=sys.stderr)
+
     ref_seq = "".join(seq_parts).upper()
+    # Every coverage figure divides by len(ref_seq). An empty or header-only FASTA sailed
+    # through to `cov = covered_bases / ref_len` and died there with a bare
+    # ZeroDivisionError, naming neither the file nor the reason.
+    if not ref_seq:
+        raise ValueError(
+            f"Reference FASTA has no sequence: {path} "
+            f"({n_records} record(s) read, first header {header[:60]!r})"
+        )
     ref_name = header.split()[0] if header else path.stem
     return ref_name, header, ref_seq
 
@@ -342,6 +376,11 @@ def stream_lexicmap_to_msa(
     idx_qend = find_col(["qend", "q_end", "query_end"])
     idx_qseq = find_col(["qseq", "query_seq", "q_seq"])
     idx_sseq = find_col(["sseq", "subject_seq", "s_seq"])
+    # Neither of these was resolved at all, so a multi-target search was silently merged onto
+    # one reference and a mismatched reference was never noticed. Both are OPTIONAL: older or
+    # hand-made TSVs may not carry them, and requiring them would reject working inputs.
+    idx_query = find_col(["query", "qseqid", "qaccver", "qname", "query_id"])
+    idx_qlen = find_col(["qlen", "query_length", "qseqlen", "q_len"])
 
     missing = []
     if idx_sgenome is None: missing.append("sgenome/subject")
@@ -354,6 +393,13 @@ def stream_lexicmap_to_msa(
 
     if missing:
         raise KeyError(f"Missing required columns {missing} in LexicMap header: {header_cols}")
+
+    if idx_query is None:
+        print(f"[warn] no query-name column in the header ({header_cols}); rows cannot be "
+              f"filtered to '{ref_name}'. If this file holds hits for more than one target, "
+              f"their HSPs will be merged onto this one reference.", file=sys.stderr)
+    if idx_qlen is None:
+        print(f"[*] no qlen column; skipping the reference length agreement check.")
 
     # Cohort file handles
     f_clean_fa = open(f"{out_prefix}.clean.accessions.fasta", "w", encoding="utf-8")
@@ -376,6 +422,9 @@ def stream_lexicmap_to_msa(
     cov_ge_50_stops = 0
 
     total_rows = 0
+    n_malformed = 0
+    n_other_query = 0
+    n_qlen_mismatch = 0
     total_accessions = 0
     count_clean_full = 0
     count_clean_partial = 0
@@ -492,14 +541,55 @@ def stream_lexicmap_to_msa(
 
             total_rows += 1
             parts = line.split("\t")
-            if len(parts) <= max(idx_sgenome, idx_pident, idx_qcov, idx_qstart, idx_qend, idx_qseq, idx_sseq):
+            needed = [idx_sgenome, idx_pident, idx_qcov, idx_qstart, idx_qend, idx_qseq, idx_sseq]
+            needed += [i for i in (idx_query, idx_qlen) if i is not None]
+            if len(parts) <= max(needed):
                 continue
 
+            # A LexicMap search against a multi-target panel emits rows for every target in
+            # one file, distinguished ONLY by this column. Grouping is by sgenome alone, so
+            # without this an accession hit by several genes had HSPs from DIFFERENT genes
+            # tiled onto a single grid, and a file sorted by query rather than accession
+            # tripped the "reappears after its block was processed" ValueError instead.
+            if idx_query is not None and parts[idx_query] != ref_name:
+                n_other_query += 1
+                continue
+
+            # Every HSP is projected onto a grid of len(ref_seq). If the search used a
+            # different version of the gene, every projection is wrong and nothing said so.
+            if idx_qlen is not None:
+                try:
+                    row_qlen = int(parts[idx_qlen])
+                except ValueError:
+                    row_qlen = None
+                if row_qlen is not None and row_qlen != ref_len:
+                    n_qlen_mismatch += 1
+                    if n_qlen_mismatch == 1:
+                        raise ValueError(
+                            f"reference length disagreement: the search reports qlen="
+                            f"{row_qlen} for query '{parts[idx_query] if idx_query is not None else ref_name}', "
+                            f"but {ref_path} is {ref_len} nt. Every HSP is projected onto a "
+                            f"grid of the reference length, so this would mis-place all of "
+                            f"them. Use the same reference FASTA the search used."
+                        )
+
             acc = parts[idx_sgenome]
-            pident = float(parts[idx_pident])
-            qcov = float(parts[idx_qcov])
-            qstart = int(parts[idx_qstart])
-            qend = int(parts[idx_qend])
+            # Bare float()/int() here aborted the whole stream on one bad field, AFTER the
+            # cohort files had been partly written and BEFORE .summary.json was written, so
+            # the output directory looked half-plausible. Realistic triggers: concatenated
+            # LexicMap outputs with an embedded second header row, `NA` or `-` in a numeric
+            # column, a qseq containing a tab. Skip the row, count it, report at the end.
+            try:
+                pident = float(parts[idx_pident])
+                qcov = float(parts[idx_qcov])
+                qstart = int(parts[idx_qstart])
+                qend = int(parts[idx_qend])
+            except ValueError:
+                n_malformed += 1
+                if n_malformed <= MALFORMED_REPORT_LIMIT:
+                    print(f"[warn] row {total_rows}: unparseable numeric field, skipping: "
+                          f"{line[:120]}", file=sys.stderr)
+                continue
             qseq = parts[idx_qseq]
             sseq = parts[idx_sseq]
 
@@ -528,6 +618,32 @@ def stream_lexicmap_to_msa(
 
         if curr_acc is not None:
             process_accession_block(curr_acc, curr_hsps)
+
+        if n_other_query:
+            print(f"[*] {n_other_query:,} row(s) belonged to another query and were skipped; "
+                  f"only '{ref_name}' was tiled.")
+            # Everything filtered out means the reference name does not match the search's
+            # query name, not that there were no hits. An empty cohort would look plausible.
+            if n_other_query == total_rows:
+                raise ValueError(
+                    f"no row matched query '{ref_name}': every one of {total_rows:,} rows "
+                    f"names a different query. The reference FASTA's record name must match "
+                    f"the query column of the search."
+                )
+
+        if n_malformed:
+            print(f"[!] {n_malformed:,} of {total_rows:,} rows had an unparseable numeric "
+                  f"field and were skipped"
+                  f"{' (only the first %d were named)' % MALFORMED_REPORT_LIMIT if n_malformed > MALFORMED_REPORT_LIMIT else ''}.",
+                  file=sys.stderr)
+            # Every row unusable is a schema mismatch, not dirty data, and the cohort below
+            # would be empty rather than incomplete. Fail rather than write a plausible-looking
+            # empty output directory.
+            if n_malformed == total_rows:
+                raise ValueError(
+                    f"all {total_rows:,} data rows had unparseable numeric fields; "
+                    f"check the column layout of the input against the resolved schema above"
+                )
 
     finally:
         if hasattr(stream, "close"):
@@ -602,14 +718,20 @@ def stream_lexicmap_to_msa(
     print(f"\n---> Emitting clean alignments and cohort tables to '{out_prefix}'...")
 
     # Write clean MSA FASTA
-    for path in [msa_clean_fasta, msa_compat_fasta]:
-        with open(path, "w", encoding="utf-8") as f_fa:
-            f_fa.write(f">REFERENCE_{ref_name} len={ref_len} count={count_clean_full} type=reference\n{ref_seq}\n")
-            for rank, (seq, count) in enumerate(sorted_haplotypes, 1):
-                freq = count / count_clean_full if count_clean_full > 0 else 0
-                is_wt = (seq == ref_seq)
-                tag = "WT" if is_wt else f"variant_rank_{rank}"
-                f_fa.write(f">haplotype_{rank:05d} count={count} freq={freq:.5f} tag={tag}\n{seq}\n")
+    # One pass, two files. The compat alias is byte-identical, so it is written from the
+    # same formatting rather than regenerated.
+    with open(msa_clean_fasta, "w", encoding="utf-8") as f_fa, \
+         open(msa_compat_fasta, "w", encoding="utf-8") as f_fa_compat:
+        def _w(s):
+            f_fa.write(s)
+            f_fa_compat.write(s)
+
+        _w(f">REFERENCE_{ref_name} len={ref_len} count={count_clean_full} type=reference\n{ref_seq}\n")
+        for rank, (seq, count) in enumerate(sorted_haplotypes, 1):
+            freq = count / count_clean_full if count_clean_full > 0 else 0
+            is_wt = (seq == ref_seq)
+            tag = "WT" if is_wt else f"variant_rank_{rank}"
+            _w(f">haplotype_{rank:05d} count={count} freq={freq:.5f} tag={tag}\n{seq}\n")
 
     # Write A2M
     if write_a2m:
@@ -621,80 +743,95 @@ def stream_lexicmap_to_msa(
 
     # Write Haplotype TSV
     top_preview = []
-    for tsv_p in [counts_tsv_path, counts_compat_tsv]:
-        with open(tsv_p, "w", encoding="utf-8") as f_tsv:
-            headers = [
-                "haplotype_id", "rank", "count", "frequency", "mean_pident",
-                "coverage_pct", "num_nt_muts", "nt_mutations",
-                "num_aa_muts", "aa_mutations", "mutation_class",
-                "representative_samples", "sequence"
-            ]
-            f_tsv.write("\t".join(headers) + "\n")
+    # One computation pass, two files. The loop body translates the haplotype and diffs it
+    # against the reference per position; running it again for the byte-identical compat
+    # alias was measured at 30% of this stage's runtime on a 2,000-haplotype cohort.
+    with open(counts_tsv_path, "w", encoding="utf-8") as f_tsv, \
+         open(counts_compat_tsv, "w", encoding="utf-8") as f_tsv_compat:
+        def _wt(s):
+            f_tsv.write(s)
+            f_tsv_compat.write(s)
 
-            for rank, (seq, count) in enumerate(sorted_haplotypes, 1):
-                freq = count / count_clean_full if count_clean_full > 0 else 0
-                mean_pid = clean_full_pident_sum[seq] / count if count > 0 else 0
-                cov_pct = sum(1 for c in seq if c != '-') / ref_len * 100.0
+        headers = [
+            "haplotype_id", "rank", "count", "frequency", "mean_pident",
+            "coverage_pct", "num_nt_muts", "nt_mutations",
+            "num_aa_muts", "aa_mutations", "mutation_class",
+            "representative_samples", "sequence"
+        ]
+        _wt("\t".join(headers) + "\n")
 
-                nt_muts = []
-                for i, (r_char, h_char) in enumerate(zip(ref_seq, seq)):
-                    if h_char != '-' and h_char != r_char:
-                        nt_muts.append(f"{i+1}{r_char}>{h_char}")
+        for rank, (seq, count) in enumerate(sorted_haplotypes, 1):
+            freq = count / count_clean_full if count_clean_full > 0 else 0
+            mean_pid = clean_full_pident_sum[seq] / count if count > 0 else 0
+            cov_pct = sum(1 for c in seq if c != '-') / ref_len * 100.0
 
-                aa_muts = []
+            nt_muts = []
+            for i, (r_char, h_char) in enumerate(zip(ref_seq, seq)):
+                if h_char != '-' and h_char != r_char:
+                    nt_muts.append(f"{i+1}{r_char}>{h_char}")
+
+            aa_muts = []
+            if seq == ref_seq:
                 mut_class = "WT"
-                if seq == ref_seq:
-                    mut_class = "WT"
-                elif ref_is_cds:
-                    h_aa = translate_nt(seq)
-                    for r_idx, (r_a, h_a) in enumerate(zip(ref_aa, h_aa)):
-                        if h_a != '-' and h_a != r_a:
-                            aa_muts.append(f"{r_a}{r_idx+1}{h_a}")
+            elif ref_is_cds:
+                h_aa = translate_nt(seq)
+                for r_idx, (r_a, h_a) in enumerate(zip(ref_aa, h_aa)):
+                    if h_a != '-' and h_a != r_a:
+                        aa_muts.append(f"{r_a}{r_idx+1}{h_a}")
 
-                    if not aa_muts and not nt_muts:
-                        mut_class = "WT"
-                    elif not aa_muts and nt_muts:
-                        mut_class = "Synonymous"
-                    elif any(a.endswith("*") for a in aa_muts):
-                        mut_class = "Nonsense"
-                    elif aa_muts:
-                        mut_class = "Missense"
-                    else:
-                        mut_class = "Complex"
+                if not aa_muts and not nt_muts:
+                    # NOT "WT": `seq == ref_seq` was ruled out above, so this sequence
+                    # matches the reference everywhere it is COVERED and differs only
+                    # where it is not. Labelling it WT made this table disagree with
+                    # summary.json's wildtype_count, which counts exact matches only.
+                    mut_class = "WT_partial"
+                elif not aa_muts:
+                    mut_class = "Synonymous"
+                elif any(a.endswith("*") for a in aa_muts):
+                    mut_class = "Nonsense"
                 else:
-                    mut_class = "NonCoding_WT" if not nt_muts else "NonCoding_Variant"
+                    # Everything left has amino-acid changes and none is a stop. The old
+                    # `elif aa_muts` / `else: "Complex"` pair could not reach Complex:
+                    # the two arms above consume every `not aa_muts` case, so `aa_muts`
+                    # is always truthy here.
+                    mut_class = "Missense"
+            elif not nt_muts:
+                mut_class = "NonCoding_WT_partial"
+            else:
+                mut_class = "NonCoding_Variant"
 
-                nt_mut_str = ",".join(nt_muts) if nt_muts else "WT"
-                aa_mut_str = ",".join(aa_muts) if aa_muts else ("WT" if mut_class in ("WT", "Synonymous") else "NA")
-                samples_str = ",".join(clean_full_samples[seq])
+            nt_mut_str = ",".join(nt_muts) if nt_muts else "WT"
+            aa_mut_str = ",".join(aa_muts) if aa_muts else (
+                "WT" if mut_class in ("WT", "WT_partial", "Synonymous") else "NA")
+            samples_str = ",".join(clean_full_samples[seq])
 
-                row_data = [
-                    f"haplotype_{rank:05d}",
-                    str(rank),
-                    str(count),
-                    f"{freq:.6f}",
-                    f"{mean_pid:.2f}",
-                    f"{cov_pct:.2f}",
-                    str(len(nt_muts)),
-                    nt_mut_str,
-                    str(len(aa_muts)),
-                    aa_mut_str,
-                    mut_class,
-                    samples_str,
-                    seq
-                ]
-                f_tsv.write("\t".join(row_data) + "\n")
+            row_data = [
+                f"haplotype_{rank:05d}",
+                str(rank),
+                str(count),
+                f"{freq:.6f}",
+                f"{mean_pid:.2f}",
+                f"{cov_pct:.2f}",
+                str(len(nt_muts)),
+                nt_mut_str,
+                str(len(aa_muts)),
+                aa_mut_str,
+                mut_class,
+                samples_str,
+                seq
+            ]
+            _wt("\t".join(row_data) + "\n")
 
-                if rank <= 10 and tsv_p == counts_tsv_path:
-                    top_preview.append({
-                        "rank": rank,
-                        "count": count,
-                        "freq": freq,
-                        "mut_class": mut_class,
-                        "nt_muts": nt_mut_str,
-                        "aa_muts": aa_mut_str,
-                        "samples": samples_str
-                    })
+            if rank <= 10:
+                top_preview.append({
+                    "rank": rank,
+                    "count": count,
+                    "freq": freq,
+                    "mut_class": mut_class,
+                    "nt_muts": nt_mut_str,
+                    "aa_muts": aa_mut_str,
+                    "samples": samples_str
+                })
 
     # Summary JSON
     summary_data = {

@@ -18,6 +18,10 @@ pub enum Error {
     GraphAligner { accession: String, detail: String },
     /// Bad CLI input.
     Usage(String),
+    /// Every accession failed. A per-accession failure is not fatal on its own, but a run
+    /// that reconstructs nothing has produced no usable output and must not look like a
+    /// success to a scheduler. `--allow-empty` opts out.
+    NothingReconstructed { total: usize },
 }
 
 impl fmt::Display for Error {
@@ -34,6 +38,12 @@ impl fmt::Display for Error {
                 write!(f, "[{accession}] GraphAligner failed: {detail}")
             }
             Error::Usage(m) => write!(f, "usage error: {m}"),
+            Error::NothingReconstructed { total } => write!(
+                f,
+                "0/{total} accessions reconstructed; no output worth keeping. \
+                 Check the log above for per-accession errors, or pass --allow-empty \
+                 if an empty result is acceptable here"
+            ),
         }
     }
 }

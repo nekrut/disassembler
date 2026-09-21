@@ -189,6 +189,10 @@ python/disassemble.py \
     --emit-vcf --emit-snv-table --no-emit-alts -w 16 --fetch-workers 16
 ```
 
+Note that `-w 16 --fetch-workers 16` roughly doubles the memory bound, to about 36 GB worst case
+against 20 GB at the defaults. `logan-walker` prints its bound at startup; see
+[Memory](#memory) before raising either on a machine that cannot absorb it.
+
 ## LexicMapStreamer: Streaming Multi-HSP Assembly & Cohort Partitioning
 
 `python/lexicmap_streamer.py` provides streaming multi-HSP coordinate tiling, reading-frame codon QC, 4-tier cohort stratification, and online haplotype collapsing for planetary search results from [LexicMap](https://github.com/IndexThePlanet/LexicMap).
@@ -212,7 +216,7 @@ In Logan unitig collections, sequence diversity, coverage fluctuations, and de B
    - **Tier 3: Flagged Premature Stops** (`flag=PREMATURE_STOPS`): Premature stop codons detected; outputs exact 1-based codon coordinates in an audit ledger.
    - **Tier 4: Low-Coverage Fragments** (`flag=LOW_COVERAGE`): Coverage $<50\%$.
 4. **Online Haplotype Collapser:**
-   Collapses clean full-length sequences in $O(1)$ streaming memory, calculates exact frequencies, calls nucleotide (`198G>A`) and amino acid (`V66V`, `I61V`) mutations against the reference, classifies mutation types (`WT`, `Synonymous`, `Missense`, `Nonsense`, `Complex`), computes Shannon entropy, and records representative sample accessions.
+   Collapses clean full-length sequences without holding the input (memory is O(distinct haplotypes), not $O(1)$: the row count is what streams), calculates exact frequencies, calls nucleotide (`198G>A`) and amino acid (`V66V`, `I61V`) mutations against the reference, classifies mutation types (`WT`, `WT_partial`, `Synonymous`, `Missense`, `Nonsense`, and `NonCoding_WT_partial` / `NonCoding_Variant` for a non-CDS reference), computes Shannon entropy, and records representative sample accessions.
 5. **Regime Diagnostics & Cross-Tool Triage:**
    Computes coverage and identity quantiles ($p_{10}$, median, $p_{90}$) and stop-codon rates. If a target is in a **divergent regime** (median identity $<85\%$ or coverage $<0.60$), reference-guided projection fragments; `LexicMapStreamer` issues an automated alert recommending de novo graph path-walking via `logan-walker`.
 
@@ -287,6 +291,7 @@ complete set; `logan-walker --help` omits `--scratch-dir`.
 | `-q, --query <FASTA>` | — | reference in-frame CDS FASTA (required) |
 | `-o, --out-dir <DIR>` | `walker_output` | output directory (also holds `bubbles.json`, summary, VCFs, `snvs.tsv`); GFA/GAF scratch goes to `--scratch-dir` |
 | `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | reconstructed primary haplotypes |
+| `--allow-empty` | off | exit 0 even if nothing reconstructed. Without it a run that reconstructs nothing exits non-zero, so a wrapper cannot read an all-failed shard as a good one |
 
 ### Anchoring and fetch
 
@@ -297,7 +302,26 @@ complete set; `logan-walker --help` omits `--scratch-dir`.
 | `--hops <N>` | `5` | hop radius of the local-subgraph BFS around the anchors |
 | `--max-size-mb <N>` | `1024` | reject an accession whose compressed size exceeds this, on `Content-Length`, before download |
 | `--fetch-workers <N>` | `8` | parallel S3 fetch streams (bandwidth saturates ~8) |
-| `--scratch-dir <DIR>` | `/dev/shm/logan-walker` | where per-accession GFA/GAF go; should be tmpfs |
+| `--scratch-dir <DIR>` | `/dev/shm/logan-walker` | where per-accession GFA/GAF go; should be tmpfs. Filenames carry the PID and a per-task counter (`<acc>.<pid>.<n>.sub.gfa`), so concurrent runs sharing this directory cannot overwrite each other |
+
+### Memory
+
+A compressed unitig buffer is resident in three places at once, not one: queued in the bounded
+channel (`channel_capacity`, 4, not exposed as a flag), held by a fetch worker blocked on a full
+queue (`--fetch-workers`, 8), and held by a compute worker for the whole parse (`-w`, 8). That is
+20 buffers at the defaults, so the worst case is about **20 GB** at the 1 GB `--max-size-mb` cap,
+plus roughly 43 MB per compute worker for the CSR graph.
+
+The bound is worst case, not typical: it assumes every accession sits at the cap, while
+`ERR2028820` is 33 MB and the largest ERG11 accession is 343 MB (a 343 MB panel is ~6.9 GB in
+buffers). `logan-walker` prints the computed figure at startup, because three of the four terms are flags:
+
+```
+[logan-walker] memory bound: up to 20 compressed buffers resident (4 queued + 8 fetching +
+8 parsing) x 1024 MB cap = 20.0 GB worst case, plus ~43 MB per compute worker for the CSR graph
+```
+
+To contain a run, lower `--max-size-mb` and the two worker counts together; they multiply.
 
 ### Walk and consensus
 
@@ -307,7 +331,7 @@ complete set; `logan-walker --help` omits `--scratch-dir`.
 | `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align, removing the aligner's reference bias; `0.0` disables |
 | `--prefer-majority` / `--no-prefer-majority` | on | put the majority allele on the primary at two-allele sites (off = leave the reference-matching allele) |
 | `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
-| `-w, --workers <N>` | `8` | compute workers (size to cores) |
+| `-w, --workers <N>` | `8` | compute workers. A fixed default, not auto-sized to cores, because each one holds a compressed buffer for the whole parse: see [Memory](#memory) before raising it |
 
 ### Intra-host variants and their outputs
 
