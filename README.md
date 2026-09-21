@@ -162,13 +162,27 @@ Measured regimes: a cross-accession cohort of near-duplicate lineages thinned **
 intra-host single-SNV variants of one accession collapsed **33 -> 1**. Being cross-accession is not
 on its own enough to make thinning safe. The nine deep Zika NS5 accessions of
 [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md), pairwise 0 to 16 SNVs apart and 99.4%
-identical at worst, collapse **9 -> 1** at the default tau. The lineage dropped there
-(`SRR6251984`, 11 to 16 SNVs from the rest) is the only haplotype in the set carrying a
-non-negligible branch length (0.0041, against ~0 for every other haplotype tip). On that cohort the
-entire usable range is `0 < tau < 0.04`, and every value from 0.15 to 0.99 returns the same single
-survivor. Sweep tau on your own data before trusting the default, and expect the sieve to pay off
-only when the cohort is large enough for the `O(N^2)` MSA/tree to dominate **and** its lineages
-diverge by well over ~1%.
+identical at worst, collapse to a single survivor at the default tau. Those nine records hold only
+**4 unique sequences** (two groups of identical reconstructions, plus a 1-SNV and a 16-SNV
+lineage), so the loss is 4 -> 1 rather than 9 -> 1, but the lineage dropped is `SRR6251984`, the
+only haplotype in the set carrying a non-negligible branch length (0.0041, against ~0 for every
+other haplotype tip).
+
+The governing relation is **`d ~ tau / (2k)`**: at the sieve's `k = 15`, the default `tau = 0.15`
+marks a boundary at **0.5% nucleotide divergence**, while that cohort's median pairwise divergence
+is 0.18%. The threshold is independent of gene length, so it is pointed at the wrong regime rather
+than at the wrong gene.
+
+Lowering tau alone does not fix it. The sieve's 64-position MinHash sketch cannot resolve novelty
+finer than `1/64`, about 0.05% divergence, so the 1-SNV lineage is below the floor at any tau;
+`--sketch 256` is needed as well, and `disassemble.py` does not currently expose it. Full
+characterisation, including the measured transition curves and the case for leaving the defaults
+alone, is in
+[`docs/issue_sieve_calibration.md`](docs/issue_sieve_calibration.md).
+
+Sweep tau on your own data before trusting the default, and expect the sieve to pay off only when
+the cohort is large enough for the `O(N^2)` MSA/tree to dominate **and** its lineages diverge by
+well over ~1%.
 
 ### Planetary triage: Galaxy kmindex harvest to candidate cohorts
 
