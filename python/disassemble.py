@@ -34,6 +34,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WALKER = ROOT / "walker" / "target" / "release" / "logan-walker"
+DEFAULT_SIEVE = ROOT / "extern" / "kmer-diversity-sieve" / "l1_pipeline_serial"
 CODON_MSA = ROOT / "python" / "build_walker_codon_msa.py"
 
 
@@ -66,6 +67,21 @@ def main() -> None:
     ap.add_argument("--min-vaf", type=float, default=0.10, help="minimum VAF for an alternative branch (default 0.10)")
     ap.add_argument("--walker-bin", default=str(DEFAULT_WALKER), help="path to the logan-walker binary")
     ap.add_argument("--skip-tree", action="store_true", help="stop after reconstruction; do not build the MSA/tree")
+    ap.add_argument("--sieve", action="store_true",
+                    help="OPTIONAL diversity-thinning: collapse near-duplicate reconstructed haplotypes "
+                         "with the k-mer diversity sieve before the MSA/tree. HAPLOTYPE/LINEAGE-level "
+                         "reducer (MinHash/LSH): it collapses sequences differing by a single SNV to ~1 "
+                         "representative at any threshold, so use it only for LARGE cross-accession cohorts "
+                         "of near-duplicate lineages, NOT to preserve intra-host SNVs (use --emit-vcf / "
+                         "--emit-snv-table for those). Default OFF; when off, behavior is unchanged.")
+    ap.add_argument("--sieve-threshold", type=float, default=0.15,
+                    help="sieve LSH promotion threshold tau (default 0.15); only used with --sieve")
+    ap.add_argument("--sieve-min-len", type=int, default=None,
+                    help="sieve minimum sequence length (default: auto = query CDS length). The sieve's "
+                         "own default is genome-scale (27000); gene-scale CDS need this ~= the query "
+                         "length or everything is dropped. Only used with --sieve.")
+    ap.add_argument("--sieve-bin", default=str(DEFAULT_SIEVE),
+                    help="path to the kmer-diversity-sieve l1_pipeline_serial binary")
     ap.add_argument("walker_args", nargs=argparse.REMAINDER,
                     help="extra args passed to logan-walker after `--`")
     args = ap.parse_args()
@@ -82,6 +98,14 @@ def main() -> None:
             f"or pass --walker-bin.")
     if not args.skip_tree and shutil.which("mafft") is None:
         die("mafft not on PATH (needed for the codon MSA). Activate the `disassembler` env, or --skip-tree.")
+
+    sieve_bin = args.sieve_bin
+    if args.sieve and not (Path(sieve_bin).is_file() or shutil.which(sieve_bin)):
+        die(f"kmer-diversity-sieve not found at {sieve_bin}. Build it: "
+            f"(cd extern/kmer-diversity-sieve && make serial), or pass --sieve-bin.")
+
+    # length of the query CDS (sum of non-header residues) -> default sieve --min-len
+    query_cds_len = sum(len(line.strip()) for line in query.open() if not line.startswith(">"))
 
     recon = out / "reconstructed.fasta"
 
@@ -119,6 +143,43 @@ def main() -> None:
     print(f"[disassemble] reconstructed {n_recon} haplotype(s) -> {recon}", flush=True)
     if n_recon == 0:
         die("no haplotypes reconstructed; nothing to align.")
+
+    # ---- optional diversity-thinning sieve (default OFF) --------------------
+    # When off, `msa_input` stays `recon` and everything downstream is byte-identical.
+    # Skipped under --skip-tree: the sieve only exists to thin the MSA/tree input, so
+    # there is nothing to thin for.
+    msa_input = recon
+    if args.sieve and not args.skip_tree:
+        # Reconstructions are typically a few bases shorter than the reference (the walk
+        # may not reach the exact termini), and the completeness gate is strict `< min-len`.
+        # Defaulting to the exact query length would then drop every haplotype, so the
+        # auto-default takes a 5% haircut. Pass --sieve-min-len to override.
+        sieve_min_len = (args.sieve_min_len if args.sieve_min_len is not None
+                         else int(query_cds_len * 0.95))
+        sieved = out / "reconstructed.sieved.fasta"
+        emit_prefix = out / "reconstructed.sieved"
+        # clear any stale shards from a previous run so the concat glob can't pick them up
+        for stale in out.glob("reconstructed.sieved.rank*.fasta"):
+            stale.unlink()
+        scmd = [sieve_bin, "--input", str(recon),
+                "--min-len", str(sieve_min_len), "--max-n-frac", "0.05",
+                "--threshold", str(args.sieve_threshold), "--warmup", "2000",
+                "--emit-promoted", str(emit_prefix)]
+        print(f"[disassemble] sieve: {' '.join(scmd)}", flush=True)
+        subprocess.run(scmd, check=True)
+        # the serial binary writes one shard per rank; concat PREFIX.rank*.fasta = promoted subset
+        rank_files = sorted(out.glob("reconstructed.sieved.rank*.fasta"))
+        with sieved.open("w") as fh:
+            for rf in rank_files:
+                fh.write(rf.read_text())
+        n_sieved = sum(1 for line in sieved.open() if line.startswith(">")) if sieved.is_file() else 0
+        print(f"[disassemble] sieve: {n_recon} -> {n_sieved} haplotypes "
+              f"(tau={args.sieve_threshold}) -> {sieved}", flush=True)
+        if n_sieved == 0:
+            die("sieve promoted 0 haplotypes; try a lower --sieve-threshold or "
+                "a lower --sieve-min-len (reconstructions may be shorter than the reference).")
+        msa_input = sieved
+
     if args.skip_tree:
         print("[disassemble] --skip-tree: done after reconstruction.")
         return
@@ -127,7 +188,7 @@ def main() -> None:
     stem = query.stem
     aln = out / f"{stem}_codon_msa.fasta"
     tree = out / f"{stem}_fasttree.nwk"
-    cmd2 = [sys.executable, str(CODON_MSA), "--ref", str(query), "--input", str(recon),
+    cmd2 = [sys.executable, str(CODON_MSA), "--ref", str(query), "--input", str(msa_input),
             "--out-aln", str(aln), "--out-tree", str(tree),
             "--threads", str(args.threads), "--min-cov", str(args.min_cov)]
     print(f"[disassemble] 2/2 codon MSA + tree: {' '.join(cmd2)}", flush=True)
