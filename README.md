@@ -172,18 +172,18 @@ diverge by well over ~1%.
 
 ### Planetary triage: Galaxy kmindex harvest to candidate cohorts
 
-When screening planetary datasets indexed in Logan (e.g. via Galaxy `kmindex query` across thousands of shard databases), `python/harvest_kmindex.py` streams and merges the shard collections in parallel, extracts candidate SRA accessions by containment score, and creates stratified diversity cohorts:
+When screening planetary datasets indexed in Logan (e.g. via Galaxy `kmindex query` across thousands of shard databases), `python/harvest_kmindex.py` streams and merges the shard collections in parallel, extracts candidate SRA accessions by containment score, and optionally cuts a size-capped cohort from the result:
 
 ```bash
 # Stream and merge ~2,869 Galaxy shard JSONs across 32 threads
 python/harvest_kmindex.py \
     --history-id <GALAXY_HISTORY_ID> \
     --collection-id <GALAXY_COLLECTION_ID> \
-    -o candidates/ --diversity 2500
+    -o candidates/ --diversity 500
 
 # Reconstruct a target gene cohort directly with disassemble.py
 python/disassemble.py \
-    -l candidates/query_gene.diversity_2500.txt \
+    -l candidates/query_gene.diversity_500.txt \
     -q queries/query_gene.fasta \
     -o out/query_gene \
     --emit-vcf --emit-snv-table --no-emit-alts -w 16 --fetch-workers 16
@@ -192,6 +192,68 @@ python/disassemble.py \
 Note that `-w 16 --fetch-workers 16` roughly doubles the memory bound, to about 36 GB worst case
 against 20 GB at the defaults. `logan-walker` prints its bound at startup; see
 [Memory](#memory) before raising either on a machine that cannot absorb it.
+
+#### Outputs
+
+Written on every run, with no threshold of their own beyond the search's:
+
+| file | contents |
+|---|---|
+| `<target>.accessions.txt` | every accession the search returned, sorted by containment descending |
+| `<target>.scores.json` | accession to containment score |
+| `UNION.accessions.txt` | the union across all targets |
+| `summary.json` | per-target counts and max score |
+
+`--diversity N` adds `<target>.diversity_<N>.txt`, a `.json` with scores, and
+`diversity_<N>_summary.json`.
+
+#### What `--diversity` does, and how to size N
+
+It is a **post-processing step**: it reads the `*.scores.json` already in `--out-dir` and never
+contacts Galaxy, so `--stratify-only` re-cuts cohorts from a finished harvest. N is the cohort size
+**per target**.
+
+It files each accession into one of four containment brackets, then samples each bracket at even
+*rank* intervals so you get a spread across the bracket rather than its top slice, and backfills any
+shortfall from what is left over:
+
+| bracket | containment | share of N |
+|---|---|---|
+| canonical | `>= 0.99` | 20% |
+| high homology | `0.80 - 0.99` | 30% |
+| moderate | `0.50 - 0.80` | 30% |
+| divergent | everything below | 20% |
+
+The last bracket is an `else` with no floor of its own, so it inherits whatever threshold the
+kmindex search ran at. That matters: the search is launched at containment `>= 0.30` specifically to
+reach divergent homologs and filters server-side, so a second floor here could only discard what the
+search was told to find. It previously had one, at 0.50.
+
+The shares are preferences, not guarantees. A bracket holding fewer accessions than its share
+contributes all of them, and the remainder is backfilled, so a top-heavy harvest is never padded
+with accessions that do not exist.
+
+**Size N to your harvest, not to the default.** N caps each target, so a harvest smaller than N is
+returned whole and stratification does nothing but reorder it. Measured across a real six-target
+panel of 8,817 accessions:
+
+| `--diversity` | accessions run | share of harvest |
+|---|---|---|
+| 250 | 1,480 | 16.8% |
+| 500 | 2,593 | 29.4% |
+| 1,000 | 4,150 | 47.1% |
+| 2,500 | 6,799 | 77.1% |
+| 5,000 | 8,817 | 100% |
+
+At 2,500 only one of those six targets was capped at all. Values in the low hundreds are where the
+flag starts subsetting a panel of that size.
+
+**If download volume is the real constraint, `--diversity` is the wrong lever.** Unitig file sizes
+are extremely skewed: across 45 randomly sampled accessions the median was 0.6 MB and the mean
+17.6 MB, with the largest at 595 MB, and **the top 10% of files carried 90% of the bytes**.
+Stratification samples by containment score, which is unrelated to file size, so the cost of a given
+N varies a lot run to run. The knob that targets the bytes is the walker's `--max-size-mb`, which
+rejects on `Content-Length` before transferring anything.
 
 ## LexicMapStreamer: Streaming Multi-HSP Assembly & Cohort Partitioning
 

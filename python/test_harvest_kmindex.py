@@ -230,6 +230,64 @@ class TestStratifyDiversity(unittest.TestCase):
                 self.assertEqual(n, min(k, 4), f"--diversity {k} selected {n}")
 
 
+class TestDivergentBracket(unittest.TestCase):
+    """The fourth bracket is an `else`, so it inherits the search's own threshold.
+
+    The kmindex search is launched at containment >= 0.30 to reach divergent homologs and
+    filters server-side, so a second floor here can only discard what the search was told to
+    find. The chain used to end at `elif sc >= 0.50` with nothing catching the remainder.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, scores, target):
+        import json
+        (self.out / "t.scores.json").write_text(json.dumps(scores))
+        hk.stratify_diversity(self.out, total_target=target)
+        return [x for x in (self.out / f"t.diversity_{target}.txt").read_text().split() if x]
+
+    def test_nothing_falls_through_when_there_is_room(self):
+        scores = {"canon": 0.995, "high": 0.85, "mod": 0.62,
+                  "div_a": 0.47, "div_b": 0.38, "div_c": 0.31}
+        got = self._run(scores, 2500)
+        self.assertEqual(sorted(got), sorted(scores),
+                         "every harvested accession must reach the cohort when it fits")
+
+    def test_the_divergent_band_is_represented_under_a_binding_cap(self):
+        # 40 near-identical accessions and 10 divergent ones, cohort capped at 10.
+        # Taking the top 10 by score would return zero divergent.
+        scores = {f"hi{i}": 0.99 for i in range(40)}
+        scores.update({f"div{i}": 0.31 + i * 0.01 for i in range(10)})
+        got = self._run(scores, 10)
+        self.assertEqual(len(got), 10)
+        n_div = sum(1 for a in got if a.startswith("div"))
+        self.assertGreaterEqual(n_div, 1, f"no divergent accession selected: {got}")
+
+    def test_the_summary_counts_the_bracket_it_names(self):
+        import json
+        self._run({"a": 0.995, "b": 0.85, "c": 0.62, "d": 0.4, "e": 0.33}, 2500)
+        smry = json.load(open(self.out / "diversity_2500_summary.json"))["t"]
+        self.assertEqual(smry["n_canonical_ge_99"], 1)
+        self.assertEqual(smry["n_high_homology_80_99"], 1)
+        self.assertEqual(smry["n_moderate_50_80"], 1)
+        self.assertEqual(smry["n_divergent_below_50"], 2)
+        self.assertEqual(smry["n_available"], 5)
+        # The old key named the 0.50-0.80 bracket "divergent" while the genuinely
+        # divergent accessions were being discarded.
+        self.assertNotIn("n_divergent_50_80", smry)
+
+    def test_the_cohort_floor_is_the_searchs_floor_not_ours(self):
+        scores = {"a": 0.99, "b": 0.72, "c": 0.30}
+        got = self._run(scores, 2500)
+        self.assertIn("c", got, "an accession at the search threshold must survive")
+
+
 class TestSafeTargetName(unittest.TestCase):
     """Target names come from shard JSON: untrusted, used as a dict key AND a filename."""
 

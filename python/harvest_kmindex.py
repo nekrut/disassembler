@@ -4,9 +4,13 @@
 Given a Galaxy kmindex planetary job or output dataset collection:
   1. Walks all shard datasets in parallel via Galaxy history content endpoints.
   2. Merges containment scores across all shards for each query target.
-  3. Emits candidate accession lists sorted by containment score.
-  4. Generates stratified diversity cohorts (filtering out the Illumina spike-in cloud).
+  3. Emits candidate accession lists sorted by containment score, with no threshold of its own.
+  4. Optionally cuts a size-capped cohort per target, stratified across four containment brackets.
   5. Optionally chains directly into `disassemble.py` to reconstruct haplotypes and phylogenies.
+
+The phiX174 Illumina spike-in is excluded by TARGET NAME, in `safe_target_name`, not by score.
+An earlier version of this docstring credited the score brackets with that filtering, which is
+probably how their lower bound came to look deliberate; it was not. See `stratify_diversity`.
 
 Examples:
   # Harvest a Galaxy collection across 32 threads
@@ -15,14 +19,19 @@ Examples:
       --collection-id e7f5bcc8ff5aec6f \
       -o candidates/
 
-  # Harvest and generate 2,500-accession diversity cohorts per target
+  # Harvest and cut a 500-accession cohort per target
   python/harvest_kmindex.py \
       --history-id bbd44e69cb8906b5df0f53ea81dc39ae \
       --collection-id e7f5bcc8ff5aec6f \
-      -o candidates/ --diversity 2500
+      -o candidates/ --diversity 500
 
-  # Re-run diversity stratification on previously harvested scores
-  python/harvest_kmindex.py --stratify-only -o candidates/ --diversity 2500
+  # Re-cut cohorts from a harvest already on disk, without contacting Galaxy
+  python/harvest_kmindex.py --stratify-only -o candidates/ --diversity 500
+
+Size --diversity to the harvest: it caps each target, so a harvest smaller than N comes back
+whole and stratification only reorders it. On a real six-target, 8,817-accession panel,
+--diversity 2500 capped exactly one target and ran 77% of everything; the low hundreds are where
+it starts subsetting. See the README for the measured table.
 """
 
 import os
@@ -259,15 +268,39 @@ def stratified_sample(items, k):
     step = len(items) / k
     return [items[int(i * step)] for i in range(k)]
 
+# Share of each cohort drawn from each containment bracket. Preferences, not guarantees: a
+# bracket holding fewer accessions than its quota contributes everything it has, and the
+# shortfall is backfilled from whatever is left over.
+QUOTA_CANON     = 0.20
+QUOTA_HIGH      = 0.30
+QUOTA_MODERATE  = 0.30
+# divergent takes the remainder, so the four always sum to the requested size
+
+
 def stratify_diversity(out_dir, total_target=2500):
-    """Builds stratified diversity cohorts across canonical, high-homology, and divergent brackets."""
+    """Builds stratified diversity cohorts across four containment brackets.
+
+    The brackets are canonical (>= 0.99), high homology (0.80-0.99), moderate (0.50-0.80) and
+    divergent (everything below), and the last one is an `else`: it has no floor of its own and
+    so inherits whatever threshold the kmindex search was run at.
+
+    That matters. The search is launched at containment >= 0.30 specifically to reach divergent
+    homologs (logan-hyphaeon, `work/launch_master_kmindex.py`), and the shard JSONs arrive
+    already filtered, so nothing below it ever gets here. This function previously ended its
+    chain at `elif sc >= 0.50` with no `else`, which meant an accession scoring 0.42 was filed
+    nowhere at all: not rejected, not counted, just absent. Measured over six real planetary
+    harvests that silently discarded 1,955 of 8,817 accessions (22%), and 189 of 230 for
+    H5N1 HA (82%), whose median containment is 0.353. A second containment floor here is
+    redundant with the search and was never deliberate; the `else` removes it.
+    """
     print("\n" + "=" * 80)
     print(f" Generating Stratified Diversity Cohorts ({total_target:,} accessions / target)")
     print("=" * 80)
 
-    quota_canon = int(total_target * 0.20)
-    quota_high = int(total_target * 0.40)
-    quota_div = total_target - quota_canon - quota_high
+    quota_canon = int(total_target * QUOTA_CANON)
+    quota_high = int(total_target * QUOTA_HIGH)
+    quota_moderate = int(total_target * QUOTA_MODERATE)
+    quota_div = total_target - quota_canon - quota_high - quota_moderate
 
     score_files = sorted(out_dir.glob("*.scores.json"))
     if not score_files:
@@ -282,7 +315,8 @@ def stratify_diversity(out_dir, total_target=2500):
 
         b_canon = []
         b_high = []
-        b_div = []
+        b_moderate = []
+        b_divergent = []
 
         for acc, sc in scores.items():
             if sc >= 0.99:
@@ -290,20 +324,24 @@ def stratify_diversity(out_dir, total_target=2500):
             elif sc >= 0.80:
                 b_high.append((acc, sc))
             elif sc >= 0.50:
-                b_div.append((acc, sc))
+                b_moderate.append((acc, sc))
+            else:
+                # No floor: the search already applied one. See the docstring.
+                b_divergent.append((acc, sc))
 
-        b_canon.sort(key=lambda x: -x[1])
-        b_high.sort(key=lambda x: -x[1])
-        b_div.sort(key=lambda x: -x[1])
+        for b in (b_canon, b_high, b_moderate, b_divergent):
+            b.sort(key=lambda x: -x[1])
 
         s_canon = stratified_sample(b_canon, quota_canon)
         s_high = stratified_sample(b_high, quota_high)
-        s_div = stratified_sample(b_div, quota_div)
+        s_moderate = stratified_sample(b_moderate, quota_moderate)
+        s_div = stratified_sample(b_divergent, quota_div)
 
-        selected = s_canon + s_high + s_div
+        selected = s_canon + s_high + s_moderate + s_div
         if len(selected) < total_target:
             used = {x[0] for x in selected}
-            pool = [x for x in (b_high + b_canon + b_div) if x[0] not in used]
+            pool = [x for x in (b_high + b_canon + b_moderate + b_divergent)
+                    if x[0] not in used]
             selected.extend(pool[:total_target - len(selected)])
 
         selected.sort(key=lambda x: -x[1])
@@ -318,12 +356,19 @@ def stratify_diversity(out_dir, total_target=2500):
             "total_selected": len(selected),
             "n_canonical_ge_99": sum(1 for x in selected if x[1] >= 0.99),
             "n_high_homology_80_99": sum(1 for x in selected if 0.80 <= x[1] < 0.99),
-            "n_divergent_50_80": sum(1 for x in selected if 0.50 <= x[1] < 0.80),
+            # Renamed: the old key was `n_divergent_50_80`, which called this bracket
+            # divergent while the genuinely divergent accessions were being dropped.
+            "n_moderate_50_80": sum(1 for x in selected if 0.50 <= x[1] < 0.80),
+            "n_divergent_below_50": sum(1 for x in selected if x[1] < 0.50),
+            "n_available": len(scores),
             "min_score": min(x[1] for x in selected) if selected else 0.0,
             "max_score": max(x[1] for x in selected) if selected else 0.0,
         }
         all_summaries[target] = smry
-        print(f"  [✓] Target {target:12}: {len(selected):5d} selected (Canon: {smry['n_canonical_ge_99']}, High: {smry['n_high_homology_80_99']}, Div: {smry['n_divergent_50_80']}) | score range: [{smry['min_score']:.2f}, {smry['max_score']:.2f}]")
+        print(f"  [✓] Target {target:12}: {len(selected):5d} of {len(scores):,} "
+              f"(Canon: {smry['n_canonical_ge_99']}, High: {smry['n_high_homology_80_99']}, "
+              f"Mod: {smry['n_moderate_50_80']}, Div: {smry['n_divergent_below_50']}) "
+              f"| score range: [{smry['min_score']:.2f}, {smry['max_score']:.2f}]")
 
     summary_file = out_dir / f"diversity_{total_target}_summary.json"
     summary_file.write_text(json.dumps(all_summaries, indent=2))
@@ -337,7 +382,11 @@ def main():
     p.add_argument("--api-key-file", help="Path to Galaxy API key file")
     p.add_argument("-o", "--out-dir", default="candidates", help="Output directory for candidate accessions")
     p.add_argument("-w", "--workers", type=int, default=32, help="Parallel download workers (default: 32)")
-    p.add_argument("--diversity", type=int, default=None, help="Generate stratified diversity cohorts of N accessions")
+    p.add_argument("--diversity", type=int, default=None,
+                   help="Cut a cohort of N accessions PER TARGET, sampled across four containment "
+                        "brackets (canonical >=0.99, high 0.80-0.99, moderate 0.50-0.80, divergent "
+                        "below). N caps each target, so a smaller harvest is returned whole. Omit "
+                        "to keep every accession.")
     p.add_argument("--stratify-only", action="store_true", help="Skip Galaxy download; stratify existing *.scores.json")
     args = p.parse_args()
 

@@ -26,6 +26,24 @@ bound by about an order of magnitude, and the accession whose subgraph makes tho
 is also the one that takes under two seconds to fetch. Also open by design: the unreferenced
 `assets/candida_auris_venn.*`, which is a human call, not a code change.
 
+**End-to-end run 2026-09-21**, against the pinned toolchain from `environment.yml`
+(GraphAligner 1.0.20, MAFFT 7.526, FastTree 2.2.0):
+
+* `bench/check_golden.sh` is **concordant**: `ERR2028820` and `SRR12363134` reproduce their golden
+  primaries byte for byte (1,274 and 1,574 nt), which is the strongest single statement that the
+  walker changes preserved behaviour.
+* `python/disassemble.py` on nine real Zika accessions completes all stages in 30 s:
+  **9/9 reconstructed** at `cov=1.00, pid=99.8%`, then a codon MSA of 10 taxa x 2,709 nt
+  (903 codons, every record the same length and divisible by 3) and a FastTree tree naming all
+  nine taxa. No `.tmp` files left behind.
+* **5.3's banded DP was A/B'd against the exact full DP on that cohort**: `snvs.tsv` and all eight
+  VCFs byte-identical.
+* A two-record query produced a haplotype byte-identical to the single-record run, at
+  `cov=1.000` (section 0).
+* `--sieve` ran end to end and collapsed 9 haplotypes to 1 at the default `tau=0.15`, which
+  matches the measurement that made the sieve default-off, and its auto `--min-len` came out at
+  2,573, i.e. 95% of record 1 rather than of the whole file.
+
 Suite state at that point: `cargo clippy --all-targets --release -- -D warnings` exits 0,
 `cargo test --release` gives **155 passed, 0 failed, 17 ignored** (133 before this work),
 `python/test_lexicmap_streamer.py` **25 passed** (7 before), the new
@@ -156,6 +174,12 @@ wrote `SRR8209082.11257.0.sub.gfa` and `SRR8209082.11257.1.sub.gfa`, two files w
 wrote one path twice. Both fetched from S3 and extracted a 34,582-node subgraph without touching
 each other.
 
+**Re-verified 2026-09-21 with the finding's actual trigger**: two separate `logan-walker`
+processes launched concurrently on the same gene, both defaulting to `/dev/shm/logan-walker`.
+Both completed, reported `1/1 accessions reconstructed`, produced identical haplotypes, and
+matched the serial run byte for byte. That is the shape the review reproduced as GraphAligner
+SIGABRTs and a "non supported overlap" on a half-written GFA.
+
 ### 1.2 The process exits 0 when every accession fails
 `walker/src/main.rs:263-267, 308-312`.
 
@@ -190,7 +214,8 @@ status changes. A partially successful run is untouched, since one bad accession
 **Verified**, reproducing the finding's own case: two 404 accessions print
 `0/2 accessions reconstructed` and now exit **1**, and exit **0** with `--allow-empty`. The
 "GraphAligner missing entirely" variant the finding mentions also exits 1 now, confirmed on a real
-`SRR8209082` run that reached stage 5 with no GraphAligner installed.
+`SRR8209082` run that reached stage 5 with no GraphAligner installed. A successful nine-accession
+run exits 0 and reports `9/9 accessions reconstructed`, so the check does not fire on good runs.
 
 ### 1.3 Output record order is nondeterministic, and it silently decides what `--sieve` keeps
 `walker/src/pipeline.rs:132-140`; consumed by `io/output.rs:65, 137, 232, 335`.
@@ -229,8 +254,18 @@ changed.
 
 **Verified** on six accessions across two runs. Completion order differed between them
 (`96 91 92 93 95 97`, then `96 95 91 97 92 ...`), and both runs stored `95 91 97 93 92 96`, which
-is the input order exactly. All four outputs are byte-identical between the two runs:
-`reconstructed.fasta`, `bubbles.json`, `alt_haplotypes.fasta` and the summary JSON.
+is the input order exactly.
+
+**Re-verified end to end 2026-09-21** on nine real Zika accessions with GraphAligner 1.0.20, whose
+completion order the log shows scrambled: `reconstructed.fasta`, `alt_haplotypes.fasta`,
+`bubbles.json`, `snvs.tsv` and all eight per-accession VCFs came back **byte-identical** across two
+runs, in input order.
+
+One correction to an earlier version of this note, which claimed the summary JSON is byte-identical
+too: it is not, and cannot be. It embeds per-stage wall-clock timings, so it differs run to run on
+real data. Stripping the timing fields, the two summaries are identical and the accession order
+matches the input in both. The earlier claim came from a test where every accession 404'd and every
+timing was zero.
 
 Since the sieve promotes the first record it sees, its representative is now chosen by the list the
 user supplied rather than by a race. That makes the choice *deterministic*, not *principled*: it is
