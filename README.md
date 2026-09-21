@@ -119,19 +119,31 @@ python/disassemble.py -l accessions.txt -q queries/markers/zika_ns5.fasta -o out
 | flag | default | meaning |
 |---|---|---|
 | `--sieve` | off | enable diversity thinning between reconstruction and the MSA/tree |
-| `--sieve-threshold <F>` | `0.15` | LSH promotion threshold tau (lower = more aggressive collapsing) |
+| `--sieve-threshold <F>` | `0.15` | novelty threshold tau. A sequence is promoted only if `1 - maxJaccard >= tau` against the already-promoted set, so **higher** tau collapses **more**. `0.0` promotes everything (the sieve becomes a no-op) |
 | `--sieve-min-len <N>` | 95% of query CDS length | minimum sequence length; the sieve's own default is genome-scale (`27000`), so gene-scale CDS need this set near the query length. The auto-default takes a 5% haircut because reconstructions are often a few bases shorter than the reference (an exactly-equal cutoff would drop them all) |
 | `--sieve-bin <PATH>` | `extern/kmer-diversity-sieve/l1_pipeline_serial` | path to the sieve binary |
 
 **Tier caveat — read this.** The sieve is a **haplotype/lineage-level** diversity reducer
-(MinHash/LSH). It collapses near-duplicate reconstructed lineages *across a large cross-accession
-cohort* — the intended use, before the `O(N^2)` MSA/tree. It is **not** an intra-host SNV tool:
-sequences differing by a single SNV are below MinHash resolution (Jaccard ≈ 1 for a ~2700 nt
-sequence differing by one base), so they collapse to ~1 representative at any threshold. To
-preserve intra-host single-SNV variation, use the walker's `--emit-vcf` / `--emit-snv-table`
-(`snvs.tsv`) instead. Measured regimes bear this out: a cross-accession cohort of near-duplicate
-lineages thinned **~67 -> 8**, whereas 33 intra-host single-SNV variants of one accession collapsed
-**33 -> 1**.
+(MinHash/LSH). What decides whether a sequence survives is its absolute divergence from an
+already-promoted representative, not whether it came from a different accession. At `--k 15` on a
+~2700 nt CDS, the default `tau = 0.15` promotes a sequence only once its sketch Jaccard against
+every promoted sequence has fallen to 0.85 or below, which gene-scale markers of a single virus
+rarely reach. It is **not** an intra-host SNV tool: sequences differing by a single SNV are far
+below MinHash resolution (Jaccard ≈ 1 for a ~2700 nt sequence differing by one base), so they
+collapse to ~1 representative at any usable threshold. To preserve intra-host single-SNV variation,
+use the walker's `--emit-vcf` / `--emit-snv-table` (`snvs.tsv`) instead.
+
+Measured regimes: a cross-accession cohort of near-duplicate lineages thinned **~67 -> 8**, and 33
+intra-host single-SNV variants of one accession collapsed **33 -> 1**. Being cross-accession is not
+on its own enough to make thinning safe. The nine deep Zika NS5 accessions of
+[`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md), pairwise 0 to 16 SNVs apart and 99.4%
+identical at worst, collapse **9 -> 1** at the default tau. The lineage dropped there
+(`SRR6251984`, 11 to 16 SNVs from the rest) is the only haplotype in the set carrying a
+non-negligible branch length (0.0041, against ~0 for every other haplotype tip). On that cohort the
+entire usable range is `0 < tau < 0.04`, and every value from 0.15 to 0.99 returns the same single
+survivor. Sweep tau on your own data before trusting the default, and expect the sieve to pay off
+only when the cohort is large enough for the `O(N^2)` MSA/tree to dominate **and** its lineages
+diverge by well over ~1%.
 
 ### Planetary triage: Galaxy kmindex harvest to candidate cohorts
 
