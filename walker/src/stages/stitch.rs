@@ -351,7 +351,7 @@ mod golden_haplotype {
         );
         eprintln!("  sha256 {sha}");
 
-        // Values recorded in work/benchmark/golden/ERR2028820.pfcrt.golden.json,
+        // Values recorded in bench/golden/ERR2028820.pfcrt.golden.json,
         // produced by the unmodified Python walker.
         assert_eq!(h.id, "ERR2028820_primary");
         assert_eq!(h.seq.len(), 1274, "haplotype length");

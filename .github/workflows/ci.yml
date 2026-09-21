@@ -40,12 +40,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          submodules: recursive
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Run LexicMapStreamer tests
         run: python3 python/test_lexicmap_streamer.py
+      # Both sieve tests build extern/kmer-diversity-sieve themselves (cc only) and skip
+      # cleanly if the submodule or a compiler is missing.
+      - name: Sieve binary concordance
+        run: bash tests/test_sieve.sh
+      - name: Sieve pipeline integration
+        run: python3 tests/test_sieve_integration.py
 
   golden:
     name: golden concordance (manual)

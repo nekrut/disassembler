@@ -24,9 +24,10 @@ python/     lexicmap_streamer.py (streaming multi-HSP coordinate tiler, codon QC
             disassemble.py (end-to-end driver: accessions -> walker -> codon MSA -> FastTree)
             build_walker_codon_msa.py (reference-guided in-frame codon MSA + FastTree ML tree)
             harvest_kmindex.py (parallel Galaxy kmindex planetary shard harvester & cohort triage)
-queries/    reference coding sequences (pfcrt, hiv1_pol, 25 planetary markers, master panel)
+queries/    reference coding sequences (pfcrt, hiv1_pol, 26 planetary markers, master panel)
 bench/      golden fixtures, check_golden.sh concordance gate, k-mer sensitivity simulations
-docs/       codon MSA/phylogeny step, VCF example, contigs-vs-unitigs, variance-loss investigation
+docs/       codon MSA/phylogeny step, VCF example, contigs-vs-unitigs, variance-loss and
+            GraphAligner end-clipping investigations, unitig/graph topology notes
 ```
 
 ## What logan-walker does
@@ -43,7 +44,8 @@ For each SRA accession, given a reference CDS:
 6. **Stitch** the walked path into a primary haplotype, optionally **prune** reference-bias
    error branches and re-align, **prefer** the majority allele at biallelic sites, and
    **emit** intra-host alternative haplotypes to a separate file.
-7. Write `reconstructed.fasta`, `alt_haplotypes.fasta`, `bubbles.json`, and a summary JSON;
+7. Write the reconstructed primaries (`-f`, default `reconstructed_haplotypes.fasta`),
+   `alt_haplotypes.fasta`, `bubbles.json`, and a summary JSON;
    optionally the intra-host SNP calls (`--emit-vcf`, `--emit-snv-table`).
 
 Then, optionally, an eighth downstream step turns the reconstructed haplotypes into a
@@ -102,6 +104,29 @@ python/disassemble.py -a SRR6251967 -q queries/markers/zika_ns5.fasta -o out/zik
 Use `-l accessions.txt` for a cohort, `--skip-tree` to stop after reconstruction, and pass any
 extra walker flags after a literal `--`. How the codon alignment stays in frame, and what the
 outputs contain, is in [`docs/codon_msa.md`](docs/codon_msa.md).
+
+| flag | default | meaning |
+|---|---|---|
+| `-a` / `-l` | — | one accession, or a file with one per line (exactly one of the two) |
+| `-q, --query <FASTA>` | — | reference in-frame CDS FASTA, single record (see the note below) |
+| `-o, --out-dir <DIR>` | — | output directory |
+| `-w, --workers <N>` | `8` | walker compute workers |
+| `--fetch-workers <N>` | `8` | walker S3 fetch workers |
+| `--threads <N>` | `8` | MAFFT threads for the codon MSA |
+| `--min-cov <F>` | `0.70` | coverage a sequence needs to enter the MSA, applied in stage 2 only |
+| `--skip-tree` | off | stop after reconstruction, do not build the MSA or tree |
+| `--walker-bin <PATH>` | `walker/target/release/logan-walker` | path to the walker binary |
+
+**Two of those names also exist on the walker, and mean something different.**
+`disassemble.py --min-cov` (default `0.70`) is the MSA entry gate and reaches stage 2 only. The
+walker has its own `--min-cov` (default `0.85`) that decides which reconstructions are produced
+at all, and `disassemble.py` never sets it. Lowering `disassemble.py --min-cov` therefore cannot
+admit haplotypes the walker already discarded; to move that gate, pass it through with
+`-- --min-cov <F>`. The same split applies to `--threads`, which is MAFFT here and GraphAligner
+(`-t`) in the walker.
+
+Pass a **single-record** CDS to `-q`. A multi-record FASTA is not handled correctly by either
+stage (see `agent_review_9_20.md`).
 
 #### Diversity thinning (optional)
 
@@ -208,7 +233,7 @@ python/lexicmap_streamer.py \
 
 # 3. Stream from standard input in a shell pipeline:
 curl -s "https://usegalaxy.org/api/datasets/<ID>/display?key=<API_KEY>" | \
-    python/lexicmap_streamer.py -q queries/master/pfcrt.fasta -f - -o out/pfcrt
+    python/lexicmap_streamer.py -q queries/pfcrt_only.fasta -f - -o out/pfcrt
 ```
 
 ### Outputs Generated
@@ -248,9 +273,10 @@ curl -s "https://usegalaxy.org/api/datasets/<ID>/display?key=<API_KEY>" | \
 ## logan-walker Command-line reference
 
 `logan-walker [OPTIONS]`, one of `-a`/`-l` and `-q` required. Boolean options that are **on by
-default** are turned off with their `--no-…` form; boolean options that are **off by default**
-are turned on with their bare form (and back off with `--no-…`, e.g. inside a wrapper). Run
-`logan-walker --help` for the same list.
+default** are turned off with their `--no-…` form. Boolean options that are **off by default**
+are turned on with their bare form; `--emit-vcf` and `--emit-snv-table` also accept a `--no-…`
+form for use inside a wrapper, but `--allow-frameshift-alts` does not. The tables below are the
+complete set; `logan-walker --help` omits `--scratch-dir`.
 
 ### Input and output
 
@@ -259,7 +285,7 @@ are turned on with their bare form (and back off with `--no-…`, e.g. inside a 
 | `-a, --accession <ACC>` | — | a single SRA accession |
 | `-l, --accession-list <FILE>` | — | file with one accession per line (use instead of `-a`) |
 | `-q, --query <FASTA>` | — | reference in-frame CDS FASTA (required) |
-| `-o, --out-dir <DIR>` | `walker_output` | output directory (also holds `bubbles.json`, summary, VCFs, `snvs.tsv`, GFA scratch) |
+| `-o, --out-dir <DIR>` | `walker_output` | output directory (also holds `bubbles.json`, summary, VCFs, `snvs.tsv`); GFA/GAF scratch goes to `--scratch-dir` |
 | `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | reconstructed primary haplotypes |
 
 ### Anchoring and fetch
@@ -297,6 +323,10 @@ are turned on with their bare form (and back off with `--no-…`, e.g. inside a 
 | `--emit-alts` / `--no-emit-alts` | on | write intra-host alternative haplotypes to `alt_haplotypes.fasta` |
 | `--emit-vcf` | off | also write `<out-dir>/<acc>.vcf`: intra-host SNPs with `ka:f` frequency, in query coordinates |
 | `--emit-snv-table` | off | also write `<out-dir>/snvs.tsv`: the long cohort table, one row per (accession, site, allele) |
+
+Not exposed as a flag: alternative haplotypes per accession are capped at **32** (`max_alts` in
+`walker/src/config.rs`). An accession with more intra-host alleles than that has its
+`alt_haplotypes.fasta` truncated with no warning.
 
 ### Misc
 

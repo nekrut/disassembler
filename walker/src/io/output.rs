@@ -125,7 +125,7 @@ pub fn write_alts(summary: &Summary, path: &Path) -> Result<()> {
 ///
 /// This file has no Python counterpart. There, `phase_superbubbles` computes all of this and
 /// then `logan_path_walker.py:317` keeps only `len(bubbles)`, so a reported quasispecies
-/// figure cannot be checked by anyone. See `work/issue_intra_accession_variance_lost.md`.
+/// figure cannot be checked by anyone. See `docs/issue_intra_accession_variance_lost.md`.
 pub fn write_bubbles(summary: &Summary, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {

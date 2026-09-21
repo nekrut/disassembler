@@ -12,7 +12,9 @@ logan-walker -a SRR6251967 -q queries/markers/zika_ns5.fasta \
   -o out -f out/primary.fasta --no-emit-alts --emit-vcf
 ```
 
-produces [`SRR6251967.zika_ns5.vcf`](examples/zika_ns5/SRR6251967.zika_ns5.vcf) — 11 SNPs, each
+produces `out/SRR6251967.vcf` (the walker names VCFs `<accession>.vcf`; the copy committed
+here as [`SRR6251967.zika_ns5.vcf`](examples/zika_ns5/SRR6251967.zika_ns5.vcf) was renamed to
+record which gene it came from). It holds 11 SNPs, each
 a fork the walked path passes where both alleles clear the abundance and frequency gates:
 
 ```

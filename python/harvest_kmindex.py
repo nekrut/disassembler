@@ -44,7 +44,7 @@ def get_galaxy_api_key(key_file=None):
     default_tmp = Path("/tmp/gxy.txt")
     if default_tmp.exists():
         return default_tmp.read_text().strip()
-    raise RuntimeError("Galaxy API key not found. Provide --api-key, set GALAXY_API_KEY, or write /tmp/gxy.txt.")
+    raise RuntimeError("Galaxy API key not found. Provide --api-key-file, set GALAXY_API_KEY, or write /tmp/gxy.txt.")
 
 def fetch_shard(item, base_url, api_key, sess):
     name, did = item

@@ -1,7 +1,7 @@
 # Smoke-test batch for the Rust walker. Small on purpose: ~25 MB compressed total,
 # a few seconds end to end once the stages are implemented.
 #
-# All three are HIV-1 pol, so they share one query (work/viral/query_hiv1_pol.fasta).
+# All three are HIV-1 pol, so they share one query (queries/query_hiv1_pol.fasta).
 # Chosen to exercise more than one code path:
 #
 #   SRR8209082   1.8M   reconstructs (cov 1.00, pident 98.2). Also a golden-truth fixture.

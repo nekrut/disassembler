@@ -23,7 +23,7 @@
 //!
 //! `UnitigGraph::targets` keeps the strand bits precisely so this can be done correctly.
 //! Sequence the work: port to byte-identical behaviour first, verify against
-//! `work/benchmark/golden/`, then fix the strand handling as a separate reviewable change
+//! `bench/golden/`, then fix the strand handling as a separate reviewable change
 //! with a deliberate fixture regeneration.
 //!
 //! Also unlike the Python version, keep the per-bubble detail. There, only `len(bubbles)`

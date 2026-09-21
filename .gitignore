@@ -9,12 +9,18 @@ __pycache__/
 .condaenv-walker/
 
 # Walker outputs / scratch
+# The default --scratch-dir is /dev/shm/logan-walker, outside the work tree, so it needs no rule.
 *.gaf
-/dev/shm/logan-walker/
 reconstructed.fasta
+reconstructed_haplotypes.fasta
 alt_haplotypes.fasta
 bubbles.json
 *_walker_summary.json
+# default -o for logan-walker, and the out dirs used by the README examples
+/walker_output/
+/out/
+/msa/
+/candidates/
 
 # Large streamed data (regenerate from S3)
 *.unitigs.fa

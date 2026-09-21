@@ -25,7 +25,7 @@
 //! reference, so where the sample's dominant allele differs from the reference and an error
 //! branch matches it, the walk takes the error branch. Emitting those as "variants" would
 //! publish sequencing error as biology. They are a bug to fix in path selection, not signal
-//! to recover here, and `work/issue_intra_accession_variance_lost.md` covers them.
+//! to recover here, and `docs/issue_intra_accession_variance_lost.md` covers them.
 //!
 //! # Why one variant per record
 //!

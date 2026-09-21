@@ -2,23 +2,17 @@
 name = "logan-walker"
 version = "0.0.1"
 edition = "2021"
-description = "Rust path walker for Logan unitigs (skeleton). See work/plan_rust_path_walker.md"
+description = "Rust path walker for Logan unitigs. See docs/plan_rust_path_walker.md"
 publish = false
 
 [[bin]]
 name = "logan-walker"
 path = "src/main.rs"
 
-# Intentionally dependency-free while templating. The concurrency skeleton uses only
-# std::thread and std::sync::mpsc::sync_channel, which is a real bounded channel.
-#
-# Planned dependencies, to be added as stages are implemented:
-#   reqwest / ureq   S3 streaming with connection pooling      -> stages/stream.rs
-#   zstd             in-memory decompression                   -> stages/stream.rs
-#   crossbeam-channel  multi-consumer bounded channel          -> pipeline.rs
-#                      (replaces the Arc<Mutex<Receiver>> below)
-#   rayon            compute pool                              -> pipeline.rs
-#   serde / serde_json  summary.json, bubbles.json             -> io/output.rs
+# Deliberately minimal. Concurrency is std::thread plus a bounded
+# std::sync::mpsc::sync_channel behind an Arc<Mutex<Receiver>>; summary.json and bubbles.json
+# are written by hand in io/output.rs rather than through serde. Only the S3 streaming and
+# decompression in stages/stream.rs pull in crates.
 [dependencies]
 ureq = "3.4.1"
 zstd = "0.14.0"

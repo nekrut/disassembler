@@ -77,7 +77,7 @@ def main() -> None:
     ap.add_argument("--sieve-threshold", type=float, default=0.15,
                     help="sieve LSH promotion threshold tau (default 0.15); only used with --sieve")
     ap.add_argument("--sieve-min-len", type=int, default=None,
-                    help="sieve minimum sequence length (default: auto = query CDS length). The sieve's "
+                    help="sieve minimum sequence length (default: auto = 95%% of the query CDS length). The sieve's "
                          "own default is genome-scale (27000); gene-scale CDS need this ~= the query "
                          "length or everything is dropped. Only used with --sieve.")
     ap.add_argument("--sieve-bin", default=str(DEFAULT_SIEVE),

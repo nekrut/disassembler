@@ -41,7 +41,8 @@ Reproduce the old one-haplotype-per-accession behaviour with
 
 ## Outputs
 
-`reconstructed.fasta` (primaries), `alt_haplotypes.fasta`, `bubbles.json`, a summary JSON, and
+`reconstructed_haplotypes.fasta` (primaries; override with `-f`), `alt_haplotypes.fasta`,
+`bubbles.json`, a summary JSON, and
 optionally `<acc>.vcf` / `snvs.tsv`.
 
 ## Source map

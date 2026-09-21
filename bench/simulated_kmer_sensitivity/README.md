@@ -1,9 +1,9 @@
 # Simulation Study: k-mer Size ($k$) and $min\_shared\_kmers$ Sensitivity, Specificity, and Subgraph Expansion in logan-walker
 
 **Conducted**: September 11, 2026  
-**Target Codebase**: `work/rust-walker/src/stages/anchor.rs`, `config.rs`, `extract.rs`  
-**Experiment Harness**: `work/benchmark/simulated_kmer_sensitivity/harness.py`  
-**Figures**: `work/benchmark/simulated_kmer_sensitivity/figures/`
+**Target Codebase**: `walker/src/stages/anchor.rs`, `walker/src/config.rs`, `walker/src/stages/extract.rs`  
+**Experiment Harness**: `harness.py` (not committed; paths below are from the original upstream layout)  
+**Figures**: `bench/simulated_kmer_sensitivity/figures/`
 
 ---
 
@@ -11,7 +11,7 @@
 
 In `logan-walker`, Stage 3 (`anchor.rs`) identifies candidate unitigs carrying a query gene using exact canonical $k$-mer matching, followed by Stage 4 (`extract.rs`), which performs a 5-hop Breadth-First Search (BFS) to extract the local de Bruijn assembly subgraph for alignment.
 
-Currently, `logan-walker` defaults to **$k = 31$** and **$min\_shared\_kmers = 3$**. We conducted a comprehensive simulation study (121,500 trials across 4,860 parameter combinations) testing $k \in [15, 19, 21, 25, 27, 31]$ and $min\_shared\_kmers \in [1, 2, 3, 5, 8]$ across sequence divergence levels from 100% down to 60% identity (using `bla_vim` and `bla_kpc`), against a background graph of 30,000 unitigs (4.64 Mbp) derived from the complete *Escherichia coli* K-12 MG1655 genome.
+At the time of this study, `logan-walker` defaulted to **$k = 31$** and **$min\_shared\_kmers = 3$**. As a result of this study the anchor default is now **$k = 21$** (`walker/src/config.rs`); the Logan graph's own $k$ remains 31, which is a separate parameter named `graph_k`. We conducted a comprehensive simulation study (121,500 trials across 4,860 parameter combinations) testing $k \in [15, 19, 21, 25, 27, 31]$ and $min\_shared\_kmers \in [1, 2, 3, 5, 8]$ across sequence divergence levels from 100% down to 60% identity (using `bla_vim` and `bla_kpc`), against a background graph of 30,000 unitigs (4.64 Mbp) derived from the complete *Escherichia coli* K-12 MG1655 genome.
 
 ### Key Takeaways:
 1. **The $k \ge 19$ Specificity Wall**: For any $k \ge 19$ ($k \in [19, 21, 25, 27, 31]$), the background false positive rate across the entire 4.64 Mbp bacterial genome is **identically zero ($FP = 0$)**, even with $min\_shared\_kmers = 1$.

@@ -5,8 +5,8 @@ optimization issue (`docs/issue_path_walker_optimization.md`).
 
 | Accession | Gene | Query | Unitigs | Anchors | Subgraph | Primary | Bubbles |
 |---|---|---|---|---|---|---|---|
-| `ERR2028820` | PfCRT | `cds/pfcrt_only.fasta` | 1,277,362 | 76 | 356 | 1,274 nt | 202 |
-| `SRR8209082` | HIV-1 pol | `viral/query_hiv1_pol.fasta` | 81,534 | 4,102 | 26,323 | 2,738 nt | 11,825 |
+| `ERR2028820` | PfCRT | `queries/pfcrt_only.fasta` | 1,277,362 | 76 | 356 | 1,274 nt | 202 |
+| `SRR8209082` | HIV-1 pol | `queries/query_hiv1_pol.fasta` | 81,534 | 4,102 | 26,323 | 2,738 nt | 11,825 |
 
 Captured on the unmodified walker at commit `81fc1fd`, GraphAligner 1.0.20, BLAST 2.17.0+.
 
@@ -26,6 +26,12 @@ walker was removed. To regenerate a fixture, run the Rust walker with
 Python-based `capture_golden.py`/`verify_golden.py` are under `../archive/`.
 
 ## What is asserted, and what is not
+
+**What the live gate actually checks.** `check_golden.sh` byte-compares the primary sequence
+against the `*.primary.fasta` fixtures and nothing else. The richer field list below describes
+`verify_golden.py`, which moved to `../archive/` with the Python walker and is not runnable. The
+`*.golden.json` files are therefore not read by anything in the current tree; they are kept as a
+record of the original capture.
 
 Every asserted field was verified byte-stable across two `PYTHONHASHSEED` values (1 and 7):
 
@@ -47,8 +53,9 @@ They are the two named in the issue's concordance criterion. Note that neither a
 `hiv1_50.txt` or `pfcrt_50.txt`, so the shipped benchmark harness does not exercise them.
 
 `SRR8209082` is also worth treating with care as a performance baseline. Its 81,534 unitigs are
-roughly 37x below the median of the committed 50-accession ERG11 run (2,986,072), and its 5-hop
-subgraph pulls in 26,323 nodes, about a third of its entire graph. It is fast and tangled, which
+roughly 37x below the median of a 50-accession ERG11 run (2,986,072) measured during the
+optimization work (that cohort list is not committed), and its 5-hop subgraph pulls in 26,323
+nodes, about a third of its entire graph. It is fast and tangled, which
 is not the common case.
 
 ## Regression coverage (verified)
