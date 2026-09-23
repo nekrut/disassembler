@@ -139,10 +139,31 @@ def main():
             check(got == str(sieved), f"stage 2 --input is the sieved file (got {Path(got).name})")
         else:
             check(False, "stage 2 was invoked (stage2_input.txt recorded)")
-        # the sieve actually reduced the 33 near-duplicate fixture haplotypes
+        # the sieve actually thinned the 33 near-duplicate fixture haplotypes. The bound is
+        # generous on purpose: the wrapper's defaults were bumped from the sieve binary's own
+        # archive-scale defaults (tau=0.15 sketch=64 -> 33 -> 1) to gene-scale ones
+        # (tau=0.005 sketch=256 -> 33 -> ~28), and asserting any specific count would couple
+        # this seam test to a calibration decision it does not own. What matters here is that
+        # something got thinned and the sieved file reached stage 2, which the other assertions
+        # cover.
         if sieved.is_file():
             n = sum(1 for l in sieved.open() if l.startswith(">"))
-            check(1 <= n < 33, f"sieve reduced 33 -> {n} (1 <= n < 33)")
+            check(1 <= n < 33, f"sieve thinned 33 -> {n} (1 <= n < 33)")
+
+        # `--sieve-sketch` reaches the sieve binary and shows up in the summary log.
+        # A silent regression here would let the sketch flag look-like-it-works while
+        # the binary ran at its default of 64, which is precisely the failure mode the
+        # gene-scale calibration doc characterises.
+        out_sk = work / "out_sketch"
+        cmd_sk = [c if c != str(out) else str(out_sk) for c in cmd] + ["--sieve-sketch", "128"]
+        r_sk = subprocess.run(cmd_sk, capture_output=True, text=True, env=env)
+        if r_sk.returncode != 0:
+            print(r_sk.stderr)
+        check(r_sk.returncode == 0, "--sieve-sketch: disassemble.py exits 0")
+        check("--sketch 128" in r_sk.stdout,
+              "--sieve-sketch forwards --sketch 128 to the sieve binary CLI")
+        check("sketch=128" in r_sk.stdout,
+              "--sieve-sketch echoed in the disassemble.py summary log line")
 
         # off-path: WITHOUT --sieve, stage 2 must receive the RAW reconstructed.fasta
         out2 = work / "out2"

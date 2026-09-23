@@ -137,52 +137,44 @@ byte-identical to before. Because the MSA + tree are `O(N^2)`, thinning a large 
 identical lineages first can be a large speedup with negligible loss of phylogenetic signal.
 
 ```bash
-python/disassemble.py -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika \
-    --sieve --sieve-threshold 0.15
+python/disassemble.py -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika --sieve
 ```
 
 | flag | default | meaning |
 |---|---|---|
 | `--sieve` | off | enable diversity thinning between reconstruction and the MSA/tree |
-| `--sieve-threshold <F>` | `0.15` | novelty threshold tau. A sequence is promoted only if `1 - maxJaccard >= tau` against the already-promoted set, so **higher** tau collapses **more**. `0.0` promotes everything (the sieve becomes a no-op) |
+| `--sieve-threshold <F>` | `0.005` | novelty threshold tau. A sequence is promoted only if `1 - maxJaccard >= tau` against the already-promoted set, so **higher** tau collapses **more**. The wrapper's default sits at a ~0.017% divergence boundary (`d ~ tau / (2k)` at k=15), gene-scale; the sieve binary's own default of `0.15` targets archive-scale (~0.5%) and collapses a gene-scale cohort to ~1 representative |
 | `--sieve-min-len <N>` | 95% of query CDS length | minimum sequence length; the sieve's own default is genome-scale (`27000`), so gene-scale CDS need this set near the query length. The auto-default takes a 5% haircut because reconstructions are often a few bases shorter than the reference (an exactly-equal cutoff would drop them all) |
+| `--sieve-sketch <M>` | `256` | MinHash sketch size. The estimator cannot resolve novelty finer than `1/M`, so the wrapper's default sets the resolution floor near 0.015% divergence. The sieve binary's own default of `64` caps resolution at ~0.05%, coarser than the single-SNV separations gene-scale cohorts turn on |
 | `--sieve-bin <PATH>` | `extern/kmer-diversity-sieve/l1_pipeline_serial` | path to the sieve binary |
+
+The wrapper's `--sieve-threshold` and `--sieve-sketch` defaults differ from the sieve binary's own
+defaults on purpose. `disassemble.py` is a gene-scale tool, and the sieve binary was calibrated on
+an archive-scale problem (millions of near-duplicate SARS-CoV-2 consensus genomes). At its own
+defaults, run against a gene-scale cohort of one virus, the sieve collapses everything to one
+representative and drops the informative branches; the wrapper's defaults keep the sieve
+topology-preserving on the tested cohorts. Full calibration in
+[`docs/issue_sieve_calibration.md`](docs/issue_sieve_calibration.md).
 
 **Tier caveat — read this.** The sieve is a **haplotype/lineage-level** diversity reducer
 (MinHash/LSH). What decides whether a sequence survives is its absolute divergence from an
-already-promoted representative, not whether it came from a different accession. At `--k 15` on a
-~2700 nt CDS, the default `tau = 0.15` promotes a sequence only once its sketch Jaccard against
-every promoted sequence has fallen to 0.85 or below, which gene-scale markers of a single virus
-rarely reach. It is **not** an intra-host SNV tool: sequences differing by a single SNV are far
-below MinHash resolution (Jaccard ≈ 1 for a ~2700 nt sequence differing by one base), so they
-collapse to ~1 representative at any usable threshold. To preserve intra-host single-SNV variation,
-use the walker's `--emit-vcf` / `--emit-snv-table` (`snvs.tsv`) instead.
+already-promoted representative, not whether it came from a different accession. It is **not**
+an intra-host SNV tool: sequences that differ by only a base or two are typically below the
+resolution any usable sketch can distinguish. To preserve intra-host single-SNV variation, use
+the walker's `--emit-vcf` / `--emit-snv-table` (`snvs.tsv`) instead.
 
-Measured regimes: a cross-accession cohort of near-duplicate lineages thinned **~67 -> 8**, and 33
-intra-host single-SNV variants of one accession collapsed **33 -> 1**. Being cross-accession is not
-on its own enough to make thinning safe. The nine deep Zika NS5 accessions of
-[`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md), pairwise 0 to 16 SNVs apart and 99.4%
-identical at worst, collapse to a single survivor at the default tau. Those nine records hold only
-**4 unique sequences** (two groups of identical reconstructions, plus a 1-SNV and a 16-SNV
-lineage), so the loss is 4 -> 1 rather than 9 -> 1, but the lineage dropped is `SRR6251984`, the
-only haplotype in the set carrying a non-negligible branch length (0.0041, against ~0 for every
-other haplotype tip).
+Measured cohort behaviour at the wrapper defaults (`--sieve-threshold 0.005 --sieve-sketch 256`):
 
-The governing relation is **`d ~ tau / (2k)`**: at the sieve's `k = 15`, the default `tau = 0.15`
-marks a boundary at **0.5% nucleotide divergence**, while that cohort's median pairwise divergence
-is 0.18%. The threshold is independent of gene length, so it is pointed at the wrong regime rather
-than at the wrong gene.
+| cohort | N recon | unique | promoted | notes |
+|---|---|---|---|---|
+| Zika NS5 (36 accessions, PRJNA362728) | 36 | 12 | 9 | topology-identical (RF = 0) on the 9 tips, including the long-branch lineage that the sieve-binary defaults drop |
+| HIV-1 pol (17 accessions, adjacent to SRR8209082) | 17 | 17 | 17 (sieve is a no-op) | pairwise divergence is 2-3%, well above the sieve's boundary, so nothing collapses |
+| 33 intra-host alts of one HIV pol accession (fixture) | 33 | 33 | 28 | single-SNV alts are near the resolution floor; the sieve does not preserve intra-host variation and is not built to |
 
-Lowering tau alone does not fix it. The sieve's 64-position MinHash sketch cannot resolve novelty
-finer than `1/64`, about 0.05% divergence, so the 1-SNV lineage is below the floor at any tau;
-`--sketch 256` is needed as well, and `disassemble.py` does not currently expose it. Full
-characterisation, including the measured transition curves and the case for leaving the defaults
-alone, is in
-[`docs/issue_sieve_calibration.md`](docs/issue_sieve_calibration.md).
-
-Sweep tau on your own data before trusting the default, and expect the sieve to pay off only when
-the cohort is large enough for the `O(N^2)` MSA/tree to dominate **and** its lineages diverge by
-well over ~1%.
+**Rule of thumb**: think about your cohort's median pairwise divergence. Below ~0.5%, the sieve
+can help; between ~0.5% and 1%, it might; above ~1%, the sieve is either a no-op or a
+signal-losing collapse. Sweep tau on your own data before trusting any setting, and expect the
+sieve to pay off only when the cohort is large enough for the `O(N^2)` MSA/tree to dominate.
 
 ### Planetary triage: Galaxy kmindex harvest to candidate cohorts
 
