@@ -130,8 +130,19 @@ def main() -> None:
                          "of near-duplicate lineages, NOT to preserve intra-host SNVs (use --emit-vcf / "
                          "--emit-snv-table for those). Default OFF; when off, behavior is unchanged. "
                          "IGNORED under --skip-tree, since the sieve exists to thin the MSA/tree input.")
-    ap.add_argument("--sieve-threshold", type=float, default=0.15,
-                    help="sieve LSH promotion threshold tau (default 0.15); only used with --sieve")
+    ap.add_argument("--sieve-threshold", type=float, default=0.005,
+                    help="sieve LSH promotion threshold tau (default 0.005). The nucleotide-divergence "
+                         "boundary is d ~= tau / (2*k) at k=15, so 0.005 puts the boundary at ~0.017%%: "
+                         "gene-scale, topology-preserving on the tested cohorts. The sieve binary's own "
+                         "default of 0.15 targets archive-scale (~0.5%% divergence) and collapses a "
+                         "gene-scale cohort to ~1 representative. Only used with --sieve; "
+                         "see docs/issue_sieve_calibration.md.")
+    ap.add_argument("--sieve-sketch", type=int, default=256,
+                    help="sieve MinHash sketch size m (default 256). The estimator cannot resolve "
+                         "novelty finer than 1/m, so 256 sets the floor near 0.015%% divergence. The "
+                         "sieve binary's own default of 64 caps resolution at ~0.05%%, coarser than "
+                         "the single-SNV separations a gene-scale cohort turns on. Only used with "
+                         "--sieve; see docs/issue_sieve_calibration.md.")
     ap.add_argument("--sieve-min-len", type=int, default=None,
                     help="sieve minimum sequence length (default: auto = 95%% of the query CDS length, first "
                          "record only). The sieve's "
@@ -251,9 +262,14 @@ def main() -> None:
         # clear any stale shards from a previous run so the concat glob can't pick them up
         for stale in out.glob("reconstructed.sieved.rank*.fasta"):
             stale.unlink()
+        # Sketch is passed explicitly at the wrapper's default of 256, NOT the sieve binary's
+        # default of 64. The binary's default is calibrated for archive-scale near-duplicate
+        # collapse; gene-scale cohorts need the finer sketch to resolve their single-SNV
+        # separations at all. See docs/issue_sieve_calibration.md.
         scmd = [sieve_bin, "--input", str(recon),
                 "--min-len", str(sieve_min_len), "--max-n-frac", "0.05",
                 "--threshold", str(args.sieve_threshold), "--warmup", "2000",
+                "--sketch", str(args.sieve_sketch),
                 "--emit-promoted", str(emit_prefix)]
         print(f"[disassemble] sieve: {' '.join(scmd)}", flush=True)
         run_step(scmd, "kmer-diversity-sieve")
@@ -264,7 +280,7 @@ def main() -> None:
                 fh.write(rf.read_text())
         n_sieved = sum(1 for line in sieved.open() if line.startswith(">")) if sieved.is_file() else 0
         print(f"[disassemble] sieve: {n_recon} -> {n_sieved} haplotypes "
-              f"(tau={args.sieve_threshold}) -> {sieved}", flush=True)
+              f"(tau={args.sieve_threshold}, sketch={args.sieve_sketch}) -> {sieved}", flush=True)
         if n_sieved == 0:
             die("sieve promoted 0 haplotypes; try a lower --sieve-threshold or "
                 "a lower --sieve-min-len (reconstructions may be shorter than the reference).")

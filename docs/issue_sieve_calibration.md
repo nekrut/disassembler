@@ -1,6 +1,9 @@
 # The k-mer diversity sieve is calibrated for archives, not for gene cohorts
 
-**Status:** characterised, defaults unchanged. Investigated 2026-09-21.
+**Status:** characterised 2026-09-21; wrapper defaults revised 2026-09-23 after cross-cohort
+topology measurements. `disassemble.py` now defaults `--sieve-threshold 0.005 --sieve-sketch 256`
+instead of the sieve binary's own archive-scale defaults; the sieve binary is unchanged.
+`--sieve` itself remains OFF by default.
 
 `--sieve` collapses a nine-accession Zika NS5 cohort to a single haplotype at its default
 threshold, discarding the only lineage in the set that carries a non-negligible branch length.
@@ -231,49 +234,73 @@ So the sieve is worth keeping. It is the gene-scale regime that sits outside its
 
 ---
 
-## 9. Only half the fix is reachable from disassemble.py
+## 9. What was reachable from disassemble.py, and what changed
 
-`python/disassemble.py` builds:
-
-```python
-scmd = [sieve_bin, "--input", str(recon),
-        "--min-len", str(sieve_min_len), "--max-n-frac", "0.05",
-        "--threshold", str(args.sieve_threshold), "--warmup", "2000",
-        "--emit-promoted", str(emit_prefix)]
-```
-
-The sieve accepts eleven flags:
+The sieve binary accepts eleven flags:
 
 ```
 --emit-promoted --input --k --limit --max-n-frac --min-len
 --outlier-sd --sketch --threads --threshold --warmup
 ```
 
-Four are passed, two are hardcoded (`--max-n-frac 0.05`, `--warmup 2000`), and five are
-unreachable: **`--sketch`**, `--k`, `--threads`, `--limit`, `--outlier-sd`.
+At the time this doc was first written, `disassemble.py` exposed only `--threshold` (as
+`--sieve-threshold`) and `--min-len` (as `--sieve-min-len`), hardcoded `--max-n-frac 0.05` and
+`--warmup 2000`, and left `--sketch`, `--k`, `--threads`, `--limit`, `--outlier-sd`
+unreachable. `--sieve-threshold` on its own could not fix a gene-scale cohort: lowering `tau`
+past the sketch's resolution floor moves the boundary somewhere the estimator cannot see.
 
-The consequence is that `--sieve-threshold` is the only available knob, and on its own it cannot
-fix a gene-scale cohort: lowering `tau` past the sketch's resolution floor moves the boundary
-somewhere the estimator cannot see. That is why the sieve currently reads as unusable here rather
-than merely mis-defaulted.
+**Change (2026-09-23):** `--sieve-sketch` is now exposed and defaulted to 256 (gene-scale
+resolution floor ~0.015%), and `--sieve-threshold` is defaulted to 0.005 (gene-scale
+divergence boundary ~0.017%). Both defaults differ from the sieve binary's own defaults on
+purpose; the sieve binary is unchanged. `--sieve` itself is still OFF by default, so a run
+without the flag is byte-for-byte the same as before. `--k`, `--threads`, `--limit`,
+`--outlier-sd` remain unreachable and are not needed for the gene-scale problem.
 
-`--threads` being unreachable also means the serial binary is always what runs, which is
-irrelevant at these sizes but worth knowing.
+## 10. Options considered
 
----
+1. **Expose `--sieve-sketch`.** ✅ Done, defaulted to 256 alongside `--sieve-threshold 0.005`.
+   The reasoning: a naive user who flips `--sieve` on without tuning should get a
+   topology-preserving configuration on the cohort sizes this pipeline targets, not the
+   archive-scale collapse the sieve binary defaults produce. The defaults are opt-out through
+   the same flags.
+2. **Leave the sieve default-off.** ✅ Unchanged; `--sieve` is still OFF by default.
+3. **Derive `tau` from the cohort** rather than accepting a constant: measure pairwise
+   divergence on a sample of the reconstructions and set `tau ~ 2*k*d_min`. Not done — the new
+   defaults get the common cases right, and self-tuning would add machinery for a case that
+   would still need cohort-specific review.
 
-## 10. Options
+## 10a. Topology fidelity, cross-cohort
 
-1. **Expose `--sieve-sketch`** in `disassemble.py`, defaulting to 64 so nothing changes unless
-   asked, and put `d ~ tau / (2k)` in the `--sieve-threshold` help so the threshold is choosable
-   rather than guessable. This is the smallest change that makes the sieve usable at gene scale.
-2. **Leave the sieve default-off**, as it is, and document that it targets archive-scale
-   redundancy. The `--sieve` help already warns it is a lineage-level reducer.
-3. **Derive `tau` from the cohort** rather than accepting a constant: measure pairwise divergence
-   on a sample of the reconstructions and set `tau ~ 2*k*d_min`. More machinery than the problem
-   currently justifies.
+Measured 2026-09-23 on two real cohorts, comparing sieved-tree topology to the full-cohort
+tree (both from `build_walker_codon_msa.py`) pruned to the same tips. RF is the unrooted
+Robinson-Foulds distance; RF/RFmax = 0 means the sieved tree is topologically identical to
+the full tree on those tips.
 
-Nothing here has been changed. The sieve remains default-off, and its defaults are untouched.
+Zika NS5, 36 reconstructions from PRJNA362728, median pairwise divergence ~0.18%, 12 unique:
+
+```
+tau     sketch  promoted  RF/RFmax
+0.005   64      6         0.67       old wrapper default: too coarse, loses structure
+0.005   256    10         0.00       new wrapper defaults: topology-preserving
+0.15    64      3         n/a        sieve-binary defaults: collapse; long-branch tip lost
+0.15    256    3          n/a        sketch alone flips survivors so the long-branch tip is kept
+```
+
+HIV-1 pol, 17 reconstructions adjacent to SRR8209082, median pairwise divergence 2-3%, 17
+unique:
+
+```
+tau     sketch  promoted  RF/RFmax
+0.005   64     17         0.00       everyone passes: sieve is a no-op
+0.005   256    17         0.00       everyone passes: sieve is a no-op
+0.15    64      5         0.50       collapses too aggressively for this diversity
+0.15    256     4         0.00       small subset, but drops distinct lineages
+```
+
+Reading: the new defaults are topology-preserving on the Zika cohort (rescue) and a no-op on
+the HIV cohort (harmless). The sieve binary's own defaults would drop informative branches on
+Zika and lose half the topology on HIV. This is the argument for the wrapper's defaults being
+different from the binary's.
 
 ---
 
