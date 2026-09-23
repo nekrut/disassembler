@@ -288,7 +288,7 @@ mod find_tests {
         parse::build(&"T".to_string(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
     }
     fn query(seq: &str) -> Query {
-        Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa") }
+        Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa"), n_records: 1 }
     }
     fn cfg(k: usize, m: u32) -> Config {
         Config { k, min_shared_kmers: m, ..Config::default() }
@@ -418,6 +418,7 @@ mod tests {
             record_id: "test".into(),
             seq: seq.as_bytes().to_vec(),
             path: PathBuf::from("test.fasta"),
+            n_records: 1,
         }
     }
     fn cfg_k(k: usize) -> Config {
@@ -600,6 +601,7 @@ mod python_concordance_find {
         }
 
         let fetched = FetchedUnitigs {
+            index: 0,
             accession: "ERR2028820".to_string(),
             compressed_len: compressed.len(),
             compressed,

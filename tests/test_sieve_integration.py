@@ -38,15 +38,22 @@ def check(cond, msg):
 
 def ensure_sieve():
     if SIEVE_BIN.exists():
-        return True
+        return "ok"
+    if not (SIEVE_BIN.parent / "Makefile").is_file():
+        return "no-submodule"
     print("[integration] building sieve (make serial)...")
-    r = subprocess.run(["make", "serial"], cwd=SIEVE_BIN.parent, capture_output=True, text=True)
-    return SIEVE_BIN.exists()
+    subprocess.run(["make", "serial"], cwd=SIEVE_BIN.parent, capture_output=True, text=True)
+    return "ok" if SIEVE_BIN.exists() else "no-compiler"
 
 
 def main():
-    if not ensure_sieve():
-        print("SKIP: sieve binary unavailable (no C compiler?) -- not a failure")
+    state = ensure_sieve()
+    if state == "no-submodule":
+        print(f"SKIP: extern/kmer-diversity-sieve is empty (run `git submodule update --init "
+              f"{SIEVE_BIN.parent.relative_to(REPO)}`) -- not a failure")
+        return 0
+    if state == "no-compiler":
+        print("SKIP: sieve binary failed to build (no C compiler?) -- not a failure")
         return 0
     if not FIXTURE.is_file() or not QUERY.is_file():
         print("SKIP: fixtures missing")
@@ -65,12 +72,15 @@ def main():
         )
         fake_walker.chmod(0o755)
 
-        # disassemble.py preflights `mafft` on PATH (real check); satisfy it with a stub
-        # on a PATH we prepend for the subprocess. The actual MSA/tree step is our fake_msa.
+        # disassemble.py preflights the MSA-stage tools on PATH (a real check); satisfy them
+        # with stubs on a PATH we prepend for the subprocess. The actual MSA/tree step is our
+        # fake_msa, so these are never executed, they only have to resolve.
+        # Both tools, not just mafft: the preflight covers fasttree as well.
         binstub = work / "bin"
         binstub.mkdir()
-        (binstub / "mafft").write_text("#!/usr/bin/env bash\nexit 0\n")
-        (binstub / "mafft").chmod(0o755)
+        for tool in ("mafft", "fasttree"):
+            (binstub / tool).write_text("#!/usr/bin/env bash\nexit 0\n")
+            (binstub / tool).chmod(0o755)
         env = dict(os.environ, PATH=f"{binstub}{os.pathsep}{os.environ.get('PATH', '')}")
 
         # a fake codon-MSA/tree: records which --input it received, writes stub outputs
@@ -81,7 +91,10 @@ def main():
             "inp = args[args.index('--input') + 1]\n"
             "aln = args[args.index('--out-aln') + 1]\n"
             "tree = args[args.index('--out-tree') + 1]\n"
-            f"pathlib.Path('{work}/stage2_input.txt').write_text(inp)\n"
+            # Recorded next to the alignment, so each run writes into its own -o directory.
+            # A single shared path let run 2 read run 1's file, which made the
+            # "stage 2 never ran" branch unreachable and misreported it as a wrong --input.
+            "pathlib.Path(aln).with_name('stage2_input.txt').write_text(inp)\n"
             "pathlib.Path(aln).write_text('>stub\\nACGT\\n')\n"
             "pathlib.Path(tree).write_text('(stub);\\n')\n"
         )
@@ -115,7 +128,7 @@ def main():
 
         recon = out / "reconstructed.fasta"
         sieved = out / "reconstructed.sieved.fasta"
-        stage2_input = work / "stage2_input.txt"
+        stage2_input = out / "stage2_input.txt"
 
         check(r.returncode == 0, "disassemble.py --sieve exits 0")
         check(recon.is_file(), "reconstructed.fasta written by (fake) stage 1")
@@ -138,8 +151,11 @@ def main():
             "-a", "STUBACC", "-q", str(QUERY), "-o", str(out2),
             "--walker-bin", str(fake_walker),
         ]
-        subprocess.run(cmd_off, capture_output=True, text=True, env=env)
-        stage2_off = work / "stage2_input.txt"
+        r_off = subprocess.run(cmd_off, capture_output=True, text=True, env=env)
+        if r_off.returncode != 0:
+            print(r_off.stderr)
+        check(r_off.returncode == 0, "off-path: disassemble.py (no --sieve) exits 0")
+        stage2_off = out2 / "stage2_input.txt"
         if stage2_off.is_file():
             got_off = stage2_off.read_text().strip()
             check(got_off == str(out2 / "reconstructed.fasta"),

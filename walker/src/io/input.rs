@@ -29,7 +29,7 @@ pub fn read_accession_list(path: &Path) -> Result<Vec<Accession>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        validate_accession(line, lineno + 1, path)?;
+        validate_accession(line, &format!("{}:{}", path.display(), lineno + 1))?;
         out.push(line.to_string());
     }
 
@@ -54,12 +54,20 @@ pub fn read_accession_list(path: &Path) -> Result<Vec<Accession>> {
 
 /// Reject anything that cannot be an accession before it becomes a confusing 404 or,
 /// worse, a malformed URL.
-fn validate_accession(s: &str, lineno: usize, path: &Path) -> Result<()> {
+/// Reject an accession that cannot safely be interpolated into a URL and two filesystem
+/// paths, and warn about one that does not look like an SRA run.
+///
+/// `source` names where the value came from, e.g. `"list.txt:12"` or `"--accession"`. It used
+/// to take a path and a line number, which is why only the `--accession-list` path could call
+/// it: `-a` therefore accepted anything, and the value reaches `s3://logan-pub/u/<acc>/…`,
+/// the scratch GFA name and `<out_dir>/<acc>.vcf`, so `-a ../../foo` escaped both directories.
+pub fn validate_accession(s: &str, source: &str) -> Result<()> {
+    if s.is_empty() {
+        return Err(Error::Usage(format!("{source}: empty accession")));
+    }
     if !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
         return Err(Error::Usage(format!(
-            "{}:{}: {s:?} is not a usable accession (unexpected characters)",
-            path.display(),
-            lineno
+            "{source}: {s:?} is not a usable accession (unexpected characters)"
         )));
     }
     // Logan run accessions are SRR/ERR/DRR followed by digits. Warn rather than reject,
@@ -68,11 +76,7 @@ fn validate_accession(s: &str, lineno: usize, path: &Path) -> Result<()> {
         && matches!(&s[..3], "SRR" | "ERR" | "DRR")
         && s[3..].bytes().all(|b| b.is_ascii_digit());
     if !looks_right {
-        eprintln!(
-            "[warn] {}:{}: {s:?} does not look like an SRA run accession",
-            path.display(),
-            lineno
-        );
+        eprintln!("[warn] {source}: {s:?} does not look like an SRA run accession");
     }
     Ok(())
 }
@@ -135,6 +139,7 @@ pub fn read_query(path: &Path) -> Result<Query> {
         );
     }
 
+    let n_records = records.len();
     let (record_id, seq) = records.swap_remove(0);
     if seq.is_empty() {
         return Err(Error::Usage(format!(
@@ -172,6 +177,7 @@ pub fn read_query(path: &Path) -> Result<Query> {
         record_id,
         seq,
         path: path.to_path_buf(),
+        n_records,
     })
 }
 
@@ -332,5 +338,54 @@ mod repo_files {
             }
         }
         assert!(n > 0, "expected to find some query fastas");
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::validate_accession;
+
+    /// The value reaches `s3://logan-pub/u/<acc>/…`, the scratch GFA name and
+    /// `<out_dir>/<acc>.vcf`, so anything that can leave a directory must be refused.
+    #[test]
+    fn path_traversal_and_separators_are_refused() {
+        for bad in [
+            "../../foo",
+            "..",
+            ".",
+            "SRR8209082/../evil",
+            "a/b",
+            "a\\b",
+            "SRR 123",
+            "SRR8209082\n",
+            "",
+        ] {
+            assert!(
+                validate_accession(bad, "--accession").is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// Accepting is the common case, and the SRA-shape check is only a warning, because the
+    /// bucket's naming is not ours to constrain.
+    #[test]
+    fn real_accessions_are_accepted() {
+        for good in ["SRR8209082", "ERR2028820", "DRR012345", "SRR12363134", "odd_but_safe-1"] {
+            assert!(
+                validate_accession(good, "--accession").is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    /// The message has to name where the value came from; that is why it takes a `source`
+    /// string rather than a path and a line number.
+    #[test]
+    fn the_error_names_its_source() {
+        let e = validate_accession("../x", "--accession").unwrap_err().to_string();
+        assert!(e.contains("--accession"), "{e}");
+        let e = validate_accession("../x", "list.txt:12").unwrap_err().to_string();
+        assert!(e.contains("list.txt:12"), "{e}");
     }
 }

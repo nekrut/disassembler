@@ -248,7 +248,7 @@ pub fn prefer_majority(
                 path_end: new_end,
                 ..copy_coords(path)
             };
-            let Some(restitched) = stitch::stitch(cfg, &candidate, subgraph, query)? else {
+            let Some(restitched) = stitch::stitch(cfg, graph, &candidate, subgraph, query)? else {
                 continue; // would fail the coverage gate; leave the site alone
             };
             // Defence in depth on the consensus, mirroring the `expected` check in `find_alts`.
@@ -354,7 +354,7 @@ pub fn find_alts(
         at.entry(o).or_insert(i);
     }
 
-    let Some(primary) = stitch::stitch(cfg, path, subgraph, query)? else {
+    let Some(primary) = stitch::stitch(cfg, graph, path, subgraph, query)? else {
         return Ok(Vec::new());
     };
     let baseline_len = stitched_len(cfg, &path.steps, subgraph);
@@ -468,7 +468,7 @@ pub fn find_alts(
                 path_end: new_end,
                 ..copy_coords(path)
             };
-            let Some(mut hap) = stitch::stitch(cfg, &spliced, subgraph, query)? else {
+            let Some(mut hap) = stitch::stitch(cfg, graph, &spliced, subgraph, query)? else {
                 continue;
             };
             if hap.seq == primary.seq {
@@ -740,6 +740,7 @@ mod tests {
             record_id: "q".into(),
             seq: seq.as_bytes().to_vec(),
             path: PathBuf::from("q.fa"),
+            n_records: 1,
         }
     }
     fn cfg(emit: bool) -> Config {
@@ -765,11 +766,11 @@ mod tests {
         let g = diamond(40.0, 60.0);
         let s = subgraph_of(&g);
         let query = q("ACGTAG");
-        let before = stitch::stitch(&maj(true), &walked(), &s, &query).unwrap().unwrap();
+        let before = stitch::stitch(&maj(true), &g, &walked(), &s, &query).unwrap().unwrap();
         let fixed = prefer_majority(&maj(true), &g, &s, &walked(), &query)
             .unwrap()
             .expect("the site should be corrected");
-        let after = stitch::stitch(&maj(true), &fixed, &s, &query).unwrap().unwrap();
+        let after = stitch::stitch(&maj(true), &g, &fixed, &s, &query).unwrap().unwrap();
         assert_ne!(after.seq, before.seq);
         assert_eq!(after.seq.len(), before.seq.len(), "substitution, not indel");
         assert!(fixed.steps.iter().any(|p| p.node == 2), "must now traverse the 60% branch");
@@ -844,7 +845,7 @@ mod tests {
     fn recovers_the_second_allele_at_a_biallelic_site() {
         let g = diamond(60.0, 40.0);
         let s = subgraph_of(&g);
-        let primary = stitch::stitch(&cfg(true), &walked(), &s, &q("ACGTAG")).unwrap().unwrap();
+        let primary = stitch::stitch(&cfg(true), &g, &walked(), &s, &q("ACGTAG")).unwrap().unwrap();
         let alts = find_alts(&cfg(true), &g, &s, &walked(), &q("ACGTAG")).unwrap();
 
         assert_eq!(alts.len(), 1, "one site, one record");
@@ -892,7 +893,7 @@ mod tests {
         let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap();
         let s = subgraph_of(&g);
         let query = q("ACGTAG");
-        let primary = stitch::stitch(&cfg(true), &walked(), &s, &query).unwrap().unwrap();
+        let primary = stitch::stitch(&cfg(true), &g, &walked(), &s, &query).unwrap().unwrap();
         let alts = find_alts(&cfg(true), &g, &s, &walked(), &query).unwrap();
         assert_eq!(alts.len(), 1, "an in-frame indel allele is recoverable");
         assert_eq!(alts[0].length_delta, 3);

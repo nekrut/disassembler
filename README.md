@@ -162,32 +162,112 @@ Measured regimes: a cross-accession cohort of near-duplicate lineages thinned **
 intra-host single-SNV variants of one accession collapsed **33 -> 1**. Being cross-accession is not
 on its own enough to make thinning safe. The nine deep Zika NS5 accessions of
 [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md), pairwise 0 to 16 SNVs apart and 99.4%
-identical at worst, collapse **9 -> 1** at the default tau. The lineage dropped there
-(`SRR6251984`, 11 to 16 SNVs from the rest) is the only haplotype in the set carrying a
-non-negligible branch length (0.0041, against ~0 for every other haplotype tip). On that cohort the
-entire usable range is `0 < tau < 0.04`, and every value from 0.15 to 0.99 returns the same single
-survivor. Sweep tau on your own data before trusting the default, and expect the sieve to pay off
-only when the cohort is large enough for the `O(N^2)` MSA/tree to dominate **and** its lineages
-diverge by well over ~1%.
+identical at worst, collapse to a single survivor at the default tau. Those nine records hold only
+**4 unique sequences** (two groups of identical reconstructions, plus a 1-SNV and a 16-SNV
+lineage), so the loss is 4 -> 1 rather than 9 -> 1, but the lineage dropped is `SRR6251984`, the
+only haplotype in the set carrying a non-negligible branch length (0.0041, against ~0 for every
+other haplotype tip).
+
+The governing relation is **`d ~ tau / (2k)`**: at the sieve's `k = 15`, the default `tau = 0.15`
+marks a boundary at **0.5% nucleotide divergence**, while that cohort's median pairwise divergence
+is 0.18%. The threshold is independent of gene length, so it is pointed at the wrong regime rather
+than at the wrong gene.
+
+Lowering tau alone does not fix it. The sieve's 64-position MinHash sketch cannot resolve novelty
+finer than `1/64`, about 0.05% divergence, so the 1-SNV lineage is below the floor at any tau;
+`--sketch 256` is needed as well, and `disassemble.py` does not currently expose it. Full
+characterisation, including the measured transition curves and the case for leaving the defaults
+alone, is in
+[`docs/issue_sieve_calibration.md`](docs/issue_sieve_calibration.md).
+
+Sweep tau on your own data before trusting the default, and expect the sieve to pay off only when
+the cohort is large enough for the `O(N^2)` MSA/tree to dominate **and** its lineages diverge by
+well over ~1%.
 
 ### Planetary triage: Galaxy kmindex harvest to candidate cohorts
 
-When screening planetary datasets indexed in Logan (e.g. via Galaxy `kmindex query` across thousands of shard databases), `python/harvest_kmindex.py` streams and merges the shard collections in parallel, extracts candidate SRA accessions by containment score, and creates stratified diversity cohorts:
+When screening planetary datasets indexed in Logan (e.g. via Galaxy `kmindex query` across thousands of shard databases), `python/harvest_kmindex.py` streams and merges the shard collections in parallel, extracts candidate SRA accessions by containment score, and optionally cuts a size-capped cohort from the result:
 
 ```bash
 # Stream and merge ~2,869 Galaxy shard JSONs across 32 threads
 python/harvest_kmindex.py \
     --history-id <GALAXY_HISTORY_ID> \
     --collection-id <GALAXY_COLLECTION_ID> \
-    -o candidates/ --diversity 2500
+    -o candidates/ --diversity 500
 
 # Reconstruct a target gene cohort directly with disassemble.py
 python/disassemble.py \
-    -l candidates/query_gene.diversity_2500.txt \
+    -l candidates/query_gene.diversity_500.txt \
     -q queries/query_gene.fasta \
     -o out/query_gene \
     --emit-vcf --emit-snv-table --no-emit-alts -w 16 --fetch-workers 16
 ```
+
+Note that `-w 16 --fetch-workers 16` roughly doubles the memory bound, to about 36 GB worst case
+against 20 GB at the defaults. `logan-walker` prints its bound at startup; see
+[Memory](#memory) before raising either on a machine that cannot absorb it.
+
+#### Outputs
+
+Written on every run, with no threshold of their own beyond the search's:
+
+| file | contents |
+|---|---|
+| `<target>.accessions.txt` | every accession the search returned, sorted by containment descending |
+| `<target>.scores.json` | accession to containment score |
+| `UNION.accessions.txt` | the union across all targets |
+| `summary.json` | per-target counts and max score |
+
+`--diversity N` adds `<target>.diversity_<N>.txt`, a `.json` with scores, and
+`diversity_<N>_summary.json`.
+
+#### What `--diversity` does, and how to size N
+
+It is a **post-processing step**: it reads the `*.scores.json` already in `--out-dir` and never
+contacts Galaxy, so `--stratify-only` re-cuts cohorts from a finished harvest. N is the cohort size
+**per target**.
+
+It files each accession into one of four containment brackets, then samples each bracket at even
+*rank* intervals so you get a spread across the bracket rather than its top slice, and backfills any
+shortfall from what is left over:
+
+| bracket | containment | share of N |
+|---|---|---|
+| canonical | `>= 0.99` | 20% |
+| high homology | `0.80 - 0.99` | 30% |
+| moderate | `0.50 - 0.80` | 30% |
+| divergent | everything below | 20% |
+
+The last bracket is an `else` with no floor of its own, so it inherits whatever threshold the
+kmindex search ran at. That matters: the search is launched at containment `>= 0.30` specifically to
+reach divergent homologs and filters server-side, so a second floor here could only discard what the
+search was told to find. It previously had one, at 0.50.
+
+The shares are preferences, not guarantees. A bracket holding fewer accessions than its share
+contributes all of them, and the remainder is backfilled, so a top-heavy harvest is never padded
+with accessions that do not exist.
+
+**Size N to your harvest, not to the default.** N caps each target, so a harvest smaller than N is
+returned whole and stratification does nothing but reorder it. Measured across a real six-target
+panel of 8,817 accessions:
+
+| `--diversity` | accessions run | share of harvest |
+|---|---|---|
+| 250 | 1,480 | 16.8% |
+| 500 | 2,593 | 29.4% |
+| 1,000 | 4,150 | 47.1% |
+| 2,500 | 6,799 | 77.1% |
+| 5,000 | 8,817 | 100% |
+
+At 2,500 only one of those six targets was capped at all. Values in the low hundreds are where the
+flag starts subsetting a panel of that size.
+
+**If download volume is the real constraint, `--diversity` is the wrong lever.** Unitig file sizes
+are extremely skewed: across 45 randomly sampled accessions the median was 0.6 MB and the mean
+17.6 MB, with the largest at 595 MB, and **the top 10% of files carried 90% of the bytes**.
+Stratification samples by containment score, which is unrelated to file size, so the cost of a given
+N varies a lot run to run. The knob that targets the bytes is the walker's `--max-size-mb`, which
+rejects on `Content-Length` before transferring anything.
 
 ## LexicMapStreamer: Streaming Multi-HSP Assembly & Cohort Partitioning
 
@@ -212,7 +292,7 @@ In Logan unitig collections, sequence diversity, coverage fluctuations, and de B
    - **Tier 3: Flagged Premature Stops** (`flag=PREMATURE_STOPS`): Premature stop codons detected; outputs exact 1-based codon coordinates in an audit ledger.
    - **Tier 4: Low-Coverage Fragments** (`flag=LOW_COVERAGE`): Coverage $<50\%$.
 4. **Online Haplotype Collapser:**
-   Collapses clean full-length sequences in $O(1)$ streaming memory, calculates exact frequencies, calls nucleotide (`198G>A`) and amino acid (`V66V`, `I61V`) mutations against the reference, classifies mutation types (`WT`, `Synonymous`, `Missense`, `Nonsense`, `Complex`), computes Shannon entropy, and records representative sample accessions.
+   Collapses clean full-length sequences without holding the input (memory is O(distinct haplotypes), not $O(1)$: the row count is what streams), calculates exact frequencies, calls nucleotide (`198G>A`) and amino acid (`V66V`, `I61V`) mutations against the reference, classifies mutation types (`WT`, `WT_partial`, `Synonymous`, `Missense`, `Nonsense`, and `NonCoding_WT_partial` / `NonCoding_Variant` for a non-CDS reference), computes Shannon entropy, and records representative sample accessions.
 5. **Regime Diagnostics & Cross-Tool Triage:**
    Computes coverage and identity quantiles ($p_{10}$, median, $p_{90}$) and stop-codon rates. If a target is in a **divergent regime** (median identity $<85\%$ or coverage $<0.60$), reference-guided projection fragments; `LexicMapStreamer` issues an automated alert recommending de novo graph path-walking via `logan-walker`.
 
@@ -287,6 +367,7 @@ complete set; `logan-walker --help` omits `--scratch-dir`.
 | `-q, --query <FASTA>` | — | reference in-frame CDS FASTA (required) |
 | `-o, --out-dir <DIR>` | `walker_output` | output directory (also holds `bubbles.json`, summary, VCFs, `snvs.tsv`); GFA/GAF scratch goes to `--scratch-dir` |
 | `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | reconstructed primary haplotypes |
+| `--allow-empty` | off | exit 0 even if nothing reconstructed. Without it a run that reconstructs nothing exits non-zero, so a wrapper cannot read an all-failed shard as a good one |
 
 ### Anchoring and fetch
 
@@ -297,7 +378,26 @@ complete set; `logan-walker --help` omits `--scratch-dir`.
 | `--hops <N>` | `5` | hop radius of the local-subgraph BFS around the anchors |
 | `--max-size-mb <N>` | `1024` | reject an accession whose compressed size exceeds this, on `Content-Length`, before download |
 | `--fetch-workers <N>` | `8` | parallel S3 fetch streams (bandwidth saturates ~8) |
-| `--scratch-dir <DIR>` | `/dev/shm/logan-walker` | where per-accession GFA/GAF go; should be tmpfs |
+| `--scratch-dir <DIR>` | `/dev/shm/logan-walker` | where per-accession GFA/GAF go; should be tmpfs. Filenames carry the PID and a per-task counter (`<acc>.<pid>.<n>.sub.gfa`), so concurrent runs sharing this directory cannot overwrite each other |
+
+### Memory
+
+A compressed unitig buffer is resident in three places at once, not one: queued in the bounded
+channel (`channel_capacity`, 4, not exposed as a flag), held by a fetch worker blocked on a full
+queue (`--fetch-workers`, 8), and held by a compute worker for the whole parse (`-w`, 8). That is
+20 buffers at the defaults, so the worst case is about **20 GB** at the 1 GB `--max-size-mb` cap,
+plus roughly 43 MB per compute worker for the CSR graph.
+
+The bound is worst case, not typical: it assumes every accession sits at the cap, while
+`ERR2028820` is 33 MB and the largest ERG11 accession is 343 MB (a 343 MB panel is ~6.9 GB in
+buffers). `logan-walker` prints the computed figure at startup, because three of the four terms are flags:
+
+```
+[logan-walker] memory bound: up to 20 compressed buffers resident (4 queued + 8 fetching +
+8 parsing) x 1024 MB cap = 20.0 GB worst case, plus ~43 MB per compute worker for the CSR graph
+```
+
+To contain a run, lower `--max-size-mb` and the two worker counts together; they multiply.
 
 ### Walk and consensus
 
@@ -307,7 +407,7 @@ complete set; `logan-walker --help` omits `--scratch-dir`.
 | `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align, removing the aligner's reference bias; `0.0` disables |
 | `--prefer-majority` / `--no-prefer-majority` | on | put the majority allele on the primary at two-allele sites (off = leave the reference-matching allele) |
 | `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
-| `-w, --workers <N>` | `8` | compute workers (size to cores) |
+| `-w, --workers <N>` | `8` | compute workers. A fixed default, not auto-sized to cores, because each one holds a compressed buffer for the whole parse: see [Memory](#memory) before raising it |
 
 ### Intra-host variants and their outputs
 

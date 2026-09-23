@@ -30,12 +30,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Build the GraphAligner command line. Mirrors `logan_path_walker.py:174-177` exactly.
-pub fn command(bin: &Path, cfg: &Config, subgraph: &Subgraph, query: &Query, gaf_out: &Path) -> Command {
+///
+/// `query_fa` is the FASTA to align, which is `query.path` only when that file holds a single
+/// record; see `run` for why.
+pub fn command(bin: &Path, cfg: &Config, subgraph: &Subgraph, query_fa: &Path, gaf_out: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.arg("-g")
         .arg(&subgraph.gfa_path)
         .arg("-f")
-        .arg(&query.path)
+        .arg(query_fa)
         .arg("-a")
         .arg(gaf_out)
         .arg("-x")
@@ -86,6 +89,18 @@ pub fn resolve_binary(cfg: &Config) -> Result<PathBuf> {
 ///
 /// A nodeless subgraph short-circuits before spawning, since handing GraphAligner an empty
 /// graph is a known abort rather than a question worth asking.
+///
+/// # One record in, one record out
+///
+/// `read_query` selects the first record of the query FASTA and warns about the rest, but
+/// handing the whole file to GraphAligner undoes that: it aligns every record, and
+/// `parse_gaf` used to take the best-scoring row across all of them. `stitch` then sliced
+/// with that row's coordinates while dividing by the *selected* record's length, so a
+/// 160-record panel such as `queries/master_planetary_targets.fasta` produced another gene's
+/// path published under the first gene's name, at a coverage above 1.0.
+///
+/// So a multi-record query is written out as its selected record alone before spawning, and
+/// `parse_gaf` filters on the GAF's query-name column either way.
 pub fn run(
     cfg: &Config,
     subgraph: &Subgraph,
@@ -96,7 +111,29 @@ pub fn run(
         return Ok(None);
     }
     let bin = resolve_binary(cfg)?;
-    let mut cmd = command(&bin, cfg, subgraph, query, gaf_out);
+
+    // Single-record queries (every golden fixture, and every well-formed run) are handed to
+    // GraphAligner untouched, so their behaviour is bit-for-bit what it was.
+    let single_record_fa = if query.n_records > 1 {
+        let p = gaf_out.with_extension("query.fa");
+        let mut body = Vec::with_capacity(query.seq.len() + query.record_id.len() + 3);
+        body.push(b'>');
+        body.extend_from_slice(query.record_id.as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(&query.seq);
+        body.push(b'\n');
+        std::fs::write(&p, &body)?;
+        eprintln!(
+            "[{}] query has {} records; aligning only {:?}",
+            subgraph.accession, query.n_records, query.record_id
+        );
+        Some(p)
+    } else {
+        None
+    };
+    let query_fa = single_record_fa.as_deref().unwrap_or(&query.path);
+
+    let mut cmd = command(&bin, cfg, subgraph, query_fa, gaf_out);
     // GraphAligner is chatty on stdout; only stderr is kept, for error reporting.
     cmd.stdout(std::process::Stdio::null());
 
@@ -108,6 +145,9 @@ pub fn run(
     if !output.status.success() {
         // Remove any partial GAF so a later run cannot read a truncated file.
         let _ = std::fs::remove_file(gaf_out);
+        if let Some(p) = &single_record_fa {
+            let _ = std::fs::remove_file(p);
+        }
         let tail = String::from_utf8_lossy(&output.stderr);
         let tail = tail.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
         return Err(Error::GraphAligner {
@@ -122,14 +162,31 @@ pub fn run(
 
     let bytes = match std::fs::read(gaf_out) {
         Ok(b) => b,
-        // Exited cleanly but wrote nothing: no alignment found.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::Io(e)),
+        // Exited cleanly but wrote nothing: no alignment found. This mapping is only sound
+        // because `extract::scratch_stem` keys the GAF on PID and a per-task counter, so no
+        // other worker or process can have deleted it out from under us; keyed on the
+        // accession alone, a file another run unlinked arrived here as a biological negative.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(p) = &single_record_fa {
+                let _ = std::fs::remove_file(p);
+            }
+            return Ok(None);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(gaf_out);
+            if let Some(p) = &single_record_fa {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err(Error::Io(e));
+        }
     };
     if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
         let _ = std::fs::remove_file(gaf_out);
+        if let Some(p) = &single_record_fa {
+            let _ = std::fs::remove_file(p);
+        }
     }
-    parse_gaf(&bytes)
+    parse_gaf(&bytes, &query.record_id)
 }
 
 /// Parse the GAF GraphAligner emits and return the best alignment.
@@ -137,7 +194,7 @@ pub fn run(
 /// Column 6 is the path, e.g. `>860013>579233<27101`. The best row is the one with the most
 /// residue matches (column 10), chosen with a stable sort so ties keep file order, matching
 /// `logan_path_walker.py:193`.
-pub fn parse_gaf(gaf_bytes: &[u8]) -> Result<Option<GafPath>> {
+pub fn parse_gaf(gaf_bytes: &[u8], expect: &str) -> Result<Option<GafPath>> {
     let text = std::str::from_utf8(gaf_bytes)
         .map_err(|e| Error::Usage(format!("GAF is not valid UTF-8: {e}")))?;
 
@@ -156,6 +213,26 @@ pub fn parse_gaf(gaf_bytes: &[u8]) -> Result<Option<GafPath>> {
     if rows.is_empty() {
         return Ok(None);
     }
+
+    // GAF column 1 is the query name, which GraphAligner copies from the FASTA record
+    // (`pfcrt`, `hiv1_pol`). Taking the best row without checking it is what let one gene's
+    // path be published under another gene's name.
+    let mine: Vec<Vec<&str>> = rows.iter().filter(|r| r[0] == expect).cloned().collect();
+    let mut rows = if !mine.is_empty() {
+        mine
+    } else {
+        // Only one record was ever handed to GraphAligner, so these rows are this query
+        // under a name the tool spelled differently. Say so rather than silently dropping
+        // the alignment, and carry on with what is there.
+        let mut names: Vec<&str> = rows.iter().map(|r| r[0]).collect();
+        names.sort_unstable();
+        names.dedup();
+        eprintln!(
+            "[warn] GAF carries no row for query {expect:?} (names present: {names:?}); \
+             using the best row anyway"
+        );
+        rows
+    };
 
     let matches_of = |r: &Vec<&str>| r[9].parse::<usize>().unwrap_or(0);
     rows.sort_by_key(|r| std::cmp::Reverse(matches_of(r)));
@@ -219,7 +296,7 @@ mod tests {
 
     #[test]
     fn parses_a_real_gaf_line() {
-        let g = parse_gaf(REAL.as_bytes()).unwrap().expect("a path");
+        let g = parse_gaf(REAL.as_bytes(), "pfcrt").unwrap().expect("a path");
         assert_eq!(g.path_len, 1288);
         assert_eq!(g.path_start, 7);
         assert_eq!(g.path_end, 1281);
@@ -248,7 +325,7 @@ mod tests {
         let gaf = "q\t10\t0\t10\t+\t>1\t10\t0\t10\t50\t60\t60\n\
              q\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60\n\
              q\t10\t0\t10\t+\t>3\t10\t0\t10\t100\t120\t60\n".to_string();
-        let g = parse_gaf(gaf.as_bytes()).unwrap().unwrap();
+        let g = parse_gaf(gaf.as_bytes(), "q").unwrap().unwrap();
         assert_eq!(g.num_matches, 900);
         assert_eq!(g.steps[0].node, 2);
     }
@@ -258,24 +335,49 @@ mod tests {
     fn ties_keep_file_order() {
         let gaf = "q\t10\t0\t10\t+\t>7\t10\t0\t10\t500\t600\t60\n\
                    q\t10\t0\t10\t+\t>9\t10\t0\t10\t500\t600\t60\n";
-        let g = parse_gaf(gaf.as_bytes()).unwrap().unwrap();
+        let g = parse_gaf(gaf.as_bytes(), "q").unwrap().unwrap();
         assert_eq!(g.steps[0].node, 7);
     }
 
     #[test]
     fn empty_or_unusable_gaf_is_none_not_an_error() {
-        assert!(parse_gaf(b"").unwrap().is_none(), "empty file");
-        assert!(parse_gaf(b"\n\n").unwrap().is_none(), "blank lines");
-        assert!(parse_gaf(b"too\tfew\tcolumns\n").unwrap().is_none(), "short row");
+        assert!(parse_gaf(b"", "q").unwrap().is_none(), "empty file");
+        assert!(parse_gaf(b"\n\n", "q").unwrap().is_none(), "blank lines");
+        assert!(parse_gaf(b"too\tfew\tcolumns\n", "q").unwrap().is_none(), "short row");
         // Well-formed row whose path names no nodes.
         let g = "q\t10\t0\t10\t+\t*\t10\t0\t10\t5\t6\t60\n";
-        assert!(parse_gaf(g.as_bytes()).unwrap().is_none(), "empty path");
+        assert!(parse_gaf(g.as_bytes(), "q").unwrap().is_none(), "empty path");
+    }
+
+    /// The bug this guards: a multi-record query used to let another gene's row win, and
+    /// `stitch` then divided that row's span by the selected record's length.
+    #[test]
+    fn rows_for_another_query_are_ignored() {
+        let gaf = "pfcrt\t10\t0\t10\t+\t>1\t10\t0\t10\t50\t60\t60\n\
+                   hiv1_pol\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60\n";
+        let g = parse_gaf(gaf.as_bytes(), "pfcrt").unwrap().unwrap();
+        assert_eq!(g.num_matches, 50, "the higher-scoring hiv1_pol row must not win");
+        assert_eq!(g.steps[0].node, 1);
+
+        // Asking for the other gene selects the other row, from the same bytes.
+        let g = parse_gaf(gaf.as_bytes(), "hiv1_pol").unwrap().unwrap();
+        assert_eq!(g.num_matches, 900);
+        assert_eq!(g.steps[0].node, 2);
+    }
+
+    /// Only one record is ever handed to GraphAligner, so an unrecognised name means the
+    /// tool spelled it differently, not that a foreign gene crept in. Warn, do not drop.
+    #[test]
+    fn unknown_query_name_still_parses() {
+        let gaf = "some_other_spelling\t10\t0\t10\t+\t>5\t10\t0\t10\t7\t8\t60\n";
+        let g = parse_gaf(gaf.as_bytes(), "pfcrt").unwrap().expect("a path");
+        assert_eq!(g.steps[0].node, 5);
     }
 
     #[test]
     fn non_numeric_column_is_an_error() {
         let g = "q\t10\t0\t10\t+\t>1\tNOTANUMBER\t0\t10\t5\t6\t60\n";
-        assert!(parse_gaf(g.as_bytes()).is_err());
+        assert!(parse_gaf(g.as_bytes(), "q").is_err());
     }
 
     #[test]
@@ -302,12 +404,8 @@ mod tests {
             accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGT".to_vec()],
             gfa_path: "/tmp/nonexistent-logan-test/ACC.sub.gfa".into(), n_edges: 0,
         };
-        let q = Query {
-            name: "q".into(), record_id: "q".into(), seq: b"ACGT".to_vec(),
-            path: "/tmp/q.fasta".into(),
-        };
-        let cmd = command(Path::new("/usr/bin/GraphAligner"), &cfg, &sub, &q,
-                          Path::new("/tmp/out.gaf"));
+        let cmd = command(Path::new("/usr/bin/GraphAligner"), &cfg, &sub,
+                          Path::new("/tmp/q.fasta"), Path::new("/tmp/out.gaf"));
         let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert_eq!(args, vec![
             "-g", "/tmp/nonexistent-logan-test/ACC.sub.gfa",
@@ -352,6 +450,7 @@ mod align_real {
         }
 
         let f = FetchedUnitigs {
+            index: 0,
             accession: "ERR2028820".into(),
             compressed_len: compressed.len(),
             compressed,
@@ -412,6 +511,7 @@ mod align_real {
         let q = Query {
             name: "q".into(), record_id: "q".into(), seq: b"ACGTACGT".to_vec(),
             path: "../queries/pfcrt_only.fasta".into(),
+            n_records: 1,
         };
         let got = run(&cfg, &sub, &q, &cfg.scratch_dir.join("EMPTY.sub.gaf")).unwrap();
         assert!(got.is_none(), "must report no path rather than invoking the tool");
@@ -457,6 +557,7 @@ mod determinism {
                 return;
             }
             let f = FetchedUnitigs {
+                index: 0,
                 accession: acc.into(),
                 compressed_len: compressed.len(),
                 compressed,

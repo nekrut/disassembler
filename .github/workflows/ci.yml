@@ -48,6 +48,10 @@ jobs:
           python-version: "3.11"
       - name: Run LexicMapStreamer tests
         run: python3 python/test_lexicmap_streamer.py
+      # Skips cleanly when `requests` is absent, which it is on this runner: the module
+      # imports it at scope. Runs for real wherever the harvester's deps are installed.
+      - name: Run kmindex harvester tests
+        run: python3 python/test_harvest_kmindex.py
       # Both sieve tests build extern/kmer-diversity-sieve themselves (cc only) and skip
       # cleanly if the submodule or a compiler is missing.
       - name: Sieve binary concordance

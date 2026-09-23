@@ -38,6 +38,7 @@ MAX_N_FRAC=0.05
 THRESHOLD=0.15
 WARMUP=10
 
+EXPECTED_INPUT_N=33     # MAX_PROMOTED is calibrated against a fixture of this size
 MAX_PROMOTED=3          # intra-host single-SNV alts collapse hard (see header)
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -60,7 +61,12 @@ fi
 
 INPUT_N="$(grep -c '^>' "$FIXTURE")"
 echo "[test_sieve] fixture: $FIXTURE ($INPUT_N haplotypes)"
-[[ "$INPUT_N" -eq 33 ]] || echo "[test_sieve] note: expected 33 input haplotypes, got $INPUT_N"
+# Hard failure, not a note. MAX_PROMOTED below is a property of THIS fixture, so a fixture
+# that grew or shrank silently changes what the bound means while the bound stays enforced.
+(( INPUT_N == EXPECTED_INPUT_N )) || fail \
+    "fixture has $INPUT_N haplotypes, expected $EXPECTED_INPUT_N. MAX_PROMOTED=$MAX_PROMOTED is \
+calibrated against that fixture: if the fixture changed deliberately, re-derive the bound and \
+update EXPECTED_INPUT_N and MAX_PROMOTED together."
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -77,8 +83,17 @@ run_sieve() {
         --emit-promoted "$prefix" >"$log" 2>&1
     local rc=$?
     [[ $rc -eq 0 ]] || { echo "[test_sieve] run '$tag' exit=$rc"; cat "$log" >&2; return 1; }
-    # count promoted sequences from the emitted shards
-    cat "$prefix".rank*.fasta 2>/dev/null | grep -c '^>'
+    # Count promoted sequences from the emitted shards.
+    #
+    # `grep -c` exits 1 when the count is 0, and it used to be the last command here, so a
+    # sieve that ran fine and promoted nothing was reported as "did not exit 0" and the
+    # dedicated `N1 >= 1` assertion below could never run. An unexpanded glob (if
+    # --emit-promoted ever changes its shard naming) hits the same path. Keep the count and
+    # the exit status separate.
+    local n
+    n="$(cat "$prefix".rank*.fasta 2>/dev/null | grep -c '^>')" || true
+    printf '%s\n' "${n:-0}"
+    return 0
 }
 
 # --- 2/3. run twice; capture counts and exit status ------------------------

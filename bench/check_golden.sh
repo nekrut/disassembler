@@ -32,11 +32,35 @@ if [ ! -x "$WALKER" ]; then
 fi
 command -v GraphAligner >/dev/null || { echo "FAIL: GraphAligner not on PATH"; exit 1; }
 
-run_primary() {  # acc query -> writes $WORK/$acc.got (bare sequence)
+# Record the aligner version with the result. The fixtures are version-dependent: 1.0.19+
+# clips the query's final base, so these goldens (captured under an affected build) PASS on
+# 1.0.20 and would FAIL on 1.0.18, which is the version that is actually end to end. Without
+# this line a green gate does not say which behaviour it green-lit.
+# See docs/issue_graphaligner_end_clipping.md.
+echo "using $(GraphAligner --version 2>&1 | head -n 1) at $(command -v GraphAligner)"
+
+# Writes $WORK/$acc.got (bare sequence) and $WORK/$acc.log, and RETURNS the walker's exit
+# status. That status used to be thrown away along with stderr, so an S3 timeout produced an
+# absent recon.fasta, an empty .got, and the message "FAIL <acc> (got 0 nt vs golden 1476 nt)":
+# an infrastructure outage reported as a walk regression, with every diagnostic discarded.
+run_primary() {  # acc query -> rc
   local acc="$1" query="$2"
+  # Separate statement on purpose: every word of a simple command is expanded before the
+  # command runs, so `local acc="$1" log="$WORK/$acc.log"` would expand $acc to whatever the
+  # CALLER last left in it, not to "$1".
+  local log="$WORK/$acc.log"
   "$WALKER" -a "$acc" -q "$ROOT/$query" -o "$WORK/$acc" -f "$WORK/$acc/recon.fasta" \
-    --prune-frac 0.0 --no-prefer-majority --no-emit-alts >/dev/null 2>&1
+    --prune-frac 0.0 --no-prefer-majority --no-emit-alts >"$log" 2>&1
+  local rc=$?
   grep -v '^>' "$WORK/$acc/recon.fasta" 2>/dev/null | tr -d '\n ' > "$WORK/$acc.got"
+  return $rc
+}
+
+# Print the tail of a failed run's log, indented, so CI output carries the cause.
+show_log() {
+  local acc="$1"
+  echo "    --- last 5 lines of $acc.log ---"
+  tail -n 5 "$WORK/$acc.log" 2>/dev/null | sed 's/^/    | /'
 }
 
 fails=0
@@ -49,7 +73,14 @@ GATES=(
 )
 for g in "${GATES[@]}"; do
   set -- $g; acc="$1"; query="$2"; golden="$3"
-  run_primary "$acc" "$query"
+  if ! run_primary "$acc" "$query"; then
+    # Since logan-walker exits non-zero when nothing reconstructed, this catches the fetch
+    # and GraphAligner failures that used to masquerade as a golden mismatch.
+    echo "ERROR $acc  (walker exited non-zero: a run failure, NOT a walk regression)"
+    show_log "$acc"
+    fails=$((fails+1))
+    continue
+  fi
   grep -v '^>' "$ROOT/$golden" | tr -d '\n ' > "$WORK/$acc.exp"
   if [ -s "$WORK/$acc.got" ] && cmp -s "$WORK/$acc.got" "$WORK/$acc.exp"; then
     echo "PASS $acc  ($(wc -c < "$WORK/$acc.exp") nt, byte-identical)"
@@ -60,9 +91,14 @@ for g in "${GATES[@]}"; do
 done
 
 # --- informational: SRR8209082 / HIV-1 pol (not gated) ---
-run_primary SRR8209082 queries/query_hiv1_pol.fasta
-got_len=$(wc -c < "$WORK/SRR8209082.got" 2>/dev/null || echo 0)
 exp_len=$(grep -v '^>' "$ROOT/bench/golden/SRR8209082.hiv1_pol.primary.fasta" | tr -d '\n ' | wc -c)
-echo "INFO SRR8209082  (walker $got_len nt, golden $exp_len nt; not byte-gated, see header)"
+if run_primary SRR8209082 queries/query_hiv1_pol.fasta; then
+  got_len=$(wc -c < "$WORK/SRR8209082.got" 2>/dev/null || echo 0)
+  echo "INFO SRR8209082  (walker $got_len nt, golden $exp_len nt; not byte-gated, see header)"
+else
+  # Not gated, so this does not fail the run, but it must not read as a 0 nt walk either.
+  echo "INFO SRR8209082  (walker exited non-zero; golden $exp_len nt; not byte-gated)"
+  show_log SRR8209082
+fi
 
 if [ "$fails" -eq 0 ]; then echo "golden: concordant"; exit 0; else echo "golden: $fails regression(s)"; exit 1; fi

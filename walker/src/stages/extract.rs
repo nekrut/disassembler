@@ -138,6 +138,24 @@ pub fn path_depth(graph: &UnitigGraph, steps: &[PathStep]) -> f32 {
     ab[ab.len() / 2]
 }
 
+/// Mean `ka:f` over the unitigs the path traverses, for reporting.
+///
+/// Deliberately the arithmetic mean, not `path_depth`'s median: the field it fills is named
+/// `mean_ka` and is published as `ka=` in the FASTA header, so it must be what it says it is.
+/// The median is the right statistic for *deciding* a prune floor, where one repeat-collapsed
+/// unitig must not drag the estimate, and `path_depth` stays that. Use this only to describe
+/// a haplotype, never to gate one.
+///
+/// Unweighted per step, so a 50 bp unitig counts as much as a 50 kb one, and a unitig visited
+/// twice counts twice.
+pub fn path_mean_ka(graph: &UnitigGraph, steps: &[PathStep]) -> f64 {
+    if steps.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = steps.iter().map(|s| graph.abundance[s.node as usize] as f64).sum();
+    sum / steps.len() as f64
+}
+
 /// The coverage a unitig must carry to survive a prune, given the gene's depth.
 ///
 /// Never below `min_abund`: this can only tighten the existing floor, never loosen it.
@@ -230,6 +248,24 @@ pub fn collect_seqs(graph: &UnitigGraph, nodes: &[UnitigId]) -> Result<Vec<Vec<u
     Ok(out)
 }
 
+/// A scratch basename no other worker or process can collide with.
+///
+/// The GFA, the GAF derived from it, and the single-record query FASTA derived from that all
+/// hang off this stem. Keying them on the accession alone meant two `logan-walker` processes,
+/// or one process with the same accession twice in its list, truncated and unlinked each
+/// other's files: measured as GraphAligner SIGABRTs, a "non supported overlap" on a
+/// half-written GFA, and a run that produced zero records at exit 0.
+///
+/// `--scratch-dir` defaults to `/dev/shm/logan-walker` for *every* process, so two runs over
+/// different genes collide by default. The PID separates processes and the counter separates
+/// duplicate accessions inside one process.
+fn scratch_stem(accession: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{accession}.{}.{n}", std::process::id())
+}
+
 /// Serialise nodes and edges to GFA and return the populated `Subgraph`.
 ///
 /// Byte-for-byte compatible with `logan_path_walker.py:153-165`, because GraphAligner's
@@ -261,7 +297,7 @@ pub fn write_gfa(
     }
 
     std::fs::create_dir_all(&cfg.scratch_dir)?;
-    let gfa_path = cfg.scratch_dir.join(format!("{}.sub.gfa", graph.accession));
+    let gfa_path = cfg.scratch_dir.join(format!("{}.sub.gfa", scratch_stem(&graph.accession)));
     let file = std::fs::File::create(&gfa_path)?;
     let mut w = BufWriter::with_capacity(1 << 16, file);
 
@@ -486,7 +522,7 @@ mod python_concordance_expand {
     fn load(dir: &str, acc: &str) -> Option<UnitigGraph> {
         let p = format!("{dir}/{acc}.unitigs.fa.zst");
         let compressed = std::fs::read(&p).ok()?;
-        let f = FetchedUnitigs { accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
+        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
         let g = {
             let rd = stream::decoder(&f).ok()?;
             parse::build(&f.accession, rd).ok()
@@ -574,6 +610,7 @@ mod real_data_collect {
             return;
         };
         let f = FetchedUnitigs {
+            index: 0,
             accession: "ERR2028820".into(),
             compressed_len: compressed.len(),
             compressed,
@@ -715,7 +752,11 @@ mod gfa_tests {
         let sub = write_gfa(&cfg, &g, vec![0, 1], seqs).unwrap();
         assert_eq!(sub.n_edges, 2, "one connection, recorded from both ends");
         assert_eq!(sub.nodes.len(), 2);
-        assert!(sub.gfa_path.ends_with("ACC.sub.gfa"));
+        // The name carries the accession plus a PID and a per-task counter, so two runs
+        // cannot write the same file; see `scratch_stem`.
+        let name = sub.gfa_path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("ACC."), "accession stays legible: {name}");
+        assert!(name.ends_with(".sub.gfa"), "suffix is unchanged: {name}");
         assert!(sub.gfa_path.exists());
         std::fs::remove_file(&sub.gfa_path).ok();
     }
@@ -767,6 +808,7 @@ mod cross_check {
             return;
         };
         let f = FetchedUnitigs {
+            index: 0,
             accession: "ERR2028820".into(),
             compressed_len: compressed.len(),
             compressed,
@@ -913,5 +955,41 @@ mod depth_tests {
         );
         assert_eq!(kept, vec![0, 2]);
         assert_eq!(seqs, vec![b"AAAA".to_vec(), b"GGGG".to_vec()]);
+    }
+}
+
+#[cfg(test)]
+mod scratch_stem_tests {
+    use super::scratch_stem;
+
+    /// The bug: two `logan-walker` processes, or one list with a duplicate accession, wrote
+    /// the same `<acc>.sub.gfa` and unlinked each other's files mid-alignment.
+    #[test]
+    fn two_stems_for_one_accession_differ() {
+        let a = scratch_stem("SRR8209082");
+        let b = scratch_stem("SRR8209082");
+        assert_ne!(a, b, "duplicate accessions must not share a scratch path");
+        for s in [&a, &b] {
+            assert!(s.starts_with("SRR8209082."), "accession stays legible in {s:?}");
+            assert!(
+                s.contains(&std::process::id().to_string()),
+                "PID separates concurrent processes in {s:?}"
+            );
+        }
+    }
+
+    /// The GAF and the single-record query FASTA are derived from the GFA path, so
+    /// uniqueness has to survive `with_extension`.
+    #[test]
+    fn derived_scratch_paths_stay_unique() {
+        let p = |acc: &str| std::path::PathBuf::from(format!("/tmp/{}.sub.gfa", scratch_stem(acc)));
+        let (g1, g2) = (p("ERR2028820"), p("ERR2028820"));
+        assert_ne!(g1.with_extension("gaf"), g2.with_extension("gaf"));
+        assert_ne!(g1.with_extension("query.fa"), g2.with_extension("query.fa"));
+        assert_eq!(
+            g1.with_extension("gaf").extension().unwrap(),
+            "gaf",
+            "the stem's dots must not swallow the extension"
+        );
     }
 }

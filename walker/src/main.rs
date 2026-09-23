@@ -93,6 +93,10 @@ INTRA-HOST VARIANTS:
         --max-alt-indel <N>       Largest length change still treated as an indel allele
                                   rather than a rerouting [default: 30]
 
+        --allow-empty             Exit 0 even if no accession reconstructed. Without it, a
+                                  run that reconstructs nothing exits non-zero, so a wrapper
+                                  cannot mistake an all-failed shard for a good one
+
     -h, --help                    Print this help
     -V, --version                 Print version
 ";
@@ -103,6 +107,9 @@ struct Args {
     query: Option<PathBuf>,
     out_dir: PathBuf,
     out_fasta: PathBuf,
+    /// Exit 0 even when nothing was reconstructed. Off by default: a shard that
+    /// reconstructs nothing is a failure a scheduler needs to see.
+    allow_empty: bool,
     cfg: Config,
 }
 
@@ -113,6 +120,7 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
         query: None,
         out_dir: PathBuf::from("walker_output"),
         out_fasta: PathBuf::from("reconstructed_haplotypes.fasta"),
+        allow_empty: false,
         cfg: Config::default(),
     };
     let mut i = 0;
@@ -193,6 +201,11 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
                 args.cfg.max_alt_indel = value()?.parse().map_err(|e| {
                     error::Error::Usage(format!("--max-alt-indel: {e}"))
                 })?;
+            }
+            "--allow-empty" => {
+                args.allow_empty = true;
+                i += 1;
+                continue;
             }
             "--emit-alts" | "--no-emit-alts" => {
                 args.cfg.emit_alts = flag == "--emit-alts";
@@ -275,7 +288,12 @@ fn real_main(args: Args) -> error::Result<()> {
     let query = io::input::read_query(&query_path)?;
 
     let accessions = match (&args.accession, &args.accession_list) {
-        (Some(a), _) => vec![a.clone()],
+        (Some(a), _) => {
+            // The list path has always validated; `-a` did not, though the value reaches the
+            // same URL and the same two filesystem paths.
+            io::input::validate_accession(a, "--accession")?;
+            vec![a.clone()]
+        }
         (None, Some(p)) => io::input::read_accession_list(p)?,
         (None, None) => {
             return Err(error::Error::Usage(
@@ -285,17 +303,42 @@ fn real_main(args: Args) -> error::Result<()> {
     };
 
     // ---- the pipeline -----------------------------------------------------
+    // State the memory bound up front. This used to be a comment in `pipeline`, and it was
+    // wrong by 5x; a number that moves with -w, --fetch-workers and --max-size-mb is worth
+    // printing rather than documenting.
+    let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    eprintln!(
+        "[logan-walker] memory bound: up to {} compressed buffers resident \
+         ({} queued + {} fetching + {} parsing) x {} MB cap = {:.1} GB worst case, \
+         plus ~43 MB per compute worker for the CSR graph",
+        args.cfg.peak_compressed_buffers(),
+        args.cfg.channel_capacity,
+        args.cfg.fetch_workers,
+        args.cfg.compute_workers,
+        args.cfg.max_compressed_bytes / (1024 * 1024),
+        gb(args.cfg.max_compressed_resident_bytes()),
+    );
+
     let summary = pipeline::run(&args.cfg, accessions, &query)?;
 
     // ---- OUT of the pipeline ----------------------------------------------
     std::fs::create_dir_all(&args.out_dir)?;
     io::output::write_fasta(&summary, &args.out_fasta)?;
     io::output::write_bubbles(&summary, &args.out_dir.join("bubbles.json"))?;
-    if args.cfg.emit_vcf {
-        io::output::write_vcfs(&summary, &query, &args.out_dir)?;
-    }
-    if args.cfg.emit_snv_table {
-        io::output::write_snv_table(&summary, &query, &args.out_dir.join("snvs.tsv"))?;
+    // One alignment pass per accession, shared by both writers.
+    if args.cfg.emit_vcf || args.cfg.emit_snv_table {
+        let sites = io::output::snv_sites_all(&summary, &query);
+        if args.cfg.emit_vcf {
+            io::output::write_vcfs(&summary, &query, &args.out_dir, &sites)?;
+        }
+        if args.cfg.emit_snv_table {
+            io::output::write_snv_table(
+                &summary,
+                &query,
+                &args.out_dir.join("snvs.tsv"),
+                &sites,
+            )?;
+        }
     }
     if args.cfg.emit_alts {
         io::output::write_alts(&summary, &args.out_dir.join("alt_haplotypes.fasta"))?;
@@ -309,5 +352,13 @@ fn real_main(args: Args) -> error::Result<()> {
         "[logan-walker] {}/{} accessions reconstructed",
         summary.success, summary.total
     );
+
+    // Per-accession failures are collected rather than propagated, which is what lets one bad
+    // accession not sink a 10,000-accession shard. The cost is that a run where *every*
+    // accession failed used to write a 0-byte FASTA and exit 0, which any scheduler reads as
+    // a good shard. Outputs are already written above, so they stay on disk for inspection.
+    if summary.success == 0 && summary.total > 0 && !args.allow_empty {
+        return Err(error::Error::NothingReconstructed { total: summary.total });
+    }
     Ok(())
 }

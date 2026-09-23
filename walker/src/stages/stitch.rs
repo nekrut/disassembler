@@ -20,7 +20,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::types::{GafPath, Haplotype, Orient, PathStep, Query, Subgraph};
+use crate::types::{GafPath, Haplotype, Orient, PathStep, Query, Subgraph, UnitigGraph};
 
 /// Reverse complement. Sequences come from the 2-bit store so they are pure ACGT; anything
 /// else would already have been rejected by `parse::build`.
@@ -99,6 +99,7 @@ pub fn stitch_steps(
 
 pub fn stitch(
     cfg: &Config,
+    graph: &UnitigGraph,
     path: &GafPath,
     subgraph: &Subgraph,
     query: &Query,
@@ -125,6 +126,20 @@ pub fn stitch(
     let target: Vec<u8> = stitched[start..end.max(start)].to_vec();
 
     let cov = target.len() as f64 / query.seq.len() as f64;
+
+    // Tripwire for the multi-record-query bug fixed in `align::run`: that published another
+    // gene's span under this gene's length and reached cov 2.097. A genuine alignment can
+    // exceed 1.0 slightly, because insertions in the path push `path_end` past
+    // `path_start + qlen`, so this warns on a real excess rather than asserting.
+    const COV_EXCESS: f64 = 1.02;
+    if cov > COV_EXCESS {
+        eprintln!(
+            "[warn] {}: reconstructed span is {:.3}x the query ({} nt from a {} nt query {:?}); \
+             a coverage this far above 1.0 means the wrong alignment row was used",
+            subgraph.accession, cov, target.len(), query.seq.len(), query.record_id
+        );
+    }
+
     let pident = if path.aln_len > 0 {
         (path.num_matches as f64 / path.aln_len as f64) * 100.0
     } else {
@@ -140,8 +155,12 @@ pub fn stitch(
         seq: target,
         cov,
         pident,
+        // Set by the caller when it splices a path; `stitch` itself is always handed the
+        // path the GAF describes.
+        pident_inherited: false,
         nodes: path.steps.len(),
-        mean_ka: 0.0,
+        // Was hardcoded 0.0 while being published in every FASTA header and in summary.json.
+        mean_ka: crate::stages::extract::path_mean_ka(graph, &path.steps),
         vaf: 1.0,
     }))
 }
@@ -164,7 +183,7 @@ mod tests {
         s
     }
     fn q(seq: &str) -> Query {
-        Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa") }
+        Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa"), n_records: 1 }
     }
     fn path(steps: &[(Orient, u32)], len: usize, start: usize, end: usize) -> GafPath {
         GafPath {
@@ -176,12 +195,68 @@ mod tests {
     fn cfg(k: usize, min_cov: f64) -> Config {
         Config { graph_k: k, min_cov, ..Config::default() }
     }
+    /// A graph whose unitig `i` carries `ka[i]`. `stitch` reads only `abundance` from it;
+    /// the sequences it stitches come from the `Subgraph`.
+    fn gph(ka: &[f32]) -> UnitigGraph {
+        let fa: String = ka
+            .iter()
+            .enumerate()
+            .map(|(i, a)| format!(">T_{i} ka:f:{a}\nACGT\n"))
+            .collect();
+        crate::stages::parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.into_bytes())))
+            .unwrap()
+    }
+    /// For the cases where abundance is irrelevant; wide enough for every node id used here.
+    fn anyg() -> UnitigGraph {
+        gph(&[10.0; 78])
+    }
 
     #[test]
     fn revcomp_is_correct_and_involutive() {
         assert_eq!(revcomp(b"ACGT"), b"ACGT".to_vec(), "ACGT is its own reverse complement");
         assert_eq!(revcomp(b"AAAC"), b"GTTT".to_vec());
         assert_eq!(revcomp(&revcomp(b"ACGGTCA")), b"ACGGTCA".to_vec());
+    }
+
+    /// `mean_ka` was hardcoded to 0.0 while being published as `ka=` in every FASTA header
+    /// and in summary.json.
+    #[test]
+    fn mean_ka_is_the_mean_over_the_path() {
+        let c = cfg(4, 0.0);
+        let s = sub(vec![1, 2], vec!["ACGTA", "GTACC"]);
+        let p = path(&[(Orient::Forward, 1), (Orient::Forward, 2)], 7, 0, 7);
+
+        let h = stitch(&c, &gph(&[0.0, 10.0, 20.0]), &p, &s, &q("ACGTACC")).unwrap().unwrap();
+        assert!((h.mean_ka - 15.0).abs() < 1e-9, "mean of 10 and 20, got {}", h.mean_ka);
+
+        // It tracks the graph rather than being any fixed value.
+        let h = stitch(&c, &gph(&[0.0, 4.0, 100.0]), &p, &s, &q("ACGTACC")).unwrap().unwrap();
+        assert!((h.mean_ka - 52.0).abs() < 1e-9, "got {}", h.mean_ka);
+
+        // A repeated step counts twice: unweighted per step, as documented.
+        let p2 = path(&[(Orient::Forward, 1), (Orient::Forward, 1), (Orient::Forward, 2)], 7, 0, 7);
+        let h = stitch(&c, &gph(&[0.0, 10.0, 40.0]), &p2, &s, &q("ACGTACC")).unwrap().unwrap();
+        assert!((h.mean_ka - 20.0).abs() < 1e-9, "(10+10+40)/3, got {}", h.mean_ka);
+    }
+
+    /// Mean, not `path_depth`'s median: one deep repeat-collapsed unitig must move `ka=`,
+    /// or the two statistics would be indistinguishable on the data that separates them.
+    #[test]
+    fn mean_ka_is_not_the_median() {
+        let c = cfg(4, 0.0);
+        let s = sub(vec![1, 2, 3], vec!["ACGTA", "GTACC", "ACCGT"]);
+        let p = path(
+            &[(Orient::Forward, 1), (Orient::Forward, 2), (Orient::Forward, 3)],
+            9, 0, 9,
+        );
+        let g = gph(&[0.0, 1.0, 2.0, 300.0]);
+        let h = stitch(&c, &g, &p, &s, &q("ACGTACCGT")).unwrap().unwrap();
+        assert!((h.mean_ka - 101.0).abs() < 1e-9, "mean of 1,2,300, got {}", h.mean_ka);
+        assert_eq!(
+            crate::stages::extract::path_depth(&g, &p.steps),
+            2.0,
+            "path_depth stays the median and must not move with the outlier"
+        );
     }
 
     /// Consecutive nodes share k-1 bases, so only the first contributes in full.
@@ -191,7 +266,7 @@ mod tests {
         let s = sub(vec![1, 2], vec!["ACGTA", "GTACC"]);
         // node1 "ACGTA" whole, node2 contributes "CC" (drops first 3)
         let p = path(&[(Orient::Forward, 1), (Orient::Forward, 2)], 7, 0, 7);
-        let h = stitch(&c, &p, &s, &q("ACGTACC")).unwrap().unwrap();
+        let h = stitch(&c, &anyg(), &p, &s, &q("ACGTACC")).unwrap().unwrap();
         assert_eq!(h.seq, b"ACGTACC");
     }
 
@@ -201,7 +276,7 @@ mod tests {
         // revcomp("GGTAC") = "GTACC"; after trimming 3 it contributes "CC"
         let s = sub(vec![1, 2], vec!["ACGTA", "GGTAC"]);
         let p = path(&[(Orient::Forward, 1), (Orient::Reverse, 2)], 7, 0, 7);
-        let h = stitch(&c, &p, &s, &q("ACGTACC")).unwrap().unwrap();
+        let h = stitch(&c, &anyg(), &p, &s, &q("ACGTACC")).unwrap().unwrap();
         assert_eq!(h.seq, b"ACGTACC");
     }
 
@@ -216,7 +291,7 @@ mod tests {
         let expected = 40 + 45 + 50 - 30 * 2;
         let p = path(&[(Orient::Forward, 1), (Orient::Forward, 2), (Orient::Forward, 3)],
                      expected, 0, expected);
-        let h = stitch(&c, &p, &s, &q(&"N".repeat(expected))).unwrap().unwrap();
+        let h = stitch(&c, &anyg(), &p, &s, &q(&"N".repeat(expected))).unwrap().unwrap();
         assert_eq!(h.seq.len(), expected);
     }
 
@@ -226,7 +301,7 @@ mod tests {
         let c = cfg(4, 0.0);
         let s = sub(vec![1], vec!["ACGTACGTAC"]);
         let p = path(&[(Orient::Forward, 1)], 10, 2, 7);
-        let h = stitch(&c, &p, &s, &q("ACGTA")).unwrap().unwrap();
+        let h = stitch(&c, &anyg(), &p, &s, &q("ACGTA")).unwrap().unwrap();
         assert_eq!(h.seq, b"GTACG", "expected stitched[2..7]");
     }
 
@@ -236,7 +311,7 @@ mod tests {
         let c = cfg(4, 0.0);
         let s = sub(vec![1], vec!["ACGTACGTAC"]);
         let p = path(&[(Orient::Forward, 1)], 10, 6, 9999);
-        let h = stitch(&c, &p, &s, &q("ACGT")).unwrap().unwrap();
+        let h = stitch(&c, &anyg(), &p, &s, &q("ACGT")).unwrap().unwrap();
         assert_eq!(h.seq, b"GTAC");
     }
 
@@ -247,7 +322,7 @@ mod tests {
         let mut p = path(&[(Orient::Forward, 1)], 10, 0, 10);
         p.num_matches = 95;
         p.aln_len = 100;
-        let h = stitch(&c, &p, &s, &q(&"N".repeat(20))).unwrap().unwrap();
+        let h = stitch(&c, &anyg(), &p, &s, &q(&"N".repeat(20))).unwrap().unwrap();
         assert!((h.cov - 0.5).abs() < 1e-12, "10 bases over a 20 bp query");
         assert!((h.pident - 95.0).abs() < 1e-12);
         assert_eq!(h.nodes, 1);
@@ -260,7 +335,7 @@ mod tests {
         let s = sub(vec![1], vec!["ACGTACGTAC"]);
         let p = path(&[(Orient::Forward, 1)], 10, 0, 10);
         // 10 bases against a 100 bp query is 10% coverage.
-        assert!(stitch(&c, &p, &s, &q(&"N".repeat(100))).unwrap().is_none());
+        assert!(stitch(&c, &anyg(), &p, &s, &q(&"N".repeat(100))).unwrap().is_none());
     }
 
     /// GraphAligner naming a node absent from the GFA means the alignment cannot be
@@ -270,14 +345,14 @@ mod tests {
         let c = cfg(4, 0.0);
         let s = sub(vec![1], vec!["ACGTACGTAC"]);
         let p = path(&[(Orient::Forward, 1), (Orient::Forward, 77)], 10, 0, 10);
-        assert!(stitch(&c, &p, &s, &q("ACGT")).unwrap().is_none());
+        assert!(stitch(&c, &anyg(), &p, &s, &q("ACGT")).unwrap().is_none());
     }
 
     #[test]
     fn empty_path_yields_none() {
         let c = cfg(4, 0.0);
         let s = sub(vec![1], vec!["ACGT"]);
-        assert!(stitch(&c, &path(&[], 0, 0, 0), &s, &q("ACGT")).unwrap().is_none());
+        assert!(stitch(&c, &anyg(), &path(&[], 0, 0, 0), &s, &q("ACGT")).unwrap().is_none());
     }
 
     #[test]
@@ -285,7 +360,7 @@ mod tests {
         let c = cfg(4, 0.0);
         let s = sub(vec![1], vec!["ACGT"]);
         let p = path(&[(Orient::Forward, 1)], 4, 0, 4);
-        assert!(stitch(&c, &p, &s, &q("")).is_err());
+        assert!(stitch(&c, &anyg(), &p, &s, &q("")).is_err());
     }
 }
 
@@ -325,6 +400,7 @@ mod golden_haplotype {
         }
 
         let f = FetchedUnitigs {
+            index: 0,
             accession: "ERR2028820".into(),
             compressed_len: compressed.len(),
             compressed,
@@ -339,7 +415,7 @@ mod golden_haplotype {
         let subgraph = extract::write_gfa(&cfg, &graph, nodes, seqs).unwrap();
         let gaf = subgraph.gfa_path.with_extension("gaf");
         let gp = align::run(&cfg, &subgraph, &query, &gaf).unwrap().expect("a path");
-        let h = stitch(&cfg, &gp, &subgraph, &query).unwrap().expect("a haplotype");
+        let h = stitch(&cfg, &graph, &gp, &subgraph, &query).unwrap().expect("a haplotype");
 
         let sha: String = Sha256::digest(&h.seq)
             .iter()

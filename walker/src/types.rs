@@ -37,9 +37,14 @@ pub struct Query {
     pub record_id: String,
     /// Uppercased sequence with all whitespace removed.
     pub seq: Vec<u8>,
-    /// Path on disk. GraphAligner is handed this directly (`-f`), so it must stay valid
-    /// for the life of the run.
+    /// Path on disk. For a single-record query GraphAligner is handed this directly (`-f`).
+    /// A multi-record file is NOT: `align::run` writes the selected record to its own file
+    /// first, because GraphAligner would otherwise align every record and the best-scoring
+    /// row across all of them would win.
     pub path: PathBuf,
+    /// Records present in `path`. Only the first is used; more than one is a warning at
+    /// read time and changes how `align` invokes GraphAligner.
+    pub n_records: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +60,9 @@ pub struct Query {
 /// Everything the rest of the pipeline needs (adjacency, abundance, sequences) is extracted
 /// during that single pass, so this buffer can be dropped as soon as `parse::build` returns.
 pub struct FetchedUnitigs {
+    /// Position of this accession in the input list. Carried the whole way through so the
+    /// collector can restore input order; see `AccessionResult::index`.
+    pub index: usize,
     pub accession: Accession,
     pub compressed: Vec<u8>,
     pub compressed_len: usize,
@@ -243,9 +251,27 @@ pub struct Haplotype {
     pub seq: Vec<u8>,
     /// Fraction of the reference covered.
     pub cov: f64,
+    /// Identity of the GraphAligner alignment that produced this path: `num_matches /
+    /// aln_len` from the GAF.
+    ///
+    /// When `pident_inherited` is set it describes a DIFFERENT sequence: the route as
+    /// aligned, before this haplotype's path was spliced. See that field.
     pub pident: f64,
+    /// True when `pident` was carried over from the alignment of another path rather than
+    /// measured on this one.
+    ///
+    /// A spliced path (an alternative allele, or the primary after `prefer_majority` moves
+    /// it onto the more abundant allele) has no GAF of its own. `variants::copy_coords`
+    /// carries the original's `num_matches`/`aln_len` forward so the coordinates stay usable,
+    /// but the resulting identity is the pre-splice one. Measuring it properly would need an
+    /// alignment per haplotype, so it is labelled rather than recomputed: publishing it as a
+    /// plain `pident=` claimed a number about the wrong sequence.
+    pub pident_inherited: bool,
     pub nodes: usize,
     /// Mean k-mer coverage (`ka:f`) across the unitig path.
+    ///
+    /// Arithmetic mean over path steps, unweighted by unitig length. For the robust statistic
+    /// used to decide prune floors, see `stages::extract::path_depth`, which is a median.
     pub mean_ka: f64,
     /// Variant allele frequency at the defining fork (1.0 if primary backbone).
     pub vaf: f64,
@@ -346,6 +372,14 @@ pub struct Timing {
 
 /// Everything one accession produced. This is what crosses back to the collector.
 pub struct AccessionResult {
+    /// Position of this accession in the input list, 0-based.
+    ///
+    /// Results come back in *completion* order, which is decided by S3 and by how long each
+    /// graph takes, so without this every output file was ordered differently run to run and
+    /// `reconstructed.fasta` was not byte-reproducible. That also silently chose which
+    /// haplotype `--sieve` keeps, since the sieve promotes the first record it sees.
+    /// `pipeline::run` sorts on this before returning.
+    pub index: usize,
     pub accession: Accession,
     pub outcome: Outcome,
     pub n_unitigs: usize,
@@ -364,8 +398,11 @@ pub struct AccessionResult {
 }
 
 impl AccessionResult {
-    pub fn failed(accession: Accession, error: String) -> Self {
+    /// `index` is the accession's position in the input list. It must survive every failure
+    /// path, or a run where some accessions failed would come back partly ordered.
+    pub fn failed(index: usize, accession: Accession, error: String) -> Self {
         Self {
+            index,
             accession,
             outcome: Outcome::Failed,
             n_unitigs: 0,
