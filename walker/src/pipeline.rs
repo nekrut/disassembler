@@ -472,11 +472,9 @@ fn run_one(
             //
             // Three outcomes, and the old code collapsed two of them. It tested
             // `dropped == 0 || kept_nodes.is_empty()` and, in the second case, assigned the
-            // EMPTY vectors back while logging "nothing to remove". An accession whose gene
-            // sits entirely below `min_abund` then kept its pass-1 primary but lost its whole
-            // search space: `variants::view` returns None and `find_alts` returns early, so no
-            // majority correction, no alts, no VCF rows and no SNV rows, under a line asserting
-            // nothing had been pruned.
+            // EMPTY vectors back while logging "nothing to remove". Splitting the empty case
+            // out keeps the unpruned subgraph in that branch, which is the same "never a
+            // regression" rule the failed-realign path applies.
             //
             // Predicate must match `prune_nodes` exactly.
             let surviving = subgraph

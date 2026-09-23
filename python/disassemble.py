@@ -165,11 +165,18 @@ def main() -> None:
               "reconstructed.sieved.fasta.", file=sys.stderr)
 
     if not args.skip_tree:
-        # Spellings must match build_walker_codon_msa.find_bin, or this blocks a run the
-        # MSA step would have accepted. bioconda ships FastTree under either name.
+        # Spellings and search order must match build_walker_codon_msa.find_bin, or this blocks
+        # a run the MSA step would have accepted. bioconda ships FastTree under either name,
+        # and find_bin falls back to $MAMBA_ROOT_PREFIX/envs/codon/bin when the tool is not on
+        # PATH; skipping that fallback here would fail preflight on a machine where mafft and
+        # fasttree live only in the codon env.
+        codon_env_bin = Path(os.environ.get("MAMBA_ROOT_PREFIX",
+                                            str(Path.home() / "micromamba"))) / "envs" / "codon" / "bin"
         for names, why in ((("mafft",), "the codon MSA"), (("fasttree", "FastTree"), "the ML tree")):
-            if not any(shutil.which(n) for n in names):
-                die(f"{names[0]} not on PATH (needed for {why}). "
+            on_path = any(shutil.which(n) for n in names)
+            in_codon_env = any(os.access(codon_env_bin / n, os.X_OK) for n in names)
+            if not (on_path or in_codon_env):
+                die(f"{names[0]} not on PATH or in {codon_env_bin} (needed for {why}). "
                     f"Activate the `disassembler` env, or --skip-tree.")
 
     sieve_bin = args.sieve_bin

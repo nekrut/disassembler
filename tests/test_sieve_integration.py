@@ -38,15 +38,22 @@ def check(cond, msg):
 
 def ensure_sieve():
     if SIEVE_BIN.exists():
-        return True
+        return "ok"
+    if not (SIEVE_BIN.parent / "Makefile").is_file():
+        return "no-submodule"
     print("[integration] building sieve (make serial)...")
-    r = subprocess.run(["make", "serial"], cwd=SIEVE_BIN.parent, capture_output=True, text=True)
-    return SIEVE_BIN.exists()
+    subprocess.run(["make", "serial"], cwd=SIEVE_BIN.parent, capture_output=True, text=True)
+    return "ok" if SIEVE_BIN.exists() else "no-compiler"
 
 
 def main():
-    if not ensure_sieve():
-        print("SKIP: sieve binary unavailable (no C compiler?) -- not a failure")
+    state = ensure_sieve()
+    if state == "no-submodule":
+        print(f"SKIP: extern/kmer-diversity-sieve is empty (run `git submodule update --init "
+              f"{SIEVE_BIN.parent.relative_to(REPO)}`) -- not a failure")
+        return 0
+    if state == "no-compiler":
+        print("SKIP: sieve binary failed to build (no C compiler?) -- not a failure")
         return 0
     if not FIXTURE.is_file() or not QUERY.is_file():
         print("SKIP: fixtures missing")

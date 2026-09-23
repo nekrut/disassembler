@@ -172,7 +172,13 @@ pub fn run(
             }
             return Ok(None);
         }
-        Err(e) => return Err(Error::Io(e)),
+        Err(e) => {
+            let _ = std::fs::remove_file(gaf_out);
+            if let Some(p) = &single_record_fa {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err(Error::Io(e));
+        }
     };
     if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
         let _ = std::fs::remove_file(gaf_out);
