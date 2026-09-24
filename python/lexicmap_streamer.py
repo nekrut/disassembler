@@ -6,9 +6,13 @@ a local TSV file, or standard input (stdin).
 
 Core capabilities:
   1. Multi-HSP coordinate tiling:
-     Solves the Logan cDBG unitig-split challenge by grouping HSPs by SRA accession
+     Solves the Logan contig-shattering problem by grouping HSPs by SRA accession
      (`sgenome`), projecting alignment blocks onto the reference CDS coordinate system,
-     and resolving overlapping positions by highest percent identity.
+     and resolving overlapping positions by highest percent identity. LexicMap is indexed
+     on Logan's *contigs* (`s3://logan-pub/c/`), not its unitig graph. On a diverse sample
+     the assembler shatters the gene at every bubble it cannot cleanly pop -- on Zika NS5
+     the gene tiles across ~50 short contigs, longest under 100 nt -- so LexicMap emits
+     one HSP per surviving contig. See docs/contigs_vs_unitigs.md.
   2. Reading-frame codon QC & Stop-codon screening:
      Translates in-frame CDS (NCBI Code 11 or Standard), detects premature internal stop
      codons (e.g. Sanger am3 amber mutants, sequencing errors, or out-of-frame projections),
