@@ -28,10 +28,21 @@ Examples:
   # Re-cut cohorts from a harvest already on disk, without contacting Galaxy
   python/harvest_kmindex.py --stratify-only -o candidates/ --diversity 500
 
+  # Sample fixed counts from arbitrary score bins (e.g. 10 accessions each from three low
+  # non-zero coverage bins), for walker calibration or histogram-driven experiments
+  python/harvest_kmindex.py --stratify-only -o candidates/ \
+      --bin 0.0:0.05:10 --bin 0.05:0.10:10 --bin 0.10:0.15:10
+
 Size --diversity to the harvest: it caps each target, so a harvest smaller than N comes back
 whole and stratification only reorders it. On a real six-target, 8,817-accession panel,
 --diversity 2500 capped exactly one target and ran 77% of everything; the low hundreds are where
 it starts subsetting. See the README for the measured table.
+
+--diversity and --bin are the two cohort-cutting modes and are mutually exclusive. --diversity
+imposes the fixed 20/30/30/20 quotas over the four containment brackets, with backfill;
+--bin lets the caller specify arbitrary [LO, HI) ranges and per-range counts with no backfill,
+so a bin whose harvest has fewer than N candidates contributes what it has. --bin only
+considers nonzero-score accessions.
 """
 
 import os
@@ -374,6 +385,121 @@ def stratify_diversity(out_dir, total_target=2500):
     summary_file.write_text(json.dumps(all_summaries, indent=2))
     print(f"[✓] Diversity summary saved: {summary_file}")
 
+
+def parse_bin_spec(s):
+    """Parse `LO:HI:N` into `(lo, hi, n)`. Raises ValueError with the offending spec on failure.
+
+    Half-open `[lo, hi)` intervals match the existing bracket convention (`>= 0.99`, `< 0.99`).
+    N is the count requested for the bin; N == 0 is legal and useful for "reserve a bin
+    boundary but do not sample from it this run".
+    """
+    parts = s.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"--bin '{s}' must be LO:HI:N (three colon-separated fields)")
+    try:
+        lo, hi, n = float(parts[0]), float(parts[1]), int(parts[2])
+    except ValueError as e:
+        raise ValueError(f"--bin '{s}': could not parse as LO:HI:N ({e})")
+    if not (lo < hi):
+        raise ValueError(f"--bin '{s}': LO ({lo}) must be strictly less than HI ({hi})")
+    if n < 0:
+        raise ValueError(f"--bin '{s}': N ({n}) must be non-negative")
+    return (lo, hi, n)
+
+
+def assert_bins_disjoint(bins):
+    """Raise ValueError if any two half-open bins overlap. Pass --allow-overlap to skip.
+
+    Sorted-neighbours is enough because [a,b) and [c,d) with c < d overlap iff
+    c < b when sorted by lo.
+    """
+    ordered = sorted(bins, key=lambda b: b[0])
+    for (a_lo, a_hi, _), (b_lo, b_hi, _) in zip(ordered, ordered[1:]):
+        if b_lo < a_hi:
+            raise ValueError(
+                f"--bin ranges overlap: [{a_lo}, {a_hi}) and [{b_lo}, {b_hi}). "
+                f"Pass --allow-overlap if that is intentional; the same accession will "
+                f"then be able to appear in more than one bin's sample."
+            )
+
+
+def sample_bins_from_scores(scores, bins):
+    """Sample per bin. Zero-score accessions are excluded up front.
+
+    Returns `(picks, per_bin)` where `picks` is a merged list `(acc, score)` sorted by
+    descending score, and `per_bin` is one dict per bin with counts and selections.
+
+    No backfill: a bin with fewer than N candidates contributes what it has. This is the
+    difference from `stratify_diversity`; here the caller is asking for a specific
+    per-bin count, so quietly reshuffling would defeat the point.
+    """
+    nonzero = {a: s for a, s in scores.items() if s > 0.0}
+    picks = []
+    per_bin = []
+    for lo, hi, n in bins:
+        in_range = sorted(
+            ((a, s) for a, s in nonzero.items() if lo <= s < hi),
+            key=lambda x: -x[1],
+        )
+        selected = stratified_sample(in_range, n)
+        per_bin.append({
+            "lo": lo,
+            "hi": hi,
+            "requested": n,
+            "available": len(in_range),
+            "selected": len(selected),
+            "accessions": [{"acc": a, "score": s} for a, s in selected],
+        })
+        picks.extend(selected)
+    picks.sort(key=lambda x: -x[1])
+    return picks, per_bin
+
+
+def stratify_bins(out_dir, bins):
+    """Per-target bin stratification. Emits `<target>.bins.txt` and `<target>.bins.json`
+    per target and a combined `bins_summary.json`.
+    """
+    print("\n" + "=" * 80)
+    ranges = ", ".join(f"[{lo}, {hi})x{n}" for lo, hi, n in bins)
+    print(f" Bin stratification (nonzero scores only): {ranges}")
+    print("=" * 80)
+
+    score_files = sorted(out_dir.glob("*.scores.json"))
+    if not score_files:
+        print(f"[!] No *.scores.json files found in {out_dir}.")
+        return
+
+    all_summaries = {}
+    for sf in score_files:
+        target = sf.stem.replace(".scores", "")
+        with open(sf, "r") as f:
+            scores = json.load(f)
+
+        picks, per_bin = sample_bins_from_scores(scores, bins)
+
+        out_txt = out_dir / f"{target}.bins.txt"
+        out_json = out_dir / f"{target}.bins.json"
+        out_txt.write_text(("\n".join(x[0] for x in picks) + "\n") if picks else "")
+        out_json.write_text(json.dumps({
+            "target": target,
+            "n_available_nonzero": sum(1 for s in scores.values() if s > 0.0),
+            "n_total_input": len(scores),
+            "total_selected": len(picks),
+            "bins": per_bin,
+        }, indent=2))
+
+        bin_str = ", ".join(
+            f"[{b['lo']}, {b['hi']}): {b['selected']}/{b['requested']}" for b in per_bin
+        )
+        print(f"  [✓] Target {target:12}: {len(picks):5d} selected | {bin_str}")
+        all_summaries[target] = {"total_selected": len(picks), "bins": per_bin,
+                                 "n_available_nonzero": sum(1 for s in scores.values() if s > 0.0)}
+
+    summary_file = out_dir / "bins_summary.json"
+    summary_file.write_text(json.dumps(all_summaries, indent=2))
+    print(f"[✓] Bins summary saved: {summary_file}")
+
+
 def main():
     p = argparse.ArgumentParser(description="Harvest Galaxy kmindex planetary shard collections into candidate cohorts.")
     p.add_argument("--history-id", help="Galaxy history ID containing the collection")
@@ -386,9 +512,31 @@ def main():
                    help="Cut a cohort of N accessions PER TARGET, sampled across four containment "
                         "brackets (canonical >=0.99, high 0.80-0.99, moderate 0.50-0.80, divergent "
                         "below). N caps each target, so a smaller harvest is returned whole. Omit "
-                        "to keep every accession.")
+                        "to keep every accession. Mutually exclusive with --bin.")
+    p.add_argument("--bin", action="append", dest="bins", metavar="LO:HI:N",
+                   help="Sample N accessions with score in [LO, HI). Only nonzero-score "
+                        "accessions are considered. Repeatable: pass one --bin per range, e.g. "
+                        "--bin 0.0:0.05:10 --bin 0.05:0.10:10. Bins are strict: a bin with fewer "
+                        "than N candidates contributes what it has and no other bin backfills it. "
+                        "Mutually exclusive with --diversity.")
+    p.add_argument("--allow-overlap", action="store_true",
+                   help="Allow --bin ranges to overlap. Off by default because overlapping bins "
+                        "usually mean a typo in the boundaries; on, the same accession can appear "
+                        "in more than one bin's sample.")
     p.add_argument("--stratify-only", action="store_true", help="Skip Galaxy download; stratify existing *.scores.json")
     args = p.parse_args()
+
+    if args.diversity and args.bins:
+        p.error("--diversity and --bin are mutually exclusive; pick one.")
+
+    parsed_bins = None
+    if args.bins:
+        try:
+            parsed_bins = [parse_bin_spec(b) for b in args.bins]
+            if not args.allow_overlap:
+                assert_bins_disjoint(parsed_bins)
+        except ValueError as e:
+            p.error(str(e))
 
     out_dir = Path(args.out_dir)
 
@@ -400,6 +548,8 @@ def main():
 
     if args.diversity:
         stratify_diversity(out_dir, total_target=args.diversity)
+    if parsed_bins is not None:
+        stratify_bins(out_dir, parsed_bins)
 
 if __name__ == "__main__":
     main()

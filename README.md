@@ -9,7 +9,7 @@ Planetary-scale sequence extraction, de novo graph path-walking, and streaming m
 `disassembler` provides two primary, complementary engines:
 
 1. **`logan-walker`** (Native Rust graph path-walker) — Streams unitig cDBGs from S3, anchors a reference coding sequence by canonical $k$-mer containment, extracts the local subgraph, walks paths with GraphAligner, and reconstructs full-length coding haplotypes, intra-host alternative alleles, and biallelic SNVs (`--emit-vcf`, `--emit-snv-table`) without collapsing intra-host variation or suffering reference-bias loss.
-2. **`LexicMapStreamer`** (`python/lexicmap_streamer.py`) — Streams planetary tabular search outputs from [LexicMap](https://github.com/IndexThePlanet/LexicMap) over the Galaxy HTTP API, local TSV, or STDIN. Resolves Logan unitig fragmentation by collinear multi-HSP coordinate tiling on the reference CDS, enforces reading-frame codon QC (screening premature stop codons like Sanger $am3$ amber mutants), partitions accessions into a 4-tier Clean and Flagged cohort ledger, and collapses full-length clean sequences into unique haplotypes online with mutation calling and Shannon entropy.
+2. **`LexicMapStreamer`** (`python/lexicmap_streamer.py`) — Streams planetary tabular search outputs from [LexicMap](https://github.com/IndexThePlanet/LexicMap) over the Galaxy HTTP API, local TSV, or STDIN. Resolves Logan contig shattering (LexicMap indexes Logan's contigs, and on internally diverse samples the assembler splits the gene across many short contigs, see [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md)) by collinear multi-HSP coordinate tiling on the reference CDS, enforces reading-frame codon QC (screening premature stop codons like Sanger $am3$ amber mutants), partitions accessions into a 4-tier Clean and Flagged cohort ledger, and collapses full-length clean sequences into unique haplotypes online with mutation calling and Shannon entropy.
 
 This repository is a decoupled extraction of the path-walking and sequence assembly components from
 [`nekrut/logan-hypyaeon`](https://github.com/nekrut/logan-hypyaeon). It carries only the
@@ -261,21 +261,53 @@ Stratification samples by containment score, which is unrelated to file size, so
 N varies a lot run to run. The knob that targets the bytes is the walker's `--max-size-mb`, which
 rejects on `Content-Length` before transferring anything.
 
+#### Custom score bins: `--bin LO:HI:N`
+
+`--diversity` bakes in four containment brackets and a 20/30/30/20 split. For walker calibration
+experiments or histogram-driven cohorts (e.g. "give me 10 accessions each from three low
+non-zero-coverage bins"), pass one or more `--bin LO:HI:N` instead. Each bin selects up to N
+accessions with score in the half-open interval `[LO, HI)`, sampled evenly across the sorted
+range using the same helper `--diversity` uses.
+
+```bash
+# 30 accessions total: 10 each from three low-coverage bins
+python/harvest_kmindex.py --stratify-only -o candidates/ \
+    --bin 0.0:0.05:10 --bin 0.05:0.10:10 --bin 0.10:0.15:10
+```
+
+Semantics:
+
+- **Nonzero scores only.** Zero-score accessions are excluded up front, so `--bin 0.0:0.05:10`
+  means "10 from the [1e-9, 0.05) range." Same behavior for every bin.
+- **No backfill.** A bin with fewer than N candidates contributes what it has and no other bin
+  is topped up above its own N. This is the difference from `--diversity`, which reshuffles to
+  hit the requested cohort size; `--bin` treats each range as an independent request the caller
+  cares about individually.
+- **Half-open `[LO, HI)`.** Same convention as the `--diversity` brackets (`>= 0.99`, `< 0.99`),
+  so bins can touch at boundaries without double-counting.
+- **Overlapping bins are an error** unless `--allow-overlap` is passed; the same accession would
+  otherwise land in more than one bin's sample, which is almost always a typo in the boundaries.
+- **Mutually exclusive with `--diversity`.** Pick one cohort-cutting mode per run.
+
+Outputs, per target: `<target>.bins.txt` (merged accession list, sorted by descending score),
+`<target>.bins.json` (per-bin `requested`, `available`, `selected` counts and the accession
+lists), and a combined `bins_summary.json`. Feeds straight into `disassemble.py -l <target>.bins.txt`.
+
 ## LexicMapStreamer: Streaming Multi-HSP Assembly & Cohort Partitioning
 
 `python/lexicmap_streamer.py` provides streaming multi-HSP coordinate tiling, reading-frame codon QC, 4-tier cohort stratification, and online haplotype collapsing for planetary search results from [LexicMap](https://github.com/IndexThePlanet/LexicMap).
 
 ### The Multi-HSP Unitig-Split Challenge
 
-In Logan unitig collections, sequence diversity, coverage fluctuations, and de Bruijn graph branchings frequently break a coding gene across multiple collinear unitigs. In standard LexicMap tabular outputs, each unitig is reported as an individual high-scoring pair (HSP) with its own `hsp`, `qcovHSP`, `alenHSP`, `qstart`, `qend`, and `pident`:
+LexicMap is indexed on Logan's **contigs** (`s3://logan-pub/c/`), not on the unitig graph the walker uses. On internally diverse samples the assembler shatters a coding gene at every bubble it cannot cleanly pop, so the gene ends up spread across many short contigs; on Zika NS5 the gene tiles across ~50 contig fragments, longest under 100 nt (see [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md)). LexicMap reports each surviving contig as its own high-scoring pair (HSP) with its own `hsp`, `qcovHSP`, `alenHSP`, `qstart`, `qend`, and `pident`:
 
-- A gene split across two unitigs (e.g. 55% coverage on unitig 1 and 45% on unitig 2) fails naive single-row filters (like `qcovHSP >= 80%`).
+- A gene split across two contigs (e.g. 55% coverage on contig 1 and 45% on contig 2) fails naive single-row filters (like `qcovHSP >= 80%`).
 - Filtering by row coverage discards complete biological sequences or produces fragmented assemblies.
 
 ### How LexicMapStreamer Works
 
 1. **Collinear Multi-HSP Coordinate Tiling:**
-   Groups search rows on the fly by SRA accession (`sgenome`). For each accession, projects all qualifying HSPs onto the reference coordinate system (`qstart` to `qend`). Overlapping positions between HSPs are resolved by selecting the base from the HSP with the higher percent identity (`pident`), seamlessly stitching split unitigs into full-length sequences without introducing spurious indels.
+   Groups search rows on the fly by SRA accession (`sgenome`). For each accession, projects all qualifying HSPs onto the reference coordinate system (`qstart` to `qend`). Overlapping positions between HSPs are resolved by selecting the base from the HSP with the higher percent identity (`pident`), seamlessly stitching split contigs into full-length sequences without introducing spurious indels.
 2. **Reading-Frame Codon QC & Stop-Codon Screening:**
    Translates CDS in-frame using Genetic Code Table 11 (bacterial/standard). Scans the coding body (excluding the natural terminal stop codon) for internal premature stop codons (e.g. amber mutants like Sanger $\Phi$X174 $am3$ dual-coding $gpE\text{ }W7^*$, sequencing errors, or out-of-frame indels).
 3. **Four-Tier Cohort Partitioning:**
