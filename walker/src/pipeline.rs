@@ -136,6 +136,67 @@ fn prune_outcome(surviving: usize, before: usize) -> PruneOutcome {
     }
 }
 
+/// --fetch-only variant: download every accession into the unitigs cache, no compute stage.
+///
+/// Returns `(ok, fail)`. Uses only the fetch pool; the compute pool is not spawned. Each
+/// fetch's success side is a no-op beyond writing the cache entry (which `Fetcher::fetch`
+/// already does), and each failure is reported inline. Bounded parallelism is
+/// `cfg.fetch_workers`.
+///
+/// Requires `cfg.unitigs_cache` — validated by the caller (main.rs).
+pub fn run_fetch_only(
+    cfg: &Config,
+    accessions: Vec<Accession>,
+) -> Result<(usize, usize)> {
+    let total = accessions.len();
+    let work: SharedReceiver<(usize, Accession)> = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, a) in accessions.into_iter().enumerate() {
+            let _ = tx.send((i, a));
+        }
+        Arc::new(Mutex::new(rx))
+    };
+
+    let fetcher = stages::stream::Fetcher::new(cfg);
+    let fetcher = &fetcher;
+    let done = Arc::new(Mutex::new((0usize, 0usize))); // (ok, fail)
+
+    std::thread::scope(|scope| {
+        for _ in 0..cfg.fetch_workers {
+            let work = Arc::clone(&work);
+            let done = Arc::clone(&done);
+            scope.spawn(move || loop {
+                let (index, accession) = match work.lock().unwrap().recv() {
+                    Ok(a) => a,
+                    Err(_) => break,
+                };
+                let t = Instant::now();
+                match fetcher.fetch(index, &accession) {
+                    Ok(f) => {
+                        let mut d = done.lock().unwrap();
+                        d.0 += 1;
+                        let progress = d.0 + d.1;
+                        println!(
+                            "[{progress}/{total}] {accession}: cached ({} bytes in {:.1}s)",
+                            f.compressed_len,
+                            t.elapsed().as_secs_f64()
+                        );
+                    }
+                    Err(e) => {
+                        let mut d = done.lock().unwrap();
+                        d.1 += 1;
+                        let progress = d.0 + d.1;
+                        eprintln!("[{progress}/{total}] {accession}: FETCH FAILED: {e}");
+                    }
+                }
+            });
+        }
+    });
+
+    let (ok, fail) = *done.lock().unwrap();
+    Ok((ok, fail))
+}
+
 /// Fan accessions through the two pools and collect results.
 pub fn run(cfg: &Config, accessions: Vec<Accession>, query: &Query) -> Result<Summary> {
     let total = accessions.len();

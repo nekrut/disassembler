@@ -12,7 +12,7 @@ channels:
 dependencies:
   # Graph alignment: the walker shells out to `GraphAligner -x dbg`.
   - graphaligner=1.0.20
-  # Codon MSA + phylogeny (python/build_walker_codon_msa.py).
+  # Codon MSA + phylogeny (`disassembler msa`).
   - mafft=7.526
   - fasttree=2.2.0
   # BLAST: the Rust walker does not use it (in-memory k-mer anchoring replaced it). Kept for
@@ -27,3 +27,7 @@ dependencies:
   - numpy
   - pandas
   - matplotlib
+  - pip
+  # Install the `disassembler` console script and package from this checkout.
+  - pip:
+      - -e .

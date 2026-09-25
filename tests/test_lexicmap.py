@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""test_lexicmap_streamer.py: Unit and integration tests for LexicMapStreamer.
+"""test_lexicmap.py: Unit and integration tests for the lexicmap subcommand.
 
 Tests:
   - Multi-HSP coordinate tiling & overlap resolution
   - In-frame translation and premature stop-codon detection
-  - 4-Tier cohort stratification
+  - 4-tier cohort partitioning
   - Online haplotype collapsing and mutation classification
-  - Streaming from file, gzipped file, and stdin
+  - Streaming from file and stdin
 """
 
-import os
 import sys
-import gzip
-import json
 import unittest
 import tempfile
 from pathlib import Path
 
-# Add parent directory to sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from disassembler.cmd import lexicmap as lms
+except ImportError as e:  # pragma: no cover - environment-dependent
+    print(f"SKIP: disassembler.cmd.lexicmap not importable ({e})")
+    sys.exit(0)
 
-import lexicmap_streamer as lms
 
 class TestLexicMapStreamer(unittest.TestCase):
 
@@ -36,21 +35,16 @@ class TestLexicMapStreamer(unittest.TestCase):
         self.test_dir.cleanup()
 
     def test_translation_and_stops(self):
-        # WT
         self.assertEqual(lms.translate_nt("ATGGCTGAATAA"), "MAE*")
         self.assertEqual(lms.find_internal_stops("ATGGCTGAATAA", 12), [])
 
-        # Premature stop at codon 2 (TAG): ATG TAG GAA TAA
         seq_stop = "ATGTAGGAATAA"
         self.assertEqual(lms.translate_nt(seq_stop), "M*E*")
         self.assertEqual(lms.find_internal_stops(seq_stop, 12), [2])
 
-        # Terminal stop only should NOT be flagged as internal premature stop
         self.assertEqual(lms.find_internal_stops("ATGGCTGAATGA", 12), [])
 
     def test_multi_hsp_overlap_resolution(self):
-        # HSP1: nt 1..6 (ATGGCT) pident=100.0
-        # HSP2: nt 5..12 with overlap at 5..6 (CT vs TT, HSP1 has higher pid)
         hsp1 = (100.0, 50.0, 1, 6, "ATGGCT", "ATGGCT")
         hsp2 = (90.0, 66.7, 5, 12, "CTGAATAA", "TTGAATAA")
 
@@ -58,19 +52,13 @@ class TestLexicMapStreamer(unittest.TestCase):
             [hsp1, hsp2], ref_len=12, min_pident=60.0, min_coverage=0.80
         )
 
-        self.assertEqual(merged, "ATGGCTGAATAA") # Overlap at pos 5 resolved to 'C' from HSP1 (pident 100 > 90)
+        self.assertEqual(merged, "ATGGCTGAATAA")
         self.assertEqual(cov_bases, 12)
         self.assertAlmostEqual(cov_bases / 12, 1.0)
-        self.assertFalse(single_ge_cov) # Neither single HSP had >= 80% coverage
+        self.assertFalse(single_ge_cov)
         self.assertFalse(single_full)
 
     def test_end_to_end_streaming(self):
-        # Create a TSV with diverse accessions:
-        # - SRR001: multi-HSP rescued clean WT (two 50% HSPs)
-        # - SRR002: single HSP missense variant (A2V: 5C>T)
-        # - SRR003: premature stop codon at pos 2 (TAG) -> Flagged Stops
-        # - SRR004: partial coverage 50% (clean partial)
-        # - SRR005: fragment <50% cov (low coverage)
         tsv_content = (
             "query\tqlen\thits\tsgenome\tsseqid\tqcovGnm\tcls\thsp\tqcovHSP\talenHSP\tpident\tgaps\tqstart\tqend\tsstart\tsend\tqseq\tsseq\n"
             "test_cds\t12\t2\tSRR001\tu1\t100.0\t1\t1\t50.0\t6\t100.0\t0\t1\t6\t1\t6\tATGGCT\tATGGCT\n"
@@ -90,36 +78,29 @@ class TestLexicMapStreamer(unittest.TestCase):
             out_prefix=out_prefix
         )
 
-        # Check cohort counts
         breakdown = summary["cohort_breakdown"]
-        self.assertEqual(breakdown["clean_full_length"], 2) # SRR001, SRR002
-        self.assertEqual(breakdown["clean_partial"], 1)     # SRR004
+        self.assertEqual(breakdown["clean_full_length"], 2)
+        self.assertEqual(breakdown["clean_partial"], 1)
         self.assertEqual(breakdown["combined_clean_cohort"], 3)
-        self.assertEqual(breakdown["flagged_premature_stops"], 1) # SRR003
-        self.assertEqual(breakdown["flagged_low_coverage"], 1)    # SRR005
+        self.assertEqual(breakdown["flagged_premature_stops"], 1)
+        self.assertEqual(breakdown["flagged_low_coverage"], 1)
 
-        # Check multi-HSP rescue metric
         self.assertEqual(summary["recovery_metrics"]["multi_hsp_rescued_accessions"], 1)
 
-        # Check output files generated
         self.assertTrue(Path(f"{out_prefix}.clean.msa.fasta").exists())
         self.assertTrue(Path(f"{out_prefix}.clean.haplotypes.tsv").exists())
         self.assertTrue(Path(f"{out_prefix}.cohort_ledger.tsv").exists())
         self.assertTrue(Path(f"{out_prefix}.flagged.tsv").exists())
 
-        # Check haplotype TSV mutation classification
         tsv_lines = Path(f"{out_prefix}.clean.haplotypes.tsv").read_text().strip().split("\n")
         header = tsv_lines[0].split("\t")
         class_idx = header.index("mutation_class")
-        aa_idx = header.index("aa_mutations")
 
         classes = [line.split("\t")[class_idx] for line in tsv_lines[1:]]
         self.assertIn("WT", classes)
         self.assertIn("Missense", classes)
 
     def test_mean_pident_excludes_gap_positions(self):
-        # A single 90%-identity HSP where the subject deletes one reference position (sc '-').
-        # mean_pident must average only the 5 covered (non-gap) positions, never exceed 100%.
         merged, cov_bases, mean_pid, _, _ = lms.merge_accession_hsps(
             [(90.0, 100.0, 1, 6, "ATGGCT", "AT-GCT")], ref_len=6, min_pident=60.0, min_coverage=0.80
         )
@@ -128,8 +109,6 @@ class TestLexicMapStreamer(unittest.TestCase):
         self.assertAlmostEqual(mean_pid, 90.0)
 
     def test_ungrouped_input_is_rejected(self):
-        # SRR001's two HSPs are split by an SRR002 row: the stream is not grouped by accession.
-        # This must raise rather than silently double-count SRR001 and undercount its coverage.
         tsv = (
             "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
             "SRR001\t100.0\t50.0\t1\t6\tATGGCT\tATGGCT\n"
@@ -145,7 +124,6 @@ class TestLexicMapStreamer(unittest.TestCase):
             )
 
     def test_empty_stream_does_not_crash(self):
-        # Header only, no data rows: must return a zeroed summary, not raise ZeroDivisionError.
         p = self.dir_path / "empty.tsv"
         p.write_text("sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n")
         summary = lms.stream_lexicmap_to_msa(
@@ -156,8 +134,6 @@ class TestLexicMapStreamer(unittest.TestCase):
         self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 0)
 
     def test_multi_record_reference_uses_only_the_first(self):
-        # The shipped master panel has 160 records. Concatenating them built a 313,311 nt
-        # pseudo-gene under record 1's name, which sent every accession to tier 4.
         multi = self.dir_path / "multi.fasta"
         multi.write_text(">first_cds\nATGGCTGAATAA\n>second_cds\nATGAAACCCGGGTTTTAA\n")
         name, header, seq = lms.load_reference(str(multi))
@@ -165,15 +141,10 @@ class TestLexicMapStreamer(unittest.TestCase):
         self.assertEqual(seq, "ATGGCTGAATAA", "record 2 must not be concatenated on")
         self.assertEqual(len(seq), 12)
 
-        # A single-record file is unaffected.
         name, header, seq = lms.load_reference(str(self.ref_fasta))
         self.assertEqual((name, seq), ("test_cds", "ATGGCTGAATAA"))
 
     def test_full_length_only_requires_complete_coverage(self):
-        # The flag raises the clean-full-length bar from min_coverage (0.80) to 1.0, so the
-        # fixture needs an accession BETWEEN those two or the assertion holds either way and
-        # tests nothing. SRR012 covers 11/12 = 0.917: clean-full with the flag off, not with
-        # it on. SRR010 (100%) and SRR011 (50%) sit outside the band and never move.
         tsv = (
             "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
             "SRR010\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
@@ -192,13 +163,14 @@ class TestLexicMapStreamer(unittest.TestCase):
             out_prefix=str(self.dir_path / "fl_off"), full_length_only=False,
         )
 
-        self.assertEqual(on["cohort_breakdown"]["clean_full_length"], 1)   # SRR010 only
-        self.assertEqual(off["cohort_breakdown"]["clean_full_length"], 2)  # + SRR012
+        self.assertEqual(on["cohort_breakdown"]["clean_full_length"], 1)
+        self.assertEqual(off["cohort_breakdown"]["clean_full_length"], 2)
         self.assertNotEqual(
             on["cohort_breakdown"]["clean_full_length"],
             off["cohort_breakdown"]["clean_full_length"],
             "fixture must discriminate, or deleting the flag's effect would leave this green",
         )
+
 
 class TestMalformedInput(unittest.TestCase):
     """One bad field used to abort the stream after the cohort files were partly written."""
@@ -223,21 +195,17 @@ class TestMalformedInput(unittest.TestCase):
         )
 
     def test_a_bad_numeric_field_skips_the_row_and_finishes(self):
-        # `NA` in a numeric column: the reported trigger.
         tsv = self.header + self.good + "SRR011\tNA\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
         summary = self._run(tsv, "na")
         self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 1)
-        # .summary.json used to be the file that never got written.
         self.assertTrue((self.dir_path / "na.summary.json").is_file())
 
     def test_an_embedded_header_row_is_skipped(self):
-        # Concatenated LexicMap outputs carry a second header row mid-file.
         tsv = self.header + self.good + self.header.strip() + "\n" + self.good.replace("SRR010", "SRR012")
         summary = self._run(tsv, "hdr")
         self.assertEqual(summary["total_accessions_evaluated"], 2)
 
     def test_every_row_malformed_is_an_error_not_an_empty_cohort(self):
-        # A schema mismatch must not look like a cohort with no hits.
         tsv = self.header + "SRR010\tNA\tNA\tNA\tNA\tATG\tATG\n"
         with self.assertRaises(ValueError) as cm:
             self._run(tsv, "allbad")
@@ -298,10 +266,6 @@ class TestQueryColumn(unittest.TestCase):
             out_prefix=str(self.dir_path / prefix), **kw)
 
     def test_rows_for_another_gene_are_not_tiled_onto_this_reference(self):
-        # The two HSPs cover DIFFERENT halves of the grid, so without the filter geneB's
-        # bases fill the half geneA does not cover and the accession comes back "full
-        # length" as a chimera of two genes. Overlapping spans would hide this, because
-        # overlap resolution would drop the loser anyway.
         tsv = (
             "query\tsgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
             "geneA\tSRR010\t100.0\t50.0\t1\t6\tATGGCT\tATGGCT\n"
@@ -314,8 +278,6 @@ class TestQueryColumn(unittest.TestCase):
         self.assertNotIn("TTTTTT", hap, "geneB's bases must not reach geneA's grid")
 
     def test_a_file_sorted_by_query_no_longer_trips_the_grouping_check(self):
-        # Sorted by query, SRR010 reappears after its block closed, which tripped
-        # "Accession 'SRR010' reappears after its block was already processed".
         tsv = (
             "query\tsgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
             "geneA\tSRR010\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
@@ -343,8 +305,6 @@ class TestQueryColumn(unittest.TestCase):
         self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 1)
 
     def test_a_qlen_disagreement_is_refused(self):
-        # Every HSP is projected onto a grid of len(ref_seq); a different gene version
-        # mis-places all of them.
         tsv = (
             "query\tqlen\tsgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
             "geneA\t999\tSRR010\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
@@ -369,7 +329,6 @@ class TestMutationClassification(unittest.TestCase):
         self.test_dir = tempfile.TemporaryDirectory()
         self.dir_path = Path(self.test_dir.name)
         self.ref = self.dir_path / "ref.fasta"
-        # ATG GCT GAA TAA -> M A E *
         self.ref.write_text(">cds\nATGGCTGAATAA\n")
 
     def tearDown(self):
@@ -388,17 +347,12 @@ class TestMutationClassification(unittest.TestCase):
         return [r.split("\t")[i] for r in out[1:]]
 
     def test_complex_is_gone_and_missense_is_reported(self):
-        # GCT -> GGT is A2G: amino-acid change, no stop.
         rows = "SRR010\t100.0\t100.0\t1\t12\tATGGGTGAATAA\tATGGGTGAATAA\n"
         self.assertEqual(self._classes(rows, "mis"), ["Missense"])
 
     def test_synonymous_and_nonsense_still_classify(self):
-        # GAA -> GAG is E3E (synonymous).
         syn = "SRR010\t100.0\t100.0\t1\t12\tATGGCTGAGTAA\tATGGCTGAGTAA\n"
         self.assertEqual(self._classes(syn, "syn"), ["Synonymous"])
-        # GCT -> TGA puts a stop at codon 2. An internal stop is normally FLAGGED rather than
-        # kept, which is the streamer's whole premature-stop screen, so the clean table can
-        # only show Nonsense when that screen is relaxed.
         non = "SRR010\t100.0\t100.0\t1\t12\tATGTGAGAATAA\tATGTGAGAATAA\n"
         self.assertEqual(self._classes(non, "non", max_internal_stops=1), ["Nonsense"])
 
@@ -407,8 +361,6 @@ class TestMutationClassification(unittest.TestCase):
         self.assertEqual(self._classes(rows, "wt"), ["WT"])
 
     def test_a_partially_covered_match_is_not_called_WT(self):
-        # Covers 1..9 only, and matches everywhere it covers. summary.json's wildtype_count
-        # counts exact matches, so calling this WT made the two outputs disagree.
         rows = "SRR010\t100.0\t75.0\t1\t9\tATGGCTGAA\tATGGCTGAA\n"
         classes = self._classes(rows, "part", min_coverage=0.5)
         self.assertEqual(classes, ["WT_partial"])

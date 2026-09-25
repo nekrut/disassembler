@@ -295,6 +295,28 @@ pub struct Config {
     pub scratch_dir: PathBuf,
     /// GraphAligner executable, resolved on PATH if not absolute.
     pub graphaligner_bin: String,
+
+    // ---- offline cache ----
+    /// On-disk read-through cache for compressed unitig payloads.
+    ///
+    /// When set, `Fetcher::fetch` looks for `<dir>/<ACC>.unitigs.fa.zst` before hitting S3.
+    /// A miss with `offline == false` falls through to the normal S3 fetch and writes the
+    /// downloaded bytes back to the cache atomically (tempfile + rename in the same dir).
+    ///
+    /// Files are byte-identical to the S3 payload, so `sha256sum` against the original object
+    /// verifies. Layout is flat: one file per accession, no manifest.
+    pub unitigs_cache: Option<PathBuf>,
+    /// Refuse the S3 fallback. Only meaningful with `unitigs_cache`.
+    ///
+    /// A cache miss becomes a hard error naming the missing accession, rather than a silent
+    /// download. Off by default; opt in for reproducibility runs or air-gapped hosts.
+    pub offline: bool,
+    /// Fetch every accession into the cache and exit before the compute stages run.
+    ///
+    /// Requires `unitigs_cache`. `pipeline::run_fetch_only` handles this shortcut; the compute
+    /// pool is not spawned, and the run's success criterion is "every requested accession is
+    /// now in the cache". This is what `disassembler fetch` wraps.
+    pub fetch_only: bool,
 }
 
 impl Config {
@@ -358,6 +380,9 @@ impl Default for Config {
             max_compressed_bytes: 1024 * 1024 * 1024,
             scratch_dir: PathBuf::from("/dev/shm/logan-walker"),
             graphaligner_bin: String::from("GraphAligner"),
+            unitigs_cache: None,
+            offline: false,
+            fetch_only: false,
         }
     }
 }

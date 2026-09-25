@@ -1,39 +1,35 @@
 #!/usr/bin/env python3
-"""test_sieve_integration.py -- exercise disassemble.py's --sieve wiring end to end.
+"""test_sieve_integration.py -- exercise `disassembler reconstruct --sieve` end to end.
 
 The bash test (test_sieve.sh) covers the sieve BINARY. This covers the Python SEAM
-that test could not: it stubs stage 1 (the walker, which needs GraphAligner + S3 and
-so cannot run on every host) with a trivial script that just drops a known
-`reconstructed.fasta` into the out-dir, then runs the real disassemble.py with
---sieve --skip-tree... except --skip-tree now skips the sieve by design. So instead
-we stub BOTH ends: a fake walker for stage 1 and a fake codon-MSA/tree for stage 2,
-and assert disassemble.py sieved the reconstructions and handed the SIEVED file to
-stage 2.
+that test can not: it stubs stage 1 (the walker, which needs GraphAligner + S3 and
+so can not run on every host) with a fake `--walker-bin`, and it stubs stage 2
+(codon MSA + FastTree) by monkey-patching `disassembler.cmd.msa.run`. Then it runs
+`pipe_reconstruct.run(...)` in-process and asserts:
 
-Dependency-free: standard library only. Skips cleanly if the sieve binary can't build.
+  - the sieve stage ran on the walker's reconstructed.fasta,
+  - stage 2 received the SIEVED file (not the raw one),
+  - the `--sieve-sketch` flag reaches the sieve binary CLI (a regression that
+    would let the flag look-like-it-works while the binary ran at its default of 64,
+    which is precisely the failure mode the gene-scale calibration doc characterises).
+
+Skips cleanly if the sieve binary or its submodule are absent.
 """
+import contextlib
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
+import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-DISASSEMBLE = REPO / "python" / "disassemble.py"
 SIEVE_BIN = REPO / "extern" / "kmer-diversity-sieve" / "l1_pipeline_serial"
 FIXTURE = Path(__file__).resolve().parent / "fixture_reconstructed.fasta"
 QUERY = Path(__file__).resolve().parent / "fixture_query.fasta"
-
-FAILURES = []
-
-
-def check(cond, msg):
-    if cond:
-        print(f"  PASS: {msg}")
-    else:
-        print(f"  FAIL: {msg}")
-        FAILURES.append(msg)
 
 
 def ensure_sieve():
@@ -46,154 +42,148 @@ def ensure_sieve():
     return "ok" if SIEVE_BIN.exists() else "no-compiler"
 
 
-def main():
-    state = ensure_sieve()
-    if state == "no-submodule":
-        print(f"SKIP: extern/kmer-diversity-sieve is empty (run `git submodule update --init "
-              f"{SIEVE_BIN.parent.relative_to(REPO)}`) -- not a failure")
-        return 0
-    if state == "no-compiler":
-        print("SKIP: sieve binary failed to build (no C compiler?) -- not a failure")
-        return 0
-    if not FIXTURE.is_file() or not QUERY.is_file():
-        print("SKIP: fixtures missing")
-        return 0
+class TestReconstructSieveSeam(unittest.TestCase):
 
-    work = Path(tempfile.mkdtemp())
-    try:
-        # a fake walker: writes the fixture as reconstructed.fasta into -o <dir>, honoring -f
-        fake_walker = work / "fake_walker.sh"
-        fake_walker.write_text(
+    @classmethod
+    def setUpClass(cls):
+        state = ensure_sieve()
+        if state == "no-submodule":
+            raise unittest.SkipTest(
+                f"extern/kmer-diversity-sieve is empty (run `git submodule update "
+                f"--init {SIEVE_BIN.parent.relative_to(REPO)}`)"
+            )
+        if state == "no-compiler":
+            raise unittest.SkipTest("sieve binary failed to build (no C compiler?)")
+        if not FIXTURE.is_file() or not QUERY.is_file():
+            raise unittest.SkipTest("fixtures missing")
+        try:
+            from disassembler.cmd import pipe_reconstruct  # noqa: F401
+        except ImportError as e:  # pragma: no cover
+            raise unittest.SkipTest(f"disassembler package not importable: {e}")
+
+    def setUp(self):
+        # Import inside setUp so the SkipTest above triggers before we touch the module.
+        from disassembler.cmd import msa as msa_cmd
+        from disassembler.cmd import pipe_reconstruct
+        self.msa_cmd = msa_cmd
+        self.pipe_reconstruct = pipe_reconstruct
+        self.work = Path(tempfile.mkdtemp())
+
+        # A fake walker: writes the fixture as reconstructed.fasta into -o <dir>, honoring -f.
+        self.fake_walker = self.work / "fake_walker.sh"
+        self.fake_walker.write_text(
             "#!/usr/bin/env bash\n"
             "out=''; fasta=''\n"
             'while [ $# -gt 0 ]; do case "$1" in\n'
             '  -o) out="$2"; shift 2;; -f) fasta="$2"; shift 2;; *) shift;; esac; done\n'
             f'cp "{FIXTURE}" "$fasta"\n'
         )
-        fake_walker.chmod(0o755)
+        self.fake_walker.chmod(0o755)
 
-        # disassemble.py preflights the MSA-stage tools on PATH (a real check); satisfy them
-        # with stubs on a PATH we prepend for the subprocess. The actual MSA/tree step is our
-        # fake_msa, so these are never executed, they only have to resolve.
-        # Both tools, not just mafft: the preflight covers fasttree as well.
-        binstub = work / "bin"
-        binstub.mkdir()
+        # Preflight in pipe_reconstruct.run checks that mafft and fasttree are on PATH.
+        # Satisfy that with stubs; the actual MSA/tree call is monkey-patched below and
+        # never runs the real binaries.
+        self.binstub = self.work / "bin"
+        self.binstub.mkdir()
         for tool in ("mafft", "fasttree"):
-            (binstub / tool).write_text("#!/usr/bin/env bash\nexit 0\n")
-            (binstub / tool).chmod(0o755)
-        env = dict(os.environ, PATH=f"{binstub}{os.pathsep}{os.environ.get('PATH', '')}")
+            (self.binstub / tool).write_text("#!/usr/bin/env bash\nexit 0\n")
+            (self.binstub / tool).chmod(0o755)
+        self._old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{self.binstub}{os.pathsep}{self._old_path}"
 
-        # a fake codon-MSA/tree: records which --input it received, writes stub outputs
-        fake_msa = work / "fake_msa.py"
-        fake_msa.write_text(
-            "import sys, pathlib\n"
-            "args = sys.argv[1:]\n"
-            "inp = args[args.index('--input') + 1]\n"
-            "aln = args[args.index('--out-aln') + 1]\n"
-            "tree = args[args.index('--out-tree') + 1]\n"
-            # Recorded next to the alignment, so each run writes into its own -o directory.
-            # A single shared path let run 2 read run 1's file, which made the
-            # "stage 2 never ran" branch unreachable and misreported it as a wrong --input.
-            "pathlib.Path(aln).with_name('stage2_input.txt').write_text(inp)\n"
-            "pathlib.Path(aln).write_text('>stub\\nACGT\\n')\n"
-            "pathlib.Path(tree).write_text('(stub);\\n')\n"
+        # Monkey-patch msa.run to record its --input and skip real work.
+        self._real_msa_run = self.msa_cmd.run
+        self.stage2_input = None
+
+        def stub_msa_run(ns):
+            self.stage2_input = ns.input
+            Path(ns.out_aln).write_text(">stub\nACGT\n")
+            Path(ns.out_tree).write_text("(stub);\n")
+            return 0
+
+        self.msa_cmd.run = stub_msa_run
+
+    def tearDown(self):
+        self.msa_cmd.run = self._real_msa_run
+        os.environ["PATH"] = self._old_path
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def _make_ns(self, out_dir, **overrides):
+        # Default namespace that mirrors what the argparse subparser would produce.
+        ns = types.SimpleNamespace(
+            accession="STUBACC",
+            accession_list=None,
+            query=str(QUERY),
+            out_dir=str(out_dir),
+            workers=None,
+            fetch_workers=None,
+            mafft_threads=1,
+            msa_min_cov=0.70,
+            emit_vcf=False,
+            emit_snv_table=False,
+            no_emit_alts=False,
+            prune_frac=None,
+            max_size_mb=None,
+            no_prefer_majority=False,
+            min_abund=None,
+            min_vaf=None,
+            walker_bin=str(self.fake_walker),
+            skip_tree=False,
+            sieve=True,
+            sieve_threshold=0.005,
+            sieve_sketch=256,
+            sieve_min_len=None,
+            sieve_bin=str(SIEVE_BIN),
+            unitigs_cache=None,
+            offline=False,
+            walker_args=[],
         )
+        for k, v in overrides.items():
+            setattr(ns, k, v)
+        return ns
 
-        out = work / "out"
-        # Point disassemble.py's CODON_MSA at our stub by monkeypatching via env is not
-        # supported; instead we run with a patched copy that swaps CODON_MSA. Simplest:
-        # copy disassemble.py and rewrite the CODON_MSA constant to the stub.
-        patched = work / "disassemble_patched.py"
-        src = DISASSEMBLE.read_text().replace(
-            'CODON_MSA = ROOT / "python" / "build_walker_codon_msa.py"',
-            f'CODON_MSA = pathlib.Path("{fake_msa}")',
-        )
-        # ensure pathlib is imported in the patched module (it already imports Path; add module)
-        src = src.replace("from pathlib import Path", "import pathlib\nfrom pathlib import Path")
-        patched.write_text(src)
+    def test_on_sieve_stage2_receives_the_sieved_file(self):
+        out = self.work / "out"
+        ns = self._make_ns(out)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = self.pipe_reconstruct.run(ns)
+        stdout = buf.getvalue()
 
-        cmd = [
-            sys.executable, str(patched),
-            "-a", "STUBACC",
-            "-q", str(QUERY),
-            "-o", str(out),
-            "--walker-bin", str(fake_walker),
-            "--sieve-bin", str(SIEVE_BIN),   # patched copy lives in /tmp, so ROOT-relative default won't resolve
-            "--sieve",
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        print(r.stdout)
-        if r.returncode != 0:
-            print(r.stderr)
-
+        self.assertEqual(rc, 0, f"reconstruct exit code 0\n---\n{stdout}")
         recon = out / "reconstructed.fasta"
         sieved = out / "reconstructed.sieved.fasta"
-        stage2_input = out / "stage2_input.txt"
+        self.assertTrue(recon.is_file(), "reconstructed.fasta written by (fake) stage 1")
+        self.assertTrue(sieved.is_file(), "reconstructed.sieved.fasta produced by sieve")
+        self.assertEqual(self.stage2_input, str(sieved),
+                         "stage 2 --input must be the sieved file, not the raw one")
+        n = sum(1 for l in sieved.open() if l.startswith(">"))
+        self.assertTrue(1 <= n < 33, f"sieve thinned 33 -> {n} (1 <= n < 33)")
 
-        check(r.returncode == 0, "disassemble.py --sieve exits 0")
-        check(recon.is_file(), "reconstructed.fasta written by (fake) stage 1")
-        check(sieved.is_file(), "reconstructed.sieved.fasta produced by the sieve stage")
-        # the seam: stage 2 must receive the SIEVED file, not the raw reconstructions
-        if stage2_input.is_file():
-            got = stage2_input.read_text().strip()
-            check(got == str(sieved), f"stage 2 --input is the sieved file (got {Path(got).name})")
-        else:
-            check(False, "stage 2 was invoked (stage2_input.txt recorded)")
-        # the sieve actually thinned the 33 near-duplicate fixture haplotypes. The bound is
-        # generous on purpose: the wrapper's defaults were bumped from the sieve binary's own
-        # archive-scale defaults (tau=0.15 sketch=64 -> 33 -> 1) to gene-scale ones
-        # (tau=0.005 sketch=256 -> 33 -> ~28), and asserting any specific count would couple
-        # this seam test to a calibration decision it does not own. What matters here is that
-        # something got thinned and the sieved file reached stage 2, which the other assertions
-        # cover.
-        if sieved.is_file():
-            n = sum(1 for l in sieved.open() if l.startswith(">"))
-            check(1 <= n < 33, f"sieve thinned 33 -> {n} (1 <= n < 33)")
+    def test_sieve_sketch_reaches_the_binary_cli(self):
+        out = self.work / "out_sketch"
+        ns = self._make_ns(out, sieve_sketch=128)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = self.pipe_reconstruct.run(ns)
+        stdout = buf.getvalue()
+        self.assertEqual(rc, 0, f"reconstruct exit code 0\n---\n{stdout}")
+        self.assertIn("--sketch 128", stdout,
+                      "--sieve-sketch forwards --sketch 128 to the sieve binary CLI")
+        self.assertIn("sketch=128", stdout,
+                      "--sieve-sketch echoed in the sieve summary log line")
 
-        # `--sieve-sketch` reaches the sieve binary and shows up in the summary log.
-        # A silent regression here would let the sketch flag look-like-it-works while
-        # the binary ran at its default of 64, which is precisely the failure mode the
-        # gene-scale calibration doc characterises.
-        out_sk = work / "out_sketch"
-        cmd_sk = [c if c != str(out) else str(out_sk) for c in cmd] + ["--sieve-sketch", "128"]
-        r_sk = subprocess.run(cmd_sk, capture_output=True, text=True, env=env)
-        if r_sk.returncode != 0:
-            print(r_sk.stderr)
-        check(r_sk.returncode == 0, "--sieve-sketch: disassemble.py exits 0")
-        check("--sketch 128" in r_sk.stdout,
-              "--sieve-sketch forwards --sketch 128 to the sieve binary CLI")
-        check("sketch=128" in r_sk.stdout,
-              "--sieve-sketch echoed in the disassemble.py summary log line")
-
-        # off-path: WITHOUT --sieve, stage 2 must receive the RAW reconstructed.fasta
-        out2 = work / "out2"
-        cmd_off = [
-            sys.executable, str(patched),
-            "-a", "STUBACC", "-q", str(QUERY), "-o", str(out2),
-            "--walker-bin", str(fake_walker),
-        ]
-        r_off = subprocess.run(cmd_off, capture_output=True, text=True, env=env)
-        if r_off.returncode != 0:
-            print(r_off.stderr)
-        check(r_off.returncode == 0, "off-path: disassemble.py (no --sieve) exits 0")
-        stage2_off = out2 / "stage2_input.txt"
-        if stage2_off.is_file():
-            got_off = stage2_off.read_text().strip()
-            check(got_off == str(out2 / "reconstructed.fasta"),
-                  "off-path: stage 2 --input is the raw reconstructed.fasta (no sieve)")
-        else:
-            check(False, "off-path: stage 2 was invoked")
-
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-    print()
-    if FAILURES:
-        print(f"integration: {len(FAILURES)} FAILED")
-        return 1
-    print("integration: ALL PASS")
-    return 0
+    def test_off_sieve_stage2_receives_the_raw_reconstruction(self):
+        out = self.work / "out_off"
+        ns = self._make_ns(out, sieve=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = self.pipe_reconstruct.run(ns)
+        stdout = buf.getvalue()
+        self.assertEqual(rc, 0, f"reconstruct exit code 0\n---\n{stdout}")
+        self.assertEqual(self.stage2_input, str(out / "reconstructed.fasta"),
+                         "off-path: stage 2 --input is the raw reconstructed.fasta")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    unittest.main()

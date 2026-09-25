@@ -97,6 +97,17 @@ INTRA-HOST VARIANTS:
                                   run that reconstructs nothing exits non-zero, so a wrapper
                                   cannot mistake an all-failed shard for a good one
 
+OFFLINE / CACHE:
+        --unitigs-cache <DIR>     Read-through cache for compressed unitig payloads.
+                                  <DIR>/<ACC>.unitigs.fa.zst is used if present; otherwise
+                                  fetched from S3 and written back atomically. Byte-identical
+                                  to the S3 object
+        --offline                 Refuse the S3 fallback. A cache miss becomes a hard error
+                                  naming the missing accession. Requires --unitigs-cache
+        --fetch-only              Fetch every accession into --unitigs-cache and exit before
+                                  the compute stages. Requires --unitigs-cache; -q is not
+                                  required in this mode
+
     -h, --help                    Print this help
     -V, --version                 Print version
 ";
@@ -207,6 +218,19 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
                 i += 1;
                 continue;
             }
+            "--unitigs-cache" => {
+                args.cfg.unitigs_cache = Some(PathBuf::from(value()?));
+            }
+            "--offline" => {
+                args.cfg.offline = true;
+                i += 1;
+                continue;
+            }
+            "--fetch-only" => {
+                args.cfg.fetch_only = true;
+                i += 1;
+                continue;
+            }
             "--emit-alts" | "--no-emit-alts" => {
                 args.cfg.emit_alts = flag == "--emit-alts";
                 i += 1;
@@ -281,11 +305,28 @@ fn main() -> ExitCode {
 }
 
 fn real_main(args: Args) -> error::Result<()> {
+    // ---- validate offline / cache flag combinations -----------------------
+    if args.cfg.offline && args.cfg.unitigs_cache.is_none() {
+        return Err(error::Error::Usage(
+            "--offline requires --unitigs-cache <DIR>".into(),
+        ));
+    }
+    if args.cfg.fetch_only && args.cfg.unitigs_cache.is_none() {
+        return Err(error::Error::Usage(
+            "--fetch-only requires --unitigs-cache <DIR>".into(),
+        ));
+    }
+
     // ---- INTO the pipeline ------------------------------------------------
-    let query_path = args
-        .query
-        .ok_or_else(|| error::Error::Usage("--query is required".into()))?;
-    let query = io::input::read_query(&query_path)?;
+    // --fetch-only does not need a query: the compute stages never run.
+    let query = if args.cfg.fetch_only {
+        None
+    } else {
+        let query_path = args
+            .query
+            .ok_or_else(|| error::Error::Usage("--query is required".into()))?;
+        Some(io::input::read_query(&query_path)?)
+    };
 
     let accessions = match (&args.accession, &args.accession_list) {
         (Some(a), _) => {
@@ -318,6 +359,20 @@ fn real_main(args: Args) -> error::Result<()> {
         args.cfg.max_compressed_bytes / (1024 * 1024),
         gb(args.cfg.max_compressed_resident_bytes()),
     );
+
+    // --fetch-only takes the short path: fill the cache and exit. No compute pool, no
+    // output files, no query. Success = every accession is in the cache after this.
+    if args.cfg.fetch_only {
+        let (ok, fail) = pipeline::run_fetch_only(&args.cfg, accessions)?;
+        eprintln!("[logan-walker --fetch-only] {ok} fetched, {fail} failed");
+        if fail > 0 && !args.allow_empty {
+            return Err(error::Error::NothingReconstructed { total: ok + fail });
+        }
+        return Ok(());
+    }
+
+    // Unwrap the query for the full pipeline. The guard above ensures it is Some here.
+    let query = query.expect("query is Some when not --fetch-only");
 
     let summary = pipeline::run(&args.cfg, accessions, &query)?;
 

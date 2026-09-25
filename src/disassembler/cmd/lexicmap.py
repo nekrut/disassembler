@@ -892,9 +892,11 @@ def stream_lexicmap_to_msa(
 
     return summary_data
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="LexicMapStreamer: Stream LexicMap search results, tile multi-HSP alignments, stratify cohorts, and collapse haplotypes."
+def add_parser(subparsers):
+    parser = subparsers.add_parser(
+        "lexicmap",
+        help="Stream LexicMap tabular hits into a tiled cohort + collapsed haplotypes.",
+        description="Stream LexicMap search results, tile multi-HSP alignments, stratify cohorts, and collapse haplotypes.",
     )
     parser.add_argument("-q", "-r", "--query", "--ref", dest="ref", type=str, required=True,
                         help="Path to reference FASTA file (e.g. queries/query_hiv1_pol.fasta).")
@@ -908,15 +910,15 @@ def parse_args():
                         help="Galaxy API key string.")
     parser.add_argument("--api-key-file", type=str, default="/tmp/gxy.txt",
                         help="Path to file containing Galaxy API key (default: /tmp/gxy.txt).")
-    parser.add_argument("--min-coverage", type=float, default=0.80,
+    parser.add_argument("--min-cov", type=float, default=0.80,
                         help="Minimum merged query coverage fraction for full-length clean cohort (default: 0.80 = 80%%).")
-    parser.add_argument("--min-coverage-partial", type=float, default=0.50,
+    parser.add_argument("--min-cov-partial", type=float, default=0.50,
                         help="Minimum coverage fraction for clean partial expanded cohort (default: 0.50 = 50%%).")
     parser.add_argument("--min-pident", type=float, default=60.0,
                         help="Minimum percent identity for candidate HSPs (default: 60.0%%).")
     parser.add_argument("--max-internal-stops", type=int, default=0,
                         help="Maximum premature stop codons allowed in CDS body (default: 0).")
-    parser.add_argument("--allow-frameshifts", action="store_true",
+    parser.add_argument("--allow-frameshift-alts", action="store_true",
                         help="Allow indels/frameshifts with premature stop codons into clean cohort.")
     parser.add_argument("--full-length-only", action="store_true",
                         help="Only include accessions that cover 100%% of query length.")
@@ -928,12 +930,14 @@ def parse_args():
                         help="Output prefix or directory for generated files (default: msa/<ref_name>).")
     parser.add_argument("--no-a2m", action="store_true",
                         help="Disable generating .a2m alignment files.")
-    return parser.parse_args()
+    parser.set_defaults(func=run)
 
-def main():
-    args = parse_args()
+
+def run(args) -> int:
     if not args.dataset and not args.file:
-        sys.exit("Error: Must specify either -d/--dataset <GALAXY_ID> or -f/-i/--file <PATH> (or '-' for stdin).")
+        print("lexicmap: must specify either -d/--dataset <GALAXY_ID> or -f/-i/--file <PATH> "
+              "(or '-' for stdin).", file=sys.stderr)
+        return 2
 
     stream_lexicmap_to_msa(
         ref_path=args.ref,
@@ -942,17 +946,15 @@ def main():
         base_url=args.base_url,
         api_key=args.api_key,
         api_key_file=args.api_key_file,
-        min_coverage=args.min_coverage,
-        min_coverage_partial=args.min_coverage_partial,
+        min_coverage=args.min_cov,
+        min_coverage_partial=args.min_cov_partial,
         min_pident=args.min_pident,
         max_internal_stops=args.max_internal_stops,
-        allow_frameshifts=args.allow_frameshifts,
+        allow_frameshifts=args.allow_frameshift_alts,
         full_length_only=args.full_length_only,
         max_records=args.max_records,
         sample_cap=args.sample_cap,
         out_prefix=args.out_prefix,
-        write_a2m=not args.no_a2m
+        write_a2m=not args.no_a2m,
     )
-
-if __name__ == "__main__":
-    main()
+    return 0
