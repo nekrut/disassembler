@@ -68,16 +68,24 @@ pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
     let mut w = BufWriter::new(std::fs::File::create(path)?);
     for r in &summary.results {
         for h in &r.haplotypes {
+            // anchor_used is emitted only when set (multi-anchor mode). Single-anchor
+            // runs keep the header byte-identical to the pre-multi-anchor shape so all
+            // golden fixtures diff clean.
+            let anchor_suffix = match &h.anchor_used {
+                Some(rid) => format!(" anchor={rid}"),
+                None => String::new(),
+            };
             writeln!(
                 w,
-                ">{} cov={:.3} {}={:.1} nodes={} ka={:.1} vaf={:.2}",
+                ">{} cov={:.3} {}={:.1} nodes={} ka={:.1} vaf={:.2}{}",
                 h.id,
                 h.cov,
                 if h.pident_inherited { "inherited_pident" } else { "pident" },
                 h.pident,
                 h.nodes,
                 h.mean_ka,
-                h.vaf
+                h.vaf,
+                anchor_suffix,
             )?;
             w.write_all(&h.seq)?;
             w.write_all(b"\n")?;
@@ -115,17 +123,22 @@ pub fn write_alts(summary: &Summary, path: &Path) -> Result<()> {
     for r in &summary.results {
         for a in &r.alts {
             let h = &a.haplotype;
+            let anchor_suffix = match &h.anchor_used {
+                Some(rid) => format!(" anchor={rid}"),
+                None => String::new(),
+            };
             writeln!(
                 w,
                 ">{} cov={:.3} inherited_pident={:.1} nodes={} vaf={:.3} alt_kaf={:.1} \
-                 primary_vaf={:.3} fork={}{} alt_node={}{} detour={} dlen={:+} span={}",
+                 primary_vaf={:.3} fork={}{} alt_node={}{} detour={} dlen={:+} span={}{}",
                 h.id, h.cov, h.pident, h.nodes,
                 a.alt_vaf, a.alt_abundance, a.taken_vaf,
                 a.fork, strand_str(a.fork_strand),
                 a.alt_node, strand_str(a.alt_strand),
                 a.detour_nodes,
                 a.length_delta,
-                a.replaced_span
+                a.replaced_span,
+                anchor_suffix,
             )?;
             w.write_all(&h.seq)?;
             w.write_all(b"\n")?;
@@ -202,7 +215,13 @@ fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<(
             writeln!(w, "          \"length\": {},", h.seq.len())?;
             writeln!(w, "          \"nodes\": {},", h.nodes)?;
             writeln!(w, "          \"mean_ka\": {:.1},", h.mean_ka)?;
-            writeln!(w, "          \"vaf\": {:.2}", h.vaf)?;
+            // Emit `anchor_used` only when set. Absent field ≡ single-anchor legacy JSON.
+            if let Some(rid) = &h.anchor_used {
+                writeln!(w, "          \"vaf\": {:.2},", h.vaf)?;
+                writeln!(w, "          \"anchor_used\": \"{}\"", esc(rid))?;
+            } else {
+                writeln!(w, "          \"vaf\": {:.2}", h.vaf)?;
+            }
             writeln!(w, "        }}{}", if last_h { "" } else { "," })?;
         }
         writeln!(w, "      ],")?;
@@ -829,6 +848,7 @@ mod vcf_tests {
             nodes: 1,
             mean_ka: 0.0,
             vaf: 1.0,
+            anchor_used: None,
         }
     }
 
@@ -863,6 +883,7 @@ mod vcf_tests {
             bubbles: Vec::new(),
             timing: Timing::default(),
             error: None,
+            anchor_used: None,
         }
     }
 
@@ -953,6 +974,7 @@ mod identity_label_tests {
             nodes: 1,
             mean_ka: 12.0,
             vaf: 1.0,
+            anchor_used: None,
         }
     }
 
@@ -973,6 +995,7 @@ mod identity_label_tests {
                 bubbles: Vec::new(),
                 timing: Timing::default(),
                 error: None,
+                anchor_used: None,
             }],
         }
     }

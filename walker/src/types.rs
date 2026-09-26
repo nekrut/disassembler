@@ -275,6 +275,11 @@ pub struct Haplotype {
     pub mean_ka: f64,
     /// Variant allele frequency at the defining fork (1.0 if primary backbone).
     pub vaf: f64,
+    /// Reference record id this haplotype was scored against. `None` on the single-anchor
+    /// path (byte-identical output legacy contract); `Some(record_id)` in multi-anchor mode,
+    /// where downstream tools need to know which of the pool the `cov` and `pident` numbers
+    /// belong to.
+    pub anchor_used: Option<String>,
 }
 
 /// A recovered second allele: the primary haplotype with exactly one substitution.
@@ -395,6 +400,10 @@ pub struct AccessionResult {
     pub bubbles: Vec<Bubble>,
     pub timing: Timing,
     pub error: Option<String>,
+    /// Reference the primary haplotype was scored against. Mirrors [`Haplotype::anchor_used`]
+    /// so callers who look at `AccessionResult` directly (e.g. the summary writer) do not
+    /// need to reach into `haplotype`.
+    pub anchor_used: Option<String>,
 }
 
 impl AccessionResult {
@@ -414,6 +423,7 @@ impl AccessionResult {
             bubbles: Vec::new(),
             timing: Timing::default(),
             error: Some(error),
+            anchor_used: None,
         }
     }
 }

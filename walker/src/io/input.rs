@@ -6,7 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::types::{Accession, Query};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Read accessions, one per line. Blank lines and `#` comments are skipped.
 ///
@@ -181,6 +181,115 @@ pub fn read_query(path: &Path) -> Result<Query> {
     })
 }
 
+/// Load every record from every input FASTA as its own single-record [`Query`].
+///
+/// Used by multi-anchor mode: `read_query` keeps only the first record of a FASTA (matching
+/// legacy behaviour and warning about the rest), which is what we want on today's single-`-q`
+/// single-record path. `read_query_set` is what runs when the collected reference set is
+/// wider than that — repeated `-q file.fa`, or a multi-record FASTA passed intentionally.
+/// Each returned [`Query`] has `n_records = 1` because it *is* one record from downstream's
+/// point of view; the "one record per Query" contract every stage assumes is preserved by
+/// splitting up-front here.
+///
+/// Naming: the [`Query::name`] is the file stem when a file holds a single record (matching
+/// `read_query`), and `<stem>__<record_id>` when a file holds several. That keeps the
+/// summary filename derivation (`{name}_walker_summary.json`) unambiguous across files that
+/// happen to share a record id.
+pub fn read_query_set(paths: &[PathBuf]) -> Result<Vec<Query>> {
+    if paths.is_empty() {
+        return Err(Error::Usage("no query FASTAs provided".into()));
+    }
+    let mut out: Vec<Query> = Vec::new();
+    for path in paths {
+        let bytes = std::fs::read(path).map_err(|e| {
+            Error::Usage(format!("cannot read query {}: {e}", path.display()))
+        })?;
+
+        let mut records: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut header: Option<String> = None;
+        let mut seq: Vec<u8> = Vec::new();
+        for line in bytes.split(|&b| b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.first() == Some(&b'>') {
+                if let Some(h) = header.take() {
+                    records.push((h, std::mem::take(&mut seq)));
+                }
+                let text = String::from_utf8_lossy(&line[1..]).to_string();
+                header = Some(text.split_whitespace().next().unwrap_or("").to_string());
+            } else if header.is_some() {
+                seq.extend(
+                    line.iter()
+                        .filter(|b| !b.is_ascii_whitespace())
+                        .map(|b| b.to_ascii_uppercase()),
+                );
+            } else if !line.iter().all(|b| b.is_ascii_whitespace()) {
+                return Err(Error::Usage(format!(
+                    "{}: sequence data before any '>' header; is this FASTA?",
+                    path.display()
+                )));
+            }
+        }
+        if let Some(h) = header.take() {
+            records.push((h, seq));
+        }
+        if records.is_empty() {
+            return Err(Error::Usage(format!(
+                "{}: no FASTA records found",
+                path.display()
+            )));
+        }
+
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .ok_or_else(|| Error::Usage(format!("{}: cannot derive a name", path.display())))?;
+        let n_in_file = records.len();
+        for (record_id, seq) in records {
+            if seq.is_empty() {
+                return Err(Error::Usage(format!(
+                    "{}: record {record_id:?} has no sequence",
+                    path.display()
+                )));
+            }
+            if seq.len() % 3 != 0 {
+                eprintln!(
+                    "[warn] {}: record {record_id:?} length {} is not a multiple of 3; \
+                     codon analysis downstream expects a CDS",
+                    path.display(),
+                    seq.len()
+                );
+            }
+            let ambiguous = seq
+                .iter()
+                .filter(|b| !matches!(b, b'A' | b'C' | b'G' | b'T'))
+                .count();
+            if ambiguous > 0 {
+                eprintln!(
+                    "[warn] {}: record {record_id:?} has {ambiguous} non-ACGT base(s); \
+                     k-mers spanning them cannot match Logan unitigs",
+                    path.display()
+                );
+            }
+            let name = if n_in_file == 1 {
+                stem.clone()
+            } else {
+                format!("{stem}__{record_id}")
+            };
+            out.push(Query {
+                name,
+                record_id,
+                seq,
+                path: path.to_path_buf(),
+                n_records: 1,
+            });
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::Usage("no FASTA records found across the provided -q files".into()));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +410,60 @@ mod tests {
         let q = read_query(&p).unwrap();
         assert_eq!(q.seq, b"ACGTNRYACG".to_vec(), "must not alter the query");
         std::fs::remove_file(p).ok();
+    }
+
+    // ---- read_query_set (multi-anchor) ----
+
+    #[test]
+    fn set_from_two_files_returns_one_query_per_record() {
+        let a = tmp("set_a.fasta", b">wuhan\nACGTACGT\n");
+        let b = tmp("set_b.fasta", b">jn1\nAAAACCCC\n");
+        let qs = read_query_set(&[a.clone(), b.clone()]).unwrap();
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].record_id, "wuhan");
+        assert_eq!(qs[1].record_id, "jn1");
+        // Single-record files use the file stem as the name.
+        assert!(qs[0].name.contains("set_a"), "got {}", qs[0].name);
+        assert!(qs[1].name.contains("set_b"), "got {}", qs[1].name);
+        // Every emitted Query has n_records = 1 by contract.
+        assert!(qs.iter().all(|q| q.n_records == 1));
+        for p in [a, b] { std::fs::remove_file(p).ok(); }
+    }
+
+    #[test]
+    fn set_splits_multi_record_file_into_scoped_queries() {
+        let p = tmp("set_multi.fasta", b">wuhan\nAAA\n>jn1\nCCC\n>ba5\nGGG\n");
+        let qs = read_query_set(&[p.clone()]).unwrap();
+        assert_eq!(qs.len(), 3);
+        assert_eq!(qs[0].record_id, "wuhan");
+        assert_eq!(qs[1].record_id, "jn1");
+        assert_eq!(qs[2].record_id, "ba5");
+        // Multi-record files scope the Query name to disambiguate identical record ids
+        // across files.
+        for q in &qs {
+            assert!(q.name.contains("set_multi__"), "got {}", q.name);
+        }
+        assert!(qs[0].name.ends_with("__wuhan"), "got {}", qs[0].name);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn set_rejects_empty_input_list() {
+        assert!(read_query_set(&[]).is_err());
+    }
+
+    #[test]
+    fn set_preserves_input_ordering_for_tie_break() {
+        // The primary picker will tie-break on this order in Phase 4, so it must be stable.
+        let a = tmp("first.fasta", b">a\nACGT\n");
+        let b = tmp("second.fasta", b">b\nCCCC\n");
+        let c = tmp("third.fasta", b">c\nGGGG\n");
+        let qs = read_query_set(&[a.clone(), b.clone(), c.clone()]).unwrap();
+        assert_eq!(
+            qs.iter().map(|q| q.record_id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        for p in [a, b, c] { std::fs::remove_file(p).ok(); }
     }
 }
 

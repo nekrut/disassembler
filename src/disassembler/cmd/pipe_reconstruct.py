@@ -35,7 +35,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("-a", "--accession", help="A single SRA accession")
     src.add_argument("-l", "--accession-list", help="File with one accession per line")
-    p.add_argument("-q", "--query", required=True, help="Reference in-frame CDS FASTA")
+    p.add_argument("-q", "--query", required=True, action="append",
+                   help="Reference in-frame CDS FASTA. Repeatable, and each file may hold "
+                        "multiple records; the walker unions the anchor pool when the "
+                        "collected reference set has more than one record. In multi-anchor "
+                        "mode the MSA step still needs one reference; that is the first -q "
+                        "unless --msa-reference is given.")
+    p.add_argument("--msa-reference", default=None,
+                   help="FASTA to use as the MSA reference in multi-anchor mode "
+                        "(default: first -q). Ignored under --skip-tree.")
     p.add_argument("-o", "--out-dir", required=True, help="Output directory")
 
     # None on purpose: numeric defaults would be a second copy of the walker's own,
@@ -108,9 +116,18 @@ def _die(msg: str) -> int:
 def run(args) -> int:
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    query = Path(args.query)
-    if not query.is_file():
-        return _die(f"query not found: {query}")
+    queries = [Path(q) for q in args.query]
+    for q in queries:
+        if not q.is_file():
+            return _die(f"query not found: {q}")
+    # MSA/tree stage still takes a single reference. Default is the first -q, override
+    # via --msa-reference; irrelevant under --skip-tree.
+    msa_ref = Path(args.msa_reference) if args.msa_reference else queries[0]
+    if not args.skip_tree and not msa_ref.is_file():
+        return _die(f"MSA reference not found: {msa_ref}")
+    if len(queries) > 1 and not args.skip_tree and args.msa_reference is None:
+        print(f"[reconstruct] multi-anchor: MSA reference defaults to first -q ({msa_ref}); "
+              f"pass --msa-reference to override.", flush=True)
 
     if not resolve_walker(args.walker_bin):
         return _die(
@@ -148,7 +165,10 @@ def run(args) -> int:
     recon = out / "reconstructed.fasta"
 
     # ---- stage 1: walker ---------------------------------------------------
-    walker_argv = ["-q", str(query), "-o", str(out), "-f", str(recon)]
+    walker_argv: list[str] = []
+    for q in queries:
+        walker_argv += ["-q", str(q)]
+    walker_argv += ["-o", str(out), "-f", str(recon)]
     if args.workers is not None:
         walker_argv += ["-w", str(args.workers)]
     if args.fetch_workers is not None:
@@ -212,13 +232,13 @@ def run(args) -> int:
         return 0
 
     # ---- stage 2: codon MSA + FastTree ------------------------------------
-    stem = query.stem
+    stem = msa_ref.stem
     aln = out / f"{stem}_codon_msa.fasta"
     tree = out / f"{stem}_fasttree.nwk"
     print(f"[reconstruct] 2/2 codon MSA + tree: --input {msa_input} --out-aln {aln} "
           f"--out-tree {tree}", flush=True)
     msa_args = types.SimpleNamespace(
-        ref=str(query),
+        ref=str(msa_ref),
         input=str(msa_input),
         out_aln=str(aln),
         out_tree=str(tree),

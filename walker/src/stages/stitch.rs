@@ -97,6 +97,49 @@ pub fn stitch_steps(
     Some(stitched)
 }
 
+/// One reference's candidate haplotype and the GAF path it was stitched from, tagged with
+/// the reference id and the reference's position in the anchor pool. `pick_primary` uses
+/// the pool index for tie-breaking so the choice is stable across runs.
+///
+/// The `path` field lets the caller carry both halves through the fan-out without having
+/// to re-align to recover the winning path (which would double the align cost).
+pub struct Candidate {
+    pub record_id: String,
+    pub pool_index: usize,
+    pub path: Option<GafPath>,
+    pub haplotype: Option<Haplotype>,
+}
+
+/// Rank per-reference candidates and pick the winning primary.
+///
+/// Ordering, descending: `cov`, then `pident`. `stitch` already returns `None` for a
+/// candidate whose coverage fell below `min_cov`, so an under-covered reference is filtered
+/// out before it can win. Ties break on `pool_index` so the first reference in the anchor
+/// pool wins — matching the plan's "input order" rule and giving stable primary selection.
+///
+/// Returns `None` when no reference produced a stitchable haplotype.
+pub fn pick_primary(candidates: Vec<Candidate>) -> Option<(String, GafPath, Haplotype)> {
+    let mut with_haps: Vec<(usize, String, GafPath, Haplotype)> = candidates
+        .into_iter()
+        .filter_map(|c| match (c.path, c.haplotype) {
+            (Some(p), Some(h)) => Some((c.pool_index, c.record_id, p, h)),
+            _ => None,
+        })
+        .collect();
+    with_haps.sort_by(|a, b| {
+        b.3.cov
+            .partial_cmp(&a.3.cov)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.3.pident
+                    .partial_cmp(&a.3.pident)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then(a.0.cmp(&b.0))
+    });
+    with_haps.into_iter().next().map(|(_, name, p, h)| (name, p, h))
+}
+
 pub fn stitch(
     cfg: &Config,
     graph: &UnitigGraph,
@@ -162,6 +205,9 @@ pub fn stitch(
         // Was hardcoded 0.0 while being published in every FASTA header and in summary.json.
         mean_ka: crate::stages::extract::path_mean_ka(graph, &path.steps),
         vaf: 1.0,
+        // stitch does not know how big the anchor pool is; the pipeline sets this field
+        // to the winning reference id only when a pool of >1 reference is in play.
+        anchor_used: None,
     }))
 }
 
@@ -216,6 +262,101 @@ mod tests {
         assert_eq!(revcomp(b"ACGT"), b"ACGT".to_vec(), "ACGT is its own reverse complement");
         assert_eq!(revcomp(b"AAAC"), b"GTTT".to_vec());
         assert_eq!(revcomp(&revcomp(b"ACGGTCA")), b"ACGGTCA".to_vec());
+    }
+
+    // ---- pick_primary (multi-anchor) ----
+
+    fn cand(name: &str, pool_index: usize, cov: f64, pident: f64) -> Candidate {
+        // Real GafPath and Haplotype shells: pick_primary reads path only for the winner
+        // (to carry it back out), and hap.cov / hap.pident for ranking. Everything else
+        // is placeholder.
+        let path = GafPath {
+            steps: vec![PathStep { orient: Orient::Forward, node: 1 }],
+            path_len: 1, path_start: 0, path_end: 1,
+            num_matches: 1, aln_len: 1,
+        };
+        let hap = Haplotype {
+            id: name.into(),
+            seq: vec![],
+            cov,
+            pident,
+            pident_inherited: false,
+            nodes: 1,
+            mean_ka: 0.0,
+            vaf: 1.0,
+            anchor_used: None,
+        };
+        Candidate {
+            record_id: name.into(),
+            pool_index,
+            path: Some(path),
+            haplotype: Some(hap),
+        }
+    }
+
+    #[test]
+    fn pick_primary_returns_none_on_empty_pool() {
+        assert!(pick_primary(vec![]).is_none());
+    }
+
+    #[test]
+    fn pick_primary_returns_none_when_all_haplotypes_are_none() {
+        let none_cand = Candidate {
+            record_id: "a".into(),
+            pool_index: 0,
+            path: None,
+            haplotype: None,
+        };
+        assert!(pick_primary(vec![none_cand]).is_none());
+    }
+
+    #[test]
+    fn pick_primary_picks_highest_coverage() {
+        let cs = vec![
+            cand("low", 0, 0.30, 99.5),
+            cand("high", 1, 0.80, 99.5),
+            cand("mid", 2, 0.55, 99.5),
+        ];
+        let (name, _, hap) = pick_primary(cs).unwrap();
+        assert_eq!(name, "high");
+        assert!((hap.cov - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pick_primary_breaks_ties_on_pident() {
+        let cs = vec![
+            cand("weaker", 0, 0.80, 98.5),
+            cand("stronger", 1, 0.80, 99.9),
+        ];
+        let (name, _, _) = pick_primary(cs).unwrap();
+        assert_eq!(name, "stronger");
+    }
+
+    #[test]
+    fn pick_primary_breaks_full_ties_on_pool_order() {
+        // Same cov and pident: the earlier pool_index wins, so the anchor set's ordering
+        // is what a downstream sieve or reader can rely on.
+        let cs = vec![
+            cand("second", 5, 0.60, 99.0),
+            cand("first",  1, 0.60, 99.0),
+        ];
+        let (name, _, _) = pick_primary(cs).unwrap();
+        assert_eq!(name, "first");
+    }
+
+    #[test]
+    fn pick_primary_ignores_candidates_without_a_haplotype() {
+        let mut cs = vec![
+            cand("valid", 3, 0.50, 99.0),
+        ];
+        cs.push(Candidate {
+            record_id: "no_stitch".into(),
+            pool_index: 0,
+            path: None,
+            haplotype: None,
+        });
+        let (name, _, _) = pick_primary(cs).unwrap();
+        assert_eq!(name, "valid", "None candidates must not win by having pool_index 0");
     }
 
     /// `mean_ka` was hardcoded to 0.0 while being published as `ka=` in every FASTA header
@@ -414,7 +555,8 @@ mod golden_haplotype {
         let seqs = extract::collect_seqs(&graph, &nodes).unwrap();
         let subgraph = extract::write_gfa(&cfg, &graph, nodes, seqs).unwrap();
         let gaf = subgraph.gfa_path.with_extension("gaf");
-        let gp = align::run(&cfg, &subgraph, &query, &gaf).unwrap().expect("a path");
+        let mut gaf_map = align::run(&cfg, &subgraph, std::slice::from_ref(&query), &gaf).unwrap();
+        let gp = gaf_map.remove(query.record_id.as_str()).expect("a path");
         let h = stitch(&cfg, &graph, &gp, &subgraph, &query).unwrap().expect("a haplotype");
 
         let sha: String = Sha256::digest(&h.seq)

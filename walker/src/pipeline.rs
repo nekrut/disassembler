@@ -198,7 +198,16 @@ pub fn run_fetch_only(
 }
 
 /// Fan accessions through the two pools and collect results.
-pub fn run(cfg: &Config, accessions: Vec<Accession>, query: &Query) -> Result<Summary> {
+///
+/// `queries` is the reference pool. In today's single-anchor path it holds one [`Query`];
+/// multi-anchor mode passes several and the walker unions their canonical k-mers into one
+/// anchor index. The downstream stages are handed the first [`Query`] for now — later phases
+/// of the multi-anchor feature (align/stitch/pick_primary) fan out over the whole pool.
+pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Result<Summary> {
+    if queries.is_empty() {
+        return Err(crate::error::Error::Usage("no queries supplied".into()));
+    }
+
     let total = accessions.len();
     let (fetch_tx, fetch_rx) = sync_channel::<FetchedUnitigs>(cfg.channel_capacity);
     let (result_tx, result_rx) = std::sync::mpsc::channel::<AccessionResult>();
@@ -211,8 +220,11 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, query: &Query) -> Result<Su
         Arc::new(Mutex::new(rx))
     };
 
-    // Built once per run, not per accession: it depends only on cfg and query.
-    let query_index = stages::anchor::index_query(cfg, query)?;
+    // Built once per run, not per accession: it depends only on cfg and the anchor pool.
+    // Multi-anchor mode's whole point lives here — the anchor index is the union of every
+    // reference's canonical k-mers, so a graph carrying an Omicron-like spike is anchor-hit
+    // even under a Wuhan-only invocation of downstream stages (until Phase 4 fans them out).
+    let query_index = stages::anchor::index_query_set(cfg, queries)?;
     let query_index = &query_index;
 
     // One pooled HTTP client shared by every fetch thread. The bucket is a single host,
@@ -234,7 +246,7 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, query: &Query) -> Result<Su
         for _ in 0..cfg.compute_workers {
             let rx = Arc::clone(&fetch_rx);
             let tx = result_tx.clone();
-            scope.spawn(move || compute_worker(cfg, query, query_index, rx, tx));
+            scope.spawn(move || compute_worker(cfg, queries, query_index, rx, tx));
         }
         drop(result_tx);
 
@@ -337,7 +349,7 @@ fn fetch_worker(
 /// Pull fetched buffers and run every compute stage for that accession.
 fn compute_worker(
     cfg: &Config,
-    query: &Query,
+    queries: &[Query],
     query_index: &stages::anchor::QueryIndex,
     input: SharedReceiver<FetchedUnitigs>,
     out: std::sync::mpsc::Sender<AccessionResult>,
@@ -359,7 +371,7 @@ fn compute_worker(
         // result and keeps the worker alive.
         let panic_acc = accession.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_one(cfg, query, query_index, fetched)
+            run_one(cfg, queries, query_index, fetched)
                 .unwrap_or_else(|e| AccessionResult::failed(index, accession, e.to_string()))
         }))
         .unwrap_or_else(|_| {
@@ -393,7 +405,7 @@ fn compute_worker(
 /// See the module doc and `Config::peak_compressed_buffers`.
 fn run_one(
     cfg: &Config,
-    query: &Query,
+    queries: &[Query],
     query_index: &stages::anchor::QueryIndex,
     fetched: FetchedUnitigs,
 ) -> Result<AccessionResult> {
@@ -438,6 +450,7 @@ fn run_one(
             bubbles: Vec::new(),
             timing,
             error: None,
+            anchor_used: None,
         });
     }
 
@@ -466,23 +479,57 @@ fn run_one(
     let bubbles = stages::phase::phase(cfg, &graph, &subgraph)?;
     timing.phase = t.elapsed().as_secs_f64();
 
-    // align returns None when GraphAligner found no alignment; that is Outcome::NoPath,
-    // not an error. An empty GFA making GraphAligner abort IS an error, and must not be
-    // silently folded into this branch.
+    // align now returns one best GafPath per reference in the anchor pool. Multi-anchor
+    // mode fans out over the pool: stitch each reference against its own length and let
+    // `pick_primary` choose the winning haplotype. Under the single-anchor path (the
+    // legacy shape used by every golden fixture) this reduces to one candidate and picks
+    // it iff it clears `min_cov`, which is exactly what the old code did.
+    //
+    // An empty map == no alignment == Outcome::NoPath (not an error). An empty GFA making
+    // GraphAligner abort IS an error, and must not be silently folded into this branch.
     let gaf_path = subgraph.gfa_path.with_extension("gaf");
     let t = Instant::now();
-    let gaf = stages::align::run(cfg, &subgraph, query, &gaf_path)?;
+    let mut gaf_by_ref = stages::align::run(cfg, &subgraph, queries, &gaf_path)?;
     timing.align = t.elapsed().as_secs_f64();
 
     let t = Instant::now();
+    let candidates: Vec<stages::stitch::Candidate> = queries
+        .iter()
+        .enumerate()
+        .map(|(pool_index, q)| {
+            let path = gaf_by_ref.remove(q.record_id.as_str());
+            let hap = match &path {
+                Some(p) => stages::stitch::stitch(cfg, &graph, p, &subgraph, q)?,
+                None => None,
+            };
+            Ok::<_, crate::error::Error>(stages::stitch::Candidate {
+                record_id: q.record_id.clone(),
+                pool_index,
+                path,
+                haplotype: hap,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let winner = stages::stitch::pick_primary(candidates);
     // Alternative-haplotype recovery is `stages::variants`: it corrects the consensus to the
     // majority allele and emits second alleles at biallelic sites. See that module for why it
     // replaced the upstream `detour` engine (gap rate and VAF labelling).
-    let mut final_path = gaf;
-    let mut haplotype = match &final_path {
-        Some(path) => stages::stitch::stitch(cfg, &graph, path, &subgraph, query)?,
-        None => None,
+    let (mut final_path, mut haplotype, winning_ref): (
+        Option<crate::types::GafPath>,
+        Option<crate::types::Haplotype>,
+        Option<String>,
+    ) = match winner {
+        Some((name, path, hap)) => (Some(path), Some(hap), Some(name)),
+        None => (None, None, None),
     };
+    // The winning reference's Query is what every subsequent stage aligns against — prune
+    // pass, prefer_majority, find_alts. `queries[0]` is a defensible fallback when nothing
+    // won: the downstream code paths that follow all bail on `final_path == None` before
+    // touching `query`.
+    let query: &Query = winning_ref
+        .as_deref()
+        .and_then(|rid| queries.iter().find(|q| q.record_id == rid))
+        .unwrap_or(&queries[0]);
     timing.stitch = t.elapsed().as_secs_f64();
 
     // Second pass, off unless --prune-frac is set.
@@ -573,7 +620,8 @@ fn run_one(
                     stages::extract::write_gfa(cfg, &graph, kept_nodes, kept_seqs)?;
                 let gaf2 = pruned.gfa_path.with_extension("pass2.gaf");
                 let t = Instant::now();
-                let second = match stages::align::run(cfg, &pruned, query, &gaf2)? {
+                let mut gaf2_map = stages::align::run(cfg, &pruned, std::slice::from_ref(query), &gaf2)?;
+                let second = match gaf2_map.remove(query.record_id.as_str()) {
                     Some(p) => stages::stitch::stitch(cfg, &graph, &p, &pruned, query)?.map(|h| (p, h)),
                     None => None,
                 };
@@ -640,7 +688,21 @@ fn run_one(
     if let (Some(path), Some(_)) = (&final_path, &haplotype) {
         alts = stages::variants::find_alts(cfg, &graph, &subgraph, path, query)?;
     }
-    let haplotypes: Vec<crate::types::Haplotype> = haplotype.clone().into_iter().collect();
+    // Tag the primary with the winning reference when the anchor pool held more than one.
+    // Single-anchor mode leaves anchor_used = None on Haplotype, alts, and AccessionResult
+    // so the FASTA header, alt header, snvs.tsv and summary.json stay byte-identical to
+    // today's shape. Multi-anchor mode tags them all with the winning reference id.
+    let multi_anchor = queries.len() > 1;
+    let anchor_used_for_output: Option<String> = if multi_anchor { winning_ref.clone() } else { None };
+    let mut haplotypes: Vec<crate::types::Haplotype> = haplotype.clone().into_iter().collect();
+    if multi_anchor {
+        for h in haplotypes.iter_mut() {
+            h.anchor_used = winning_ref.clone();
+        }
+        for a in alts.iter_mut() {
+            a.haplotype.anchor_used = winning_ref.clone();
+        }
+    }
     timing.stitch += t.elapsed().as_secs_f64();
     timing.total = t_start.elapsed().as_secs_f64();
 
@@ -665,6 +727,7 @@ fn run_one(
         bubbles,
         timing,
         error: None,
+        anchor_used: anchor_used_for_output,
     })
 }
 

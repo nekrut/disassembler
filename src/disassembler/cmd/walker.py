@@ -4,6 +4,10 @@ Every argument after `disassembler walker` is forwarded to `logan-walker` verbat
 including `--help`. The only intercepted flag is `--walker-bin <PATH>`, which the
 Rust binary does not accept and which lets a caller override the resolution search.
 
+`-q` is repeatable — pass it more than once, or hand a multi-record FASTA, to invoke
+the walker's multi-anchor mode. See `logan-walker --help` for details on the
+anchor pool union and per-primary winning-reference tagging.
+
 Binary resolution follows `disassembler.resolve.resolve_walker`:
   1. --walker-bin
   2. $DISASSEMBLER_WALKER_BIN

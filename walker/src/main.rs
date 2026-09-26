@@ -51,7 +51,10 @@ USAGE:
 INPUT:
     -a, --accession <ACC>         Single SRA accession
     -l, --accession-list <FILE>   File with a list of SRA accessions
-    -q, --query <FASTA>           Reference CDS FASTA
+    -q, --query <FASTA>           Reference CDS FASTA. Repeatable, and each file may hold
+                                  multiple records; two or more references switches on
+                                  multi-anchor mode (union anchor pool, primary is the
+                                  reference whose alignment gives the best cov/pident)
 
 OUTPUT:
     -o, --out-dir <DIR>           Working directory
@@ -115,7 +118,10 @@ OFFLINE / CACHE:
 struct Args {
     accession: Option<String>,
     accession_list: Option<PathBuf>,
-    query: Option<PathBuf>,
+    /// One or more reference FASTAs. A single-file, single-record invocation stays on the
+    /// legacy path (byte-identical output, multi-record warning intact). Anything wider
+    /// switches the walker into multi-anchor mode.
+    query: Vec<PathBuf>,
     out_dir: PathBuf,
     out_fasta: PathBuf,
     /// Exit 0 even when nothing was reconstructed. Off by default: a shard that
@@ -128,7 +134,7 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
     let mut args = Args {
         accession: None,
         accession_list: None,
-        query: None,
+        query: Vec::new(),
         out_dir: PathBuf::from("walker_output"),
         out_fasta: PathBuf::from("reconstructed_haplotypes.fasta"),
         allow_empty: false,
@@ -145,7 +151,7 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
         match flag {
             "-a" | "--accession" => args.accession = Some(value()?),
             "-l" | "--accession-list" => args.accession_list = Some(PathBuf::from(value()?)),
-            "-q" | "--query" => args.query = Some(PathBuf::from(value()?)),
+            "-q" | "--query" => args.query.push(PathBuf::from(value()?)),
             "-o" | "--out-dir" => args.out_dir = PathBuf::from(value()?),
             "-f" | "--out-fasta" => args.out_fasta = PathBuf::from(value()?),
             "-k" | "--k" => {
@@ -319,13 +325,30 @@ fn real_main(args: Args) -> error::Result<()> {
 
     // ---- INTO the pipeline ------------------------------------------------
     // --fetch-only does not need a query: the compute stages never run.
-    let query = if args.cfg.fetch_only {
+    //
+    // Multi-anchor is auto-enabled when the collected reference set has more than one
+    // record, from any combination: several -q files, one multi-record file, or both.
+    // The single-file/single-record legacy path stays byte-identical (uses `read_query`,
+    // which fires the tools-iuc #8388 warning). Any wider intake uses `read_query_set`.
+    let queries: Option<Vec<crate::types::Query>> = if args.cfg.fetch_only {
         None
     } else {
-        let query_path = args
-            .query
-            .ok_or_else(|| error::Error::Usage("--query is required".into()))?;
-        Some(io::input::read_query(&query_path)?)
+        if args.query.is_empty() {
+            return Err(error::Error::Usage("--query is required".into()));
+        }
+        // Try the legacy single-file path first for its warning + n_records semantics.
+        // If that file turns out to hold more than one record, re-load through
+        // read_query_set so the whole pool goes into anchor union / align fan-out.
+        Some(if args.query.len() == 1 {
+            let first = io::input::read_query(&args.query[0])?;
+            if first.n_records > 1 {
+                io::input::read_query_set(&args.query)?
+            } else {
+                vec![first]
+            }
+        } else {
+            io::input::read_query_set(&args.query)?
+        })
     };
 
     let accessions = match (&args.accession, &args.accession_list) {
@@ -371,10 +394,15 @@ fn real_main(args: Args) -> error::Result<()> {
         return Ok(());
     }
 
-    // Unwrap the query for the full pipeline. The guard above ensures it is Some here.
-    let query = query.expect("query is Some when not --fetch-only");
+    // Unwrap the query set for the full pipeline. The guard above ensures it is Some here.
+    let queries = queries.expect("queries is Some when not --fetch-only");
 
-    let summary = pipeline::run(&args.cfg, accessions, &query)?;
+    let summary = pipeline::run(&args.cfg, accessions, &queries)?;
+
+    // Downstream writers that still take a single reference use the first query in the pool.
+    // In multi-anchor mode this is only used for coordinate contexts where the collector
+    // records the winning reference per haplotype separately.
+    let query = &queries[0];
 
     // ---- OUT of the pipeline ----------------------------------------------
     std::fs::create_dir_all(&args.out_dir)?;
@@ -382,14 +410,14 @@ fn real_main(args: Args) -> error::Result<()> {
     io::output::write_bubbles(&summary, &args.out_dir.join("bubbles.json"))?;
     // One alignment pass per accession, shared by both writers.
     if args.cfg.emit_vcf || args.cfg.emit_snv_table {
-        let sites = io::output::snv_sites_all(&summary, &query);
+        let sites = io::output::snv_sites_all(&summary, query);
         if args.cfg.emit_vcf {
-            io::output::write_vcfs(&summary, &query, &args.out_dir, &sites)?;
+            io::output::write_vcfs(&summary, query, &args.out_dir, &sites)?;
         }
         if args.cfg.emit_snv_table {
             io::output::write_snv_table(
                 &summary,
-                &query,
+                query,
                 &args.out_dir.join("snvs.tsv"),
                 &sites,
             )?;

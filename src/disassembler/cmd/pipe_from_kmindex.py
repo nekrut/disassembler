@@ -63,7 +63,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                         "reconstruct from.")
 
     # reconstruct inputs
-    p.add_argument("-q", "--query", required=True, help="Reference in-frame CDS FASTA")
+    p.add_argument("-q", "--query", required=True, action="append",
+                   help="Reference in-frame CDS FASTA. Repeatable, and each file may hold "
+                        "multiple records; passing more than one activates the walker's "
+                        "multi-anchor mode (union anchor pool, primary is the reference "
+                        "whose alignment gives the best cov/pident).")
+    p.add_argument("--msa-reference", default=None,
+                   help="FASTA to use as the MSA reference in multi-anchor mode "
+                        "(default: first -q). Ignored under --skip-tree.")
     p.add_argument("-o", "--out-dir", required=True, help="Output directory for reconstruct")
     p.add_argument("-w", "--workers", type=int, default=None,
                    help="walker compute workers (walker default 8)")
@@ -162,6 +169,7 @@ def run(args) -> int:
         accession=None,
         accession_list=str(acc_list),
         query=args.query,
+        msa_reference=args.msa_reference,
         out_dir=str(out_dir),
         workers=args.workers,
         fetch_workers=args.fetch_workers,
