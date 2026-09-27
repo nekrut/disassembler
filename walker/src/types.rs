@@ -226,6 +226,7 @@ pub struct PathStep {
 /// Note `path_start` and `path_end` are offsets into the *stitched path*, not into the
 /// query. `stitch` slices the assembled sequence with them (`logan_path_walker.py:217-220`),
 /// so mistaking them for query coordinates yields a plausible but wrong haplotype.
+#[derive(Clone)]
 pub struct GafPath {
     pub steps: Vec<PathStep>,
     /// GAF column 7.
@@ -349,6 +350,45 @@ pub struct Bubble {
     pub branches: Vec<Branch>,
 }
 
+/// One reference's candidate at the point `pick_primary` chose the winner.
+///
+/// Multi-anchor mode fans one alignment per reference, then keeps only the winner. Every
+/// non-winning candidate's `cov`/`pident`/nodes were discarded, which is what every
+/// after-the-fact "which strain does this look like" analysis had to reconstruct with a
+/// post-hoc BLAST against the reference panel. This carries the numbers the walker
+/// already computed to the summary writer, so downstream code can re-rank or audit
+/// without a second alignment.
+///
+/// Populated even for candidates that did not clear `min_cov`: `cov` and the alignment
+/// counters come from the GAF (which `stitch` inspected before returning `None`), and a
+/// user asking "why did nothing win" needs the sub-floor numbers as much as the winning
+/// ones. Only single-anchor runs emit an empty vec, so their JSON stays byte-identical.
+#[derive(Debug, Clone)]
+pub struct CandidateReport {
+    /// FASTA record id of the reference, matches [`Haplotype::anchor_used`].
+    pub record_id: String,
+    /// Order in the anchor pool. `pick_primary` uses this as its final tie-break, so a
+    /// consumer wanting to reproduce the winner must have it.
+    pub pool_index: usize,
+    /// `num_matches / aln_len * 100`, same as [`Haplotype::pident`]. `None` when this
+    /// reference produced no GAF row (i.e. GraphAligner found no alignment for it).
+    pub pident: Option<f64>,
+    /// Fraction of the reference length covered by the stitched span. `None` when there
+    /// was no path to stitch.
+    pub cov: Option<f64>,
+    /// Length of the stitched span in bases. `None` when there was no path.
+    pub length: Option<usize>,
+    pub nodes: Option<usize>,
+    /// GAF column 7, path length in bases.
+    pub path_len: Option<usize>,
+    /// GAF column 10.
+    pub num_matches: Option<usize>,
+    /// GAF column 11.
+    pub aln_len: Option<usize>,
+    /// True iff this candidate was the winner `pick_primary` returned.
+    pub selected: bool,
+}
+
 // ---------------------------------------------------------------------------
 // per-accession result
 // ---------------------------------------------------------------------------
@@ -404,6 +444,11 @@ pub struct AccessionResult {
     /// so callers who look at `AccessionResult` directly (e.g. the summary writer) do not
     /// need to reach into `haplotype`.
     pub anchor_used: Option<String>,
+    /// One entry per reference in the anchor pool, populated only in multi-anchor mode.
+    ///
+    /// Single-anchor runs leave this empty so `summary.json` stays byte-identical to the
+    /// pre-multi-anchor shape.
+    pub candidates: Vec<CandidateReport>,
 }
 
 impl AccessionResult {
@@ -424,6 +469,7 @@ impl AccessionResult {
             timing: Timing::default(),
             error: Some(error),
             anchor_used: None,
+            candidates: Vec::new(),
         }
     }
 }

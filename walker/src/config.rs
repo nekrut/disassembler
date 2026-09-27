@@ -2,6 +2,52 @@
 
 use std::path::PathBuf;
 
+/// How multi-anchor mode ranks per-reference candidates in [`stages::stitch::pick_primary`].
+///
+/// The default is `Cov`: sort by fraction of the reference covered, break ties on identity,
+/// then on pool order. It maximises how much of each accession's sequence gets walked,
+/// but on a mixed-strain panel (measured on the SARS-CoV-2 spike 11-strain panel) it
+/// concentrates ~70% of primaries on `Omicron_XBB15` — the mid-cluster reference whose
+/// alignment finds long walks in graphs across the archive — even when phylogenetically
+/// closer strains sit in the pool. See `docs/anchor_primary_metric.md`.
+///
+/// `Pident` swaps the primary and secondary sort keys: highest identity to reference wins,
+/// then coverage. On the same panel, it moves the primary tag onto the strain the graph
+/// route actually matches best, but it may prefer a shorter walk that hits its own
+/// reference cleanly over a fuller walk that hits a moderately-similar reference.
+///
+/// `CovXPident` orders on `cov * pident/100`, a joint score. Restores full-length runs
+/// as the tie-break winner while letting a large identity gap override a small coverage
+/// advantage. Recommended when both matter and neither dominates.
+///
+/// Only affects which candidate is tagged as the primary and written to the FASTA. Every
+/// candidate's numbers are emitted in `summary.json` under `"candidates"` regardless, so
+/// a downstream tool can always re-rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimaryMetric {
+    Cov,
+    Pident,
+    CovXPident,
+}
+
+impl PrimaryMetric {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "cov" => Some(Self::Cov),
+            "pident" => Some(Self::Pident),
+            "cov_x_pident" | "cov-x-pident" => Some(Self::CovXPident),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cov => "cov",
+            Self::Pident => "pident",
+            Self::CovXPident => "cov_x_pident",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     // ---- algorithm ----
@@ -19,6 +65,10 @@ pub struct Config {
     pub min_vaf: f64,
     /// Minimum fraction of the reference a haplotype must cover to be kept.
     pub min_cov: f64,
+    /// How multi-anchor mode ranks per-reference candidates. See [`PrimaryMetric`].
+    ///
+    /// Single-anchor runs ignore this: there is only one candidate to pick from.
+    pub primary_metric: PrimaryMetric,
     /// Second-pass prune: drop unitigs below this fraction of the gene's own depth, then
     /// realign. `0.0` disables it and restores the previous behaviour exactly.
     ///
@@ -357,6 +407,7 @@ impl Default for Config {
             min_abund: 5.0,
             min_vaf: 0.10,
             min_cov: 0.85,
+            primary_metric: PrimaryMetric::Cov,
             prune_frac: 0.01,
             min_abund_frac: 0.0,
             prefer_majority: true,

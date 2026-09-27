@@ -38,7 +38,7 @@ mod pipeline;
 mod stages;
 mod types;
 
-use config::Config;
+use config::{Config, PrimaryMetric};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -68,6 +68,9 @@ TUNING:
         --min-abund-frac <F>      Raise the variant floor to this fraction of gene depth,
                                   median ka:f on the walked path [default: 0.0 = off]
         --min-cov <F>             Minimum reference coverage [default: 0.85]
+        --primary-metric <M>      Multi-anchor primary selection: cov | pident |
+                                  cov_x_pident [default: cov]. Ignored in single-anchor
+                                  mode. See config docs for tradeoffs
         --min-shared-kmers <N>    Anchor threshold, validated 1..=5 [default: 3]
         --max-size-mb <N>         Maximum compressed SRA size in MB [default: 1024]
         --prune-frac <F>          Drop unitigs below this fraction of the gene's depth and
@@ -168,6 +171,14 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             }
             "--min-cov" => {
                 args.cfg.min_cov = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-cov: {e}")))?;
+            }
+            "--primary-metric" => {
+                let raw = value()?;
+                args.cfg.primary_metric = PrimaryMetric::parse(&raw).ok_or_else(|| {
+                    error::Error::Usage(format!(
+                        "--primary-metric: expected cov | pident | cov_x_pident, got {raw:?}"
+                    ))
+                })?;
             }
             "--min-shared-kmers" => {
                 args.cfg.min_shared_kmers = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-shared-kmers: {e}")))?;

@@ -451,6 +451,7 @@ fn run_one(
             timing,
             error: None,
             anchor_used: None,
+            candidates: Vec::new(),
         });
     }
 
@@ -510,7 +511,39 @@ fn run_one(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let winner = stages::stitch::pick_primary(candidates);
+    // Snapshot per-reference stats before `pick_primary` consumes the candidates. Every
+    // number here was computed by `stitch`/`align` for this accession; without the snapshot
+    // the non-winning references' cov/pident are dropped on the floor. Only populated in
+    // multi-anchor mode so single-anchor `summary.json` stays byte-identical.
+    let multi_anchor = queries.len() > 1;
+    let candidate_reports: Vec<crate::types::CandidateReport> = if multi_anchor {
+        candidates
+            .iter()
+            .map(|c| crate::types::CandidateReport {
+                record_id: c.record_id.clone(),
+                pool_index: c.pool_index,
+                pident: c.haplotype.as_ref().map(|h| h.pident).or_else(|| {
+                    c.path.as_ref().map(|p| {
+                        if p.aln_len > 0 {
+                            (p.num_matches as f64 / p.aln_len as f64) * 100.0
+                        } else {
+                            0.0
+                        }
+                    })
+                }),
+                cov: c.haplotype.as_ref().map(|h| h.cov),
+                length: c.haplotype.as_ref().map(|h| h.seq.len()),
+                nodes: c.haplotype.as_ref().map(|h| h.nodes),
+                path_len: c.path.as_ref().map(|p| p.path_len),
+                num_matches: c.path.as_ref().map(|p| p.num_matches),
+                aln_len: c.path.as_ref().map(|p| p.aln_len),
+                selected: false, // set below once pick_primary names a winner
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let winner = stages::stitch::pick_primary(candidates, cfg.primary_metric);
     // Alternative-haplotype recovery is `stages::variants`: it corrects the consensus to the
     // majority allele and emits second alleles at biallelic sites. See that module for why it
     // replaced the upstream `detour` engine (gap rate and VAF labelling).
@@ -692,8 +725,16 @@ fn run_one(
     // Single-anchor mode leaves anchor_used = None on Haplotype, alts, and AccessionResult
     // so the FASTA header, alt header, snvs.tsv and summary.json stay byte-identical to
     // today's shape. Multi-anchor mode tags them all with the winning reference id.
-    let multi_anchor = queries.len() > 1;
     let anchor_used_for_output: Option<String> = if multi_anchor { winning_ref.clone() } else { None };
+    // Mark the winning candidate in the snapshot so the summary writer can flag it.
+    let mut candidate_reports = candidate_reports;
+    if let Some(rid) = winning_ref.as_deref() {
+        for c in candidate_reports.iter_mut() {
+            if c.record_id == rid {
+                c.selected = true;
+            }
+        }
+    }
     let mut haplotypes: Vec<crate::types::Haplotype> = haplotype.clone().into_iter().collect();
     if multi_anchor {
         for h in haplotypes.iter_mut() {
@@ -728,6 +769,7 @@ fn run_one(
         timing,
         error: None,
         anchor_used: anchor_used_for_output,
+        candidates: candidate_reports,
     })
 }
 
