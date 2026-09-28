@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from disassembler.resolve import resolve_sieve
+from disassembler.validators import fraction, positive_int
 
 
 def first_record_len(path: Path):
@@ -138,16 +139,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("-i", "--input", required=True, help="Input FASTA")
     p.add_argument("-o", "--output", required=True, help="Output (promoted) FASTA")
-    p.add_argument("--min-len", type=int, default=None,
+    p.add_argument("--min-len", type=positive_int, default=None,
                    help="Minimum sequence length gate. Default: auto = 95%% of the "
                         "first record in --ref.")
     p.add_argument("--ref", default=None,
                    help="Reference CDS FASTA, used only to auto-derive --min-len "
                         "when --min-len is not given.")
-    p.add_argument("--threshold", type=float, default=0.005,
+    p.add_argument("--threshold", type=fraction, default=0.005,
                    help="LSH promotion threshold tau (default 0.005, gene-scale). "
                         "The sieve binary's own default of 0.15 targets archive-scale.")
-    p.add_argument("--sketch", type=int, default=256,
+    p.add_argument("--sketch", type=positive_int, default=256,
                    help="MinHash sketch size m (default 256, gene-scale). The "
                         "estimator cannot resolve novelty finer than 1/m.")
     p.add_argument("--sieve-bin", default=None,

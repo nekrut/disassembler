@@ -28,6 +28,8 @@ from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
 
+from disassembler.validators import positive_int, validate_api_key_file
+
 ATTEMPTS = 5
 
 
@@ -304,7 +306,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                         "then /tmp/gxy.txt)")
     p.add_argument("-o", "--out-dir", default="candidates",
                    help="Output directory for candidate accessions")
-    p.add_argument("--download-workers", type=int, default=6,
+    p.add_argument("--download-workers", type=positive_int, default=6,
                    help="Parallel download workers (default: 6). Empirically the ceiling "
                         "before usegalaxy.org's per-source rate limiter starts returning "
                         "HTTP 429; higher values still complete thanks to the Retry-After "
@@ -316,6 +318,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run(args) -> int:
+    key_err = validate_api_key_file(args.api_key_file)
+    if key_err:
+        print(f"harvest: {key_err}", file=sys.stderr)
+        return 1
     try:
         api_key = get_galaxy_api_key(args.api_key_file)
     except RuntimeError as e:

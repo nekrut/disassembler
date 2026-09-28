@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from disassembler.validators import fraction, positive_int
+
 MAMBA_PREFIX = Path(os.environ.get("MAMBA_ROOT_PREFIX", str(Path.home() / "micromamba")))
 CODON_ENV_BIN = MAMBA_PREFIX / "envs" / "codon" / "bin"
 
@@ -82,8 +84,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("--out-aln", "-a", required=True, help="Output codon MSA FASTA")
     p.add_argument("--out-tree", "-t", required=True, help="Output Newick tree")
-    p.add_argument("--mafft-threads", type=int, default=8, help="MAFFT threads")
-    p.add_argument("--msa-min-cov", type=float, default=0.70,
+    p.add_argument("--mafft-threads", type=positive_int, default=8, help="MAFFT threads")
+    p.add_argument("--msa-min-cov", type=fraction, default=0.70,
                    help="Minimum sequence coverage fraction (fraction of reference length "
                         "a sequence must reach to enter the MSA)")
     p.set_defaults(func=run)

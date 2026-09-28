@@ -79,6 +79,14 @@ import urllib.request
 from pathlib import Path
 from collections import Counter, defaultdict
 
+from disassembler.validators import (
+    fraction,
+    non_negative_int,
+    percentage,
+    positive_int,
+    validate_api_key_file,
+)
+
 # Translation table: NCBI standard / bacterial code 11
 CODON_TABLE_11 = {
     'TTT': 'F', 'TTC': 'F', 'TTA': 'L', 'TTG': 'L',
@@ -489,7 +497,7 @@ def stream_lexicmap_to_msa(
             if n_stops > 0:
                 cov_ge_50_stops += 1
 
-        # Stratify accession. With --full-length-only, the clean full-length tier requires
+        # Stratify accession. With --require-full-length, the clean full-length tier requires
         # complete coverage of the reference (every position tiled), not merely min_coverage.
         full_cov = 1.0 if full_length_only else min_coverage
         if cov >= full_cov and (n_stops <= max_internal_stops or allow_frameshifts):
@@ -899,37 +907,68 @@ def add_parser(subparsers):
         description="Stream LexicMap search results, tile multi-HSP alignments, stratify cohorts, and collapse haplotypes.",
     )
     parser.add_argument("-q", "-r", "--query", "--ref", dest="ref", type=str, required=True,
-                        help="Path to reference FASTA file (e.g. queries/query_hiv1_pol.fasta).")
+                        help="Reference in-frame CDS FASTA (e.g. queries/query_hiv1_pol.fasta). "
+                             "Only the first record is read; its length defines the coordinate "
+                             "grid every HSP is projected onto.")
     parser.add_argument("-d", "--dataset", type=str, default=None,
-                        help="Galaxy dataset ID to stream from over HTTP.")
+                        help="Galaxy dataset ID to stream from over HTTP. Mutually exclusive "
+                             "with -f/-i/--file; one of the two is required.")
     parser.add_argument("-f", "-i", "--file", "--input", dest="file", type=str, default=None,
-                        help="Path to local LexicMap tabular file (or '-' for stdin).")
+                        help="Local LexicMap tabular file, or '-' to read from stdin. "
+                             "Mutually exclusive with -d/--dataset.")
     parser.add_argument("--base-url", type=str, default="https://usegalaxy.org",
-                        help="Galaxy server base URL (default: https://usegalaxy.org).")
+                        help="Galaxy instance base URL used with -d/--dataset "
+                             "(default: https://usegalaxy.org).")
     parser.add_argument("--api-key", type=str, default=None,
-                        help="Galaxy API key string.")
+                        help="Galaxy API key as a literal string. If unset, the key is read "
+                             "from --api-key-file, then $GALAXY_API_KEY, then /tmp/gxy.txt.")
     parser.add_argument("--api-key-file", type=str, default="/tmp/gxy.txt",
-                        help="Path to file containing Galaxy API key (default: /tmp/gxy.txt).")
-    parser.add_argument("--min-cov", type=float, default=0.80,
-                        help="Minimum merged query coverage fraction for full-length clean cohort (default: 0.80 = 80%%).")
-    parser.add_argument("--min-cov-partial", type=float, default=0.50,
-                        help="Minimum coverage fraction for clean partial expanded cohort (default: 0.50 = 50%%).")
-    parser.add_argument("--min-pident", type=float, default=60.0,
-                        help="Minimum percent identity for candidate HSPs (default: 60.0%%).")
-    parser.add_argument("--max-internal-stops", type=int, default=0,
-                        help="Maximum premature stop codons allowed in CDS body (default: 0).")
+                        help="Path to a file whose contents are the Galaxy API key "
+                             "(default: /tmp/gxy.txt). Ignored if --api-key is set.")
+    parser.add_argument("--min-cov", type=fraction, default=0.80,
+                        help="Clean full-length cohort gate: fraction of the reference an "
+                             "accession's merged HSPs must cover (default: 0.80 = 80%%). "
+                             "Below this, an accession falls through to the partial or "
+                             "low-coverage tier. Distinct from --msa-min-cov, which gates a "
+                             "later MSA stage in the composites.")
+    parser.add_argument("--min-cov-partial", type=fraction, default=0.50,
+                        help="Clean partial cohort gate: minimum coverage fraction for the "
+                             "expanded clean cohort (default: 0.50 = 50%%). Must be "
+                             "<= --min-cov. Anything below this is filed as a low-coverage "
+                             "fragment.")
+    parser.add_argument("--min-pident", type=percentage, default=60.0,
+                        help="Minimum percent identity for an HSP to contribute to the tiled "
+                             "reconstruction (default: 60.0%%). HSPs below this are dropped "
+                             "before the coverage gates are evaluated.")
+    parser.add_argument("--max-internal-stops", type=non_negative_int, default=0,
+                        help="Maximum premature stop codons tolerated in the CDS body before "
+                             "an accession is flagged out of the clean cohort (default: 0).")
     parser.add_argument("--allow-frameshift-alts", action="store_true",
-                        help="Allow indels/frameshifts with premature stop codons into clean cohort.")
-    parser.add_argument("--full-length-only", action="store_true",
-                        help="Only include accessions that cover 100%% of query length.")
-    parser.add_argument("--max-records", type=int, default=None,
-                        help="Stop after processing N lines (useful for testing/previews).")
-    parser.add_argument("--sample-cap", type=int, default=10,
-                        help="Maximum sample accessions to record per haplotype in TSV (default: 10).")
+                        help="Let accessions with indels/frameshifts that produce premature "
+                             "stops into the clean cohort anyway. Off by default.")
+    parser.add_argument("--require-full-length", action="store_true",
+                        help="Require 100%% reference coverage (every position tiled) for the "
+                             "clean full-length tier, instead of the --min-cov threshold. "
+                             "Off by default.")
+    parser.add_argument("--max-records", type=positive_int, default=None,
+                        help="Stop after processing N input rows. Useful for a quick preview "
+                             "on a large tabular stream.")
+    parser.add_argument("--samples-per-haplotype", type=positive_int, default=10,
+                        dest="samples_per_haplotype",
+                        help="Maximum representative accessions listed per collapsed haplotype "
+                             "in <prefix>.clean.haplotypes.tsv (default: 10). Does not affect "
+                             "the .accessions.fasta outputs.")
     parser.add_argument("-o", "--out-prefix", "--out-dir", dest="out_prefix", type=str, default=None,
-                        help="Output prefix or directory for generated files (default: msa/<ref_name>).")
+                        help="Output prefix, or a directory (all lexicmap outputs land at "
+                             "<prefix>.*, default: msa/<ref_name>).")
     parser.add_argument("--no-a2m", action="store_true",
-                        help="Disable generating .a2m alignment files.")
+                        help="Skip writing the .a2m formatted MSA files "
+                             "(<prefix>.clean.a2m and the .a2m compat alias).")
+    parser.add_argument("--allow-empty", action="store_true",
+                        help="Exit 0 even if the clean cohort is empty. Off by default: "
+                             "an empty cohort exits non-zero so a wrapping workflow does "
+                             "not mistake a whole-target miss for a good run. Mirrors "
+                             "`disassembler walker --allow-empty`.")
     parser.set_defaults(func=run)
 
 
@@ -939,7 +978,22 @@ def run(args) -> int:
               "(or '-' for stdin).", file=sys.stderr)
         return 2
 
-    stream_lexicmap_to_msa(
+    if args.min_cov_partial > args.min_cov:
+        print(f"lexicmap: --min-cov-partial ({args.min_cov_partial}) must be "
+              f"<= --min-cov ({args.min_cov}); otherwise the partial tier is empty by "
+              f"construction.", file=sys.stderr)
+        return 2
+
+    # Galaxy API key file: only validate when streaming from a dataset AND we're
+    # actually going to fall back to the file (--api-key and $GALAXY_API_KEY both
+    # win first, matching get_galaxy_api_key's resolution order).
+    if args.dataset and not args.api_key and not os.environ.get("GALAXY_API_KEY"):
+        key_err = validate_api_key_file(args.api_key_file)
+        if key_err:
+            print(f"lexicmap: {key_err}", file=sys.stderr)
+            return 1
+
+    summary = stream_lexicmap_to_msa(
         ref_path=args.ref,
         dataset_id=args.dataset,
         file_path=args.file,
@@ -951,10 +1005,22 @@ def run(args) -> int:
         min_pident=args.min_pident,
         max_internal_stops=args.max_internal_stops,
         allow_frameshifts=args.allow_frameshift_alts,
-        full_length_only=args.full_length_only,
+        full_length_only=args.require_full_length,
         max_records=args.max_records,
-        sample_cap=args.sample_cap,
+        sample_cap=args.samples_per_haplotype,
         out_prefix=args.out_prefix,
         write_a2m=not args.no_a2m,
     )
+
+    # Empty-cohort hard-fail: a wrapping workflow should treat "no clean accessions
+    # streamed" as failure, not as a good run with an empty output. Mirrors the
+    # walker's --allow-empty escape hatch.
+    if isinstance(summary, dict) and summary.get("status") == "ok":
+        breakdown = summary.get("cohort_breakdown", {})
+        n_clean = int(breakdown.get("combined_clean_cohort", 0))
+        if n_clean == 0 and not args.allow_empty:
+            print(f"lexicmap: clean cohort is empty (0 full-length + 0 partial). "
+                  f"Exiting non-zero. Pass --allow-empty to accept this as a good "
+                  f"run.", file=sys.stderr)
+            return 1
     return 0

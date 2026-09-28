@@ -1,8 +1,8 @@
 """stratify: cut a size-capped cohort from a harvested `<out-dir>/*.scores.json` tree.
 
-`--bin LO:HI:N` (repeatable): sample N accessions with score in the half-open
-`[LO, HI)`. Nonzero scores only. No backfill: a bin short on candidates
-contributes what it has.
+`--score-bin LO:HI:N` (repeatable): sample N accessions with score in the
+half-open `[LO, HI)`. Nonzero scores only. No backfill: a bin short on
+candidates contributes what it has.
 
 The phiX174 Illumina spike-in is filtered upstream in `harvest` by target NAME,
 not by score. See `harvest.safe_target_name`.
@@ -12,7 +12,7 @@ An earlier `--diversity N` mode also existed (four containment brackets,
 while download cost is byte-driven, so it was the wrong lever for the download-
 volume problem it was meant to solve; `walker --max-size-mb` gates bytes.
 Calibration-experiment workflows that used `--diversity` can express the same
-shape with four `--bin` invocations.
+shape with four `--score-bin` invocations.
 """
 
 from __future__ import annotations
@@ -50,15 +50,15 @@ def parse_bin_spec(s: str):
     """
     parts = s.split(":")
     if len(parts) != 3:
-        raise ValueError(f"--bin '{s}' must be LO:HI:N (three colon-separated fields)")
+        raise ValueError(f"--score-bin '{s}' must be LO:HI:N (three colon-separated fields)")
     try:
         lo, hi, n = float(parts[0]), float(parts[1]), int(parts[2])
     except ValueError as e:
-        raise ValueError(f"--bin '{s}': could not parse as LO:HI:N ({e})")
+        raise ValueError(f"--score-bin '{s}': could not parse as LO:HI:N ({e})")
     if not (lo < hi):
-        raise ValueError(f"--bin '{s}': LO ({lo}) must be strictly less than HI ({hi})")
+        raise ValueError(f"--score-bin '{s}': LO ({lo}) must be strictly less than HI ({hi})")
     if n < 0:
-        raise ValueError(f"--bin '{s}': N ({n}) must be non-negative")
+        raise ValueError(f"--score-bin '{s}': N ({n}) must be non-negative")
     return (lo, hi, n)
 
 
@@ -73,7 +73,7 @@ def assert_bins_disjoint(bins) -> None:
     for (a_lo, a_hi, _), (b_lo, b_hi, _) in zip(ordered, ordered[1:]):
         if b_lo < a_hi:
             raise ValueError(
-                f"--bin ranges overlap: [{a_lo}, {a_hi}) and [{b_lo}, {b_hi}). "
+                f"--score-bin ranges overlap: [{a_lo}, {a_hi}) and [{b_lo}, {b_hi}). "
                 f"Overlap is refused; run stratify once per disjoint bin set if "
                 f"you need the same accession in more than one bin's sample."
             )
@@ -162,21 +162,29 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "stratify",
         help="Cut a size-capped cohort from a `harvest` output directory.",
         description=(
-            "Sample N accessions per --bin from `<out-dir>/*.scores.json`. Bins are "
-            "half-open [LO, HI), nonzero-scores only, no backfill, disjoint."
+            "Sample N accessions per --score-bin from `<out-dir>/*.scores.json`. "
+            "Bins are half-open [LO, HI), nonzero-scores only, no backfill, disjoint."
         ),
     )
     p.add_argument("-o", "--out-dir", default="candidates",
-                   help="Directory with *.scores.json (same directory used by `harvest`).")
-    p.add_argument("--bin", action="append", dest="bins", metavar="LO:HI:N", required=True,
-                   help="Sample N accessions with score in [LO, HI). Nonzero-score accessions "
-                        "only. Repeatable. No backfill. Overlapping bins are refused.")
+                   help="Directory with *.scores.json produced by `harvest` (the same "
+                        "directory passed to `harvest -o`). Per-target outputs "
+                        "<target>.bins.txt and <target>.bins.json are written here, "
+                        "next to a combined bins_summary.json.")
+    p.add_argument("--score-bin", action="append", dest="score_bins",
+                   metavar="LO:HI:N", required=True,
+                   help="Sample up to N accessions whose kmindex score falls in the "
+                        "half-open interval [LO, HI). Repeatable to define multiple "
+                        "bins in one run (e.g. --score-bin 0.0:0.05:10 "
+                        "--score-bin 0.05:0.10:10). Nonzero scores only; a bin short "
+                        "on candidates contributes what it has (no backfill); "
+                        "overlapping bins are refused.")
     p.set_defaults(func=run)
 
 
 def run(args) -> int:
     try:
-        parsed_bins = [parse_bin_spec(b) for b in args.bins]
+        parsed_bins = [parse_bin_spec(b) for b in args.score_bins]
         assert_bins_disjoint(parsed_bins)
     except ValueError as e:
         print(f"stratify: {e}", file=sys.stderr)

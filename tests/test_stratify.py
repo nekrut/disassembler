@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_stratify.py -- unit tests for the cohort stratifier.
 
---bin: arbitrary half-open [LO, HI) ranges, no backfill, nonzero scores only.
+--score-bin: arbitrary half-open [LO, HI) ranges, no backfill, nonzero scores only.
 """
 import json
 import sys
@@ -31,8 +31,8 @@ class TestStratifiedSample(unittest.TestCase):
 
 
 class TestBinStratification(unittest.TestCase):
-    """--bin gives the caller arbitrary [LO, HI) ranges with per-range counts, no backfill,
-    and only nonzero-score accessions.
+    """--score-bin gives the caller arbitrary [LO, HI) ranges with per-range counts, no
+    backfill, and only nonzero-score accessions.
     """
 
     def setUp(self):

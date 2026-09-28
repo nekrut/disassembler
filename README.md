@@ -223,7 +223,7 @@ disassembler harvest \
 # Optional: sample per-target from arbitrary score bins (histogram-driven experiments).
 # If omitted, reconstruct just runs against the raw <target>.accessions.txt list.
 disassembler stratify -o candidates/ \
-    --bin 0.0:0.05:10 --bin 0.05:0.10:10 --bin 0.10:0.15:10
+    --score-bin 0.0:0.05:10 --score-bin 0.05:0.10:10 --score-bin 0.10:0.15:10
 
 # Reconstruct a target gene cohort directly.
 disassembler reconstruct \
@@ -254,26 +254,26 @@ Written on every run, with no threshold of their own beyond the search's:
 | `UNION.accessions.txt` | the union across all targets |
 | `summary.json` | per-target counts and max score |
 
-#### Custom score bins: `disassembler stratify --bin LO:HI:N`
+#### Custom score bins: `disassembler stratify --score-bin LO:HI:N`
 
 For walker calibration experiments or histogram-driven cohorts (e.g. "give me 10 accessions each
-from three low non-zero-coverage bins"), pass one or more `--bin LO:HI:N`. Each bin selects up to
-N accessions with score in the half-open interval `[LO, HI)`, sampled evenly across the sorted
-range.
+from three low non-zero-coverage bins"), pass one or more `--score-bin LO:HI:N`. Each bin selects
+up to N accessions with score in the half-open interval `[LO, HI)`, sampled evenly across the
+sorted range.
 
 ```bash
 # 30 accessions total: 10 each from three low-coverage bins
 disassembler stratify -o candidates/ \
-    --bin 0.0:0.05:10 --bin 0.05:0.10:10 --bin 0.10:0.15:10
+    --score-bin 0.0:0.05:10 --score-bin 0.05:0.10:10 --score-bin 0.10:0.15:10
 ```
 
 Semantics:
 
-- **Nonzero scores only.** Zero-score accessions are excluded up front, so `--bin 0.0:0.05:10`
-  means "10 from the [1e-9, 0.05) range." Same behavior for every bin.
+- **Nonzero scores only.** Zero-score accessions are excluded up front, so
+  `--score-bin 0.0:0.05:10` means "10 from the [1e-9, 0.05) range." Same behavior for every bin.
 - **No backfill.** A bin with fewer than N candidates contributes what it has and no other bin
-  is topped up above its own N. Each `--bin` is an independent request the caller cares about
-  individually.
+  is topped up above its own N. Each `--score-bin` is an independent request the caller cares
+  about individually.
 - **Half-open `[LO, HI)`.** Bins can touch at boundaries without double-counting.
 - **Overlapping bins are an error.**
 
@@ -413,7 +413,7 @@ disassembler from-lexicmap \
 | `--min-pident <F>` | `60.0` | Minimum percent identity for candidate HSPs |
 | `--max-internal-stops <N>` | `0` | Maximum premature internal stops allowed in CDS |
 | `--allow-frameshift-alts` | off | Allow indels/premature stops into clean cohort |
-| `--sample-cap <N>` | `10` | Maximum sample accessions recorded per haplotype in TSV |
+| `--samples-per-haplotype <N>` | `10` | Maximum representative accessions recorded per haplotype in the clean-haplotypes TSV |
 | `--max-records <N>` | — | Stop after processing $N$ lines (for testing/previews) |
 | `--no-a2m` | off | Disable `.a2m` output |
 

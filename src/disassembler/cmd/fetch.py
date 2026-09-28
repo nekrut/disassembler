@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import argparse
 
+import sys
+
 from disassembler.cmd import walker as walker_cmd
+from disassembler.validators import positive_int, validate_unitigs_cache
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -31,9 +34,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     src.add_argument("-l", "--accession-list", help="file with one accession per line")
     p.add_argument("--unitigs-cache", required=True, metavar="DIR",
                    help="Directory to write <ACC>.unitigs.fa.zst files into. Created if absent.")
-    p.add_argument("--fetch-workers", type=int, default=None,
+    p.add_argument("--fetch-workers", type=positive_int, default=None,
                    help="Parallel S3 fetch workers (walker default 8)")
-    p.add_argument("--max-size-mb", type=int, default=None,
+    p.add_argument("--max-size-mb", type=positive_int, default=None,
                    help="Refuse accessions above this compressed size (walker default 1024)")
     p.add_argument("--allow-empty", action="store_true",
                    help="Exit 0 even if some accessions fail. Off by default.")
@@ -43,6 +46,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run(args) -> int:
+    # Fetch always writes into the cache, so offline=False is the right semantics
+    # for the shared validator: only reject not-a-directory, permit missing (walker
+    # creates it).
+    cache_err = validate_unitigs_cache(args.unitigs_cache, offline=False)
+    if cache_err:
+        print(f"fetch: {cache_err}", file=sys.stderr)
+        return 1
     argv: list[str] = ["--fetch-only", "--unitigs-cache", args.unitigs_cache]
     if args.accession:
         argv += ["-a", args.accession]
