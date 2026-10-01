@@ -127,9 +127,12 @@ class TestLexicMapStreamer(unittest.TestCase):
         self.assertLessEqual(mean_pid, 100.0)
         self.assertAlmostEqual(mean_pid, 90.0)
 
-    def test_ungrouped_input_is_rejected(self):
-        # SRR001's two HSPs are split by an SRR002 row: the stream is not grouped by accession.
-        # This must raise rather than silently double-count SRR001 and undercount its coverage.
+    def test_ungrouped_input_is_handled_correctly(self):
+        # SRR001's two HSPs are split by an SRR002 row: the stream is NOT grouped by accession.
+        # Real production LexicMap output is routinely ordered this way (ranked by score across
+        # all matched genomes, not grouped by genome), so this must be handled correctly rather
+        # than raising: SRR001's two split HSPs must still be merged together into one
+        # full-coverage clean accession, exactly as if the input had been pre-sorted.
         tsv = (
             "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
             "SRR001\t100.0\t50.0\t1\t6\tATGGCT\tATGGCT\n"
@@ -138,11 +141,42 @@ class TestLexicMapStreamer(unittest.TestCase):
         )
         p = self.dir_path / "ungrouped.tsv"
         p.write_text(tsv)
-        with self.assertRaises(ValueError):
-            lms.stream_lexicmap_to_msa(
-                ref_path=str(self.ref_fasta), file_path=str(p),
-                out_prefix=str(self.dir_path / "ung"),
-            )
+        summary = lms.stream_lexicmap_to_msa(
+            ref_path=str(self.ref_fasta), file_path=str(p),
+            out_prefix=str(self.dir_path / "ung"),
+        )
+        # Both SRR001 (rescued from its two split HSPs) and SRR002 (single full-length HSP) must
+        # be counted as clean full-length -- not raised on, not double-counted, not undercounted.
+        breakdown = summary["cohort_breakdown"]
+        self.assertEqual(summary["total_accessions_evaluated"], 2)
+        self.assertEqual(breakdown["clean_full_length"], 2)
+        self.assertEqual(summary["recovery_metrics"]["multi_hsp_rescued_accessions"], 1)  # SRR001
+
+        clean_fa = Path(f"{self.dir_path / 'ung'}.clean.accessions.fasta").read_text()
+        self.assertIn("SRR001", clean_fa)
+        self.assertIn("SRR002", clean_fa)
+        self.assertIn("ATGGCTGAATAA", clean_fa)  # SRR001's merged, full-coverage sequence
+
+    def test_reappearing_accession_does_not_double_count(self):
+        # A three-way split (interleaved with two other accessions) is a stronger version of the
+        # same real-world scenario: SRR900's three HSPs are scattered across the file. Must still
+        # be merged into exactly one accession record, not three.
+        tsv = (
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            "SRR900\t100.0\t33.3\t1\t4\tATGG\tATGG\n"
+            "SRR901\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
+            "SRR900\t100.0\t33.3\t5\t8\tCTGA\tCTGA\n"
+            "SRR902\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
+            "SRR900\t100.0\t33.3\t9\t12\tATAA\tATAA\n"
+        )
+        p = self.dir_path / "scattered.tsv"
+        p.write_text(tsv)
+        summary = lms.stream_lexicmap_to_msa(
+            ref_path=str(self.ref_fasta), file_path=str(p),
+            out_prefix=str(self.dir_path / "scat"),
+        )
+        self.assertEqual(summary["total_accessions_evaluated"], 3)  # not 5, not double-counted
+        self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 3)
 
     def test_empty_stream_does_not_crash(self):
         # Header only, no data rows: must return a zeroed summary, not raise ZeroDivisionError.
