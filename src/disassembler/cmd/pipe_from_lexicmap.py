@@ -21,6 +21,50 @@ from disassembler.cmd import lexicmap as lexicmap_cmd
 from disassembler.cmd import msa as msa_cmd
 from disassembler.cmd import sieve as sieve_cmd
 from disassembler.resolve import resolve_sieve
+
+
+def _byte_exact_dedup(src: Path, dst: Path) -> tuple[int, int]:
+    """Write to `dst` the first-encountered record per unique sequence from `src`.
+
+    Returns (n_in, n_out). Headers are preserved verbatim from the first copy;
+    sequence lines are compared case-insensitively (upper-cased) with newline
+    whitespace stripped, so cosmetic line-wrapping differences between two
+    otherwise identical sequences are folded together.
+
+    Preserving the ORDER of first occurrence is what makes the subsequent
+    sieve output byte-identical to sieving `src` directly: the sieve is a
+    deterministic in-order filter that would have rejected every later copy
+    of an exact-duplicate sequence as novelty=0 anyway, so folding them out
+    beforehand is observationally equivalent while strictly reducing work.
+    """
+    seen: set[str] = set()
+    n_in = 0
+    n_out = 0
+    header: str | None = None
+    seq_lines: list[str] = []
+
+    def _emit(fout) -> None:
+        nonlocal n_out
+        if header is None:
+            return
+        seq = "".join(seq_lines).replace("\n", "").upper()
+        if seq and seq not in seen:
+            seen.add(seq)
+            fout.write(header)
+            fout.writelines(seq_lines)
+            n_out += 1
+
+    with src.open() as fin, dst.open("w") as fout:
+        for line in fin:
+            if line.startswith(">"):
+                _emit(fout)
+                header = line
+                seq_lines = []
+                n_in += 1
+            else:
+                seq_lines.append(line)
+        _emit(fout)
+    return n_in, n_out
 import os
 
 from disassembler.validators import (
@@ -268,9 +312,25 @@ def run(args) -> int:
 
     # ---- 2/3 sieve (optional) ---------------------------------------------
     if args.sieve:
+        # Byte-exact dedup before the sieve. The sieve is a MinHash/LSH filter
+        # that iterates records in order and keeps a sequence only when its
+        # novelty vs. the already-promoted set is >= tau; a byte-exact later
+        # copy of a sequence has novelty 0 and is always rejected. Folding
+        # those duplicates out ahead of time is observationally equivalent to
+        # the sieve's own fold (see tests/test_dedup_sieve_equivalence.py)
+        # and strictly reduces the sieve's work.
+        deduped = out_dir / f"{cohort.stem}.deduped.fasta"
+        n_in, n_out = _byte_exact_dedup(cohort, deduped)
+        if n_in == 0:
+            print("from-lexicmap: cohort is empty after dedup; nothing to sieve.",
+                  file=sys.stderr)
+            return 1
+        fold = n_in / n_out if n_out else 0.0
+        print(f"[from-lexicmap] dedup: {n_in} -> {n_out} records "
+              f"({fold:.2f}x fold) before sieve", flush=True)
         sieved = out_dir / f"{cohort.stem}.sieved.fasta"
         rc = sieve_cmd.sieve_run(
-            cohort, sieved,
+            deduped, sieved,
             ref=Path(args.ref),
             min_len=args.sieve_min_len,
             threshold=args.sieve_threshold,
