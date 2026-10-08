@@ -185,6 +185,119 @@ class TestHarvestAccounting(unittest.TestCase):
         self.assertEqual(dict(per_target), {"gene": {"SRR1": 0.91}})
 
 
+class TestHarvestLocal(unittest.TestCase):
+    """Local-files input mode: read shard JSONs from disk, same merge semantics as API."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.shards = Path(self._tmp.name) / "shards"
+        self.shards.mkdir()
+        self.out = Path(self._tmp.name) / "out"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_shard(self, name, payload):
+        import json as _json
+        (self.shards / name).write_text(_json.dumps(payload))
+
+    def test_merges_scores_per_target_across_shard_files(self):
+        self._write_shard("s1.json", {"idx": {"pfcrt": {"SRR1": 0.4, "SRR2": 0.9}}})
+        self._write_shard("s2.json", {"idx": {"pfcrt": {"SRR1": 0.7}}})
+        per_target = hk.harvest_local(self.shards, self.out)
+        self.assertEqual(dict(per_target["pfcrt"]), {"SRR1": 0.7, "SRR2": 0.9})
+        self.assertTrue((self.out / "pfcrt.accessions.txt").is_file())
+        self.assertTrue((self.out / "pfcrt.scores.json").is_file())
+        self.assertTrue((self.out / "UNION.accessions.txt").is_file())
+        self.assertTrue((self.out / "summary.json").is_file())
+
+    def test_accession_order_matches_api_mode(self):
+        # Sorted by score descending, same as harvest_collection.
+        self._write_shard("s.json", {"idx": {"g": {"A": 0.1, "B": 0.9, "C": 0.5}}})
+        hk.harvest_local(self.shards, self.out)
+        got = (self.out / "g.accessions.txt").read_text().splitlines()
+        self.assertEqual(got, ["B", "C", "A"])
+
+    def test_missing_directory_raises(self):
+        with self.assertRaises(RuntimeError) as cm:
+            hk.harvest_local(self.shards / "nope", self.out)
+        self.assertIn("not found", str(cm.exception))
+
+    def test_empty_directory_raises(self):
+        with self.assertRaises(RuntimeError) as cm:
+            hk.harvest_local(self.shards, self.out)
+        self.assertIn("no .json shard files", str(cm.exception))
+
+    def test_malformed_shard_is_counted_as_failure_not_lost_silently(self):
+        self._write_shard("good.json", {"idx": {"g": {"A": 0.5}}})
+        (self.shards / "bad.json").write_text("{not json")
+        per_target = hk.harvest_local(self.shards, self.out)
+        self.assertEqual(dict(per_target["g"]), {"A": 0.5})
+
+    def test_every_shard_malformed_raises(self):
+        (self.shards / "a.json").write_text("{")
+        (self.shards / "b.json").write_text("<")
+        with self.assertRaises(RuntimeError) as cm:
+            hk.harvest_local(self.shards, self.out)
+        self.assertIn("all 2 shard files failed", str(cm.exception))
+
+    def test_empty_shards_are_a_valid_answer_not_a_failure(self):
+        self._write_shard("a.json", {})
+        self._write_shard("b.json", {})
+        per_target = hk.harvest_local(self.shards, self.out)
+        self.assertEqual(dict(per_target), {})
+        self.assertTrue((self.out / "summary.json").is_file())
+
+    def test_non_json_files_in_the_directory_are_ignored(self):
+        self._write_shard("s.json", {"idx": {"g": {"A": 0.5}}})
+        (self.shards / "README").write_text("not a shard")
+        (self.shards / "s.json.bak").write_text("stale")
+        per_target = hk.harvest_local(self.shards, self.out)
+        self.assertEqual(dict(per_target["g"]), {"A": 0.5})
+
+
+class TestModeValidation(unittest.TestCase):
+    """`run()` must route by mode and reject mixed or incomplete flag sets."""
+
+    class Args:
+        history_id = None
+        collection_id = None
+        shards_dir = None
+
+    def test_shards_dir_alone_selects_local_mode(self):
+        a = self.Args()
+        a.shards_dir = "/tmp/x"
+        self.assertEqual(hk._validate_mode(a), ("local", None))
+
+    def test_history_and_collection_together_select_galaxy_mode(self):
+        a = self.Args()
+        a.history_id = "h"
+        a.collection_id = "c"
+        self.assertEqual(hk._validate_mode(a), ("galaxy", None))
+
+    def test_shards_dir_with_galaxy_flags_is_rejected(self):
+        a = self.Args()
+        a.shards_dir = "/tmp/x"
+        a.history_id = "h"
+        a.collection_id = "c"
+        mode, err = hk._validate_mode(a)
+        self.assertIsNone(mode)
+        self.assertIn("mutually exclusive", err)
+
+    def test_partial_galaxy_flags_rejected(self):
+        a = self.Args()
+        a.history_id = "h"
+        mode, err = hk._validate_mode(a)
+        self.assertIsNone(mode)
+        self.assertIn("together", err)
+
+    def test_no_flags_rejected(self):
+        a = self.Args()
+        mode, err = hk._validate_mode(a)
+        self.assertIsNone(mode)
+        self.assertIn("required", err)
+
+
 class TestSafeTargetName(unittest.TestCase):
     """Target names come from shard JSON: untrusted, used as a dict key AND a filename."""
 

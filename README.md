@@ -220,6 +220,12 @@ disassembler harvest \
     --collection-id <GALAXY_COLLECTION_ID> \
     -o candidates/
 
+# Or merge from a local directory of shard JSONs (no Galaxy API calls). The two
+# input modes produce identical output and are mutually exclusive. This is the
+# mode a Galaxy tool wrapper will drive once the shards are staged into the job
+# directory, and it also works for a saved copy of a prior fetch.
+disassembler harvest --shards-dir path/to/shards/ -o candidates/
+
 # Optional: sample per-target from arbitrary score bins (histogram-driven experiments).
 # If omitted, reconstruct just runs against the raw <target>.accessions.txt list.
 disassembler stratify -o candidates/ \

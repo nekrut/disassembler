@@ -1,7 +1,12 @@
-"""harvest: pull kmindex planetary shard collections from a Galaxy history.
+"""harvest: pull kmindex planetary shard collections.
 
-For each shard dataset in the collection:
-  1. Fetches its JSON body via the history content endpoint.
+Two input modes, same output. One of:
+  - a Galaxy history + collection id (fetches shard JSONs via the Galaxy API), or
+  - a local directory of shard JSON files already on disk (e.g. staged by Galaxy
+    for a workflow step, or a cached copy from a prior run).
+
+For each shard, in either mode:
+  1. Loads its JSON body.
   2. Merges containment scores per target across all shards.
   3. Emits `<target>.accessions.txt` (sorted by score descending) and
      `<target>.scores.json` per target, plus `UNION.accessions.txt` and
@@ -131,6 +136,143 @@ def fetch_shard(item, base_url, sess):
     return None
 
 
+def _merge_payload(d, per_target):
+    """Fold one shard payload into per_target in place. Returns the count of
+    target names that were skipped as unusable (dict key / filename).
+
+    Pulled out of harvest_collection so the local-files path can reuse the
+    exact same merge semantics. Malformed-payload handling stays at the call
+    site, where it is wired to the per-mode failure counter.
+    """
+    n_bad_target = 0
+    for shard, q in d.items():
+        if not isinstance(q, dict):
+            continue
+        for target_name, hits in q.items():
+            if not isinstance(hits, dict):
+                continue
+            clean_target = safe_target_name(target_name)
+            if clean_target is None:
+                n_bad_target += 1
+                continue
+            for acc, score in hits.items():
+                try:
+                    sc = float(score)
+                except Exception:
+                    continue
+                if sc > per_target[clean_target].get(acc, 0.0):
+                    per_target[clean_target][acc] = sc
+    return n_bad_target
+
+
+def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target,
+                   failure_noun="shard"):
+    """Emit the per-target accession lists, union, and summary.
+
+    `failure_noun` is just a label for the human-facing message so the local-files
+    path can say "shard files" instead of "shards" without duplicating the block.
+    """
+    all_union = set()
+    summary = {}
+    for target, acc_dict in sorted(per_target.items()):
+        accs = sorted(acc_dict, key=lambda a: -acc_dict[a])
+        all_union.update(accs)
+        acc_file = out_dir / f"{target}.accessions.txt"
+        score_file = out_dir / f"{target}.scores.json"
+        acc_file.write_text("\n".join(accs) + "\n")
+        score_file.write_text(json.dumps(acc_dict, indent=2))
+        summary[target] = {
+            "n": len(accs),
+            "max_score": max(acc_dict.values()) if acc_dict else 0.0,
+        }
+        print(f"  [✓] Target {target:12}: {len(accs):7d} candidates "
+              f"(max containment: {summary[target]['max_score']:.2f})")
+
+    union_file = out_dir / "UNION.accessions.txt"
+    union_file.write_text("\n".join(sorted(all_union)) + "\n")
+    summary["_union"] = {"n": len(all_union)}
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    if n_failed:
+        print(f"[!] {n_failed}/{n_items} {failure_noun}s failed to load; the cohort "
+              f"below is INCOMPLETE.", file=sys.stderr)
+    if n_empty:
+        print(f"[*] {n_empty}/{n_items} {failure_noun}s were empty (no hits), which "
+              f"is normal.")
+    if n_bad_target:
+        print(f"[!] {n_bad_target} target name(s) were unusable as a key or filename "
+              f"and were skipped.", file=sys.stderr)
+
+    print(f"\n[{'!' if n_failed else '✓'}] Harvest complete: {len(all_union)} unique "
+          f"SRA runs across {len(per_target)} targets"
+          f"{f', {n_failed} {failure_noun}(s) FAILED' if n_failed else ''}.")
+
+
+def harvest_local(shards_dir, out_dir):
+    """Harvest from a local directory of shard JSON files.
+
+    Non-recursive: reads `*.json` directly under `shards_dir`. This matches how
+    Galaxy stages a `list` collection into a job directory, and keeps the mental
+    model simple when a user points at a cached shard dump from a prior run.
+
+    Same output as `harvest_collection`; raises RuntimeError on the same
+    unrecoverable conditions (no shards found, every shard unreadable).
+    """
+    shards_dir = Path(shards_dir)
+    if not shards_dir.is_dir():
+        raise RuntimeError(f"shards directory not found: {shards_dir}")
+    shard_files = sorted(p for p in shards_dir.iterdir()
+                         if p.is_file() and p.suffix.lower() == ".json")
+    if not shard_files:
+        raise RuntimeError(f"no .json shard files found in {shards_dir}")
+
+    print(f"[*] Found {len(shard_files)} shard JSON file(s) in {shards_dir}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    per_target = collections.defaultdict(dict)
+    n_failed = 0
+    n_empty = 0
+    n_bad_target = 0
+    start_t = time.time()
+
+    for i, path in enumerate(shard_files, start=1):
+        if i % 250 == 0 or i == len(shard_files):
+            elapsed = time.time() - start_t
+            rate = i / elapsed if elapsed > 0 else 0
+            print(f"    Merged {i}/{len(shard_files)} shards in {elapsed:.1f}s "
+                  f"({rate:.1f} shards/s)...", flush=True)
+        try:
+            d = json.loads(path.read_text())
+        except Exception as e:
+            n_failed += 1
+            print(f"    [!] shard {path.name}: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            continue
+        if not isinstance(d, dict):
+            n_failed += 1
+            continue
+        if not d:
+            n_empty += 1
+            continue
+        try:
+            n_bad_target += _merge_payload(d, per_target)
+        except Exception as e:
+            n_failed += 1
+            print(f"    [!] shard {path.name} payload unusable "
+                  f"({type(e).__name__}: {e})", file=sys.stderr)
+            continue
+
+    _write_outputs(per_target, out_dir, len(shard_files), n_failed, n_empty,
+                   n_bad_target, failure_noun="shard file")
+
+    if shard_files and n_failed == len(shard_files):
+        raise RuntimeError(
+            f"all {len(shard_files)} shard files failed to parse (last error "
+            f"above); no cohort was harvested."
+        )
+    return per_target
+
+
 def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_workers=32):
     """Walk a dataset collection via the history endpoint; fetch all shard JSONs in parallel."""
     print(f"[*] Fetching collection elements for {coll_id} in history {history_id}...")
@@ -213,23 +355,7 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
                 # One malformed shard must not tear down the executor and lose the
                 # whole run.
                 try:
-                    for shard, q in d.items():
-                        if not isinstance(q, dict):
-                            continue
-                        for target_name, hits in q.items():
-                            if not isinstance(hits, dict):
-                                continue
-                            clean_target = safe_target_name(target_name)
-                            if clean_target is None:
-                                n_bad_target += 1
-                                continue
-                            for acc, score in hits.items():
-                                try:
-                                    sc = float(score)
-                                except Exception:
-                                    continue
-                                if sc > per_target[clean_target].get(acc, 0.0):
-                                    per_target[clean_target][acc] = sc
+                    n_bad_target += _merge_payload(d, per_target)
                 except Exception as e:
                     n_failed += 1
                     print(f"    [!] shard payload unusable "
@@ -239,40 +365,8 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
         # 32 pooled connections against one host outlive the harvest otherwise.
         sess.close()
 
-    all_union = set()
-    summary = {}
-    for target, acc_dict in sorted(per_target.items()):
-        accs = sorted(acc_dict, key=lambda a: -acc_dict[a])
-        all_union.update(accs)
-        acc_file = out_dir / f"{target}.accessions.txt"
-        score_file = out_dir / f"{target}.scores.json"
-        acc_file.write_text("\n".join(accs) + "\n")
-        score_file.write_text(json.dumps(acc_dict, indent=2))
-        summary[target] = {
-            "n": len(accs),
-            "max_score": max(acc_dict.values()) if acc_dict else 0.0,
-        }
-        print(f"  [✓] Target {target:12}: {len(accs):7d} candidates "
-              f"(max containment: {summary[target]['max_score']:.2f})")
-
-    union_file = out_dir / "UNION.accessions.txt"
-    union_file.write_text("\n".join(sorted(all_union)) + "\n")
-    summary["_union"] = {"n": len(all_union)}
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-
-    if n_failed:
-        print(f"[!] {n_failed}/{len(items)} shards failed to fetch after "
-              f"{ATTEMPTS} attempts each; the cohort below is INCOMPLETE.",
-              file=sys.stderr)
-    if n_empty:
-        print(f"[*] {n_empty}/{len(items)} shards were empty (no hits), which is normal.")
-    if n_bad_target:
-        print(f"[!] {n_bad_target} target name(s) were unusable as a key or filename "
-              f"and were skipped.", file=sys.stderr)
-
-    print(f"\n[{'!' if n_failed else '✓'}] Harvest complete: {len(all_union)} unique "
-          f"SRA runs across {len(per_target)} targets"
-          f"{f', {n_failed} shard(s) FAILED' if n_failed else ''}.")
+    _write_outputs(per_target, out_dir, len(items), n_failed, n_empty, n_bad_target,
+                   failure_noun="shard")
 
     # A run that fetched nothing has produced no cohort. Saying so is the
     # difference between a downstream stage refusing to start and one silently
@@ -288,22 +382,37 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "harvest",
-        help="Pull kmindex shard collections from a Galaxy history.",
+        help="Pull kmindex shard collections (from a Galaxy history or local files).",
         description=(
-            "Streams a Galaxy kmindex planetary dataset collection and writes per-target "
-            "accession lists and score files. Cohort cutting is a separate step; see "
-            "`disassembler stratify`."
+            "Merges kmindex planetary shard JSONs into per-target accession lists and "
+            "score files. Takes shards either from a Galaxy dataset collection (over the "
+            "Galaxy API) or from a local directory of JSON files already on disk "
+            "(e.g. staged by Galaxy for a workflow step, or a saved copy of a prior "
+            "fetch). Cohort cutting is a separate step; see `disassembler stratify`."
         ),
     )
-    p.add_argument("--history-id", required=True,
-                   help="Galaxy history ID containing the collection")
-    p.add_argument("--collection-id", required=True,
-                   help="Galaxy dataset collection ID for kmindex query shards")
+
+    # Galaxy API mode (requires history + collection together).
+    p.add_argument("--history-id",
+                   help="Galaxy history ID containing the collection (Galaxy API mode)")
+    p.add_argument("--collection-id",
+                   help="Galaxy dataset collection ID for kmindex query shards "
+                        "(Galaxy API mode)")
     p.add_argument("--base-url", default="https://usegalaxy.org",
-                   help="Galaxy instance URL (default: https://usegalaxy.org)")
+                   help="Galaxy instance URL (default: https://usegalaxy.org); "
+                        "Galaxy API mode only")
     p.add_argument("--api-key-file",
                    help="Path to Galaxy API key file (also honours $GALAXY_API_KEY, "
-                        "then /tmp/gxy.txt)")
+                        "then /tmp/gxy.txt); Galaxy API mode only")
+
+    # Local-files mode (no Galaxy API traffic).
+    p.add_argument("--shards-dir",
+                   help="Directory of shard JSON files on disk (local-files mode). "
+                        "Reads *.json non-recursively from this directory. Use this "
+                        "when shards are already staged (e.g. inside a Galaxy tool "
+                        "wrapper, or from a cached fetch). Mutually exclusive with "
+                        "--history-id/--collection-id.")
+
     p.add_argument("-o", "--out-dir", default="candidates",
                    help="Output directory for candidate accessions")
     p.add_argument("--download-workers", type=positive_int, default=6,
@@ -313,11 +422,49 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                         "handshake but pay 30-60 s per throttled shard. Raise it for a "
                         "self-hosted Galaxy without a rate limiter. Named --download-workers "
                         "to keep -w/--workers reserved for the walker's compute workers, "
-                        "which are a different resource.")
+                        "which are a different resource. Ignored in local-files mode.")
     p.set_defaults(func=run)
 
 
+def _validate_mode(args):
+    """Return the chosen mode or an error string.
+
+    Returns ('local', None), ('galaxy', None), or (None, '<msg>').
+    """
+    gxy_set = bool(args.history_id) or bool(args.collection_id)
+    gxy_complete = bool(args.history_id) and bool(args.collection_id)
+    local_set = bool(args.shards_dir)
+
+    if local_set and gxy_set:
+        return None, ("--shards-dir is mutually exclusive with "
+                      "--history-id/--collection-id")
+    if local_set:
+        return "local", None
+    if gxy_set and not gxy_complete:
+        return None, "--history-id and --collection-id must be given together"
+    if gxy_complete:
+        return "galaxy", None
+    return None, ("either --shards-dir, or both --history-id and --collection-id, "
+                  "is required")
+
+
 def run(args) -> int:
+    mode, err = _validate_mode(args)
+    if err:
+        print(f"harvest: {err}", file=sys.stderr)
+        return 1
+
+    out_dir = Path(args.out_dir)
+
+    if mode == "local":
+        try:
+            harvest_local(args.shards_dir, out_dir)
+        except RuntimeError as e:
+            print(f"harvest: {e}", file=sys.stderr)
+            return 1
+        return 0
+
+    # Galaxy API mode.
     key_err = validate_api_key_file(args.api_key_file)
     if key_err:
         print(f"harvest: {key_err}", file=sys.stderr)
@@ -327,7 +474,6 @@ def run(args) -> int:
     except RuntimeError as e:
         print(f"harvest: {e}", file=sys.stderr)
         return 2
-    out_dir = Path(args.out_dir)
     try:
         harvest_collection(
             args.collection_id,
