@@ -1,0 +1,5 @@
+biopython
+requests
+zstandard
+numpy
+pandas

@@ -2,6 +2,52 @@
 
 use std::path::PathBuf;
 
+/// How multi-anchor mode ranks per-reference candidates in [`stages::stitch::pick_primary`].
+///
+/// The default is `Cov`: sort by fraction of the reference covered, break ties on identity,
+/// then on pool order. It maximises how much of each accession's sequence gets walked,
+/// but on a mixed-strain panel (measured on the SARS-CoV-2 spike 11-strain panel) it
+/// concentrates ~70% of primaries on `Omicron_XBB15` — the mid-cluster reference whose
+/// alignment finds long walks in graphs across the archive — even when phylogenetically
+/// closer strains sit in the pool. See `docs/anchor_primary_metric.md`.
+///
+/// `Pident` swaps the primary and secondary sort keys: highest identity to reference wins,
+/// then coverage. On the same panel, it moves the primary tag onto the strain the graph
+/// route actually matches best, but it may prefer a shorter walk that hits its own
+/// reference cleanly over a fuller walk that hits a moderately-similar reference.
+///
+/// `CovXPident` orders on `cov * pident/100`, a joint score. Restores full-length runs
+/// as the tie-break winner while letting a large identity gap override a small coverage
+/// advantage. Recommended when both matter and neither dominates.
+///
+/// Only affects which candidate is tagged as the primary and written to the FASTA. Every
+/// candidate's numbers are emitted in `summary.json` under `"candidates"` regardless, so
+/// a downstream tool can always re-rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimaryMetric {
+    Cov,
+    Pident,
+    CovXPident,
+}
+
+impl PrimaryMetric {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "cov" => Some(Self::Cov),
+            "pident" => Some(Self::Pident),
+            "cov_x_pident" | "cov-x-pident" => Some(Self::CovXPident),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cov => "cov",
+            Self::Pident => "pident",
+            Self::CovXPident => "cov_x_pident",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     // ---- algorithm ----
@@ -19,6 +65,10 @@ pub struct Config {
     pub min_vaf: f64,
     /// Minimum fraction of the reference a haplotype must cover to be kept.
     pub min_cov: f64,
+    /// How multi-anchor mode ranks per-reference candidates. See [`PrimaryMetric`].
+    ///
+    /// Single-anchor runs ignore this: there is only one candidate to pick from.
+    pub primary_metric: PrimaryMetric,
     /// Second-pass prune: drop unitigs below this fraction of the gene's own depth, then
     /// realign. `0.0` disables it and restores the previous behaviour exactly.
     ///
@@ -295,6 +345,28 @@ pub struct Config {
     pub scratch_dir: PathBuf,
     /// GraphAligner executable, resolved on PATH if not absolute.
     pub graphaligner_bin: String,
+
+    // ---- offline cache ----
+    /// On-disk read-through cache for compressed unitig payloads.
+    ///
+    /// When set, `Fetcher::fetch` looks for `<dir>/<ACC>.unitigs.fa.zst` before hitting S3.
+    /// A miss with `offline == false` falls through to the normal S3 fetch and writes the
+    /// downloaded bytes back to the cache atomically (tempfile + rename in the same dir).
+    ///
+    /// Files are byte-identical to the S3 payload, so `sha256sum` against the original object
+    /// verifies. Layout is flat: one file per accession, no manifest.
+    pub unitigs_cache: Option<PathBuf>,
+    /// Refuse the S3 fallback. Only meaningful with `unitigs_cache`.
+    ///
+    /// A cache miss becomes a hard error naming the missing accession, rather than a silent
+    /// download. Off by default; opt in for reproducibility runs or air-gapped hosts.
+    pub offline: bool,
+    /// Fetch every accession into the cache and exit before the compute stages run.
+    ///
+    /// Requires `unitigs_cache`. `pipeline::run_fetch_only` handles this shortcut; the compute
+    /// pool is not spawned, and the run's success criterion is "every requested accession is
+    /// now in the cache". This is what `disassembler fetch` wraps.
+    pub fetch_only: bool,
 }
 
 impl Config {
@@ -335,6 +407,7 @@ impl Default for Config {
             min_abund: 5.0,
             min_vaf: 0.10,
             min_cov: 0.85,
+            primary_metric: PrimaryMetric::Cov,
             prune_frac: 0.01,
             min_abund_frac: 0.0,
             prefer_majority: true,
@@ -358,6 +431,9 @@ impl Default for Config {
             max_compressed_bytes: 1024 * 1024 * 1024,
             scratch_dir: PathBuf::from("/dev/shm/logan-walker"),
             graphaligner_bin: String::from("GraphAligner"),
+            unitigs_cache: None,
+            offline: false,
+            fetch_only: false,
         }
     }
 }

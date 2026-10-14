@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: disassembler
+Version: 0.1.0
+Summary: Reconstruct coding haplotypes from planetary sequence indexes (Logan kmindex / LexicMap).
+Requires-Python: >=3.11
+License-File: LICENSE
+License-File: NOTICE
+Requires-Dist: biopython
+Requires-Dist: requests
+Requires-Dist: zstandard
+Requires-Dist: numpy
+Requires-Dist: pandas
+Dynamic: license-file

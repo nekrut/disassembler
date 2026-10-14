@@ -68,16 +68,24 @@ pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
     let mut w = BufWriter::new(std::fs::File::create(path)?);
     for r in &summary.results {
         for h in &r.haplotypes {
+            // anchor_used is emitted only when set (multi-anchor mode). Single-anchor
+            // runs keep the header byte-identical to the pre-multi-anchor shape so all
+            // golden fixtures diff clean.
+            let anchor_suffix = match &h.anchor_used {
+                Some(rid) => format!(" anchor={rid}"),
+                None => String::new(),
+            };
             writeln!(
                 w,
-                ">{} cov={:.3} {}={:.1} nodes={} ka={:.1} vaf={:.2}",
+                ">{} cov={:.3} {}={:.1} nodes={} ka={:.1} vaf={:.2}{}",
                 h.id,
                 h.cov,
                 if h.pident_inherited { "inherited_pident" } else { "pident" },
                 h.pident,
                 h.nodes,
                 h.mean_ka,
-                h.vaf
+                h.vaf,
+                anchor_suffix,
             )?;
             w.write_all(&h.seq)?;
             w.write_all(b"\n")?;
@@ -115,17 +123,22 @@ pub fn write_alts(summary: &Summary, path: &Path) -> Result<()> {
     for r in &summary.results {
         for a in &r.alts {
             let h = &a.haplotype;
+            let anchor_suffix = match &h.anchor_used {
+                Some(rid) => format!(" anchor={rid}"),
+                None => String::new(),
+            };
             writeln!(
                 w,
                 ">{} cov={:.3} inherited_pident={:.1} nodes={} vaf={:.3} alt_kaf={:.1} \
-                 primary_vaf={:.3} fork={}{} alt_node={}{} detour={} dlen={:+} span={}",
+                 primary_vaf={:.3} fork={}{} alt_node={}{} detour={} dlen={:+} span={}{}",
                 h.id, h.cov, h.pident, h.nodes,
                 a.alt_vaf, a.alt_abundance, a.taken_vaf,
                 a.fork, strand_str(a.fork_strand),
                 a.alt_node, strand_str(a.alt_strand),
                 a.detour_nodes,
                 a.length_delta,
-                a.replaced_span
+                a.replaced_span,
+                anchor_suffix,
             )?;
             w.write_all(&h.seq)?;
             w.write_all(b"\n")?;
@@ -202,12 +215,61 @@ fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<(
             writeln!(w, "          \"length\": {},", h.seq.len())?;
             writeln!(w, "          \"nodes\": {},", h.nodes)?;
             writeln!(w, "          \"mean_ka\": {:.1},", h.mean_ka)?;
-            writeln!(w, "          \"vaf\": {:.2}", h.vaf)?;
+            // Emit `anchor_used` only when set. Absent field ≡ single-anchor legacy JSON.
+            if let Some(rid) = &h.anchor_used {
+                writeln!(w, "          \"vaf\": {:.2},", h.vaf)?;
+                writeln!(w, "          \"anchor_used\": \"{}\"", esc(rid))?;
+            } else {
+                writeln!(w, "          \"vaf\": {:.2}", h.vaf)?;
+            }
             writeln!(w, "        }}{}", if last_h { "" } else { "," })?;
         }
         writeln!(w, "      ],")?;
     }
     writeln!(w, "      \"bubbles\": {},", r.bubbles.len())?;
+    // Per-reference candidate snapshot, multi-anchor only. Empty vec ≡ single-anchor
+    // legacy JSON, so this field never appears there and existing consumers stay unmoved.
+    if !r.candidates.is_empty() {
+        writeln!(w, "      \"candidates\": [")?;
+        let n = r.candidates.len();
+        for (i, c) in r.candidates.iter().enumerate() {
+            let last = i + 1 == n;
+            write!(w, "        {{")?;
+            write!(w, "\"record_id\": \"{}\"", esc(&c.record_id))?;
+            write!(w, ", \"pool_index\": {}", c.pool_index)?;
+            match c.cov {
+                Some(v) => write!(w, ", \"cov\": {v}")?,
+                None => write!(w, ", \"cov\": null")?,
+            }
+            match c.pident {
+                Some(v) => write!(w, ", \"pident\": {v}")?,
+                None => write!(w, ", \"pident\": null")?,
+            }
+            match c.length {
+                Some(v) => write!(w, ", \"length\": {v}")?,
+                None => write!(w, ", \"length\": null")?,
+            }
+            match c.nodes {
+                Some(v) => write!(w, ", \"nodes\": {v}")?,
+                None => write!(w, ", \"nodes\": null")?,
+            }
+            match c.path_len {
+                Some(v) => write!(w, ", \"path_len\": {v}")?,
+                None => write!(w, ", \"path_len\": null")?,
+            }
+            match c.num_matches {
+                Some(v) => write!(w, ", \"num_matches\": {v}")?,
+                None => write!(w, ", \"num_matches\": null")?,
+            }
+            match c.aln_len {
+                Some(v) => write!(w, ", \"aln_len\": {v}")?,
+                None => write!(w, ", \"aln_len\": null")?,
+            }
+            write!(w, ", \"selected\": {}", c.selected)?;
+            writeln!(w, "}}{}", if last { "" } else { "," })?;
+        }
+        writeln!(w, "      ],")?;
+    }
     if let Some(e) = &r.error {
         writeln!(w, "      \"error\": \"{}\",", esc(e))?;
     }
@@ -829,6 +891,7 @@ mod vcf_tests {
             nodes: 1,
             mean_ka: 0.0,
             vaf: 1.0,
+            anchor_used: None,
         }
     }
 
@@ -863,6 +926,8 @@ mod vcf_tests {
             bubbles: Vec::new(),
             timing: Timing::default(),
             error: None,
+            anchor_used: None,
+            candidates: Vec::new(),
         }
     }
 
@@ -953,6 +1018,7 @@ mod identity_label_tests {
             nodes: 1,
             mean_ka: 12.0,
             vaf: 1.0,
+            anchor_used: None,
         }
     }
 
@@ -973,6 +1039,8 @@ mod identity_label_tests {
                 bubbles: Vec::new(),
                 timing: Timing::default(),
                 error: None,
+                anchor_used: None,
+                candidates: Vec::new(),
             }],
         }
     }
@@ -1019,6 +1087,71 @@ mod identity_label_tests {
         assert!(
             !s.split_whitespace().any(|w| w.starts_with("pident=")),
             "a spliced haplotype must not publish a bare pident=: {s}"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Multi-anchor mode must emit every reference's cov/pident in `summary.json`, not just
+    /// the winner's. The whole point of the field is that the panel11 analysis (and every
+    /// analysis like it) does not have to re-run BLAST to recover what the walker already
+    /// computed.
+    #[test]
+    fn summary_json_contains_all_candidates_in_multi_anchor_mode() {
+        use crate::types::CandidateReport;
+        let mut s = summary(hap("ACC_primary", false), vec![]);
+        s.results[0].anchor_used = Some("XBB15".into());
+        s.results[0].candidates = vec![
+            CandidateReport {
+                record_id: "Wuhan".into(),
+                pool_index: 0,
+                pident: Some(97.5),
+                cov: Some(0.62),
+                length: Some(2350),
+                nodes: Some(120),
+                path_len: Some(4500),
+                num_matches: Some(2288),
+                aln_len: Some(2350),
+                selected: false,
+            },
+            CandidateReport {
+                record_id: "XBB15".into(),
+                pool_index: 1,
+                pident: Some(99.6),
+                cov: Some(0.99),
+                length: Some(3800),
+                nodes: Some(160),
+                path_len: Some(4600),
+                num_matches: Some(3785),
+                aln_len: Some(3800),
+                selected: true,
+            },
+        ];
+        let p = tmp("summary_candidates.json");
+        super::write_summary(&s, &p).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(out.contains("\"candidates\""), "missing candidates field: {out}");
+        assert!(out.contains("\"record_id\": \"Wuhan\""), "loser reference missing: {out}");
+        assert!(out.contains("\"record_id\": \"XBB15\""), "winner reference missing: {out}");
+        assert!(out.contains("\"selected\": true"), "winner not flagged: {out}");
+        assert!(out.contains("\"selected\": false"), "loser not flagged: {out}");
+        assert!(out.contains("\"cov\": 0.62"), "loser cov missing: {out}");
+        assert!(out.contains("\"pident\": 99.6"), "winner pident missing: {out}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Single-anchor runs leave `candidates` empty. The JSON writer must OMIT the field
+    /// entirely (not emit an empty array), so existing single-anchor summaries diff clean
+    /// against the pre-multi-anchor shape.
+    #[test]
+    fn summary_json_omits_candidates_field_in_single_anchor_mode() {
+        let s = summary(hap("ACC_primary", false), vec![]);
+        assert!(s.results[0].candidates.is_empty(), "test setup: expected empty candidates");
+        let p = tmp("summary_no_candidates.json");
+        super::write_summary(&s, &p).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !out.contains("\"candidates\""),
+            "single-anchor JSON must not carry a candidates field: {out}"
         );
         std::fs::remove_file(&p).ok();
     }

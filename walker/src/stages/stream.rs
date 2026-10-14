@@ -15,11 +15,20 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::types::{Accession, FetchedUnitigs};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// URL for an accession's unitig file.
 pub fn unitigs_url(accession: &str) -> String {
     format!("https://logan-pub.s3.amazonaws.com/u/{accession}/{accession}.unitigs.fa.zst")
+}
+
+/// Cache path for an accession's compressed payload.
+///
+/// Flat layout, one file per accession, byte-identical to the S3 object. Callers use the
+/// same function whether they are reading from the cache or writing to it.
+pub fn cache_path(dir: &Path, accession: &str) -> PathBuf {
+    dir.join(format!("{accession}.unitigs.fa.zst"))
 }
 
 /// A pooled HTTP client, shared by every fetch thread.
@@ -31,6 +40,8 @@ pub struct Fetcher {
     agent: ureq::Agent,
     max_compressed_bytes: u64,
     attempts: u32,
+    cache_dir: Option<PathBuf>,
+    offline: bool,
 }
 
 impl Fetcher {
@@ -46,20 +57,72 @@ impl Fetcher {
             agent: ureq::Agent::new_with_config(agent_config),
             max_compressed_bytes: cfg.max_compressed_bytes,
             attempts: cfg.fetch_attempts.max(1),
+            cache_dir: cfg.unitigs_cache.clone(),
+            offline: cfg.offline,
         }
     }
 
     /// Download one accession's compressed unitig file into memory.
     ///
+    /// With `--unitigs-cache`: read from `<dir>/<ACC>.unitigs.fa.zst` if present, otherwise
+    /// (under `--offline`) fail, otherwise download and write back atomically. Cache reads
+    /// bypass the Content-Length gate: the file on disk is trusted, because a truncated
+    /// file could only have arrived from a killed writer, and the atomic rename below
+    /// prevents that.
+    ///
     /// Returns the compressed bytes only. Decompression is `decoder`'s job, and happens in
     /// the compute pool so the fetch thread can immediately start the next transfer.
     pub fn fetch(&self, index: usize, accession: &Accession) -> Result<FetchedUnitigs> {
+        if let Some(dir) = &self.cache_dir {
+            let path = cache_path(dir, accession);
+            if path.exists() {
+                let compressed = std::fs::read(&path).map_err(|e| Error::Fetch {
+                    accession: accession.clone(),
+                    detail: format!("cache read {}: {e}", path.display()),
+                })?;
+                if compressed.is_empty() {
+                    return Err(Error::Fetch {
+                        accession: accession.clone(),
+                        detail: format!("cache file is empty: {}", path.display()),
+                    });
+                }
+                return Ok(FetchedUnitigs {
+                    index,
+                    accession: accession.clone(),
+                    compressed_len: compressed.len(),
+                    compressed,
+                    fetch_secs: 0.0,
+                });
+            }
+            if self.offline {
+                return Err(Error::Fetch {
+                    accession: accession.clone(),
+                    detail: format!(
+                        "cache miss under --offline; expected {}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+
         let url = unitigs_url(accession);
         let mut last: String = String::from("no attempt made");
 
         for attempt in 1..=self.attempts {
             match self.try_once(index, accession, &url) {
-                Ok(f) => return Ok(f),
+                Ok(f) => {
+                    if let Some(dir) = &self.cache_dir {
+                        if let Err(e) = write_cache_atomic(dir, accession, &f.compressed) {
+                            // Cache-write failure must not lose a successful fetch. Warn and
+                            // hand the bytes back so the compute stage still runs; the next
+                            // run will just have to fetch again.
+                            eprintln!(
+                                "[{accession}] warning: could not write cache entry: {e}"
+                            );
+                        }
+                    }
+                    return Ok(f);
+                }
                 Err(FetchAttempt::Permanent(detail)) => {
                     return Err(Error::Fetch {
                         accession: accession.clone(),
@@ -141,6 +204,35 @@ enum FetchAttempt {
     Transient(String),
     /// 404, oversized, or another 4xx. Retrying cannot help.
     Permanent(String),
+}
+
+/// Write `bytes` to `<dir>/<ACC>.unitigs.fa.zst` via a tempfile-and-rename so a killed
+/// process cannot leave a partial file behind. A partial file that survived a crash would
+/// otherwise look valid to a subsequent `--offline` run and corrupt the analysis.
+fn write_cache_atomic(dir: &Path, accession: &str, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let final_path = cache_path(dir, accession);
+    // Tempfile in the same directory so `rename` is same-filesystem and atomic. PID + nanos
+    // is enough uniqueness for one host writing its own cache; two processes racing on the
+    // same accession may both fetch and one rename wins, which is fine (same bytes).
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{accession}.{}.{ns}.tmp", std::process::id()));
+    // Written-then-renamed. Errors during write must not leave the tempfile around either;
+    // the finally-style branch below handles that.
+    let write_result = std::fs::write(&tmp, bytes);
+    match write_result {
+        Ok(()) => std::fs::rename(&tmp, &final_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e
+        }),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// A streaming zstd decoder over the compressed buffer.
@@ -253,6 +345,109 @@ mod network_tests {
             started.elapsed() < Duration::from_secs(20),
             "must reject on Content-Length, not after downloading 3.9 GB"
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// Random-ish tempdir under the system temp root; no external `tempfile` dep.
+    fn tempdir(tag: &str) -> PathBuf {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "logan-walker-{tag}-{}-{ns}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    /// A cache hit returns the exact bytes on disk. Verified against a preloaded file so
+    /// nothing about this test needs the network.
+    #[test]
+    fn a_cache_hit_returns_the_bytes_on_disk() {
+        let dir = tempdir("hit");
+        let bytes = zstd::encode_all(&b">CACHED0001_0\nACGT\n"[..], 3).unwrap();
+        std::fs::write(cache_path(&dir, "CACHED0001"), &bytes).unwrap();
+
+        let cfg = Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            ..Config::default()
+        };
+        let f = Fetcher::new(&cfg);
+        let got = f.fetch(0, &"CACHED0001".to_string()).expect("cache hit");
+        assert_eq!(got.compressed, bytes);
+        assert_eq!(got.accession, "CACHED0001");
+        assert_eq!(got.compressed_len, bytes.len());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A cache miss under --offline fails fast, without touching the network. The error
+    /// message names the accession and the expected cache path so a user can act on it.
+    #[test]
+    fn a_cache_miss_under_offline_errors_without_network() {
+        let dir = tempdir("miss");
+        let cfg = Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            fetch_attempts: 1,
+            ..Config::default()
+        };
+        let f = Fetcher::new(&cfg);
+        let started = std::time::Instant::now();
+        let err = f
+            .fetch(0, &"NOTINCACHE".to_string())
+            .err()
+            .expect("must fail");
+        assert!(started.elapsed() < Duration::from_secs(2), "must not hit the network");
+        let msg = err.to_string();
+        assert!(msg.contains("NOTINCACHE"), "error names accession: {msg}");
+        assert!(msg.contains("cache miss under --offline"), "error names cause: {msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An empty cache file is rejected explicitly rather than being handed to zstd as an
+    /// empty payload. A killed writer normally cannot produce this because writes are
+    /// atomic (tempfile + rename), but a manually placed empty file must still surface.
+    #[test]
+    fn an_empty_cache_file_is_rejected_not_returned_as_success() {
+        let dir = tempdir("empty");
+        std::fs::write(cache_path(&dir, "EMPTY"), b"").unwrap();
+        let cfg = Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            ..Config::default()
+        };
+        let f = Fetcher::new(&cfg);
+        let err = f.fetch(0, &"EMPTY".to_string()).err().expect("must fail");
+        assert!(err.to_string().contains("empty"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `write_cache_atomic` uses a tempfile + rename, so a mid-write crash cannot leave a
+    /// partial file at the final path.
+    #[test]
+    fn atomic_write_lands_the_final_file_and_leaves_no_tempfile() {
+        let dir = tempdir("atomic");
+        write_cache_atomic(&dir, "ATOMIC1", b"payload").unwrap();
+        let final_path = cache_path(&dir, "ATOMIC1");
+        assert!(final_path.exists());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"payload");
+        // No stray .tmp files linger.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "leftover tempfiles: {leftover:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

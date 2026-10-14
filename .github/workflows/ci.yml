@@ -46,12 +46,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run LexicMapStreamer tests
-        run: python3 python/test_lexicmap_streamer.py
+      - name: Install disassembler (editable)
+        run: pip install -e .
       # Skips cleanly when `requests` is absent, which it is on this runner: the module
       # imports it at scope. Runs for real wherever the harvester's deps are installed.
-      - name: Run kmindex harvester tests
-        run: python3 python/test_harvest_kmindex.py
+      - name: Run lexicmap tests
+        run: python3 tests/test_lexicmap.py
+      - name: Run harvest tests
+        run: python3 tests/test_harvest.py
+      - name: Run stratify tests
+        run: python3 tests/test_stratify.py
       # Both sieve tests build extern/kmer-diversity-sieve themselves (cc only) and skip
       # cleanly if the submodule or a compiler is missing.
       - name: Sieve binary concordance

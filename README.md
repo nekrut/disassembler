@@ -9,7 +9,7 @@ Planetary-scale sequence extraction, de novo graph path-walking, and streaming m
 `disassembler` provides two primary, complementary engines:
 
 1. **`logan-walker`** (Native Rust graph path-walker) — Streams unitig cDBGs from S3, anchors a reference coding sequence by canonical $k$-mer containment, extracts the local subgraph, walks paths with GraphAligner, and reconstructs full-length coding haplotypes, intra-host alternative alleles, and biallelic SNVs (`--emit-vcf`, `--emit-snv-table`) without collapsing intra-host variation or suffering reference-bias loss.
-2. **`LexicMapStreamer`** (`python/lexicmap_streamer.py`) — Streams planetary tabular search outputs from [LexicMap](https://github.com/IndexThePlanet/LexicMap) over the Galaxy HTTP API, local TSV, or STDIN. Resolves Logan contig shattering (LexicMap indexes Logan's contigs, and on internally diverse samples the assembler splits the gene across many short contigs, see [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md)) by collinear multi-HSP coordinate tiling on the reference CDS, enforces reading-frame codon QC (screening premature stop codons like Sanger $am3$ amber mutants), partitions accessions into a 4-tier Clean and Flagged cohort ledger, and collapses full-length clean sequences into unique haplotypes online with mutation calling and Shannon entropy.
+2. **`disassembler lexicmap`** — Streams planetary tabular search outputs from [LexicMap](https://github.com/IndexThePlanet/LexicMap) over the Galaxy HTTP API, local TSV, or STDIN. Resolves Logan contig shattering (LexicMap indexes Logan's contigs, and on internally diverse samples the assembler splits the gene across many short contigs, see [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md)) by collinear multi-HSP coordinate tiling on the reference CDS, enforces reading-frame codon QC (screening premature stop codons like Sanger $am3$ amber mutants), partitions accessions into a 4-tier Clean and Flagged cohort ledger, and collapses full-length clean sequences into unique haplotypes online with mutation calling and Shannon entropy.
 
 This repository is a decoupled extraction of the path-walking and sequence assembly components from
 [`nekrut/logan-hypyaeon`](https://github.com/nekrut/logan-hypyaeon). It carries only the
@@ -19,15 +19,40 @@ The planetary-scan orchestration, HyphAeon neural selection suite, and Roland PL
 ## Layout
 
 ```
-walker/     logan-walker: native Rust local graph path-walker (the core walker engine)
-python/     lexicmap_streamer.py (streaming multi-HSP coordinate tiler, codon QC & haplotype collapser)
-            disassemble.py (end-to-end driver: accessions -> walker -> codon MSA -> FastTree)
-            build_walker_codon_msa.py (reference-guided in-frame codon MSA + FastTree ML tree)
-            harvest_kmindex.py (parallel Galaxy kmindex planetary shard harvester & cohort triage)
-queries/    reference coding sequences (pfcrt, hiv1_pol, 26 planetary markers, master panel)
-bench/      golden fixtures, check_golden.sh concordance gate, k-mer sensitivity simulations
-docs/       codon MSA/phylogeny step, VCF example, contigs-vs-unitigs, variance-loss and
-            GraphAligner end-clipping investigations, unitig/graph topology notes
+walker/                   logan-walker: native Rust local graph path-walker
+src/disassembler/         Python package; `disassembler <sub>` dispatches to:
+  cmd/harvest.py            harvest kmindex shard collections from Galaxy
+  cmd/stratify.py           cut a size-capped cohort from a harvest
+  cmd/walker.py             passthrough to the Rust logan-walker
+  cmd/lexicmap.py           stream LexicMap tabular hits -> cohort ledger + haplotype collapse
+  cmd/sieve.py              k-mer diversity sieve (l1_pipeline_serial)
+  cmd/msa.py                reference-guided in-frame codon MSA + FastTree
+  cmd/pipe_reconstruct.py   composite: walker -> (sieve) -> msa
+  cmd/pipe_from_kmindex.py  composite: harvest -> stratify -> reconstruct
+  cmd/pipe_from_lexicmap.py composite: lexicmap -> (sieve) -> msa
+extern/                   git submodules: kmer-diversity-sieve
+queries/                  reference coding sequences (pfcrt, hiv1_pol, 26 markers, master panel)
+bench/                    golden fixtures, check_golden.sh concordance gate, k-mer sensitivity sims
+docs/                     codon MSA/phylogeny step, VCF example, contigs-vs-unitigs, variance-loss
+                          and GraphAligner end-clipping investigations, topology notes
+tests/                    Python unit + integration tests
+```
+
+## Install
+
+```bash
+conda env create -f environment.yml && conda activate disassembler
+# environment.yml runs `pip install -e .`, so `disassembler` is on PATH.
+disassembler --help
+```
+
+The Rust walker builds separately (Rust is not in `environment.yml`; install
+via [rustup](https://rustup.rs)):
+
+```bash
+(cd walker && cargo build --release)
+# `disassembler walker` finds it automatically in walker/target/release/,
+# or set $DISASSEMBLER_WALKER_BIN, or put logan-walker on PATH.
 ```
 
 ## What logan-walker does
@@ -53,8 +78,8 @@ phylogeny:
 
 8. **Codon-align and build a tree.** Reference-guided in-frame codon MSA (MAFFT `--keeplength`,
    so reference coordinates and the reading frame are preserved) and a FastTree GTR
-   maximum-likelihood tree. Run it as one command with the walker via `python/disassemble.py`
-   (see below), or on its own with `python/build_walker_codon_msa.py`. See
+   maximum-likelihood tree. Run it as one command with the walker via `disassembler reconstruct`
+   (see below), or on its own with `disassembler msa`. See
    [`docs/codon_msa.md`](docs/codon_msa.md).
 
 ### Why unitigs, not Logan contigs
@@ -70,17 +95,23 @@ contig, so the difference is intra-host diversity, not a Logan quirk. Full numbe
 
 ```bash
 # GraphAligner must be on PATH (bioconda). k-mer anchoring replaces BLAST; MAFFT is only for
-# the downstream codon MSA in python/.
+# the downstream codon MSA (`disassembler msa`).
 cd walker
 cargo build --release
 
 # Optional: build the k-mer diversity sieve (single C source, no conda deps, just a C compiler),
-# needed only for --sieve diversity thinning in disassemble.py (see below).
+# needed only for `disassembler sieve` / --sieve in the composites (see below).
 git submodule update --init && (cd extern/kmer-diversity-sieve && make serial)
 
 ./target/release/logan-walker \
   -a SRR8209082 \
   -q ../queries/query_hiv1_pol.fasta \
+  -o out -f out/reconstructed.fasta
+
+# Equivalently, once `pip install -e .` has run:
+disassembler walker \
+  -a SRR8209082 \
+  -q queries/query_hiv1_pol.fasta \
   -o out -f out/reconstructed.fasta
 ```
 
@@ -89,13 +120,13 @@ Reproduce the old one-haplotype-per-accession behaviour (matches the golden fixt
 
 ### End to end: accessions to a phylogeny
 
-`python/disassemble.py` chains the walker and the codon-MSA/FastTree step into one command, so
-you go straight from accessions to a tree. It needs `GraphAligner`, `MAFFT`, `FastTree`, and
+`disassembler reconstruct` chains the walker and the codon-MSA/FastTree step into one command,
+so you go straight from accessions to a tree. It needs `GraphAligner`, `MAFFT`, `FastTree`, and
 biopython — all in the `disassembler` conda env (`environment.yml`).
 
 ```bash
 conda env create -f environment.yml && conda activate disassembler
-python/disassemble.py -a SRR6251967 -q queries/markers/zika_ns5.fasta -o out/zika --emit-snv-table
+disassembler reconstruct -a SRR6251967 -q queries/markers/zika_ns5.fasta -o out/zika --emit-snv-table
 #   out/zika/reconstructed.fasta       reconstructed coding haplotypes
 #   out/zika/zika_ns5_codon_msa.fasta  in-frame codon alignment (MAFFT --keeplength)
 #   out/zika/zika_ns5_fasttree.nwk     GTR maximum-likelihood tree
@@ -112,18 +143,19 @@ outputs contain, is in [`docs/codon_msa.md`](docs/codon_msa.md).
 | `-o, --out-dir <DIR>` | — | output directory |
 | `-w, --workers <N>` | `8` | walker compute workers |
 | `--fetch-workers <N>` | `8` | walker S3 fetch workers |
-| `--threads <N>` | `8` | MAFFT threads for the codon MSA |
-| `--min-cov <F>` | `0.70` | coverage a sequence needs to enter the MSA, applied in stage 2 only |
+| `--mafft-threads <N>` | `8` | MAFFT threads for the codon MSA |
+| `--msa-min-cov <F>` | `0.70` | coverage a sequence needs to enter the MSA, stage 2 only |
+| `--unitigs-cache <DIR>` | — | read-through cache for compressed unitigs (see Offline) |
+| `--offline` | off | refuse the S3 fallback; requires `--unitigs-cache` |
 | `--skip-tree` | off | stop after reconstruction, do not build the MSA or tree |
 | `--walker-bin <PATH>` | `walker/target/release/logan-walker` | path to the walker binary |
 
-**Two of those names also exist on the walker, and mean something different.**
-`disassemble.py --min-cov` (default `0.70`) is the MSA entry gate and reaches stage 2 only. The
-walker has its own `--min-cov` (default `0.85`) that decides which reconstructions are produced
-at all, and `disassemble.py` never sets it. Lowering `disassemble.py --min-cov` therefore cannot
-admit haplotypes the walker already discarded; to move that gate, pass it through with
-`-- --min-cov <F>`. The same split applies to `--threads`, which is MAFFT here and GraphAligner
-(`-t`) in the walker.
+`disassembler reconstruct --msa-min-cov` (default `0.70`) is the MSA entry gate and reaches stage
+2 only. The walker has its own `--min-cov` (default `0.85`) that decides which reconstructions
+are produced at all; `reconstruct` never sets it. Lowering `--msa-min-cov` cannot admit
+haplotypes the walker already discarded; to move that gate, pass it through with
+`-- --min-cov <F>`. The same split applies to `--mafft-threads` (MAFFT here) versus
+`-t/--threads` on the walker (GraphAligner).
 
 Pass a **single-record** CDS to `-q`. A multi-record FASTA is not handled correctly by either
 stage (see `agent_review_9_20.md`).
@@ -137,7 +169,7 @@ byte-identical to before. Because the MSA + tree are `O(N^2)`, thinning a large 
 identical lineages first can be a large speedup with negligible loss of phylogenetic signal.
 
 ```bash
-python/disassemble.py -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika --sieve
+disassembler reconstruct -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika --sieve
 ```
 
 | flag | default | meaning |
@@ -149,7 +181,7 @@ python/disassemble.py -l accessions.txt -q queries/markers/zika_ns5.fasta -o out
 | `--sieve-bin <PATH>` | `extern/kmer-diversity-sieve/l1_pipeline_serial` | path to the sieve binary |
 
 The wrapper's `--sieve-threshold` and `--sieve-sketch` defaults differ from the sieve binary's own
-defaults on purpose. `disassemble.py` is a gene-scale tool, and the sieve binary was calibrated on
+defaults on purpose. `disassembler` is a gene-scale tool, and the sieve binary was calibrated on
 an archive-scale problem (millions of near-duplicate SARS-CoV-2 consensus genomes). At its own
 defaults, run against a gene-scale cohort of one virus, the sieve collapses everything to one
 representative and drops the informative branches; the wrapper's defaults keep the sieve
@@ -178,21 +210,39 @@ sieve to pay off only when the cohort is large enough for the `O(N^2)` MSA/tree 
 
 ### Planetary triage: Galaxy kmindex harvest to candidate cohorts
 
-When screening planetary datasets indexed in Logan (e.g. via Galaxy `kmindex query` across thousands of shard databases), `python/harvest_kmindex.py` streams and merges the shard collections in parallel, extracts candidate SRA accessions by containment score, and optionally cuts a size-capped cohort from the result:
+When screening planetary datasets indexed in Logan (e.g. via Galaxy `kmindex query` across thousands of shard databases), `disassembler harvest` streams and merges the shard collections in parallel and writes candidate SRA accession lists sorted by containment score. `disassembler stratify` optionally cuts a size-capped cohort from the harvest:
 
 ```bash
-# Stream and merge ~2,869 Galaxy shard JSONs across 32 threads
-python/harvest_kmindex.py \
+# Stream and merge ~2,869 Galaxy shard JSONs (6 workers is the default; safe under
+# usegalaxy.org's rate limit)
+disassembler harvest \
     --history-id <GALAXY_HISTORY_ID> \
     --collection-id <GALAXY_COLLECTION_ID> \
-    -o candidates/ --diversity 500
+    -o candidates/
 
-# Reconstruct a target gene cohort directly with disassemble.py
-python/disassemble.py \
-    -l candidates/query_gene.diversity_500.txt \
+# Or merge from a local directory of shard JSONs (no Galaxy API calls). The two
+# input modes produce identical output and are mutually exclusive. This is the
+# mode a Galaxy tool wrapper will drive once the shards are staged into the job
+# directory, and it also works for a saved copy of a prior fetch.
+disassembler harvest --shards-dir path/to/shards/ -o candidates/
+
+# Optional: sample per-target from arbitrary score bins (histogram-driven experiments).
+# If omitted, reconstruct just runs against the raw <target>.accessions.txt list.
+disassembler stratify -o candidates/ \
+    --score-bin 0.0:0.05:10 --score-bin 0.05:0.10:10 --score-bin 0.10:0.15:10
+
+# Reconstruct a target gene cohort directly.
+disassembler reconstruct \
+    -l candidates/query_gene.accessions.txt \
     -q queries/query_gene.fasta \
     -o out/query_gene \
     --emit-vcf --emit-snv-table --no-emit-alts -w 16 --fetch-workers 16
+
+# Or run harvest -> reconstruct as one composite for a single target:
+disassembler from-kmindex \
+    --history-id <GALAXY_HISTORY_ID> --collection-id <GALAXY_COLLECTION_ID> \
+    --target query_gene \
+    -q queries/query_gene.fasta -o out/query_gene
 ```
 
 Note that `-w 16 --fetch-workers 16` roughly doubles the memory bound, to about 36 GB worst case
@@ -210,92 +260,85 @@ Written on every run, with no threshold of their own beyond the search's:
 | `UNION.accessions.txt` | the union across all targets |
 | `summary.json` | per-target counts and max score |
 
-`--diversity N` adds `<target>.diversity_<N>.txt`, a `.json` with scores, and
-`diversity_<N>_summary.json`.
+#### Custom score bins: `disassembler stratify --score-bin LO:HI:N`
 
-#### What `--diversity` does, and how to size N
-
-It is a **post-processing step**: it reads the `*.scores.json` already in `--out-dir` and never
-contacts Galaxy, so `--stratify-only` re-cuts cohorts from a finished harvest. N is the cohort size
-**per target**.
-
-It files each accession into one of four containment brackets, then samples each bracket at even
-*rank* intervals so you get a spread across the bracket rather than its top slice, and backfills any
-shortfall from what is left over:
-
-| bracket | containment | share of N |
-|---|---|---|
-| canonical | `>= 0.99` | 20% |
-| high homology | `0.80 - 0.99` | 30% |
-| moderate | `0.50 - 0.80` | 30% |
-| divergent | everything below | 20% |
-
-The last bracket is an `else` with no floor of its own, so it inherits whatever threshold the
-kmindex search ran at. That matters: the search is launched at containment `>= 0.30` specifically to
-reach divergent homologs and filters server-side, so a second floor here could only discard what the
-search was told to find. It previously had one, at 0.50.
-
-The shares are preferences, not guarantees. A bracket holding fewer accessions than its share
-contributes all of them, and the remainder is backfilled, so a top-heavy harvest is never padded
-with accessions that do not exist.
-
-**Size N to your harvest, not to the default.** N caps each target, so a harvest smaller than N is
-returned whole and stratification does nothing but reorder it. Measured across a real six-target
-panel of 8,817 accessions:
-
-| `--diversity` | accessions run | share of harvest |
-|---|---|---|
-| 250 | 1,480 | 16.8% |
-| 500 | 2,593 | 29.4% |
-| 1,000 | 4,150 | 47.1% |
-| 2,500 | 6,799 | 77.1% |
-| 5,000 | 8,817 | 100% |
-
-At 2,500 only one of those six targets was capped at all. Values in the low hundreds are where the
-flag starts subsetting a panel of that size.
-
-**If download volume is the real constraint, `--diversity` is the wrong lever.** Unitig file sizes
-are extremely skewed: across 45 randomly sampled accessions the median was 0.6 MB and the mean
-17.6 MB, with the largest at 595 MB, and **the top 10% of files carried 90% of the bytes**.
-Stratification samples by containment score, which is unrelated to file size, so the cost of a given
-N varies a lot run to run. The knob that targets the bytes is the walker's `--max-size-mb`, which
-rejects on `Content-Length` before transferring anything.
-
-#### Custom score bins: `--bin LO:HI:N`
-
-`--diversity` bakes in four containment brackets and a 20/30/30/20 split. For walker calibration
-experiments or histogram-driven cohorts (e.g. "give me 10 accessions each from three low
-non-zero-coverage bins"), pass one or more `--bin LO:HI:N` instead. Each bin selects up to N
-accessions with score in the half-open interval `[LO, HI)`, sampled evenly across the sorted
-range using the same helper `--diversity` uses.
+For walker calibration experiments or histogram-driven cohorts (e.g. "give me 10 accessions each
+from three low non-zero-coverage bins"), pass one or more `--score-bin LO:HI:N`. Each bin selects
+up to N accessions with score in the half-open interval `[LO, HI)`, sampled evenly across the
+sorted range.
 
 ```bash
 # 30 accessions total: 10 each from three low-coverage bins
-python/harvest_kmindex.py --stratify-only -o candidates/ \
-    --bin 0.0:0.05:10 --bin 0.05:0.10:10 --bin 0.10:0.15:10
+disassembler stratify -o candidates/ \
+    --score-bin 0.0:0.05:10 --score-bin 0.05:0.10:10 --score-bin 0.10:0.15:10
 ```
 
 Semantics:
 
-- **Nonzero scores only.** Zero-score accessions are excluded up front, so `--bin 0.0:0.05:10`
-  means "10 from the [1e-9, 0.05) range." Same behavior for every bin.
+- **Nonzero scores only.** Zero-score accessions are excluded up front, so
+  `--score-bin 0.0:0.05:10` means "10 from the [1e-9, 0.05) range." Same behavior for every bin.
 - **No backfill.** A bin with fewer than N candidates contributes what it has and no other bin
-  is topped up above its own N. This is the difference from `--diversity`, which reshuffles to
-  hit the requested cohort size; `--bin` treats each range as an independent request the caller
-  cares about individually.
-- **Half-open `[LO, HI)`.** Same convention as the `--diversity` brackets (`>= 0.99`, `< 0.99`),
-  so bins can touch at boundaries without double-counting.
-- **Overlapping bins are an error** unless `--allow-overlap` is passed; the same accession would
-  otherwise land in more than one bin's sample, which is almost always a typo in the boundaries.
-- **Mutually exclusive with `--diversity`.** Pick one cohort-cutting mode per run.
+  is topped up above its own N. Each `--score-bin` is an independent request the caller cares
+  about individually.
+- **Half-open `[LO, HI)`.** Bins can touch at boundaries without double-counting.
+- **Overlapping bins are an error.**
 
 Outputs, per target: `<target>.bins.txt` (merged accession list, sorted by descending score),
 `<target>.bins.json` (per-bin `requested`, `available`, `selected` counts and the accession
-lists), and a combined `bins_summary.json`. Feeds straight into `disassemble.py -l <target>.bins.txt`.
+lists), and a combined `bins_summary.json`. Feeds straight into `disassembler reconstruct -l <target>.bins.txt`.
 
-## LexicMapStreamer: Streaming Multi-HSP Assembly & Cohort Partitioning
+If download volume is the real constraint, count-based sampling is the wrong lever. Unitig file
+sizes are extremely skewed: across 45 randomly sampled accessions the median was 0.6 MB and the
+mean 17.6 MB, with the largest at 595 MB, and **the top 10% of files carried 90% of the bytes**.
+The knob that targets the bytes is the walker's `--max-size-mb`, which rejects on
+`Content-Length` before transferring anything.
 
-`python/lexicmap_streamer.py` provides streaming multi-HSP coordinate tiling, reading-frame codon QC, 4-tier cohort stratification, and online haplotype collapsing for planetary search results from [LexicMap](https://github.com/IndexThePlanet/LexicMap).
+## Offline mode: cache once, analyse locally
+
+Every `disassembler walker` run fetches `s3://logan-pub/u/<ACC>/<ACC>.unitigs.fa.zst` from S3.
+On a workstation that iterates on the same cohort many times, that is the biggest per-run cost.
+`--unitigs-cache DIR` makes the walker read from a local directory first and only fall back to
+S3 on a cache miss. `--offline` refuses that fallback.
+
+`disassembler fetch` populates the cache in one pass, no analysis:
+
+```bash
+# Download every accession into ./unitigs/, one file per accession, byte-identical to S3.
+disassembler fetch -l candidates/query_gene.accessions.txt --unitigs-cache ./unitigs/
+
+# Every subsequent run reads from disk, no network, no S3 costs.
+disassembler walker \
+    -l candidates/query_gene.accessions.txt \
+    -q queries/query_gene.fasta \
+    -o out/run1 --unitigs-cache ./unitigs/ --offline
+
+# The composites forward the same two flags.
+disassembler reconstruct \
+    -l candidates/query_gene.accessions.txt \
+    -q queries/query_gene.fasta \
+    -o out/run1 --unitigs-cache ./unitigs/ --offline
+
+# Fully offline kmindex -> tree: prewarm the harvest scores AND the unitigs, then --skip-harvest.
+disassembler harvest --history-id H --collection-id C -o cohort/
+disassembler fetch -l cohort/query_gene.accessions.txt --unitigs-cache ./unitigs/
+disassembler from-kmindex --skip-harvest --cohort-dir cohort/ --target query_gene \
+    -q queries/query_gene.fasta -o out/run1 --unitigs-cache ./unitigs/ --offline
+```
+
+The cache is flat: `<DIR>/<ACC>.unitigs.fa.zst`. Files are byte-identical to what S3 hosts, so
+`sha256sum` verifies against the original object. Writes are atomic (tempfile + rename), so a
+killed `fetch` cannot leave a partial file that later looks valid to `--offline`.
+
+Skip-existing is implicit: `fetch` reuses whatever is already in the cache. To refetch, delete
+the file.
+
+The two Python subcommands also have offline replay paths already: `stratify` reads the
+`*.scores.json` files `harvest` wrote (no Galaxy call), and `lexicmap -f local.tsv[.gz]` reads
+a saved LexicMap TSV.
+
+## `disassembler lexicmap`: Streaming Multi-HSP Assembly & Cohort Partitioning
+
+`disassembler lexicmap` provides streaming multi-HSP coordinate tiling, reading-frame codon QC, 4-tier cohort stratification, and online haplotype collapsing for planetary search results from [LexicMap](https://github.com/IndexThePlanet/LexicMap).
 
 ### The Multi-HSP Unitig-Split Challenge
 
@@ -304,40 +347,46 @@ LexicMap is indexed on Logan's **contigs** (`s3://logan-pub/c/`), not on the uni
 - A gene split across two contigs (e.g. 55% coverage on contig 1 and 45% on contig 2) fails naive single-row filters (like `qcovHSP >= 80%`).
 - Filtering by row coverage discards complete biological sequences or produces fragmented assemblies.
 
-### How LexicMapStreamer Works
+### How `disassembler lexicmap` Works
 
 1. **Collinear Multi-HSP Coordinate Tiling:**
    Groups search rows on the fly by SRA accession (`sgenome`). For each accession, projects all qualifying HSPs onto the reference coordinate system (`qstart` to `qend`). Overlapping positions between HSPs are resolved by selecting the base from the HSP with the higher percent identity (`pident`), seamlessly stitching split contigs into full-length sequences without introducing spurious indels.
 2. **Reading-Frame Codon QC & Stop-Codon Screening:**
    Translates CDS in-frame using Genetic Code Table 11 (bacterial/standard). Scans the coding body (excluding the natural terminal stop codon) for internal premature stop codons (e.g. amber mutants like Sanger $\Phi$X174 $am3$ dual-coding $gpE\text{ }W7^*$, sequencing errors, or out-of-frame indels).
 3. **Four-Tier Cohort Partitioning:**
-   - **Tier 1: Clean Full-Length** (`status=CLEAN_FULL_LENGTH`): Coverage $\ge 80\%$ (configurable via `--min-coverage`) and 0 premature stop codons.
+   - **Tier 1: Clean Full-Length** (`status=CLEAN_FULL_LENGTH`): Coverage $\ge 80\%$ (configurable via `--min-cov`) and 0 premature stop codons.
    - **Tier 2: Clean Partial** (`status=CLEAN_PARTIAL`): Coverage between $50\%\text{--}80\%$ and 0 premature stop codons. Rescues partial hits without contaminating full-length alignments.
    - **Tier 3: Flagged Premature Stops** (`flag=PREMATURE_STOPS`): Premature stop codons detected; outputs exact 1-based codon coordinates in an audit ledger.
    - **Tier 4: Low-Coverage Fragments** (`flag=LOW_COVERAGE`): Coverage $<50\%$.
 4. **Online Haplotype Collapser:**
    Collapses clean full-length sequences without holding the input (memory is O(distinct haplotypes), not $O(1)$: the row count is what streams), calculates exact frequencies, calls nucleotide (`198G>A`) and amino acid (`V66V`, `I61V`) mutations against the reference, classifies mutation types (`WT`, `WT_partial`, `Synonymous`, `Missense`, `Nonsense`, and `NonCoding_WT_partial` / `NonCoding_Variant` for a non-CDS reference), computes Shannon entropy, and records representative sample accessions.
 5. **Regime Diagnostics & Cross-Tool Triage:**
-   Computes coverage and identity quantiles ($p_{10}$, median, $p_{90}$) and stop-codon rates. If a target is in a **divergent regime** (median identity $<85\%$ or coverage $<0.60$), reference-guided projection fragments; `LexicMapStreamer` issues an automated alert recommending de novo graph path-walking via `logan-walker`.
+   Computes coverage and identity quantiles ($p_{10}$, median, $p_{90}$) and stop-codon rates. If a target is in a **divergent regime** (median identity $<85\%$ or coverage $<0.60$), reference-guided projection fragments; `disassembler lexicmap` issues an automated alert recommending de novo graph path-walking via `disassembler walker` / `disassembler reconstruct`.
 
 ### Usage Examples
 
 ```bash
 # 1. Stream directly from Galaxy over HTTP (using Galaxy dataset ID):
-python/lexicmap_streamer.py \
+disassembler lexicmap \
     -q queries/markers/zika_ns5.fasta \
     -d f9cad7b01a47213500416a19986dca5c \
     -o out/zika_lexicmap
 
 # 2. Process a local LexicMap tabular file (or gzipped TSV):
-python/lexicmap_streamer.py \
+disassembler lexicmap \
     -q queries/query_hiv1_pol.fasta \
     -f /data/hiv1_pol_lexicmap.tsv.gz \
     -o out/hiv1_pol
 
 # 3. Stream from standard input in a shell pipeline:
 curl -s "https://usegalaxy.org/api/datasets/<ID>/display?key=<API_KEY>" | \
-    python/lexicmap_streamer.py -q queries/pfcrt_only.fasta -f - -o out/pfcrt
+    disassembler lexicmap -q queries/pfcrt_only.fasta -f - -o out/pfcrt
+
+# 4. As a composite: stream -> (optional sieve) -> codon MSA + tree in one command:
+disassembler from-lexicmap \
+    -q queries/query_hiv1_pol.fasta \
+    -f /data/hiv1_pol_lexicmap.tsv.gz \
+    -o out/hiv1_pol --sieve
 ```
 
 ### Outputs Generated
@@ -354,7 +403,7 @@ curl -s "https://usegalaxy.org/api/datasets/<ID>/display?key=<API_KEY>" | \
 | `<prefix>.summary.json` | Machine-readable summary: quantiles, cohort counts, multi-HSP rescue statistics, and Shannon entropy |
 | `<prefix>.clean.a2m` | A2M formatted alignment for protein language models and evolutionary couplings |
 
-### LexicMapStreamer CLI Reference
+### `disassembler lexicmap` CLI Reference
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -365,12 +414,12 @@ curl -s "https://usegalaxy.org/api/datasets/<ID>/display?key=<API_KEY>" | \
 | `--base-url <URL>` | `https://usegalaxy.org` | Galaxy server base URL |
 | `--api-key <KEY>` | — | Galaxy API key string |
 | `--api-key-file <PATH>` | `/tmp/gxy.txt` | Path to Galaxy API key file |
-| `--min-coverage <F>` | `0.80` | Minimum merged query coverage for clean full-length cohort |
-| `--min-coverage-partial <F>` | `0.50` | Minimum coverage for clean partial cohort |
+| `--min-cov <F>` | `0.80` | Minimum merged query coverage for clean full-length cohort |
+| `--min-cov-partial <F>` | `0.50` | Minimum coverage for clean partial cohort |
 | `--min-pident <F>` | `60.0` | Minimum percent identity for candidate HSPs |
 | `--max-internal-stops <N>` | `0` | Maximum premature internal stops allowed in CDS |
-| `--allow-frameshifts` | off | Allow indels/premature stops into clean cohort |
-| `--sample-cap <N>` | `10` | Maximum sample accessions recorded per haplotype in TSV |
+| `--allow-frameshift-alts` | off | Allow indels/premature stops into clean cohort |
+| `--samples-per-haplotype <N>` | `10` | Maximum representative accessions recorded per haplotype in the clean-haplotypes TSV |
 | `--max-records <N>` | — | Stop after processing $N$ lines (for testing/previews) |
 | `--no-a2m` | off | Disable `.a2m` output |
 

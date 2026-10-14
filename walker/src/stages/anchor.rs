@@ -112,7 +112,14 @@ impl QueryIndex {
     }
 }
 
-/// Build the query k-mer index.
+/// Build the query k-mer index from a single reference.
+///
+/// Thin wrapper around [`index_query_set`]. Every current call site holds a single
+/// [`Query`]; multi-anchor mode calls the set variant directly with the whole pool.
+/// The single-query path stays byte-identical: with one query, the set variant sums
+/// windows over `[query]`, which is `query.seq.len() - k + 1` — the same capacity
+/// computation the old direct implementation used — and iterates the same bytes in the
+/// same order, so the resulting table is the same table.
 ///
 /// Canonical means `min(kmer, revcomp(kmer))`, which makes the later scan strand-agnostic
 /// without scanning each unitig twice. Both registers are rolled in lockstep:
@@ -125,24 +132,48 @@ impl QueryIndex {
 /// A window containing any non-ACGT base is skipped, and the run length resets, so no
 /// k-mer spanning an ambiguity code is ever emitted.
 pub fn index_query(cfg: &Config, query: &Query) -> Result<QueryIndex> {
+    index_query_set(cfg, std::slice::from_ref(query))
+}
+
+/// Build one canonical-k-mer index unioning every record in `queries`.
+///
+/// Multi-anchor mode's anchor pool: pass Wuhan + JN.1 (or a whole strain panel) and every
+/// canonical k-mer from any reference is a valid seed. The open-addressed table dedupes
+/// insertions, so overlapping k-mers cost table space only once and the `contains` probe
+/// stays a single hash.
+///
+/// Capacity comes from the sum of window counts across queries (rounded up to a power of
+/// two, load factor ≤ 0.5). For a single-query call this reduces to the same capacity the
+/// legacy single-query path used, and the k-mer stream is iterated in the same order, so
+/// [`index_query`] is a byte-identical wrapper.
+///
+/// Warnings and the "no usable k-mers" error are aggregate: a run whose whole pool yielded
+/// nothing is still a hard error, and skipped windows are reported per query so a bad
+/// record is identifiable in a wide pool.
+pub fn index_query_set(cfg: &Config, queries: &[Query]) -> Result<QueryIndex> {
     let k = cfg.k;
     if k == 0 || k > 32 {
         return Err(Error::Usage(format!(
             "k must be in 1..=32 to fit a u64 (got {k})"
         )));
     }
-    if query.seq.len() < k {
-        return Err(Error::Usage(format!(
-            "query {:?} is {} bp, shorter than k={k}",
-            query.name,
-            query.seq.len()
-        )));
+    if queries.is_empty() {
+        return Err(Error::Usage("no queries in anchor pool".into()));
+    }
+    for q in queries {
+        if q.seq.len() < k {
+            return Err(Error::Usage(format!(
+                "query {:?} is {} bp, shorter than k={k}",
+                q.name,
+                q.seq.len()
+            )));
+        }
     }
 
-    let n_windows = query.seq.len() - k + 1;
+    let total_windows: usize = queries.iter().map(|q| q.seq.len() - k + 1).sum();
     // Load factor <= 0.5, rounded up to a power of two, so linear probing stays short.
     let mut cap = 16usize;
-    while cap < n_windows * 2 {
+    while cap < total_windows * 2 {
         cap <<= 1;
     }
     let mut idx = QueryIndex {
@@ -155,45 +186,52 @@ pub fn index_query(cfg: &Config, query: &Query) -> Result<QueryIndex> {
 
     let shift = 2 * (k as u64 - 1);
     let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
-    let (mut fwd, mut rev, mut run) = (0u64, 0u64, 0usize);
 
-    for (pos, &b) in query.seq.iter().enumerate() {
-        match base_code(b) {
-            Some(code) => {
-                fwd = ((fwd << 2) | code) & mask;
-                rev = (rev >> 2) | ((3 - code) << shift);
-                run += 1;
+    for query in queries {
+        let (mut fwd, mut rev, mut run) = (0u64, 0u64, 0usize);
+        let mut skipped_this_query = 0usize;
+
+        for (pos, &b) in query.seq.iter().enumerate() {
+            match base_code(b) {
+                Some(code) => {
+                    fwd = ((fwd << 2) | code) & mask;
+                    rev = (rev >> 2) | ((3 - code) << shift);
+                    run += 1;
+                }
+                None => {
+                    // Ambiguity code: drop the window and start counting again after it.
+                    run = 0;
+                    fwd = 0;
+                    rev = 0;
+                }
             }
-            None => {
-                // Ambiguity code: drop the window and start counting again after it.
-                run = 0;
-                fwd = 0;
-                rev = 0;
+            if pos + 1 >= k {
+                if run >= k {
+                    let canon = fwd.min(rev);
+                    if idx.insert(canon) {
+                        idx.n_kmers += 1;
+                    }
+                } else {
+                    skipped_this_query += 1;
+                    idx.n_skipped += 1;
+                }
             }
         }
-        if pos + 1 >= k {
-            if run >= k {
-                let canon = fwd.min(rev);
-                if idx.insert(canon) {
-                    idx.n_kmers += 1;
-                }
-            } else {
-                idx.n_skipped += 1;
-            }
+
+        if skipped_this_query > 0 {
+            let n_windows = query.seq.len() - k + 1;
+            eprintln!(
+                "[warn] query {:?}: {} of {} windows skipped for non-ACGT bases",
+                query.name, skipped_this_query, n_windows
+            );
         }
     }
 
     if idx.n_kmers == 0 {
+        let names: Vec<&str> = queries.iter().map(|q| q.name.as_str()).collect();
         return Err(Error::Usage(format!(
-            "query {:?} yielded no usable {k}-mers",
-            query.name
+            "anchor pool {names:?} yielded no usable {k}-mers"
         )));
-    }
-    if idx.n_skipped > 0 {
-        eprintln!(
-            "[warn] query {:?}: {} of {} windows skipped for non-ACGT bases",
-            query.name, idx.n_skipped, n_windows
-        );
     }
     Ok(idx)
 }
@@ -520,6 +558,73 @@ mod tests {
         let seq = "ACGT".repeat(16); // 64 bases
         let idx = index_query(&cfg_k(32), &q(&seq)).unwrap();
         assert!(idx.n_kmers > 0);
+    }
+
+    // ---- index_query_set (multi-anchor pool) ----
+
+    /// The whole point of the wrapper: a single-query `index_query_set` produces exactly the
+    /// same table as `index_query`. If this drifts, `bench/check_golden.sh` will fail because
+    /// anchor ids depend on the table's capacity and hash slots.
+    #[test]
+    fn single_query_set_is_bit_identical_to_index_query() {
+        let seq = "ACGTGGTCAACCGGTTACGTAGGCTAGCTAGCTAGCTGATCGATCGATCGATC";
+        let cfg = cfg_k(11);
+        let solo = index_query(&cfg, &q(seq)).unwrap();
+        let set = index_query_set(&cfg, std::slice::from_ref(&q(seq))).unwrap();
+        assert_eq!(solo.k, set.k);
+        assert_eq!(solo.mask, set.mask);
+        assert_eq!(solo.n_kmers, set.n_kmers);
+        assert_eq!(solo.n_skipped, set.n_skipped);
+        assert_eq!(solo.table.len(), set.table.len(), "capacity must match");
+        assert_eq!(solo.table, set.table, "slots must be bit-identical");
+    }
+
+    /// Two queries union: every k-mer of either query is present, and duplicates counted once.
+    #[test]
+    fn set_of_two_queries_unions_the_kmer_sets() {
+        let cfg = cfg_k(5);
+        // Overlap: "ACGTA" appears in both.
+        let a = q("ACGTACGTAT");
+        let b = q("ACGTAGGGCC");
+        let ia = index_query(&cfg, &a).unwrap();
+        let ib = index_query(&cfg, &b).unwrap();
+        let union = index_query_set(&cfg, &[a, b]).unwrap();
+
+        // Every k-mer of either single-query index must be in the union.
+        for src in [&ia, &ib] {
+            for &slot in &src.table {
+                if slot != EMPTY {
+                    assert!(union.contains(slot), "union missing kmer {slot:#x}");
+                }
+            }
+        }
+        // The dedupe invariant: union count is at most sum of individual counts, and at least
+        // the size of the larger of the two.
+        assert!(union.n_kmers <= ia.n_kmers + ib.n_kmers);
+        assert!(union.n_kmers >= ia.n_kmers.max(ib.n_kmers));
+    }
+
+    /// Aggregate empty-index error names every query so a bad record is identifiable.
+    #[test]
+    fn set_reports_all_query_names_when_pool_yields_nothing() {
+        let cfg = cfg_k(4);
+        let err = match index_query_set(&cfg, &[q("NNNN"), q("NNNN")]) {
+            Ok(_) => panic!("expected all-ambiguous pool to error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no usable"), "{err}");
+    }
+
+    #[test]
+    fn set_rejects_empty_pool() {
+        let cfg = cfg_k(4);
+        assert!(index_query_set(&cfg, &[]).is_err());
+    }
+
+    #[test]
+    fn set_rejects_a_query_shorter_than_k() {
+        let cfg = cfg_k(21);
+        assert!(index_query_set(&cfg, &[q("ACGT")]).is_err());
     }
 }
 

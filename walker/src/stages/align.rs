@@ -26,6 +26,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::types::{GafPath, Orient, PathStep, Query, Subgraph};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -80,60 +81,84 @@ pub fn resolve_binary(cfg: &Config) -> Result<PathBuf> {
     )))
 }
 
-/// Run GraphAligner and parse its GAF output.
+/// Run GraphAligner and parse its GAF output, one best alignment per reference in the pool.
 ///
-/// Returns `Ok(None)` when the tool ran cleanly but found no alignment, which is a
-/// legitimate `Outcome::NoPath`. A crash is an `Err`, never folded into that case: an empty
-/// GFA makes GraphAligner abort with SIGABRT, and in the Python walker that exception is
-/// caught per accession at `:392` so the process still exits 0 having reconstructed nothing.
+/// Returns `Ok(HashMap::new())` when the tool ran cleanly but found no alignment against any
+/// reference — the caller reads that as `Outcome::NoPath`. A crash is an `Err`, never folded
+/// into that case: an empty GFA makes GraphAligner abort with SIGABRT, and in the Python
+/// walker that exception is caught per accession at `:392` so the process still exits 0
+/// having reconstructed nothing.
 ///
 /// A nodeless subgraph short-circuits before spawning, since handing GraphAligner an empty
 /// graph is a known abort rather than a question worth asking.
 ///
 /// # One record in, one record out
 ///
-/// `read_query` selects the first record of the query FASTA and warns about the rest, but
+/// `read_query` selects the first record of a query FASTA and warns about the rest, but
 /// handing the whole file to GraphAligner undoes that: it aligns every record, and
 /// `parse_gaf` used to take the best-scoring row across all of them. `stitch` then sliced
 /// with that row's coordinates while dividing by the *selected* record's length, so a
 /// 160-record panel such as `queries/master_planetary_targets.fasta` produced another gene's
 /// path published under the first gene's name, at a coverage above 1.0.
 ///
-/// So a multi-record query is written out as its selected record alone before spawning, and
-/// `parse_gaf` filters on the GAF's query-name column either way.
+/// Multi-anchor mode addresses that head-on: every reference in `queries` is written out as
+/// its own record in a merged temp FASTA, and `parse_gaf_multi` keeps the best row per query
+/// name so the caller can pick a primary against a known reference length. For a single
+/// [`Query`] whose source file already holds exactly one record (the byte-compat path used
+/// by every existing golden fixture) that same source file is handed to GraphAligner
+/// untouched — no temp write — so behaviour is bit-for-bit what it was.
 pub fn run(
     cfg: &Config,
     subgraph: &Subgraph,
-    query: &Query,
+    queries: &[Query],
     gaf_out: &Path,
-) -> Result<Option<GafPath>> {
+) -> Result<HashMap<String, GafPath>> {
     if subgraph.nodes.is_empty() {
-        return Ok(None);
+        return Ok(HashMap::new());
+    }
+    if queries.is_empty() {
+        return Err(Error::Usage("no queries in anchor pool for align".into()));
     }
     let bin = resolve_binary(cfg)?;
 
-    // Single-record queries (every golden fixture, and every well-formed run) are handed to
-    // GraphAligner untouched, so their behaviour is bit-for-bit what it was.
-    let single_record_fa = if query.n_records > 1 {
-        let p = gaf_out.with_extension("query.fa");
-        let mut body = Vec::with_capacity(query.seq.len() + query.record_id.len() + 3);
-        body.push(b'>');
-        body.extend_from_slice(query.record_id.as_bytes());
-        body.push(b'\n');
-        body.extend_from_slice(&query.seq);
-        body.push(b'\n');
-        std::fs::write(&p, &body)?;
-        eprintln!(
-            "[{}] query has {} records; aligning only {:?}",
-            subgraph.accession, query.n_records, query.record_id
-        );
-        Some(p)
-    } else {
-        None
-    };
-    let query_fa = single_record_fa.as_deref().unwrap_or(&query.path);
+    // Byte-compat path: exactly one Query whose source file holds exactly one record.
+    // Every existing golden fixture is this. GraphAligner is handed `query.path` untouched
+    // just as before, so no temp FASTA is written, no bytes on disk change.
+    let (query_fa, temp_fa): (PathBuf, Option<PathBuf>) =
+        if queries.len() == 1 && queries[0].n_records == 1 {
+            (queries[0].path.clone(), None)
+        } else {
+            // Merged pool: one `>record_id\n<seq>\n` block per query, in input order.
+            // This is written even for a single Query whose source file has extra records,
+            // because we can no longer trust the source file to represent only that record.
+            let p = gaf_out.with_extension("queries.fa");
+            let mut body: Vec<u8> = Vec::with_capacity(
+                queries.iter().map(|q| q.seq.len() + q.record_id.len() + 3).sum(),
+            );
+            for q in queries {
+                body.push(b'>');
+                body.extend_from_slice(q.record_id.as_bytes());
+                body.push(b'\n');
+                body.extend_from_slice(&q.seq);
+                body.push(b'\n');
+            }
+            std::fs::write(&p, &body)?;
+            if queries.len() > 1 {
+                let names: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
+                eprintln!(
+                    "[{}] multi-anchor: aligning against {} references {:?}",
+                    subgraph.accession, queries.len(), names
+                );
+            } else {
+                eprintln!(
+                    "[{}] query has {} records; aligning only {:?}",
+                    subgraph.accession, queries[0].n_records, queries[0].record_id
+                );
+            }
+            (p.clone(), Some(p))
+        };
 
-    let mut cmd = command(&bin, cfg, subgraph, query_fa, gaf_out);
+    let mut cmd = command(&bin, cfg, subgraph, &query_fa, gaf_out);
     // GraphAligner is chatty on stdout; only stderr is kept, for error reporting.
     cmd.stdout(std::process::Stdio::null());
 
@@ -145,7 +170,7 @@ pub fn run(
     if !output.status.success() {
         // Remove any partial GAF so a later run cannot read a truncated file.
         let _ = std::fs::remove_file(gaf_out);
-        if let Some(p) = &single_record_fa {
+        if let Some(p) = &temp_fa {
             let _ = std::fs::remove_file(p);
         }
         let tail = String::from_utf8_lossy(&output.stderr);
@@ -167,14 +192,14 @@ pub fn run(
         // other worker or process can have deleted it out from under us; keyed on the
         // accession alone, a file another run unlinked arrived here as a biological negative.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(p) = &single_record_fa {
+            if let Some(p) = &temp_fa {
                 let _ = std::fs::remove_file(p);
             }
-            return Ok(None);
+            return Ok(HashMap::new());
         }
         Err(e) => {
             let _ = std::fs::remove_file(gaf_out);
-            if let Some(p) = &single_record_fa {
+            if let Some(p) = &temp_fa {
                 let _ = std::fs::remove_file(p);
             }
             return Err(Error::Io(e));
@@ -182,11 +207,80 @@ pub fn run(
     };
     if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
         let _ = std::fs::remove_file(gaf_out);
-        if let Some(p) = &single_record_fa {
+        if let Some(p) = &temp_fa {
             let _ = std::fs::remove_file(p);
         }
     }
-    parse_gaf(&bytes, &query.record_id)
+    let expects: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
+    parse_gaf_multi(&bytes, &expects)
+}
+
+/// Parse a GAF and keep the best alignment for every expected reference name.
+///
+/// Multi-anchor's stitch stage needs one `GafPath` per reference so it can score each
+/// reference against its own length and pick a primary. This is the same logic as
+/// [`parse_gaf`] applied per record id: rows are grouped by column 1, the one with the most
+/// residue matches (column 10) wins per group, ties keep file order.
+///
+/// Rows whose query name is not in `expects` are dropped. In practice GraphAligner echoes
+/// exactly the record ids we handed it, so this only kicks in on a name the tool spelled
+/// differently — a case the single-record path handled with a warning. In multi-anchor mode
+/// we do not warn (there is no single "expected" name), but a caller that finds a reference
+/// missing from the returned map knows nothing aligned against it.
+pub fn parse_gaf_multi(
+    gaf_bytes: &[u8],
+    expects: &[&str],
+) -> Result<HashMap<String, GafPath>> {
+    let text = std::str::from_utf8(gaf_bytes)
+        .map_err(|e| Error::Usage(format!("GAF is not valid UTF-8: {e}")))?;
+
+    let expected: std::collections::HashSet<&str> = expects.iter().copied().collect();
+    let mut best_by_name: HashMap<String, (usize, Vec<&str>)> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 11 {
+            continue;
+        }
+        let name = f[0];
+        if !expected.contains(name) {
+            continue;
+        }
+        let matches: usize = f[9].parse().unwrap_or(0);
+        let take = match best_by_name.get(name) {
+            None => true,
+            // Strictly greater beats existing; ties keep file order (first-seen wins).
+            Some((prev, _)) => matches > *prev,
+        };
+        if take {
+            best_by_name.insert(name.to_string(), (matches, f));
+        }
+    }
+
+    let mut out: HashMap<String, GafPath> = HashMap::with_capacity(best_by_name.len());
+    for (name, (_matches, best)) in best_by_name {
+        let num = |i: usize| -> Result<usize> {
+            best[i].parse::<usize>().map_err(|e| {
+                Error::Usage(format!("GAF column {} is not a number: {e}", i + 1))
+            })
+        };
+        let steps = parse_path(best[5]);
+        if steps.is_empty() {
+            continue; // path with no nodes: no usable alignment against this ref
+        }
+        out.insert(name, GafPath {
+            steps,
+            path_len: num(6)?,
+            path_start: num(7)?,
+            path_end: num(8)?,
+            num_matches: num(9)?,
+            aln_len: num(10)?,
+        });
+    }
+    Ok(out)
 }
 
 /// Parse the GAF GraphAligner emits and return the best alignment.
@@ -397,6 +491,68 @@ mod tests {
         assert!(e.contains("not found at"), "{e}");
     }
 
+    // ---- parse_gaf_multi (multi-anchor) ----
+
+    /// One best row per expected query name, from the same bytes.
+    #[test]
+    fn multi_returns_best_row_per_expected_name() {
+        let gaf = "\
+wuhan\t10\t0\t10\t+\t>1\t10\t0\t10\t50\t60\t60
+wuhan\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
+jn1\t10\t0\t10\t+\t>7\t10\t0\t10\t200\t260\t60
+jn1\t10\t0\t10\t+\t>8\t10\t0\t10\t150\t180\t60
+";
+        let m = parse_gaf_multi(gaf.as_bytes(), &["wuhan", "jn1"]).unwrap();
+        assert_eq!(m.len(), 2);
+        // Best for `wuhan` is the 900-matches row (node 2).
+        assert_eq!(m["wuhan"].num_matches, 900);
+        assert_eq!(m["wuhan"].steps[0].node, 2);
+        // Best for `jn1` is the 200-matches row (node 7).
+        assert_eq!(m["jn1"].num_matches, 200);
+        assert_eq!(m["jn1"].steps[0].node, 7);
+    }
+
+    /// A reference the GAF has no row for is absent from the map. In multi-anchor mode this
+    /// means the walker walked nothing against that particular reference; the caller reads
+    /// the missing key as "not a candidate for primary".
+    #[test]
+    fn multi_omits_references_with_no_rows() {
+        let gaf = "wuhan\t10\t0\t10\t+\t>1\t10\t0\t10\t50\t60\t60\n";
+        let m = parse_gaf_multi(gaf.as_bytes(), &["wuhan", "jn1"]).unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(m.contains_key("wuhan"));
+        assert!(!m.contains_key("jn1"));
+    }
+
+    /// Rows whose query name is not in `expects` are ignored. The single-query codepath
+    /// used to warn here; multi-anchor mode has no single "expected" to warn against, so
+    /// we drop silently and trust the caller.
+    #[test]
+    fn multi_ignores_rows_whose_name_is_not_expected() {
+        let gaf = "\
+wuhan\t10\t0\t10\t+\t>1\t10\t0\t10\t50\t60\t60
+some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
+";
+        let m = parse_gaf_multi(gaf.as_bytes(), &["wuhan", "jn1"]).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(m["wuhan"].num_matches, 50);
+    }
+
+    /// A row whose path names no nodes is not a usable alignment.
+    #[test]
+    fn multi_drops_paths_with_no_nodes() {
+        let gaf = "wuhan\t10\t0\t10\t+\t*\t10\t0\t10\t50\t60\t60\n";
+        let m = parse_gaf_multi(gaf.as_bytes(), &["wuhan"]).unwrap();
+        assert!(m.is_empty());
+    }
+
+    /// Empty or blank input is an empty map, not an error.
+    #[test]
+    fn multi_empty_input_is_empty_map() {
+        assert!(parse_gaf_multi(b"", &["wuhan"]).unwrap().is_empty());
+        assert!(parse_gaf_multi(b"\n\n", &["wuhan"]).unwrap().is_empty());
+    }
+
     #[test]
     fn command_matches_the_python_invocation() {
         let cfg = Config { graphaligner_threads: 2, ..Config::default() };
@@ -466,7 +622,8 @@ mod align_real {
 
         let gaf = sub.gfa_path.with_extension("gaf");
         let t0 = std::time::Instant::now();
-        let path = run(&cfg, &sub, &query, &gaf).expect("align").expect("a path");
+        let mut gaf_map = run(&cfg, &sub, std::slice::from_ref(&query), &gaf).expect("align");
+        let path = gaf_map.remove(query.record_id.as_str()).expect("a path");
         let elapsed = t0.elapsed();
 
         let fwd = path.steps.iter().filter(|s| s.orient == Orient::Forward).count();
@@ -513,8 +670,8 @@ mod align_real {
             path: "../queries/pfcrt_only.fasta".into(),
             n_records: 1,
         };
-        let got = run(&cfg, &sub, &q, &cfg.scratch_dir.join("EMPTY.sub.gaf")).unwrap();
-        assert!(got.is_none(), "must report no path rather than invoking the tool");
+        let got = run(&cfg, &sub, std::slice::from_ref(&q), &cfg.scratch_dir.join("EMPTY.sub.gaf")).unwrap();
+        assert!(got.is_empty(), "must report no path rather than invoking the tool");
     }
 }
 
@@ -577,7 +734,8 @@ mod determinism {
             let mut seen: Vec<(usize, String)> = Vec::new();
             for i in 0..5 {
                 let gaf = sub.gfa_path.with_extension(format!("det{i}.gaf"));
-                let path = run(&cfg, &sub, &query, &gaf).unwrap().expect("an alignment");
+                let mut gaf_map = run(&cfg, &sub, std::slice::from_ref(&query), &gaf).unwrap();
+                let path = gaf_map.remove(query.record_id.as_str()).expect("an alignment");
                 let steps: String = path
                     .steps
                     .iter()

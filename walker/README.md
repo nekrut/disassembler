@@ -35,6 +35,9 @@ Key flags (`logan-walker --help` for the full list):
 | `--emit-vcf` | write per-accession `<acc>.vcf` of intra-host SNPs (default off) |
 | `--emit-snv-table` | write one long `snvs.tsv` across the run — the cohort output that scales (default off) |
 | `-w` / `--fetch-workers` | compute workers / S3 fetch workers |
+| `--unitigs-cache <DIR>` | read-through cache for compressed unitig payloads; byte-identical to the S3 object. A cache miss falls through to S3 and is written back atomically |
+| `--offline` | refuse the S3 fallback; requires `--unitigs-cache`. A cache miss becomes a hard error naming the accession |
+| `--fetch-only` | fetch every accession into `--unitigs-cache` and exit before the compute stages. `disassembler fetch` is the wrapper |
 
 Reproduce the old one-haplotype-per-accession behaviour with
 `--prune-frac 0.0 --no-prefer-majority --no-emit-alts`.
@@ -66,8 +69,8 @@ src/
 ```
 
 The walker reconstructs haplotypes; to codon-align them and build a tree, feed
-`reconstructed.fasta` to `../python/build_walker_codon_msa.py`, or run the whole thing in one
-command with `../python/disassemble.py` (see [`../docs/codon_msa.md`](../docs/codon_msa.md)).
+`reconstructed.fasta` to `disassembler msa`, or run the whole thing in one command with
+`disassembler reconstruct` (see [`../docs/codon_msa.md`](../docs/codon_msa.md)).
 
 See [`../docs/`](../docs/) for the design plan, as-built notes, the variance-loss
 investigation, the codon-MSA step, and the VCF / contig experiments.
