@@ -216,6 +216,15 @@ def load_reference(fasta_path: str):
     ref_name = header.split()[0] if header else path.stem
     return ref_name, header, ref_seq
 
+def is_gzip(path: str) -> bool:
+    """True when the file starts with the gzip magic bytes.
+
+    Decided by content, not by a `.gz` suffix: the name is the caller's to choose, and a
+    Galaxy dataset arrives as `dataset_<uuid>.dat` whether or not it is compressed.
+    """
+    with open(path, "rb") as fh:
+        return fh.read(2) == b"\x1f\x8b"
+
 def get_galaxy_stream(dataset_id: str, base_url: str = "https://usegalaxy.org", api_key: str = None, key_file: str = None):
     """Opens a buffered HTTP streaming connection to Galaxy dataset display endpoint."""
     key = get_galaxy_api_key(api_key, key_file)
@@ -331,7 +340,7 @@ def stream_lexicmap_to_msa(
         is_http = False
     elif file_path:
         print(f" Input Source       : Local file: {file_path}")
-        if file_path.endswith(".gz"):
+        if is_gzip(file_path):
             stream = gzip.open(file_path, "rt", encoding="utf-8")
         else:
             stream = open(file_path, "r", encoding="utf-8")

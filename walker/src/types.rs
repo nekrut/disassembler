@@ -37,10 +37,11 @@ pub struct Query {
     pub record_id: String,
     /// Uppercased sequence with all whitespace removed.
     pub seq: Vec<u8>,
-    /// Path on disk. For a single-record query GraphAligner is handed this directly (`-f`).
-    /// A multi-record file is NOT: `align::run` writes the selected record to its own file
-    /// first, because GraphAligner would otherwise align every record and the best-scoring
-    /// row across all of them would win.
+    /// Path on disk. GraphAligner is never handed this directly: it picks its parser from the
+    /// file name, which is the user's to choose. For a single-record query `align::run` copies
+    /// it byte for byte to a temp `.fa`. A multi-record file has only the selected record
+    /// written out, because GraphAligner would otherwise align every record and the
+    /// best-scoring row across all of them would win.
     pub path: PathBuf,
     /// Records present in `path`. Only the first is used; more than one is a warning at
     /// read time and changes how `align` invokes GraphAligner.

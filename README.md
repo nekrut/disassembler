@@ -223,7 +223,9 @@ disassembler harvest \
 # Or merge from a local directory of shard JSONs (no Galaxy API calls). The two
 # input modes produce identical output and are mutually exclusive. This is the
 # mode a Galaxy tool wrapper will drive once the shards are staged into the job
-# directory, and it also works for a saved copy of a prior fetch.
+# directory, and it also works for a saved copy of a prior fetch. Every file in the
+# directory is read as a shard whatever it is called; one that is not valid JSON
+# counts as a failed shard.
 disassembler harvest --shards-dir path/to/shards/ -o candidates/
 
 # Optional: sample per-target from arbitrary score bins (histogram-driven experiments).

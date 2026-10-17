@@ -32,8 +32,8 @@ use std::process::Command;
 
 /// Build the GraphAligner command line. Mirrors `logan_path_walker.py:174-177` exactly.
 ///
-/// `query_fa` is the FASTA to align, which is `query.path` only when that file holds a single
-/// record; see `run` for why.
+/// `query_fa` is the FASTA to align: the temp `.fa` that `run` writes next to the GAF, never
+/// the user's file itself; see `run` for why.
 pub fn command(bin: &Path, cfg: &Config, subgraph: &Subgraph, query_fa: &Path, gaf_out: &Path) -> Command {
     let mut cmd = Command::new(bin);
     cmd.arg("-g")
@@ -105,8 +105,16 @@ pub fn resolve_binary(cfg: &Config) -> Result<PathBuf> {
 /// its own record in a merged temp FASTA, and `parse_gaf_multi` keeps the best row per query
 /// name so the caller can pick a primary against a known reference length. For a single
 /// [`Query`] whose source file already holds exactly one record (the byte-compat path used
-/// by every existing golden fixture) that same source file is handed to GraphAligner
-/// untouched — no temp write — so behaviour is bit-for-bit what it was.
+/// by every existing golden fixture) GraphAligner gets a byte-for-byte copy of that source
+/// file, so behaviour is bit-for-bit what it was when it was handed the file directly.
+///
+/// # Never the user's file name
+///
+/// GraphAligner chooses its input parser from the file name and aborts on anything that does
+/// not end in `.fa`, `.fasta`, `.fq`, `.fastq` (optionally `.gz`), `.bam` or `.sam`. The walker
+/// already validated the query as FASTA by content in `read_query`, so the name the user's
+/// file happens to have is irrelevant: a Galaxy dataset arrives as `dataset_<uuid>.dat`. Both
+/// paths above therefore write the temp `.fa`, and the user's path never reaches `-f`.
 pub fn run(
     cfg: &Config,
     subgraph: &Subgraph,
@@ -121,58 +129,59 @@ pub fn run(
     }
     let bin = resolve_binary(cfg)?;
 
-    // Byte-compat path: exactly one Query whose source file holds exactly one record.
-    // Every existing golden fixture is this. GraphAligner is handed `query.path` untouched
-    // just as before, so no temp FASTA is written, no bytes on disk change.
-    let (query_fa, temp_fa): (PathBuf, Option<PathBuf>) =
-        if queries.len() == 1 && queries[0].n_records == 1 {
-            (queries[0].path.clone(), None)
-        } else {
-            // Merged pool: one `>record_id\n<seq>\n` block per query, in input order.
-            // This is written even for a single Query whose source file has extra records,
-            // because we can no longer trust the source file to represent only that record.
-            let p = gaf_out.with_extension("queries.fa");
-            let mut body: Vec<u8> = Vec::with_capacity(
-                queries.iter().map(|q| q.seq.len() + q.record_id.len() + 3).sum(),
+    // GraphAligner only sees this file, whatever the user's query is called. The name is
+    // keyed on the GAF, which `extract::scratch_stem` makes unique per worker and task.
+    let query_fa = gaf_out.with_extension("queries.fa");
+    if queries.len() == 1 && queries[0].n_records == 1 {
+        // Byte-compat path: exactly one Query whose source file holds exactly one record.
+        // Every existing golden fixture is this. The source is copied byte for byte, so
+        // GraphAligner reads exactly what it read when it was handed `query.path` itself.
+        std::fs::copy(&queries[0].path, &query_fa)?;
+    } else {
+        // Merged pool: one `>record_id\n<seq>\n` block per query, in input order.
+        // This is written even for a single Query whose source file has extra records,
+        // because we can no longer trust the source file to represent only that record.
+        let mut body: Vec<u8> = Vec::with_capacity(
+            queries.iter().map(|q| q.seq.len() + q.record_id.len() + 3).sum(),
+        );
+        for q in queries {
+            body.push(b'>');
+            body.extend_from_slice(q.record_id.as_bytes());
+            body.push(b'\n');
+            body.extend_from_slice(&q.seq);
+            body.push(b'\n');
+        }
+        std::fs::write(&query_fa, &body)?;
+        if queries.len() > 1 {
+            let names: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
+            eprintln!(
+                "[{}] multi-anchor: aligning against {} references {:?}",
+                subgraph.accession, queries.len(), names
             );
-            for q in queries {
-                body.push(b'>');
-                body.extend_from_slice(q.record_id.as_bytes());
-                body.push(b'\n');
-                body.extend_from_slice(&q.seq);
-                body.push(b'\n');
-            }
-            std::fs::write(&p, &body)?;
-            if queries.len() > 1 {
-                let names: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
-                eprintln!(
-                    "[{}] multi-anchor: aligning against {} references {:?}",
-                    subgraph.accession, queries.len(), names
-                );
-            } else {
-                eprintln!(
-                    "[{}] query has {} records; aligning only {:?}",
-                    subgraph.accession, queries[0].n_records, queries[0].record_id
-                );
-            }
-            (p.clone(), Some(p))
-        };
+        } else {
+            eprintln!(
+                "[{}] query has {} records; aligning only {:?}",
+                subgraph.accession, queries[0].n_records, queries[0].record_id
+            );
+        }
+    }
 
     let mut cmd = command(&bin, cfg, subgraph, &query_fa, gaf_out);
     // GraphAligner is chatty on stdout; only stderr is kept, for error reporting.
     cmd.stdout(std::process::Stdio::null());
 
-    let output = cmd.output().map_err(|e| Error::GraphAligner {
-        accession: subgraph.accession.clone(),
-        detail: format!("could not run {}: {e}", bin.display()),
+    let output = cmd.output().map_err(|e| {
+        let _ = std::fs::remove_file(&query_fa);
+        Error::GraphAligner {
+            accession: subgraph.accession.clone(),
+            detail: format!("could not run {}: {e}", bin.display()),
+        }
     })?;
 
     if !output.status.success() {
         // Remove any partial GAF so a later run cannot read a truncated file.
         let _ = std::fs::remove_file(gaf_out);
-        if let Some(p) = &temp_fa {
-            let _ = std::fs::remove_file(p);
-        }
+        let _ = std::fs::remove_file(&query_fa);
         let tail = String::from_utf8_lossy(&output.stderr);
         let tail = tail.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
         return Err(Error::GraphAligner {
@@ -192,24 +201,18 @@ pub fn run(
         // other worker or process can have deleted it out from under us; keyed on the
         // accession alone, a file another run unlinked arrived here as a biological negative.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(p) = &temp_fa {
-                let _ = std::fs::remove_file(p);
-            }
+            let _ = std::fs::remove_file(&query_fa);
             return Ok(HashMap::new());
         }
         Err(e) => {
             let _ = std::fs::remove_file(gaf_out);
-            if let Some(p) = &temp_fa {
-                let _ = std::fs::remove_file(p);
-            }
+            let _ = std::fs::remove_file(&query_fa);
             return Err(Error::Io(e));
         }
     };
     if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
         let _ = std::fs::remove_file(gaf_out);
-        if let Some(p) = &temp_fa {
-            let _ = std::fs::remove_file(p);
-        }
+        let _ = std::fs::remove_file(&query_fa);
     }
     let expects: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
     parse_gaf_multi(&bytes, &expects)
@@ -571,6 +574,59 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
             "-t", "2",
         ]);
         std::mem::forget(sub); // avoid Drop trying to unlink a path that was never created
+    }
+
+    /// GraphAligner picks its parser from the file name, so the user's name for the query
+    /// must never reach `-f`: a Galaxy dataset is `dataset_<uuid>.dat`, which it refuses. A
+    /// stand-in binary records what it was handed.
+    #[cfg(unix)]
+    #[test]
+    fn graphaligner_gets_a_fasta_named_byte_copy_of_the_query() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("logan_align_name_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src_bytes: &[u8] = b">pol some description\nacgtACGT\r\nAAAA\n";
+        let src = dir.join("dataset_1234.dat");
+        std::fs::write(&src, src_bytes).unwrap();
+
+        let fake = dir.join("FakeGraphAligner");
+        std::fs::write(&fake, format!(
+            "#!/bin/sh\n\
+             while [ $# -gt 0 ]; do case \"$1\" in\n\
+             -f) cp \"$2\" '{d}/seen.fa'; echo \"$2\" > '{d}/seen_name'; shift 2;;\n\
+             -a) gaf=\"$2\"; shift 2;;\n\
+             *) shift;;\n\
+             esac; done\n\
+             printf 'pol\\t12\\t0\\t12\\t+\\t>1\\t12\\t0\\t12\\t12\\t12\\t60\\n' > \"$gaf\"\n",
+            d = dir.display(),
+        )).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = Config { graphaligner_bin: fake.to_string_lossy().into_owned(), ..Config::default() };
+        let gfa = dir.join("ACC.sub.gfa");
+        std::fs::write(&gfa, b"H\tVN:Z:1.0\nS\t1\tACGTACGTAAAA\n").unwrap();
+        let sub = Subgraph {
+            accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGTACGTAAAA".to_vec()],
+            gfa_path: gfa, n_edges: 0,
+        };
+        let q = Query {
+            name: "dataset_1234".into(), record_id: "pol".into(), seq: b"ACGTACGTAAAA".to_vec(),
+            path: src, n_records: 1,
+        };
+        let gaf = dir.join("ACC.sub.gaf");
+
+        let got = run(&cfg, &sub, std::slice::from_ref(&q), &gaf).unwrap();
+
+        let seen_name = std::fs::read_to_string(dir.join("seen_name")).unwrap();
+        assert!(seen_name.trim_end().ends_with(".fa"), "GraphAligner was handed {seen_name:?}");
+        assert_eq!(std::fs::read(dir.join("seen.fa")).unwrap(), src_bytes,
+                   "a single-record query must reach GraphAligner byte for byte");
+        assert!(got.contains_key("pol"));
+        assert!(!dir.join("ACC.sub.queries.fa").exists(), "the temp query was left behind");
+
+        drop(sub);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

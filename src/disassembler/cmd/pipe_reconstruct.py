@@ -397,9 +397,11 @@ def run(args) -> int:
     msa_input = recon
     if args.sieve and not args.skip_tree:
         sieved = out / "reconstructed.sieved.fasta"
+        # The default --sieve-min-len is sized on the reference the MSA stage measures
+        # the haplotypes against; with a single -q that is the query itself.
         rc = sieve_cmd.sieve_run(
             recon, sieved,
-            ref=query,
+            ref=msa_ref,
             min_len=args.sieve_min_len,
             threshold=args.sieve_threshold,
             sketch=args.sieve_sketch,

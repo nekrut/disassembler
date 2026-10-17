@@ -19,6 +19,7 @@ import argparse
 import sys
 from typing import Sequence
 
+from disassembler import __version__
 from disassembler.cmd import (
     fetch,
     harvest,
@@ -46,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
             "and three composite pipelines (reconstruct, from-kmindex, from-lexicmap)."
         ),
     )
+    # The walker binary versions separately: `disassembler walker --version`.
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="<subcommand>")
     for mod in _ATOMIC + _COMPOSITE:
         mod.add_parser(sub)

@@ -5,6 +5,8 @@ Covers the failure accounting: a shard fetch that exhausts its retries must be
 distinguishable from a shard that legitimately matched nothing, and a run in which
 every shard failed must not report success.
 """
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -226,7 +228,7 @@ class TestHarvestLocal(unittest.TestCase):
     def test_empty_directory_raises(self):
         with self.assertRaises(RuntimeError) as cm:
             hk.harvest_local(self.shards, self.out)
-        self.assertIn("no .json shard files", str(cm.exception))
+        self.assertIn("no shard files", str(cm.exception))
 
     def test_malformed_shard_is_counted_as_failure_not_lost_silently(self):
         self._write_shard("good.json", {"idx": {"g": {"A": 0.5}}})
@@ -248,12 +250,39 @@ class TestHarvestLocal(unittest.TestCase):
         self.assertEqual(dict(per_target), {})
         self.assertTrue((self.out / "summary.json").is_file())
 
-    def test_non_json_files_in_the_directory_are_ignored(self):
-        self._write_shard("s.json", {"idx": {"g": {"A": 0.5}}})
-        (self.shards / "README").write_text("not a shard")
-        (self.shards / "s.json.bak").write_text("stale")
+    def test_shards_are_read_whatever_they_are_called(self):
+        # Galaxy stages datasets as dataset_<uuid>.dat; a .json filter found none of them.
+        self._write_shard("dataset_1.dat", {"idx": {"g": {"A": 0.5}}})
+        self._write_shard("shard_without_suffix", {"idx": {"g": {"B": 0.7}}})
         per_target = hk.harvest_local(self.shards, self.out)
+        self.assertEqual(dict(per_target["g"]), {"A": 0.5, "B": 0.7})
+
+    def test_a_file_that_is_not_json_is_a_failed_shard_not_skipped(self):
+        self._write_shard("s.dat", {"idx": {"g": {"A": 0.5}}})
+        (self.shards / "error_page.dat").write_text("<html>502 Bad Gateway</html>")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            per_target = hk.harvest_local(self.shards, self.out)
         self.assertEqual(dict(per_target["g"]), {"A": 0.5})
+        self.assertIn("error_page.dat", err.getvalue())
+        self.assertIn("1/2 shard files failed", err.getvalue())
+
+    def test_a_json_value_that_is_not_an_object_is_named(self):
+        self._write_shard("s.dat", {"idx": {"g": {"A": 0.5}}})
+        (self.shards / "list.dat").write_text("[1, 2]")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            hk.harvest_local(self.shards, self.out)
+        self.assertIn("list.dat", err.getvalue())
+
+    def test_hidden_files_are_skipped(self):
+        self._write_shard("s.dat", {"idx": {"g": {"A": 0.5}}})
+        (self.shards / ".DS_Store").write_bytes(b"\x00\x00\x00\x01Bud1")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            per_target = hk.harvest_local(self.shards, self.out)
+        self.assertEqual(dict(per_target["g"]), {"A": 0.5})
+        self.assertNotIn("failed", err.getvalue())
 
 
 class TestModeValidation(unittest.TestCase):

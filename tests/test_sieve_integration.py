@@ -22,7 +22,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 
@@ -109,35 +108,20 @@ class TestReconstructSieveSeam(unittest.TestCase):
         shutil.rmtree(self.work, ignore_errors=True)
 
     def _make_ns(self, out_dir, **overrides):
-        # Default namespace that mirrors what the argparse subparser would produce.
-        ns = types.SimpleNamespace(
-            accession="STUBACC",
-            accession_list=None,
-            query=str(QUERY),
-            out_dir=str(out_dir),
-            workers=None,
-            fetch_workers=None,
-            mafft_threads=1,
-            msa_min_cov=0.70,
-            emit_vcf=False,
-            emit_snv_table=False,
-            no_emit_alts=False,
-            prune_frac=None,
-            max_size_mb=None,
-            no_prefer_majority=False,
-            min_abund=None,
-            min_vaf=None,
-            walker_bin=str(self.fake_walker),
-            skip_tree=False,
-            sieve=True,
-            sieve_threshold=0.005,
-            sieve_sketch=256,
-            sieve_min_len=None,
-            sieve_bin=str(SIEVE_BIN),
-            unitigs_cache=None,
-            offline=False,
-            walker_args=[],
-        )
+        # Parsed by the real `reconstruct` parser, so every option `run` reads exists with
+        # its real default. A hand-built namespace went stale each time an option changed
+        # (-q became repeatable, --msa-reference was added) and failed before the seam.
+        from disassembler.cli import build_parser
+        ns = build_parser().parse_args([
+            "reconstruct",
+            "-a", "STUBACC",
+            "-q", str(QUERY),
+            "-o", str(out_dir),
+            "--walker-bin", str(self.fake_walker),
+            "--sieve",
+            "--sieve-bin", str(SIEVE_BIN),
+            "--mafft-threads", "1",
+        ])
         for k, v in overrides.items():
             setattr(ns, k, v)
         return ns

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "disassembler"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Reconstruct coding haplotypes from planetary sequence indexes (Logan kmindex / LexicMap)."
 requires-python = ">=3.11"
 dependencies = [
@@ -20,3 +20,8 @@ disassembler = "disassembler.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# One version string, in the package: `disassembler --version` prints it, and the
+# installed metadata reads it from here.
+[tool.setuptools.dynamic]
+version = {attr = "disassembler.__version__"}

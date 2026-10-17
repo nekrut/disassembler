@@ -9,6 +9,7 @@ Tests:
   - Streaming from file and stdin
 """
 
+import gzip
 import sys
 import unittest
 import tempfile
@@ -99,6 +100,27 @@ class TestLexicMapStreamer(unittest.TestCase):
         classes = [line.split("\t")[class_idx] for line in tsv_lines[1:]]
         self.assertIn("WT", classes)
         self.assertIn("Missense", classes)
+
+    def test_gzip_is_detected_by_content_not_by_name(self):
+        # Galaxy hands every dataset over as dataset_<uuid>.dat, compressed or not.
+        tsv = (
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            "SRR010\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
+        )
+        gzip_named_dat = self.dir_path / "dataset_1.dat"
+        with gzip.open(gzip_named_dat, "wt") as fh:
+            fh.write(tsv)
+        plain_named_gz = self.dir_path / "dataset_2.tsv.gz"
+        plain_named_gz.write_text(tsv)
+
+        for path in (gzip_named_dat, plain_named_gz):
+            with self.subTest(path=path.name):
+                summary = lms.stream_lexicmap_to_msa(
+                    ref_path=str(self.ref_fasta),
+                    file_path=str(path),
+                    out_prefix=str(self.dir_path / path.name),
+                )
+                self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 1)
 
     def test_mean_pident_excludes_gap_positions(self):
         merged, cov_bases, mean_pid, _, _ = lms.merge_accession_hsps(

@@ -211,9 +211,15 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
 def harvest_local(shards_dir, out_dir):
     """Harvest from a local directory of shard JSON files.
 
-    Non-recursive: reads `*.json` directly under `shards_dir`. This matches how
-    Galaxy stages a `list` collection into a job directory, and keeps the mental
-    model simple when a user points at a cached shard dump from a prior run.
+    Non-recursive: every regular file directly under `shards_dir` is a shard, whatever
+    it is called; only hidden (dot) files are skipped. This matches how Galaxy stages a
+    `list` collection into a job directory, and keeps the mental model simple when a
+    user points at a cached shard dump from a prior run.
+
+    Shards are recognised by content, not by a `.json` suffix. Galaxy hands datasets
+    over as `dataset_<uuid>.dat`, so a suffix filter found nothing there. A file that is
+    not a JSON object counts as a failed shard and is named, rather than being skipped
+    for its name: an HTML error page saved where a shard should be is a lost shard.
 
     Same output as `harvest_collection`; raises RuntimeError on the same
     unrecoverable conditions (no shards found, every shard unreadable).
@@ -222,9 +228,9 @@ def harvest_local(shards_dir, out_dir):
     if not shards_dir.is_dir():
         raise RuntimeError(f"shards directory not found: {shards_dir}")
     shard_files = sorted(p for p in shards_dir.iterdir()
-                         if p.is_file() and p.suffix.lower() == ".json")
+                         if p.is_file() and not p.name.startswith("."))
     if not shard_files:
-        raise RuntimeError(f"no .json shard files found in {shards_dir}")
+        raise RuntimeError(f"no shard files found in {shards_dir}")
 
     print(f"[*] Found {len(shard_files)} shard JSON file(s) in {shards_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -250,6 +256,8 @@ def harvest_local(shards_dir, out_dir):
             continue
         if not isinstance(d, dict):
             n_failed += 1
+            print(f"    [!] shard {path.name}: JSON {type(d).__name__}, not a kmindex "
+                  f"result object", file=sys.stderr)
             continue
         if not d:
             n_empty += 1
@@ -408,8 +416,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     # Local-files mode (no Galaxy API traffic).
     p.add_argument("--shards-dir",
                    help="Directory of shard JSON files on disk (local-files mode). "
-                        "Reads *.json non-recursively from this directory. Use this "
-                        "when shards are already staged (e.g. inside a Galaxy tool "
+                        "Every regular file directly in it is read as a shard, "
+                        "whatever its name (hidden files are skipped); one that is "
+                        "not valid JSON counts as a failed shard. Use this when "
+                        "shards are already staged (e.g. inside a Galaxy tool "
                         "wrapper, or from a cached fetch). Mutually exclusive with "
                         "--history-id/--collection-id.")
 
