@@ -224,9 +224,8 @@ fn write_cache_atomic(dir: &Path, accession: &str, bytes: &[u8]) -> std::io::Res
     // the finally-style branch below handles that.
     let write_result = std::fs::write(&tmp, bytes);
     match write_result {
-        Ok(()) => std::fs::rename(&tmp, &final_path).map_err(|e| {
+        Ok(()) => std::fs::rename(&tmp, &final_path).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
-            e
         }),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);

@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn set_splits_multi_record_file_into_scoped_queries() {
         let p = tmp("set_multi.fasta", b">wuhan\nAAA\n>jn1\nCCC\n>ba5\nGGG\n");
-        let qs = read_query_set(&[p.clone()]).unwrap();
+        let qs = read_query_set(std::slice::from_ref(&p)).unwrap();
         assert_eq!(qs.len(), 3);
         assert_eq!(qs[0].record_id, "wuhan");
         assert_eq!(qs[1].record_id, "jn1");

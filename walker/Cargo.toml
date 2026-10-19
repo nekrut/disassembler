@@ -1,6 +1,6 @@
 [package]
 name = "logan-walker"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 description = "Rust path walker for Logan unitigs. See docs/plan_rust_path_walker.md"
 publish = false

@@ -18,7 +18,7 @@ Bioconda builds every recipe from a downloadable tagged tarball, so each source 
 
 The Rust path walker, built from `walker/`. One binary, `logan-walker`.
 
-- Source: `walker/` in `nekrut/disassembler` at a tagged version, with its own tag series (for example `logan-walker-v0.0.2`) so its tags do not collide with the Python package's.
+- Source: `walker/` in `nekrut/disassembler` at a tagged version, with its own tag series (for example `logan-walker-v0.1.0`) so its tags do not collide with the Python package's.
 - Build: `cargo install --locked --path walker`. Two crate dependencies (`ureq`, `zstd`), but both compile C underneath (`ring` for TLS, `zstd-sys` for a bundled libzstd), so the recipe needs `{{ compiler('c') }}` and `{{ stdlib('c') }}` alongside `{{ compiler('rust') }}`, plus `cargo-bundle-licenses` to ship the crates' licenses.
 - Shipped artifact: the `logan-walker` executable on PATH.
 - Runtime dependency: GraphAligner (shelled out via PATH). Expressed as a Bioconda `run` dependency so a user installing `logan-walker` picks up `graphaligner` automatically.
@@ -79,10 +79,10 @@ Everything the CLI calls out to is reachable from one `conda install disassemble
 ### 1.6 Versioning policy
 
 - Each package versions independently and tags its own releases.
-- `disassembler` pins the minor versions of its dependencies, so a `disassembler 0.3.x` run reproduces regardless of whether logan-walker 0.0.2 or 0.0.3 is the latest.
+- `disassembler` pins the minor versions of its dependencies, so a `disassembler 0.1.x` run reproduces regardless of whether logan-walker 0.1.0 or 0.1.1 is the latest.
 - Golden-fixture concordance (`bench/check_golden.sh`) is the gate for a `disassembler` release.
 - `disassembler --version` prints `disassembler.__version__`, which is also the installed package version. `logan-walker --version` prints the version in `walker/Cargo.toml`. The Galaxy wrappers use these as their version commands.
-- The tree is currently at `disassembler 0.1.0` and `logan-walker 0.0.1`. The drafted wrappers require the planned first release versions, `0.3.0` and `0.0.2` (section 5).
+- The first public release is `0.1.0` for both packages (`disassembler.__version__` and `walker/Cargo.toml`). The drafted wrappers require exactly these versions through the tokens in their `macros.xml`, so a different release number means changing those tokens too.
 
 ### 1.7 CLI changes the port needed
 
@@ -367,9 +367,9 @@ A reasonable sequence; none of the steps block the next past where noted. The qu
 1. **Settle who authors the `kmer-diversity-sieve` Bioconda recipe** (section 4, who maintains the Bioconda recipes). The preferred path is a recipe contributed upstream that tracks upstream releases. **Blocks step 2.**
 2. Contribute (or receive) a Bioconda recipe for `kmer-diversity-sieve`. Direction set by step 1. Needs a tagged upstream release first (section 1.2). **Blocks step 5.**
 3. Decide the GraphAligner version pin for `logan-walker` (section 4). If 1.0.17b wins, rebuild `bench/golden/` before the port ships so the concordance gate stays live. **Blocks step 4.**
-4. Make `nekrut/disassembler` public, so Bioconda can download it. Tag `logan-walker 0.0.2` from `walker/`, including the section 1.7 changes. Contribute Bioconda recipe depending on step 3's version pin. **Blocks steps 5 and 6.**
-5. Tag `disassembler 0.3.0`, including the section 1.7 changes. Contribute Bioconda recipe depending on steps 2 and 4.
-6. **Drafted.** The six tool XMLs are in `as042/tools-iuc`, branch `disassembler`, `tools/disassembler/` (section 2). Remaining: change the requirement versions if the tags from steps 4 and 5 differ from `0.0.2` and `0.3.0`, add authors to the suite's citation, and re-run `planemo test` with normal dependency resolution once the packages from steps 2, 4 and 5 exist. Decomposing `msa` (section 4) is a later follow-up.
+4. `nekrut/disassembler` is public (done 2026-10-18), so Bioconda can download it. Tag `logan-walker 0.1.0` from `walker/`, including the section 1.7 changes. Contribute Bioconda recipe depending on step 3's version pin. **Blocks steps 5 and 6.**
+5. Tag `disassembler 0.1.0`, including the section 1.7 changes. Contribute Bioconda recipe depending on steps 2 and 4.
+6. **Drafted.** The six tool XMLs are in `as042/tools-iuc`, branch `disassembler`, `tools/disassembler/` (section 2). Remaining: change the requirement versions if the tags from steps 4 and 5 differ from `0.1.0`, add authors to the suite's citation, and re-run `planemo test` with normal dependency resolution once the packages from steps 2, 4 and 5 exist. Decomposing `msa` (section 4) is a later follow-up.
 7. Author the three `.ga` workflow files, wiring the disassembler tools together with IUC `mafft`, IUC `fasttree`, and (per section 4) `bcftools merge` where appropriate.
 8. Submit tools and workflows to the IUC (`tools-iuc`) and IWC (`iwc`) repositories respectively, following their house styles.
 
