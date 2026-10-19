@@ -12,12 +12,15 @@
 # ERR2028820 (PfCRT) and SRR12363134 (C. auris ERG11) are the byte-exact gates: clonal
 # isolates with small subgraphs and a deterministic GraphAligner run, so their primaries are
 # reproducible byte for byte. SRR12363134's fixture was cross-validated: the Rust walker and
-# the (now removed) Python walker produced the identical 1,574 nt primary.
+# the (now removed) Python walker produced the identical 1,574 nt primary under GraphAligner
+# 1.0.20. All three fixtures were recaptured from the Rust walker under 1.0.17b on 2026-10-18,
+# which gives the two gated ones their final base (bench/golden/README.md).
 #
 # SRR8209082 (HIV-1 pol) is reported but NOT gated. Its 26k-node subgraph is ~a third of the
-# whole graph; the Rust k-mer anchoring builds a different subgraph than the Python BLAST run
-# the fixture was captured with, and GraphAligner is not deterministic on a graph that size when
-# unpruned. It is therefore not byte-reproducible across implementations. See
+# whole graph, so its unpruned route depends on the anchoring implementation and on the
+# GraphAligner version (1.0.17b and 1.0.20 take different routes), and GraphAligner is not
+# deterministic on a graph that size with more than one thread. It is therefore not
+# byte-reproducible across implementations. See
 # docs/rust_walker_as_built.md section 7 and docs/issue_intra_accession_variance_lost.md
 # section 15. Its primary is stabilised by the default pruning, which this old-behaviour gate
 # turns off on purpose.
@@ -33,11 +36,15 @@ fi
 command -v GraphAligner >/dev/null || { echo "FAIL: GraphAligner not on PATH"; exit 1; }
 
 # Record the aligner version with the result. The fixtures are version-dependent: 1.0.19+
-# clips the query's final base, so these goldens (captured under an affected build) PASS on
-# 1.0.20 and would FAIL on 1.0.18, which is the version that is actually end to end. Without
-# this line a green gate does not say which behaviour it green-lit.
-# See docs/issue_graphaligner_end_clipping.md.
-echo "using $(GraphAligner --version 2>&1 | head -n 1) at $(command -v GraphAligner)"
+# clips the query's final base, so these goldens (captured under 1.0.17b, which aligns end to
+# end) FAIL on 1.0.19 and 1.0.20 by exactly that base. Without this line a green gate does not
+# say which behaviour it green-lit. See docs/issue_graphaligner_end_clipping.md.
+running="$(GraphAligner --version 2>&1 | head -n 1)"
+echo "using $running at $(command -v GraphAligner)"
+captured="$(cat "$ROOT/bench/golden/GRAPHALIGNER_VERSION" 2>/dev/null)"
+if [ -n "$captured" ] && [ "$running" != "$captured" ]; then
+  echo "WARN fixtures were captured under '$captured'; a FAIL below may be the aligner, not the walker"
+fi
 
 # Writes $WORK/$acc.got (bare sequence) and $WORK/$acc.log, and RETURNS the walker's exit
 # status. That status used to be thrown away along with stderr, so an S3 timeout produced an

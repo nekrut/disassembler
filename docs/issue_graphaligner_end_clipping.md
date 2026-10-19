@@ -1,6 +1,7 @@
 # GraphAligner 1.0.19 and later clip the last base of the query
 
-**Status:** diagnosed, not yet fixed. Investigated 2026-09-16.
+**Status:** diagnosed 2026-09-16. Decided 2026-10-18: pin GraphAligner 1.0.17b (section 10). The
+golden fixtures were recaptured under it the same day. Not yet reported upstream.
 
 `logan-walker` emits haplotypes exactly one base shorter than the reference CDS. The missing base
 is the last one, which for an in-frame CDS is the final base of the stop codon. This is not a
@@ -180,6 +181,9 @@ Option 1 is preferred. Whichever is chosen, `bench/golden/` must be recaptured a
 should record the GraphAligner version alongside the fixtures, so a future version change is
 visible rather than silent.
 
+Section 10 supersedes this choice: 1.0.18 turned out not to be installable alongside the Python
+versions disassembler needs.
+
 ---
 
 ## 9. Reproducing this investigation
@@ -189,6 +193,81 @@ conda create -n ga118 -c conda-forge -c bioconda graphaligner=1.0.18 -y
 conda create -n ga120 -c conda-forge -c bioconda graphaligner=1.0.20 -y
 # then run the section 2 repro under each
 ```
+
+---
+
+## 10. Decision, 2026-10-18: pin 1.0.17b
+
+Revisited for the first Bioconda release (`disassembler 0.1.0`), where the pin has to be one that
+users can actually install.
+
+### Upstream
+
+No GraphAligner release since 1.0.20 (2024-12-02), and no upstream issue reports this. Of the four
+commits between 1.0.18 and 1.0.19, `ec55a8d` ("trim away trace in padded prefix") adds a loop that
+pops trailing trace entries whose query and graph characters differ, which makes it the likeliest
+cause. That is unconfirmed; confirming it needs a source build.
+
+### Installability
+
+Dry-run solves against conda-forge and bioconda on 2026-10-18, each with the disassembler stack
+(`biopython`, `numpy`, `pandas`, `requests`, `zstandard`, `mafft`, `fasttree`):
+
+| GraphAligner | Python 3.11 | 3.12 | 3.13 | 3.14 | why |
+|---|---|---|---|---|---|
+| 1.0.17b | solves | solves | no | no | uses the protobuf-free build `hdcf5f25_1`, which holds `libzlib` at 1.2.13 |
+| 1.0.18 | no | no | no | not tested | its `protobuf 3.14.0` pin needs Python 3.9; on its own it solves only with Python 3.9 |
+| 1.0.19 | not tested | no | not tested | not tested | |
+| 1.0.20 | not tested | solves | solves | not tested | |
+
+No GraphAligner version has `linux-aarch64` or `osx-arm64` builds, so neither can `logan-walker`.
+
+### Behaviour on real data
+
+The current walker with its default flags, run under 1.0.20, 1.0.18 and 1.0.17b on the same cached
+unitigs for 16 accessions: `ERR2028820` (pfcrt), five *C. auris* ERG11 accessions, `SRR8209082`
+(HIV-1 pol) and nine Zika NS5 accessions.
+
+- **15 of 16:** the 1.0.18 haplotype is the 1.0.20 haplotype plus exactly its final base, which
+  restores the terminal codon (`TAA` for pfcrt and ERG11).
+- **`SRR8209082`**, which the walker already flags as provisional (its 5-hop neighbourhood is 42%
+  of the graph): 1.0.18 takes a different route (2,506 against 2,479 nodes), giving one
+  substitution and 2,738 nt against 2,737 under 1.0.20. Both are short of the 2,739 nt reference.
+- **1.0.17b is byte-identical to 1.0.18 on all 16**, alternative haplotypes included. The SNV
+  tables are identical across all three versions.
+- **Deterministic:** three repeats of `SRR8209082` gave identical output for each version.
+
+### 1.0.17b's own known defect
+
+1.0.18 fixed a backtrace corner case (`83f3daf`) that can add a spurious deletion of up to 64 bp at
+the very start of an alignment. In a reconstruction that would appear as up to 64 extra graph bases
+at the 5' end. It did not occur on any of the 16 accessions. For references shorter than about
+3,200 nt it would also trip the walker's coverage warning (`COV_EXCESS = 1.02` in `stitch.rs`).
+
+### Decision
+
+Pin `graphaligner ==1.0.17b` in the `logan-walker` recipe and in `environment.yml`.
+
+- It is the only installable version that aligns end to end. 1.0.18 cannot be installed with the
+  Python versions disassembler requires.
+- Its output matched 1.0.18 exactly on every accession tested.
+- The walker's output stays aligner-confirmed. Option 3 (extending the slice) would make 1.0.20
+  usable, but by emitting bases the aligner did not align.
+- Costs accepted: environments with disassembler resolve to Python 3.11 or 3.12 with `libzlib`
+  1.2.13, and 1.0.17b lacks the corner-case fixes that 1.0.18 made.
+
+**Revisit when** a GraphAligner release fixes the regression (move to it); when Python 3.13 or later,
+or a dependency that needs `libzlib` 1.3 or later, becomes necessary (switch to 1.0.20 plus option
+3); or when a reconstruction shows the 5' 64 bp artifact.
+
+**Done 2026-10-18:** `bench/golden/` recaptured under 1.0.17b. The two gated primaries are the
+previous fixtures plus their final base, and the gate now fails under 1.0.20 by exactly that base.
+The version is recorded in `bench/golden/GRAPHALIGNER_VERSION`, and `check_golden.sh` warns when
+it runs under another. `environment.yml` and the CI golden job pin 1.0.17b. `environment.yml` also
+moved to Python 3.12, BLAST 2.16.0 and zstd 1.5.6, because `python=3.13`, `blast=2.17.0` and
+`zstd=1.5.7` all need `libzlib` 1.3 or later.
+
+**Still to do:** report the regression upstream with the section 2 reproduction.
 
 Related: [`rust_walker_as_built.md`](rust_walker_as_built.md) section 7 on why `SRR8209082` is
 reported but not gated, and [`issue_intra_accession_variance_lost.md`](issue_intra_accession_variance_lost.md)

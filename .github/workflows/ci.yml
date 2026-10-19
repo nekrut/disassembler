@@ -78,7 +78,7 @@ jobs:
         with:
           environment-name: gaa
           create-args: >-
-            -c conda-forge -c bioconda graphaligner=1.0.20
+            -c conda-forge -c bioconda graphaligner=1.0.17b
       - name: Build walker
         run: cargo build --release
         working-directory: walker

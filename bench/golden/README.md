@@ -3,12 +3,33 @@
 Concordance baselines for the path walker, covering success criteria 2 and 3 of the
 optimization issue (`docs/issue_path_walker_optimization.md`).
 
+## Current fixtures (recaptured 2026-10-18)
+
+| Accession | Gene | Query | Primary | Reference | Gate |
+|---|---|---|---|---|---|
+| `ERR2028820` | PfCRT | `queries/pfcrt_only.fasta` | 1,275 nt | 1,275 nt | byte-exact |
+| `SRR12363134` | *C. auris* ERG11 | `queries/markers/candida_auris_erg11.fasta` | 1,575 nt | 1,575 nt | byte-exact |
+| `SRR8209082` | HIV-1 pol | `queries/query_hiv1_pol.fasta` | 2,740 nt | 2,739 nt | reported only |
+
+Captured from the Rust walker (`logan-walker` 0.1.0, commit `f655edd`) under GraphAligner
+1.0.17b, with `--prune-frac 0.0 --no-prefer-majority --no-emit-alts`. Each `*.primary.fasta` is
+the walker's FASTA output verbatim. The aligner version is recorded in `GRAPHALIGNER_VERSION`, and
+`check_golden.sh` warns when it runs under a different one.
+
+The two gated primaries are the previous fixtures plus their final base, which restores the stop
+codon that GraphAligner 1.0.19 and 1.0.20 clip (`docs/issue_graphaligner_end_clipping.md`). Under
+1.0.20 the gate now fails on exactly that base. `SRR8209082` takes a different unpruned route under
+1.0.17b than in the earlier capture; it is reported, not gated (see `check_golden.sh`).
+
+## Original capture (2026-09-10)
+
 | Accession | Gene | Query | Unitigs | Anchors | Subgraph | Primary | Bubbles |
 |---|---|---|---|---|---|---|---|
 | `ERR2028820` | PfCRT | `queries/pfcrt_only.fasta` | 1,277,362 | 76 | 356 | 1,274 nt | 202 |
 | `SRR8209082` | HIV-1 pol | `queries/query_hiv1_pol.fasta` | 81,534 | 4,102 | 26,323 | 2,738 nt | 11,825 |
 
-Captured on the unmodified walker at commit `81fc1fd`, GraphAligner 1.0.20, BLAST 2.17.0+.
+Captured on the unmodified Python walker at commit `81fc1fd`, GraphAligner 1.0.20, BLAST 2.17.0+.
+The graph statistics above and the `*.golden.json` files are from this capture.
 
 ## Usage
 
@@ -18,11 +39,12 @@ bench/check_golden.sh              # exit 0 = concordant, 1 = regression
 
 `check_golden.sh` runs the Rust `logan-walker` under old-behaviour flags and diffs the primary
 byte-for-byte against the `*.primary.fasta` fixtures here (needs `GraphAligner` on `PATH` and S3
-access). The `ERR2028820.pfcrt` and `SRR8209082.hiv1_pol` fixtures below were captured from the
-original Python walker at commit `81fc1fd`; `SRR12363134.candida_auris_erg11` was captured from
-the Rust walker and cross-validated against the Python walker (identical 1,574 nt) before that
-walker was removed. To regenerate a fixture, run the Rust walker with
-`--prune-frac 0.0 --no-prefer-majority --no-emit-alts` and save the primary. The retired
+access). Until 2026-10-18 the `ERR2028820.pfcrt` and `SRR8209082.hiv1_pol` fixtures were the
+original Python walker's output at commit `81fc1fd`, and `SRR12363134.candida_auris_erg11` was
+captured from the Rust walker and cross-validated against the Python walker (identical 1,574 nt)
+before that walker was removed. To regenerate a fixture, run the Rust walker with
+`--prune-frac 0.0 --no-prefer-majority --no-emit-alts` under the GraphAligner version in
+`environment.yml`, save the primary, and update `GRAPHALIGNER_VERSION`. The retired
 Python-based `capture_golden.py`/`verify_golden.py` are under `../archive/`.
 
 ## What is asserted, and what is not

@@ -573,9 +573,11 @@ mod tests {
     }
 }
 
-/// Full-chain comparison against the committed golden fixture, which was produced by the
-/// Python walker. This is the end-to-end concordance check: fetch through stitch, in Rust,
-/// reproducing a haplotype Python generated.
+/// Full-chain comparison against the committed golden fixture. This is the end-to-end
+/// concordance check: fetch through stitch, in Rust. The fixture was first produced by the
+/// Python walker under GraphAligner 1.0.20 and recaptured under 1.0.17b on 2026-10-18, which
+/// added the final base that 1.0.19+ clips (docs/issue_graphaligner_end_clipping.md). Run it
+/// with GraphAligner 1.0.17b on PATH.
 ///
 /// ```text
 /// PATH=$REPO/.condaenv-walker/bin:$PATH LOGAN_TEST_DIR=/dir/with/zst \
@@ -592,7 +594,7 @@ mod golden_haplotype {
 
     #[test]
     #[ignore]
-    fn rust_reproduces_the_python_golden_haplotype() {
+    fn rust_reproduces_the_golden_haplotype() {
         let Ok(dir) = std::env::var("LOGAN_TEST_DIR") else {
             eprintln!("SKIP: set LOGAN_TEST_DIR");
             return;
@@ -637,14 +639,15 @@ mod golden_haplotype {
         );
         eprintln!("  sha256 {sha}");
 
-        // Values recorded in bench/golden/ERR2028820.pfcrt.golden.json,
-        // produced by the unmodified Python walker.
+        // Values of bench/golden/ERR2028820.pfcrt.primary.fasta (2026-10-18, GraphAligner
+        // 1.0.17b). The Python capture in ERR2028820.pfcrt.golden.json is the same sequence
+        // without its final base: 1,274 nt, cov 0.999216, the same identity.
         assert_eq!(h.id, "ERR2028820_primary");
-        assert_eq!(h.seq.len(), 1274, "haplotype length");
-        assert!((h.cov - 0.999216).abs() < 1e-6, "coverage {}", h.cov);
+        assert_eq!(h.seq.len(), 1275, "haplotype length");
+        assert!((h.cov - 1.0).abs() < 1e-6, "coverage {}", h.cov);
         assert!((h.pident - 99.529).abs() < 1e-3, "identity {}", h.pident);
         assert_eq!(
-            sha, "a83dd93100279b42b5a1812982b268ef9c2cb0a5970a61b23679f3d1e761c8e7",
+            sha, "a1a952438ec40865c944ccb3dadf0095860f13f4e4a082dbb4416d93c4b1a2e3",
             "haplotype does not match the golden fixture"
         );
     }
