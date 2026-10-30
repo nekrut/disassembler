@@ -14,9 +14,9 @@ Binary resolution follows `disassembler.resolve.resolve_walker`:
   3. PATH
   4. walker/target/release/logan-walker under the repo root
 
-Not re-parsed in Python. `disassemble.py` used to keep a second copy of the walker's
-defaults; changing a walker default there left the wrapper silently pinning the old
-one. Passthrough removes the whole class of drift.
+Not re-parsed in Python. A wrapper that keeps a second copy of the walker's defaults
+silently pins the old value whenever a walker default changes; passthrough removes the
+whole class of drift.
 """
 
 from __future__ import annotations

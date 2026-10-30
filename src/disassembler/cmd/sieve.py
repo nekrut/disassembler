@@ -4,10 +4,10 @@ Wraps `extern/kmer-diversity-sieve/l1_pipeline_serial`. The sieve is a MinHash/L
 lineage-level reducer: on defaults tuned to gene scale (tau=0.005, sketch=256) it
 collapses a cohort of ~identical lineages while preserving topology; the sieve
 binary's own defaults (tau=0.15, sketch=64) target archive-scale collapse and reduce
-a gene-scale cohort to ~1 representative. See docs/issue_sieve_calibration.md.
+a gene-scale cohort to ~1 representative. See docs/sieve.md and
+docs/issue_sieve_calibration.md.
 
-Lifted from the sieve block in the old `python/disassemble.py`; behaviour is
-unchanged. Both the CLI and the composite pipelines call `sieve_run(...)`.
+Both the CLI and the composite pipelines call `sieve_run(...)`.
 """
 
 from __future__ import annotations

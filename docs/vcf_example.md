@@ -91,7 +91,7 @@ this cohort, computed without ever touching the sample axis as columns.
 ## Small cohorts only: merge and heatmap
 
 For a bounded, curated cohort (tens to a few hundred samples) it is convenient to merge into a
-multi-sample VCF and look at the dense matrix directly. **Do not do this at planetary scale** —
+multi-sample VCF and look at the dense matrix directly. **Do not do this at planetary scale:**
 use the long table above. On this 8-sample example:
 
 ```bash

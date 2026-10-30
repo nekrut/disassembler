@@ -1,13 +1,11 @@
 //! Step 4: 5-hop BFS around the anchors, emitted as GFA.
 //!
-//! Replaces `logan_path_walker.py:101-165` (`extract_local_subgraph`). The Python version
-//! indexes the whole graph before consulting the anchors, then re-reads the entire file for
-//! sequences. Here the CSR from `parse` is already in memory, so the BFS is a pointer chase
-//! and only the sequence pass needs the bytes again.
+//! The CSR from `parse` is already in memory, so the BFS is a pointer chase and only the
+//! sequence pass needs the bytes again.
 //!
 //! Scale, measured: 76 anchors expand to 356 nodes for `ERR2028820`; median 330 across the
 //! ERG11 panel; 26,323 for `SRR8209082`, which is about a third of that accession's entire
-//! graph. The issue's "20-100 local unitigs" is wrong by one to two orders of magnitude,
+//! graph. A "20-100 local unitigs" estimate is wrong by one to two orders of magnitude,
 //! so do not size buffers from it.
 //!
 //! GFA shape:
@@ -18,8 +16,7 @@
 //! L	2933	-	443893	+	30M      <- overlap is always k-1
 //! ```
 //!
-//! Write it to tmpfs. It is ~38 KB, and that is the whole of what Frontier 4 called
-//! "intermediate disk I/O".
+//! Write it to tmpfs. It is ~38 KB, and that is the whole of the intermediate disk I/O.
 //!
 //! IN   UnitigGraph, Anchors, decompressed unitig bytes
 //! OUT  Subgraph (+ a GFA file on disk for GraphAligner)
@@ -32,29 +29,27 @@ use crate::types::{Anchors, PathStep, Subgraph, UnitigGraph, UnitigId};
 
 /// Breadth-first expansion from the anchors, `cfg.hops` times.
 ///
-/// Replaces the BFS at `logan_path_walker.py:128-133`. There the adjacency is a dict of
-/// sets built over the whole accession before the anchors are even consulted; here the CSR
-/// from `parse::build` is already in memory, so this is a pointer chase with no allocation
-/// beyond the frontier.
+/// The CSR from `parse::build` is already in memory, so this is a pointer chase with no
+/// allocation beyond the frontier.
 ///
 /// # Direction
 ///
 /// Logan writes every edge into *both* endpoints' headers, so the CSR already contains each
-/// connection from both sides and following `targets` forward is equivalent to Python's
-/// explicitly symmetrised `adj`. Verified on `ERR2028820`: 2,578,430 distinct link tokens,
+/// connection from both sides and following `targets` forward is equivalent to an
+/// explicitly symmetrised adjacency. Verified on `ERR2028820`: 2,578,430 distinct link tokens,
 /// **zero** with a missing reciprocal. Also present are 1,156 self-loops, which the visited
 /// set absorbs.
 ///
 /// If a future accession did carry a one-sided edge this would quietly explore slightly
-/// less than Python does. That has not been observed, and the concordance fixtures would
-/// catch it on the two golden accessions.
+/// less than a symmetrised adjacency would. That has not been observed, and the concordance
+/// fixtures would catch it on the two golden accessions.
 ///
 /// # Scale
 ///
-/// Measured: 77 anchors expand to 422 nodes on `ERR2028820`, out of 1,277,362. The issue's
-/// "20-100 local unitigs" understates this by one to two orders of magnitude, and for
+/// Measured: 77 anchors expand to 422 nodes on `ERR2028820`, out of 1,277,362. An estimate
+/// of "20-100 local unitigs" understates this by one to two orders of magnitude, and for
 /// `SRR8209082` the neighbourhood reaches 8,466 nodes, about a tenth of that accession's
-/// entire graph. Do not size buffers from the issue's figure.
+/// entire graph. Do not size buffers from that figure.
 pub fn expand(cfg: &Config, graph: &UnitigGraph, anchors: &Anchors) -> Result<Vec<UnitigId>> {
     if anchors.ids.is_empty() {
         return Ok(Vec::new());
@@ -89,8 +84,8 @@ pub fn expand(cfg: &Config, graph: &UnitigGraph, anchors: &Anchors) -> Result<Ve
         }
     }
 
-    // Only the newly reached nodes need expanding each round. Python re-scans every node it
-    // has ever seen, which is the same closure but quadratic in the neighbourhood size.
+    // Only the newly reached nodes need expanding each round. Re-scanning every node ever
+    // seen gives the same closure but is quadratic in the neighbourhood size.
     let mut next: Vec<UnitigId> = Vec::new();
     for _ in 0..cfg.hops {
         next.clear();
@@ -216,9 +211,8 @@ pub fn subgraph_fraction(graph: &UnitigGraph, nodes: &[UnitigId]) -> f64 {
 /// Decode sequences for the selected nodes out of the graph's 2-bit store.
 ///
 /// `O(nodes kept)`, not `O(all unitigs)`: `seq_offset` gives each unitig's slice directly, so
-/// this touches 422 entries rather than rescanning 1,277,362. The Python version has to
-/// re-read the entire unitig file here (`logan_path_walker.py:138`) because it kept no
-/// sequence index and had already discarded the text.
+/// this touches 422 entries rather than rescanning 1,277,362. Without a sequence index this
+/// step would have to re-read the entire unitig file.
 ///
 /// Sequences come back expanded to one byte per base because that is what GFA output and
 /// the stitching step both need. The packed form stays in the graph; this is a copy of the
@@ -268,8 +262,8 @@ fn scratch_stem(accession: &str) -> String {
 
 /// Serialise nodes and edges to GFA and return the populated `Subgraph`.
 ///
-/// Byte-for-byte compatible with `logan_path_walker.py:153-165`, because GraphAligner's
-/// output depends on its input and the golden fixtures pin that output. Specifically:
+/// The byte layout is fixed, because GraphAligner's output depends on its input and the
+/// golden fixtures pin that output. Specifically:
 ///
 /// * `H	VN:Z:1.0` header
 /// * one `S` line per node, ascending id, sequence expanded
@@ -279,7 +273,7 @@ fn scratch_stem(accession: &str) -> String {
 /// * overlap always `{k-1}M`, which is exact for a de Bruijn graph of order k
 ///
 /// Each edge therefore appears twice, once from each endpoint, because Logan records it in
-/// both headers. Python does the same, so the duplication is preserved deliberately.
+/// both headers. The duplication is preserved deliberately.
 ///
 /// The file goes to `cfg.scratch_dir`, which should be tmpfs: it is ~38 KB for a typical
 /// accession and GraphAligner is the only consumer.
@@ -719,9 +713,8 @@ mod gfa_tests {
         );
     }
 
-    /// Python writes an L line only when both endpoints survived into the subgraph
-    /// (`if tgt in seqs`). Keeping a dangling edge would make GraphAligner reference a node
-    /// the file never declares.
+    /// An L line is written only when both endpoints survived into the subgraph. Keeping a
+    /// dangling edge would make GraphAligner reference a node the file never declares.
     #[test]
     fn drops_edges_leaving_the_subgraph() {
         let g = graph(
@@ -778,7 +771,7 @@ mod gfa_tests {
     }
 }
 
-/// Emit a real GFA plus its anchor list so the Python implementation can be run on exactly
+/// Emit a real GFA plus its anchor list so another implementation can be run on exactly
 /// the same input and the two files diffed.
 ///
 /// ```text
@@ -829,7 +822,7 @@ mod cross_check {
         let seqs = collect_seqs(&graph, &nodes).unwrap();
         let sub = write_gfa(&cfg, &graph, nodes, seqs).unwrap();
 
-        // The exact anchor ids, so Python can be driven with the same input.
+        // The exact anchor ids, so another implementation can be driven with the same input.
         let list: Vec<String> = a.ids.iter().map(|i| i.to_string()).collect();
         std::fs::write(format!("{outdir}/anchors.txt"), list.join("\n")).unwrap();
         eprintln!(

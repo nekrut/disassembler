@@ -1,8 +1,8 @@
 //! Step 6: turn a path through the graph into a sequence.
 //!
-//! Replaces `logan_path_walker.py:195-236`. The path is a list of node traversals; the
-//! sequence is their concatenation with the k-1 overlap removed from every node after the
-//! first, and each `<` node reverse-complemented before it is appended.
+//! The path is a list of node traversals; the sequence is their concatenation with the k-1
+//! overlap removed from every node after the first, and each `<` node reverse-complemented
+//! before it is appended.
 //!
 //! The arithmetic, checked against a real `ERR2028820` path:
 //!
@@ -38,8 +38,6 @@ pub fn revcomp(seq: &[u8]) -> Vec<u8> {
 }
 
 /// Walk the path, trimming `k-1` from each node after the first.
-///
-/// Mirrors `logan_path_walker.py:202-234`.
 ///
 /// # The overlap
 ///
@@ -123,8 +121,7 @@ pub struct Candidate {
 /// `stitch` already returns `None` for a candidate whose coverage fell below `min_cov`,
 /// so an under-covered reference is filtered out before it can win regardless of metric.
 /// Every metric falls back to `pool_index` as the final tie-break so the first reference
-/// in the anchor pool wins on a true tie — matching the plan's "input order" rule and
-/// giving stable primary selection.
+/// in the anchor pool wins on a true tie, which keeps primary selection stable.
 ///
 /// Returns `None` when no reference produced a stitchable haplotype.
 pub fn pick_primary(
@@ -178,7 +175,7 @@ pub fn stitch(
         return Ok(None);
     };
 
-    // Clamp exactly as Python does: a path_end past the stitched length takes the tail.
+    // Clamp rather than fail: a path_end past the stitched length takes the tail.
     let start = path.path_start.min(stitched.len());
     let end = if path.path_end <= stitched.len() {
         path.path_end
@@ -514,7 +511,7 @@ mod tests {
         assert_eq!(h.seq, b"GTACG", "expected stitched[2..7]");
     }
 
-    /// Python clamps rather than failing when path_end runs past the stitched sequence.
+    /// Clamps rather than failing when path_end runs past the stitched sequence.
     #[test]
     fn path_end_past_the_end_takes_the_tail() {
         let c = cfg(4, 0.0);
@@ -548,7 +545,7 @@ mod tests {
     }
 
     /// GraphAligner naming a node absent from the GFA means the alignment cannot be
-    /// realised. Python returns no haplotype rather than erroring; same here.
+    /// realised. That yields no haplotype rather than an error.
     #[test]
     fn unknown_node_in_path_yields_none() {
         let c = cfg(4, 0.0);
@@ -574,8 +571,8 @@ mod tests {
 }
 
 /// Full-chain comparison against the committed golden fixture. This is the end-to-end
-/// concordance check: fetch through stitch, in Rust. The fixture was first produced by the
-/// Python walker under GraphAligner 1.0.20 and recaptured under 1.0.17b on 2026-10-18, which
+/// concordance check: fetch through stitch, in Rust. The fixture was first captured under
+/// GraphAligner 1.0.20 and recaptured under 1.0.17b on 2026-10-18, which
 /// added the final base that 1.0.19+ clips (docs/issue_graphaligner_end_clipping.md). Run it
 /// with GraphAligner 1.0.17b on PATH.
 ///
@@ -640,8 +637,8 @@ mod golden_haplotype {
         eprintln!("  sha256 {sha}");
 
         // Values of bench/golden/ERR2028820.pfcrt.primary.fasta (2026-10-18, GraphAligner
-        // 1.0.17b). The Python capture in ERR2028820.pfcrt.golden.json is the same sequence
-        // without its final base: 1,274 nt, cov 0.999216, the same identity.
+        // 1.0.17b). The original 1.0.20 capture in ERR2028820.pfcrt.golden.json is the same
+        // sequence without its final base: 1,274 nt, cov 0.999216, the same identity.
         assert_eq!(h.id, "ERR2028820_primary");
         assert_eq!(h.seq.len(), 1275, "haplotype length");
         assert!((h.cov - 1.0).abs() < 1e-6, "coverage {}", h.cov);

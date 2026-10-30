@@ -1,4 +1,4 @@
-//! Tunables. Defaults mirror `logan_path_walker.py` so the two agree out of the box.
+//! Tunables.
 
 use std::path::PathBuf;
 
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 /// but on a mixed-strain panel (measured on the SARS-CoV-2 spike 11-strain panel) it
 /// concentrates ~70% of primaries on `Omicron_XBB15` — the mid-cluster reference whose
 /// alignment finds long walks in graphs across the archive — even when phylogenetically
-/// closer strains sit in the pool. See `docs/anchor_primary_metric.md`.
+/// closer strains sit in the pool. See `docs/walker.md`.
 ///
 /// `Pident` swaps the primary and secondary sort keys: highest identity to reference wins,
 /// then coverage. On the same panel, it moves the primary tag onto the strain the graph
@@ -228,7 +228,7 @@ pub struct Config {
     ///
     /// **On by default**, and safe to be: the records go to `alt_haplotypes.fasta`, not to
     /// the FASTA the rest of the pipeline reads, so nothing downstream changes unless they
-    /// are deliberately picked up. `build_walker_codon_msa.py` feeds its input straight into
+    /// are deliberately picked up. `disassembler msa` feeds its input straight into
     /// MAFFT, FastTree and HyPhy, where every sequence becomes an independent taxon, and two
     /// records from one sample are not two independent observations. Keeping them in a
     /// separate file means the variance is recovered and auditable while using it in an
@@ -463,7 +463,7 @@ mod memory_bound_tests {
         assert_eq!(cfg.max_compressed_bytes, 1024 * 1024 * 1024);
         assert_eq!(cfg.max_compressed_resident_bytes(), 20 * 1024 * 1024 * 1024);
 
-        // The ERG11 panel's largest accession, the real-data case from the review.
+        // The ERG11 panel's largest accession, a real-data case.
         let panel = 343u64 * 1024 * 1024;
         let at_panel_size = cfg.peak_compressed_buffers() as u64 * panel;
         assert!(

@@ -8,8 +8,9 @@ is the last one, which for an in-frame CDS is the final base of the stop codon. 
 walker defect. GraphAligner 1.0.19 and 1.0.20 fail to align the final base of a query even when
 the query is present in the graph verbatim; 1.0.18 and earlier align it correctly.
 
-The repo's own `environment.yml` pins `graphaligner=1.0.20`, so the documented setup is the
-affected one, and the golden fixtures under `bench/golden/` were captured under an affected build.
+When this was diagnosed, the repo's own `environment.yml` pinned `graphaligner=1.0.20`, so the
+documented setup was the affected one, and the golden fixtures under `bench/golden/` had been
+captured under an affected build. Both were fixed on 2026-10-18 (section 10).
 
 ---
 
@@ -116,9 +117,9 @@ The recovered base is `A`, completing the terminal `TAA`.
 
 ## 6. It explains a panel that looked unreproducible
 
-The 50-accession *C. auris* ERG11 panel in `nekrut/logan-hypyaeon`
-(`work/panel_output/candida_auris_erg11/`) holds 1,575 nt sequences with `cov: 1.0`. Reruns here
-produced 1,575 nt under GraphAligner 1.0.17b and old-behaviour flags:
+A 50-accession *C. auris* ERG11 panel produced earlier, outside this repository and with an
+older GraphAligner, holds 1,575 nt sequences with `cov: 1.0`. Reruns here produced 1,575 nt under
+GraphAligner 1.0.17b and old-behaviour flags:
 
 ```bash
 logan-walker -l erg11_5.txt -q queries/markers/candida_auris_erg11.fasta -o out \
@@ -127,10 +128,10 @@ logan-walker -l erg11_5.txt -q queries/markers/candida_auris_erg11.fasta -o out 
 
 ```
 ERR899743  SRR12363134  SRR14253779  SRR19738638  SRR19738642
-5/5 byte-identical to the committed panel
+5/5 byte-identical to the earlier panel
 ```
 
-Under the pinned 1.0.20 the same command gives 0/50 byte-identical, with all 50 exactly one base
+Under 1.0.20, then the pinned version, the same command gives 0/50 byte-identical, with all 50 exactly one base
 short. Sixteen of the fifty additionally differ by 1 to 3 substitutions, and all sixteen reduce to
 the trailing base alone once `--prune-frac 0.0 --no-prefer-majority` is applied, so those
 substitutions are the current defaults working as designed and are not part of this issue.
@@ -138,6 +139,9 @@ substitutions are the current defaults working as designed and are not part of t
 ---
 
 ## 7. Consequences
+
+This section describes the state at diagnosis. All of it was resolved on 2026-10-18 by pinning
+1.0.17b and recapturing the fixtures (section 10).
 
 **The golden fixtures encode the bug.** All three are `len(reference) - 1`:
 
@@ -269,6 +273,6 @@ moved to Python 3.12, BLAST 2.16.0 and zstd 1.5.6, because `python=3.13`, `blast
 
 **Still to do:** report the regression upstream with the section 2 reproduction.
 
-Related: [`rust_walker_as_built.md`](rust_walker_as_built.md) section 7 on why `SRR8209082` is
-reported but not gated, and [`issue_intra_accession_variance_lost.md`](issue_intra_accession_variance_lost.md)
+Related: [`walker.md`](walker.md#reproducibility) on why `SRR8209082` is reported but not
+gated, and [`issue_intra_accession_variance_lost.md`](issue_intra_accession_variance_lost.md)
 for the pruning and majority-preference defaults that account for the substitutions in section 6.

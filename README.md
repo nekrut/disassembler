@@ -1,561 +1,151 @@
 <p align="center">
-  <img src="assets/logo.jpg" alt="logan-disassembler" width="640">
+  <img src="assets/logo.jpg" alt="disassembler" width="640">
 </p>
 
 # disassembler
 
-Planetary-scale sequence extraction, de novo graph path-walking, and streaming multi-HSP coordinate assembly from the [Logan](https://github.com/IndexThePlanet/Logan) SRA petabase.
+Reconstruct the coding haplotypes of a gene across thousands of SRA runs, straight from the
+[Logan](https://github.com/IndexThePlanet/Logan) assemblies of the whole SRA, and turn them into
+a codon alignment and a phylogeny.
 
-`disassembler` provides two primary, complementary engines:
+Given a reference coding sequence, disassembler finds the runs that carry the gene, recovers the
+gene's sequence in each run, and aligns the results in frame. It has two routes:
 
-1. **`logan-walker`** (Native Rust graph path-walker) — Streams unitig cDBGs from S3, anchors a reference coding sequence by canonical $k$-mer containment, extracts the local subgraph, walks paths with GraphAligner, and reconstructs full-length coding haplotypes, intra-host alternative alleles, and biallelic SNVs (`--emit-vcf`, `--emit-snv-table`) without collapsing intra-host variation or suffering reference-bias loss.
-2. **`disassembler lexicmap`** — Streams planetary tabular search outputs from [LexicMap](https://github.com/IndexThePlanet/LexicMap) over the Galaxy HTTP API, local TSV, or STDIN. Resolves Logan contig shattering (LexicMap indexes Logan's contigs, and on internally diverse samples the assembler splits the gene across many short contigs, see [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md)) by collinear multi-HSP coordinate tiling on the reference CDS, enforces reading-frame codon QC (screening premature stop codons like Sanger $am3$ amber mutants), partitions accessions into a 4-tier Clean and Flagged cohort ledger, and collapses full-length clean sequences into unique haplotypes online with mutation calling and Shannon entropy.
+- **The walker route** (kmindex, then `logan-walker`). A
+  [kmindex](https://github.com/tlemane/kmindex) search names the candidate runs. For each run,
+  `logan-walker` streams Logan's unitig graph from S3, anchors the reference by shared k-mers,
+  walks the local subgraph with GraphAligner, and reconstructs the full-length haplotype. It also
+  recovers intra-host alternative alleles and can report them as VCFs or one long SNV table.
+- **The LexicMap route.** A [LexicMap](https://github.com/IndexThePlanet/LexicMap) search of
+  Logan's contigs is tiled onto the reference, checked for premature stop codons, sorted into
+  clean and flagged tiers, and collapsed into unique haplotypes. It is much faster, because it
+  never downloads a unitig graph, but it projects each run onto the reference rather than
+  walking a haplotype, and it has no intra-host variants.
 
-This repository is a decoupled extraction of the path-walking and sequence assembly components from
-[`nekrut/logan-hypyaeon`](https://github.com/nekrut/logan-hypyaeon). It carries only the
-pieces needed to go from an SRA accession list or LexicMap search plus a query gene to reconstructed haplotypes and phylogenies.
-The planetary-scan orchestration, HyphAeon neural selection suite, and Roland PLM branch are intentionally left behind.
-
-## Layout
-
-```
-walker/                   logan-walker: native Rust local graph path-walker
-src/disassembler/         Python package; `disassembler <sub>` dispatches to:
-  cmd/harvest.py            harvest kmindex shard collections from Galaxy
-  cmd/stratify.py           cut a size-capped cohort from a harvest
-  cmd/walker.py             passthrough to the Rust logan-walker
-  cmd/lexicmap.py           stream LexicMap tabular hits -> cohort ledger + haplotype collapse
-  cmd/sieve.py              k-mer diversity sieve (l1_pipeline_serial)
-  cmd/msa.py                reference-guided in-frame codon MSA + FastTree
-  cmd/pipe_reconstruct.py   composite: walker -> (sieve) -> msa
-  cmd/pipe_from_kmindex.py  composite: harvest -> stratify -> reconstruct
-  cmd/pipe_from_lexicmap.py composite: lexicmap -> (sieve) -> msa (msa is a no-op on strict clean-cohort output; see §lexicmap)
-extern/                   git submodules: kmer-diversity-sieve
-queries/                  reference coding sequences (pfcrt, hiv1_pol, 26 markers, master panel)
-bench/                    golden fixtures, check_golden.sh concordance gate, k-mer sensitivity sims
-docs/                     codon MSA/phylogeny step, VCF example, contigs-vs-unitigs, variance-loss
-                          and GraphAligner end-clipping investigations, topology notes
-tests/                    Python unit + integration tests
-```
+Both routes can thin near-duplicate haplotypes with a k-mer diversity sieve, and both end in a
+reference-guided codon MSA (MAFFT) and a FastTree tree.
 
 ## Install
 
-```bash
-conda env create -f environment.yml && conda activate disassembler
-# environment.yml runs `pip install -e .`, so `disassembler` is on PATH.
-disassembler --help
-```
-
-The Rust walker builds separately (Rust is not in `environment.yml`; install
-via [rustup](https://rustup.rs)):
+**Bioconda** (Linux):
 
 ```bash
-(cd walker && cargo build --release)
-# `disassembler walker` finds it automatically in walker/target/release/,
-# or set $DISASSEMBLER_WALKER_BIN, or put logan-walker on PATH.
+conda install -c conda-forge -c bioconda disassembler
 ```
 
-## What logan-walker does
+This installs the `disassembler` CLI together with `logan-walker`, `kmer-diversity-sieve`,
+GraphAligner, MAFFT and FastTree. See [`docs/packaging.md`](docs/packaging.md).
 
-For each SRA accession, given a reference CDS:
+**Galaxy:** the tools are under review in
+[galaxyproject/tools-iuc#8800](https://github.com/galaxyproject/tools-iuc/pull/8800). See
+[`docs/galaxy.md`](docs/galaxy.md).
 
-1. **Stream** the compressed unitig file from `s3://logan-pub/u/<ACC>/<ACC>.unitigs.fa.zst`
-   directly into memory, rejecting oversized accessions on `Content-Length` first.
-2. **Parse** the BCALM2 FASTA in a single streaming pass into a compact CSR graph
-   (adjacency + `ka:f` abundance + 2-bit sequences, ~43 MB for a 1.28M-unitig accession).
-3. **Anchor** the query by canonical k-mer containment (k=21), replacing BLAST.
-4. **Extract** the 5-hop neighbourhood around the anchors as a local GFA.
-5. **Align** the reference through the local graph with `GraphAligner -x dbg`.
-6. **Stitch** the walked path into a primary haplotype, optionally **prune** reference-bias
-   error branches and re-align, **prefer** the majority allele at biallelic sites, and
-   **emit** intra-host alternative haplotypes to a separate file.
-7. Write the reconstructed primaries (`-f`, default `reconstructed_haplotypes.fasta`),
-   `alt_haplotypes.fasta`, `bubbles.json`, and a summary JSON;
-   optionally the intra-host SNP calls (`--emit-vcf`, `--emit-snv-table`).
-
-Then, optionally, an eighth downstream step turns the reconstructed haplotypes into a
-phylogeny:
-
-8. **Codon-align and build a tree.** Reference-guided in-frame codon MSA (MAFFT `--keeplength`,
-   so reference coordinates and the reading frame are preserved) and a FastTree GTR
-   maximum-likelihood tree. Run it as one command with the walker via `disassembler reconstruct`
-   (see below), or on its own with `disassembler msa`. See
-   [`docs/codon_msa.md`](docs/codon_msa.md).
-
-### Why unitigs, not Logan contigs
-
-Logan also publishes assembled contigs, which are far smaller. On internally diverse samples,
-though, the assembler shatters the gene: measured on nine deep Zika NS5 accessions, no single
-contig held more than 8% of the gene and it took ~50 fragments to tile it, while the unitig walk
-reconstructed the full 2,708 nt from every one. A clonal control assembled into one clean
-contig, so the difference is intra-host diversity, not a Logan quirk. Full numbers in
-[`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md).
-
-## Build and run
+**From source:**
 
 ```bash
-# GraphAligner must be on PATH (bioconda). k-mer anchoring replaces BLAST; MAFFT is only for
-# the downstream codon MSA (`disassembler msa`).
-cd walker
-cargo build --release
-
-# Optional: build the k-mer diversity sieve (single C source, no conda deps, just a C compiler),
-# needed only for `disassembler sieve` / --sieve in the composites (see below).
-git submodule update --init && (cd extern/kmer-diversity-sieve && make serial)
-
-./target/release/logan-walker \
-  -a SRR8209082 \
-  -q ../queries/query_hiv1_pol.fasta \
-  -o out -f out/reconstructed.fasta
-
-# Equivalently, once `pip install -e .` has run:
-disassembler walker \
-  -a SRR8209082 \
-  -q queries/query_hiv1_pol.fasta \
-  -o out -f out/reconstructed.fasta
+git clone --recurse-submodules https://github.com/nekrut/disassembler
+cd disassembler
+conda env create -f environment.yml && conda activate disassembler   # pip install -e . included
+(cd walker && cargo build --release)                                # needs Rust (rustup.rs)
+(cd extern/kmer-diversity-sieve && make serial)                     # only for --sieve
 ```
 
-Reproduce the old one-haplotype-per-accession behaviour (matches the golden fixtures) with
-`--prune-frac 0.0 --no-prefer-majority --no-emit-alts`.
+`disassembler` finds `logan-walker` and the sieve on `PATH`, through `DISASSEMBLER_WALKER_BIN`
+and `DISASSEMBLER_SIEVE_BIN`, or in the source tree's build locations.
 
-### End to end: accessions to a phylogeny
-
-`disassembler reconstruct` chains the walker and the codon-MSA/FastTree step into one command,
-so you go straight from accessions to a tree. It needs `GraphAligner`, `MAFFT`, `FastTree`, and
-biopython — all in the `disassembler` conda env (`environment.yml`).
+## Quick start
 
 ```bash
-conda env create -f environment.yml && conda activate disassembler
-disassembler reconstruct -a SRR6251967 -q queries/markers/zika_ns5.fasta -o out/zika --emit-snv-table
-#   out/zika/reconstructed.fasta       reconstructed coding haplotypes
-#   out/zika/zika_ns5_codon_msa.fasta  in-frame codon alignment (MAFFT --keeplength)
-#   out/zika/zika_ns5_fasttree.nwk     GTR maximum-likelihood tree
+# One accession through the walker
+disassembler walker -a SRR8209082 -q queries/query_hiv1_pol.fasta -o out -f out/hiv1_pol.fasta
+
+# Accessions to a codon alignment and tree, with intra-host SNVs
+disassembler reconstruct -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika \
+    --emit-snv-table
+
+# A kmindex search (shard JSONs from Galaxy) to candidate lists, then a cohort
+disassembler harvest --history-id <HISTORY_ID> --collection-id <COLLECTION_ID> -o candidates/
+disassembler stratify -o candidates/ --score-bin 0.5:1.01:100
+disassembler reconstruct -l candidates/zika_ns5.bins.txt -q queries/markers/zika_ns5.fasta -o out/zika
+
+# A LexicMap search table to a tiled cohort, codon alignment and tree
+disassembler from-lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.tsv.gz -o out/hiv1_pol
 ```
 
-Use `-l accessions.txt` for a cohort, `--skip-tree` to stop after reconstruction, and pass any
-extra walker flags after a literal `--`. How the codon alignment stays in frame, and what the
-outputs contain, is in [`docs/codon_msa.md`](docs/codon_msa.md).
+`queries/` holds reference CDSs to start from: PfCRT, HIV-1 *pol*, 26 marker genes under
+`queries/markers/`, and a 160-record panel.
 
-| flag | default | meaning |
+## Commands
+
+| command | does | docs |
 |---|---|---|
-| `-a` / `-l` | — | one accession, or a file with one per line (exactly one of the two) |
-| `-q, --query <FASTA>` | — | reference in-frame CDS FASTA, single record (see the note below) |
-| `-o, --out-dir <DIR>` | — | output directory |
-| `-w, --workers <N>` | `8` | walker compute workers |
-| `--fetch-workers <N>` | `8` | walker S3 fetch workers |
-| `--mafft-threads <N>` | `8` | MAFFT threads for the codon MSA |
-| `--msa-min-cov <F>` | `0.70` | coverage a sequence needs to enter the MSA, stage 2 only |
-| `--unitigs-cache <DIR>` | — | read-through cache for compressed unitigs (see Offline) |
-| `--offline` | off | refuse the S3 fallback; requires `--unitigs-cache` |
-| `--skip-tree` | off | stop after reconstruction, do not build the MSA or tree |
-| `--walker-bin <PATH>` | `walker/target/release/logan-walker` | path to the walker binary |
+| `harvest` | merge kmindex shard JSONs into per-target accession lists and scores | [`kmindex.md`](docs/kmindex.md) |
+| `stratify` | sample a cohort from a harvest by score bin | [`kmindex.md`](docs/kmindex.md) |
+| `fetch` | download unitig files into a local cache for offline runs | [`walker.md`](docs/walker.md#offline-cache) |
+| `walker` | run `logan-walker`: reconstruct haplotypes from Logan unitigs | [`walker.md`](docs/walker.md) |
+| `lexicmap` | tile a LexicMap search into a codon-checked cohort | [`lexicmap.md`](docs/lexicmap.md) |
+| `sieve` | thin near-duplicate haplotypes | [`sieve.md`](docs/sieve.md) |
+| `msa` | reference-guided codon MSA and FastTree tree | [`codon_msa.md`](docs/codon_msa.md) |
+| `reconstruct` | walker, then optional sieve, then msa | [`codon_msa.md`](docs/codon_msa.md#disassembler-reconstruct) |
+| `from-kmindex` | harvest, optional stratify, then reconstruct | [`kmindex.md`](docs/kmindex.md#disassembler-from-kmindex) |
+| `from-lexicmap` | lexicmap, then optional sieve, then msa | [`lexicmap.md`](docs/lexicmap.md#from-lexicmap) |
 
-`disassembler reconstruct --msa-min-cov` (default `0.70`) is the MSA entry gate and reaches stage
-2 only. The walker has its own `--min-cov` (default `0.85`) that decides which reconstructions
-are produced at all; `reconstruct` never sets it. Lowering `--msa-min-cov` cannot admit
-haplotypes the walker already discarded; to move that gate, pass it through with
-`-- --min-cov <F>`. The same split applies to `--mafft-threads` (MAFFT here) versus
-`-t/--threads` on the walker (GraphAligner).
+Every command has `--help`. The composites group their options by stage and pass anything after
+a literal `--` to the walker.
 
-Pass a **single-record** CDS to `-q`. A multi-record FASTA is not handled correctly by either
-stage (see `agent_review_9_20.md`).
+## Documentation
 
-#### Diversity thinning (optional)
+How to use it:
 
-`--sieve` inserts a diversity-thinning pass between reconstruction and the codon MSA/tree,
-collapsing near-duplicate reconstructed lineages with the k-mer diversity sieve
-(`extern/kmer-diversity-sieve`, built above). It is **default OFF**; with the flag off, behavior is
-byte-identical to before. Because the MSA + tree are `O(N^2)`, thinning a large cohort of nearly
-identical lineages first can be a large speedup with negligible loss of phylogenetic signal.
+- [`docs/walker.md`](docs/walker.md): what `logan-walker` does, multi-anchor mode, outputs,
+  offline caching, memory, and the full option reference
+- [`docs/kmindex.md`](docs/kmindex.md): `harvest`, `stratify` and `from-kmindex`
+- [`docs/lexicmap.md`](docs/lexicmap.md): the LexicMap route
+- [`docs/sieve.md`](docs/sieve.md): diversity thinning and how to choose its threshold
+- [`docs/codon_msa.md`](docs/codon_msa.md): the codon MSA and tree, and `reconstruct`
+- [`docs/vcf_example.md`](docs/vcf_example.md): intra-host SNVs on a Zika cohort, from VCF to
+  the long table and DuckDB
+- [`docs/galaxy.md`](docs/galaxy.md) and [`docs/packaging.md`](docs/packaging.md): Galaxy
+  tools, Bioconda packages and releases
+
+Why it works the way it does:
+
+- [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md): why the walker uses unitigs
+  rather than Logan's contigs
+- [`docs/issue_intra_accession_variance_lost.md`](docs/issue_intra_accession_variance_lost.md):
+  the reference-matching minority allele bias, and the pruning and majority-preference defaults
+  that correct it
+- [`docs/issue_graphaligner_end_clipping.md`](docs/issue_graphaligner_end_clipping.md): why
+  GraphAligner is pinned to 1.0.17b
+- [`docs/issue_sieve_calibration.md`](docs/issue_sieve_calibration.md): the sieve calibration
+  study
+- [`bench/`](bench/README.md): the golden concordance gate and the k-mer sensitivity simulation
+
+## Repository layout
+
+```
+src/disassembler/   the Python package and the `disassembler` CLI (cmd/ holds one module per command)
+walker/             logan-walker, the Rust walker (see walker/README.md)
+extern/             kmer-diversity-sieve, as a git submodule
+queries/            reference CDSs
+panels/             multi-strain reference panels for multi-anchor runs
+bench/              golden fixtures and gate, k-mer sensitivity simulation, accession lists
+docs/               user and design documentation
+tests/              Python tests
+```
+
+## Tests
 
 ```bash
-disassembler reconstruct -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika --sieve
+(cd walker && cargo test --release)          # offline; network tests are #[ignore]
+for t in tests/test_*.py; do python "$t"; done
+bash tests/test_sieve.sh                      # needs the sieve submodule
+bench/check_golden.sh                         # needs GraphAligner 1.0.17b and network
 ```
 
-| flag | default | meaning |
-|---|---|---|
-| `--sieve` | off | enable diversity thinning between reconstruction and the MSA/tree |
-| `--sieve-threshold <F>` | `0.005` | novelty threshold tau. A sequence is promoted only if `1 - maxJaccard >= tau` against the already-promoted set, so **higher** tau collapses **more**. The wrapper's default sits at a ~0.017% divergence boundary (`d ~ tau / (2k)` at k=15), gene-scale; the sieve binary's own default of `0.15` targets archive-scale (~0.5%) and collapses a gene-scale cohort to ~1 representative |
-| `--sieve-min-len <N>` | 95% of query CDS length | minimum sequence length; the sieve's own default is genome-scale (`27000`), so gene-scale CDS need this set near the query length. The auto-default takes a 5% haircut because reconstructions are often a few bases shorter than the reference (an exactly-equal cutoff would drop them all) |
-| `--sieve-sketch <M>` | `256` | MinHash sketch size. The estimator cannot resolve novelty finer than `1/M`, so the wrapper's default sets the resolution floor near 0.015% divergence. The sieve binary's own default of `64` caps resolution at ~0.05%, coarser than the single-SNV separations gene-scale cohorts turn on |
-| `--sieve-bin <PATH>` | `extern/kmer-diversity-sieve/l1_pipeline_serial` | path to the sieve binary |
-
-The wrapper's `--sieve-threshold` and `--sieve-sketch` defaults differ from the sieve binary's own
-defaults on purpose. `disassembler` is a gene-scale tool, and the sieve binary was calibrated on
-an archive-scale problem (millions of near-duplicate SARS-CoV-2 consensus genomes). At its own
-defaults, run against a gene-scale cohort of one virus, the sieve collapses everything to one
-representative and drops the informative branches; the wrapper's defaults keep the sieve
-topology-preserving on the tested cohorts. Full calibration in
-[`docs/issue_sieve_calibration.md`](docs/issue_sieve_calibration.md).
-
-**Tier caveat — read this.** The sieve is a **haplotype/lineage-level** diversity reducer
-(MinHash/LSH). What decides whether a sequence survives is its absolute divergence from an
-already-promoted representative, not whether it came from a different accession. It is **not**
-an intra-host SNV tool: sequences that differ by only a base or two are typically below the
-resolution any usable sketch can distinguish. To preserve intra-host single-SNV variation, use
-the walker's `--emit-vcf` / `--emit-snv-table` (`snvs.tsv`) instead.
-
-Measured cohort behaviour at the wrapper defaults (`--sieve-threshold 0.005 --sieve-sketch 256`):
-
-| cohort | N recon | unique | promoted | notes |
-|---|---|---|---|---|
-| Zika NS5 (36 accessions, PRJNA362728) | 36 | 12 | 9 | topology-identical (RF = 0) on the 9 tips, including the long-branch lineage that the sieve-binary defaults drop |
-| HIV-1 pol (17 accessions, adjacent to SRR8209082) | 17 | 17 | 17 (sieve is a no-op) | pairwise divergence is 2-3%, well above the sieve's boundary, so nothing collapses |
-| 33 intra-host alts of one HIV pol accession (fixture) | 33 | 33 | 28 | single-SNV alts are near the resolution floor; the sieve does not preserve intra-host variation and is not built to |
-
-**Rule of thumb**: think about your cohort's median pairwise divergence. Below ~0.5%, the sieve
-can help; between ~0.5% and 1%, it might; above ~1%, the sieve is either a no-op or a
-signal-losing collapse. Sweep tau on your own data before trusting any setting, and expect the
-sieve to pay off only when the cohort is large enough for the `O(N^2)` MSA/tree to dominate.
-
-### Planetary triage: Galaxy kmindex harvest to candidate cohorts
-
-When screening planetary datasets indexed in Logan (e.g. via Galaxy `kmindex query` across thousands of shard databases), `disassembler harvest` streams and merges the shard collections in parallel and writes candidate SRA accession lists sorted by containment score. `disassembler stratify` optionally cuts a size-capped cohort from the harvest:
-
-```bash
-# Stream and merge ~2,869 Galaxy shard JSONs (6 workers is the default; safe under
-# usegalaxy.org's rate limit)
-disassembler harvest \
-    --history-id <GALAXY_HISTORY_ID> \
-    --collection-id <GALAXY_COLLECTION_ID> \
-    -o candidates/
-
-# Or merge from a local directory of shard JSONs (no Galaxy API calls). The two
-# input modes produce identical output and are mutually exclusive. This is the
-# mode a Galaxy tool wrapper will drive once the shards are staged into the job
-# directory, and it also works for a saved copy of a prior fetch. Every file in the
-# directory is read as a shard whatever it is called; one that is not valid JSON
-# counts as a failed shard.
-disassembler harvest --shards-dir path/to/shards/ -o candidates/
-
-# Optional: sample per-target from arbitrary score bins (histogram-driven experiments).
-# If omitted, reconstruct just runs against the raw <target>.accessions.txt list.
-disassembler stratify -o candidates/ \
-    --score-bin 0.0:0.05:10 --score-bin 0.05:0.10:10 --score-bin 0.10:0.15:10
-
-# Reconstruct a target gene cohort directly.
-disassembler reconstruct \
-    -l candidates/query_gene.accessions.txt \
-    -q queries/query_gene.fasta \
-    -o out/query_gene \
-    --emit-vcf --emit-snv-table --no-emit-alts -w 16 --fetch-workers 16
-
-# Or run harvest -> reconstruct as one composite for a single target:
-disassembler from-kmindex \
-    --history-id <GALAXY_HISTORY_ID> --collection-id <GALAXY_COLLECTION_ID> \
-    --target query_gene \
-    -q queries/query_gene.fasta -o out/query_gene
-```
-
-Note that `-w 16 --fetch-workers 16` roughly doubles the memory bound, to about 36 GB worst case
-against 20 GB at the defaults. `logan-walker` prints its bound at startup; see
-[Memory](#memory) before raising either on a machine that cannot absorb it.
-
-#### Outputs
-
-Written on every run, with no threshold of their own beyond the search's:
-
-| file | contents |
-|---|---|
-| `<target>.accessions.txt` | every accession the search returned, sorted by containment descending |
-| `<target>.scores.json` | accession to containment score |
-| `UNION.accessions.txt` | the union across all targets |
-| `summary.json` | per-target counts and max score |
-
-#### Custom score bins: `disassembler stratify --score-bin LO:HI:N`
-
-For walker calibration experiments or histogram-driven cohorts (e.g. "give me 10 accessions each
-from three low non-zero-coverage bins"), pass one or more `--score-bin LO:HI:N`. Each bin selects
-up to N accessions with score in the half-open interval `[LO, HI)`, sampled evenly across the
-sorted range.
-
-```bash
-# 30 accessions total: 10 each from three low-coverage bins
-disassembler stratify -o candidates/ \
-    --score-bin 0.0:0.05:10 --score-bin 0.05:0.10:10 --score-bin 0.10:0.15:10
-```
-
-Semantics:
-
-- **Nonzero scores only.** Zero-score accessions are excluded up front, so
-  `--score-bin 0.0:0.05:10` means "10 from the [1e-9, 0.05) range." Same behavior for every bin.
-- **No backfill.** A bin with fewer than N candidates contributes what it has and no other bin
-  is topped up above its own N. Each `--score-bin` is an independent request the caller cares
-  about individually.
-- **Half-open `[LO, HI)`.** Bins can touch at boundaries without double-counting.
-- **Overlapping bins are an error.**
-
-Outputs, per target: `<target>.bins.txt` (merged accession list, sorted by descending score),
-`<target>.bins.json` (per-bin `requested`, `available`, `selected` counts and the accession
-lists), and a combined `bins_summary.json`. Feeds straight into `disassembler reconstruct -l <target>.bins.txt`.
-
-If download volume is the real constraint, count-based sampling is the wrong lever. Unitig file
-sizes are extremely skewed: across 45 randomly sampled accessions the median was 0.6 MB and the
-mean 17.6 MB, with the largest at 595 MB, and **the top 10% of files carried 90% of the bytes**.
-The knob that targets the bytes is the walker's `--max-size-mb`, which rejects on
-`Content-Length` before transferring anything.
-
-## Offline mode: cache once, analyse locally
-
-Every `disassembler walker` run fetches `s3://logan-pub/u/<ACC>/<ACC>.unitigs.fa.zst` from S3.
-On a workstation that iterates on the same cohort many times, that is the biggest per-run cost.
-`--unitigs-cache DIR` makes the walker read from a local directory first and only fall back to
-S3 on a cache miss. `--offline` refuses that fallback.
-
-`disassembler fetch` populates the cache in one pass, no analysis:
-
-```bash
-# Download every accession into ./unitigs/, one file per accession, byte-identical to S3.
-disassembler fetch -l candidates/query_gene.accessions.txt --unitigs-cache ./unitigs/
-
-# Every subsequent run reads from disk, no network, no S3 costs.
-disassembler walker \
-    -l candidates/query_gene.accessions.txt \
-    -q queries/query_gene.fasta \
-    -o out/run1 --unitigs-cache ./unitigs/ --offline
-
-# The composites forward the same two flags.
-disassembler reconstruct \
-    -l candidates/query_gene.accessions.txt \
-    -q queries/query_gene.fasta \
-    -o out/run1 --unitigs-cache ./unitigs/ --offline
-
-# Fully offline kmindex -> tree: prewarm the harvest scores AND the unitigs, then --skip-harvest.
-disassembler harvest --history-id H --collection-id C -o cohort/
-disassembler fetch -l cohort/query_gene.accessions.txt --unitigs-cache ./unitigs/
-disassembler from-kmindex --skip-harvest --cohort-dir cohort/ --target query_gene \
-    -q queries/query_gene.fasta -o out/run1 --unitigs-cache ./unitigs/ --offline
-```
-
-The cache is flat: `<DIR>/<ACC>.unitigs.fa.zst`. Files are byte-identical to what S3 hosts, so
-`sha256sum` verifies against the original object. Writes are atomic (tempfile + rename), so a
-killed `fetch` cannot leave a partial file that later looks valid to `--offline`.
-
-Skip-existing is implicit: `fetch` reuses whatever is already in the cache. To refetch, delete
-the file.
-
-The two Python subcommands also have offline replay paths already: `stratify` reads the
-`*.scores.json` files `harvest` wrote (no Galaxy call), and `lexicmap -f local.tsv[.gz]` reads
-a saved LexicMap TSV.
-
-## `disassembler lexicmap`: Streaming Multi-HSP Assembly & Cohort Partitioning
-
-`disassembler lexicmap` provides streaming multi-HSP coordinate tiling, reading-frame codon QC, 4-tier cohort stratification, and online haplotype collapsing for planetary search results from [LexicMap](https://github.com/IndexThePlanet/LexicMap).
-
-### The Multi-HSP Unitig-Split Challenge
-
-LexicMap is indexed on Logan's **contigs** (`s3://logan-pub/c/`), not on the unitig graph the walker uses. On internally diverse samples the assembler shatters a coding gene at every bubble it cannot cleanly pop, so the gene ends up spread across many short contigs; on Zika NS5 the gene tiles across ~50 contig fragments, longest under 100 nt (see [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md)). LexicMap reports each surviving contig as its own high-scoring pair (HSP) with its own `hsp`, `qcovHSP`, `alenHSP`, `qstart`, `qend`, and `pident`:
-
-- A gene split across two contigs (e.g. 55% coverage on contig 1 and 45% on contig 2) fails naive single-row filters (like `qcovHSP >= 80%`).
-- Filtering by row coverage discards complete biological sequences or produces fragmented assemblies.
-
-### How `disassembler lexicmap` Works
-
-1. **Collinear Multi-HSP Coordinate Tiling:**
-   Groups search rows on the fly by SRA accession (`sgenome`). For each accession, projects all qualifying HSPs onto the reference coordinate system (`qstart` to `qend`). Overlapping positions between HSPs are resolved by selecting the base from the HSP with the higher percent identity (`pident`), seamlessly stitching split contigs into full-length sequences without introducing spurious indels.
-2. **Reading-Frame Codon QC & Stop-Codon Screening:**
-   Translates CDS in-frame using Genetic Code Table 11 (bacterial/standard). Scans the coding body (excluding the natural terminal stop codon) for internal premature stop codons (e.g. amber mutants like Sanger $\Phi$X174 $am3$ dual-coding $gpE\text{ }W7^*$, sequencing errors, or out-of-frame indels).
-3. **Four-Tier Cohort Partitioning:**
-   - **Tier 1: Clean Full-Length** (`status=CLEAN_FULL_LENGTH`): Coverage $\ge 80\%$ (configurable via `--min-cov`) and 0 premature stop codons.
-   - **Tier 2: Clean Partial** (`status=CLEAN_PARTIAL`): Coverage between $50\%\text{--}80\%$ and 0 premature stop codons. Rescues partial hits without contaminating full-length alignments.
-   - **Tier 3: Flagged Premature Stops** (`flag=PREMATURE_STOPS`): Premature stop codons detected; outputs exact 1-based codon coordinates in an audit ledger.
-   - **Tier 4: Low-Coverage Fragments** (`flag=LOW_COVERAGE`): Coverage $<50\%$.
-4. **Online Haplotype Collapser:**
-   Collapses clean full-length sequences without holding the input (memory is O(distinct haplotypes), not $O(1)$: the row count is what streams), calculates exact frequencies, calls nucleotide (`198G>A`) and amino acid (`V66V`, `I61V`) mutations against the reference, classifies mutation types (`WT`, `WT_partial`, `Synonymous`, `Missense`, `Nonsense`, and `NonCoding_WT_partial` / `NonCoding_Variant` for a non-CDS reference), computes Shannon entropy, and records representative sample accessions.
-5. **Regime Diagnostics & Cross-Tool Triage:**
-   Computes coverage and identity quantiles ($p_{10}$, median, $p_{90}$) and stop-codon rates. If a target is in a **divergent regime** (median identity $<85\%$ or coverage $<0.60$), reference-guided projection fragments; `disassembler lexicmap` issues an automated alert recommending de novo graph path-walking via `disassembler walker` / `disassembler reconstruct`.
-
-### Usage Examples
-
-```bash
-# 1. Stream directly from Galaxy over HTTP (using Galaxy dataset ID):
-disassembler lexicmap \
-    -q queries/markers/zika_ns5.fasta \
-    -d f9cad7b01a47213500416a19986dca5c \
-    -o out/zika_lexicmap
-
-# 2. Process a local LexicMap tabular file (or gzipped TSV):
-disassembler lexicmap \
-    -q queries/query_hiv1_pol.fasta \
-    -f /data/hiv1_pol_lexicmap.tsv.gz \
-    -o out/hiv1_pol
-
-# 3. Stream from standard input in a shell pipeline:
-curl -s "https://usegalaxy.org/api/datasets/<ID>/display?key=<API_KEY>" | \
-    disassembler lexicmap -q queries/pfcrt_only.fasta -f - -o out/pfcrt
-
-# 4. As a composite: stream -> (optional sieve) -> codon MSA + tree in one command:
-disassembler from-lexicmap \
-    -q queries/query_hiv1_pol.fasta \
-    -f /data/hiv1_pol_lexicmap.tsv.gz \
-    -o out/hiv1_pol --sieve
-```
-
-> **Note on the MSA step.** `disassembler lexicmap` already emits a reference-coordinate MSA
-> (`<prefix>.clean.msa.fasta`, `<prefix>.clean.accessions.fasta`, `<prefix>.clean.a2m`): every
-> row is the reference length, with no gaps and no Ns, because the clean cohort gates only pass
-> accessions whose tiled sequence sits on the reference grid without an insertion. Re-running
-> MAFFT on three real cohorts (c-auris `erg11` collapsed and uncollapsed, SARS-CoV-2 spike
-> collapsed; 27 to 14,594 sequences) reproduced the lexicmap output byte-for-byte, every row and
-> every column. So the MSA stage of `disassembler from-lexicmap` is a no-op on strict clean-cohort
-> data; it is kept in the composite so a user who writes one downstream script against
-> `disassembler from-...` gets a consistent codon MSA + Newick tree shape regardless of whether
-> they came in through the walker route (where MAFFT does real work on per-accession
-> reconstructions) or the LexicMap route. For a LexicMap-only run, feeding the clean MSA directly
-> to a tree builder (or using the sieved MSA for figures) is equivalent and faster.
-
-### Outputs Generated
-
-| Output File | Description |
-|---|---|
-| `<prefix>.clean.msa.fasta` | Collapsed clean haplotypes with rank, count, and frequency |
-| `<prefix>.clean.haplotypes.tsv` | Tabular haplotype catalog with amino acid/nucleotide mutations, mutation class, and representative accessions |
-| `<prefix>.clean.accessions.fasta` | Uncollapsed full-length clean sequences for every qualifying accession |
-| `<prefix>.clean_expanded.accessions.fasta` | Expanded clean cohort combining full-length and clean partials ($\ge 50\%$) |
-| `<prefix>.flagged.accessions.fasta` | All flagged sequences (premature stops or low coverage) |
-| `<prefix>.flagged.tsv` | Audit ledger of flagged accessions with stop codon positions |
-| `<prefix>.cohort_ledger.tsv` | Complete audit ledger recording coverage, identity, status, tier, and stops for every accession |
-| `<prefix>.summary.json` | Machine-readable summary: quantiles, cohort counts, multi-HSP rescue statistics, and Shannon entropy |
-| `<prefix>.clean.a2m` | A2M formatted alignment for protein language models and evolutionary couplings |
-
-### `disassembler lexicmap` CLI Reference
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `-q, -r, --query, --ref <FASTA>` | — | Reference in-frame CDS FASTA (required) |
-| `-d, --dataset <ID>` | — | Galaxy dataset ID to stream over HTTP |
-| `-f, -i, --file, --input <FILE>` | — | Path to local tabular file, `.gz` file, or `-` for stdin |
-| `-o, --out-prefix <PATH>` | `msa/<ref>` | Output directory or file prefix |
-| `--base-url <URL>` | `https://usegalaxy.org` | Galaxy server base URL |
-| `--api-key <KEY>` | — | Galaxy API key string |
-| `--api-key-file <PATH>` | `/tmp/gxy.txt` | Path to Galaxy API key file |
-| `--min-cov <F>` | `0.80` | Minimum merged query coverage for clean full-length cohort |
-| `--min-cov-partial <F>` | `0.50` | Minimum coverage for clean partial cohort |
-| `--min-pident <F>` | `60.0` | Minimum percent identity for candidate HSPs |
-| `--max-internal-stops <N>` | `0` | Maximum premature internal stops allowed in CDS |
-| `--allow-frameshift-alts` | off | Allow indels/premature stops into clean cohort |
-| `--samples-per-haplotype <N>` | `10` | Maximum representative accessions recorded per haplotype in the clean-haplotypes TSV |
-| `--max-records <N>` | — | Stop after processing $N$ lines (for testing/previews) |
-| `--no-a2m` | off | Disable `.a2m` output |
-
-## logan-walker Command-line reference
-
-`logan-walker [OPTIONS]`, one of `-a`/`-l` and `-q` required. Boolean options that are **on by
-default** are turned off with their `--no-…` form. Boolean options that are **off by default**
-are turned on with their bare form; `--emit-vcf` and `--emit-snv-table` also accept a `--no-…`
-form for use inside a wrapper, but `--allow-frameshift-alts` does not. The tables below are the
-complete set; `logan-walker --help` omits `--scratch-dir`.
-
-### Input and output
-
-| flag | default | meaning |
-|---|---|---|
-| `-a, --accession <ACC>` | — | a single SRA accession |
-| `-l, --accession-list <FILE>` | — | file with one accession per line (use instead of `-a`) |
-| `-q, --query <FASTA>` | — | reference in-frame CDS FASTA (required) |
-| `-o, --out-dir <DIR>` | `walker_output` | output directory (also holds `bubbles.json`, summary, VCFs, `snvs.tsv`); GFA/GAF scratch goes to `--scratch-dir` |
-| `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | reconstructed primary haplotypes |
-| `--allow-empty` | off | exit 0 even if nothing reconstructed. Without it a run that reconstructs nothing exits non-zero, so a wrapper cannot read an all-failed shard as a good one |
-
-### Anchoring and fetch
-
-| flag | default | meaning |
-|---|---|---|
-| `-k, --k <N>` | `21` | anchor k-mer size, 1–32 (the Logan graph k stays 31; this is the query-anchoring k) |
-| `--min-shared-kmers <N>` | `3` | shared canonical k-mers a unitig needs to be an anchor (validated 1–5) |
-| `--hops <N>` | `5` | hop radius of the local-subgraph BFS around the anchors |
-| `--max-size-mb <N>` | `1024` | reject an accession whose compressed size exceeds this, on `Content-Length`, before download |
-| `--fetch-workers <N>` | `8` | parallel S3 fetch streams (bandwidth saturates ~8) |
-| `--scratch-dir <DIR>` | `/dev/shm/logan-walker` | where per-accession GFA/GAF go; should be tmpfs. Filenames carry the PID and a per-task counter (`<acc>.<pid>.<n>.sub.gfa`), so concurrent runs sharing this directory cannot overwrite each other |
-
-### Memory
-
-A compressed unitig buffer is resident in three places at once, not one: queued in the bounded
-channel (`channel_capacity`, 4, not exposed as a flag), held by a fetch worker blocked on a full
-queue (`--fetch-workers`, 8), and held by a compute worker for the whole parse (`-w`, 8). That is
-20 buffers at the defaults, so the worst case is about **20 GB** at the 1 GB `--max-size-mb` cap,
-plus roughly 43 MB per compute worker for the CSR graph.
-
-The bound is worst case, not typical: it assumes every accession sits at the cap, while
-`ERR2028820` is 33 MB and the largest ERG11 accession is 343 MB (a 343 MB panel is ~6.9 GB in
-buffers). `logan-walker` prints the computed figure at startup, because three of the four terms are flags:
-
-```
-[logan-walker] memory bound: up to 20 compressed buffers resident (4 queued + 8 fetching +
-8 parsing) x 1024 MB cap = 20.0 GB worst case, plus ~43 MB per compute worker for the CSR graph
-```
-
-To contain a run, lower `--max-size-mb` and the two worker counts together; they multiply.
-
-### Walk and consensus
-
-| flag | default | meaning |
-|---|---|---|
-| `--min-cov <F>` | `0.85` | minimum fraction of the reference a haplotype must cover to be kept |
-| `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align, removing the aligner's reference bias; `0.0` disables |
-| `--prefer-majority` / `--no-prefer-majority` | on | put the majority allele on the primary at two-allele sites (off = leave the reference-matching allele) |
-| `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
-| `-w, --workers <N>` | `8` | compute workers. A fixed default, not auto-sized to cores, because each one holds a compressed buffer for the whole parse: see [Memory](#memory) before raising it |
-
-### Intra-host variants and their outputs
-
-| flag | default | meaning |
-|---|---|---|
-| `--min-abund <F>` | `5.0` | minimum `ka:f` for a branch to count as a real allele |
-| `--min-vaf <F>` | `0.10` | minimum variant allele frequency for an alternative branch |
-| `--min-abund-frac <F>` | `0.0` (off) | raise the variant floor to this fraction of gene depth (median `ka:f` on the walked path) |
-| `--alt-max-detour <N>` | `100` | unitigs an alternative allele may traverse before it must rejoin the route |
-| `--no-indel-alts` | (indels on) | substitutions only; refuse alternatives that change length |
-| `--allow-frameshift-alts` | off | also accept indel alleles whose length change is not a multiple of 3 (these reframe the CDS) |
-| `--max-alt-indel <N>` | `30` | largest length change still treated as an indel allele rather than a rerouting |
-| `--emit-alts` / `--no-emit-alts` | on | write intra-host alternative haplotypes to `alt_haplotypes.fasta` |
-| `--emit-vcf` | off | also write `<out-dir>/<acc>.vcf`: intra-host SNPs with `ka:f` frequency, in query coordinates |
-| `--emit-snv-table` | off | also write `<out-dir>/snvs.tsv`: the long cohort table, one row per (accession, site, allele) |
-
-Not exposed as a flag: alternative haplotypes per accession are capped at **32** (`max_alts` in
-`walker/src/config.rs`). An accession with more intra-host alleles than that has its
-`alt_haplotypes.fasta` truncated with no warning.
-
-### Misc
-
-| flag | meaning |
-|---|---|
-| `-h, --help` | print help |
-| `-V, --version` | print version |
-
-## Provenance and status
-
-The walker began as `logan-hypyaeon` PR #4 (`Haplotype recovery`), which layered intra-accession
-variant recovery on top of the PR #3 Rust port. Intra-host alleles are recovered by
-`stages::variants`; the parallel upstream `stages::detour` engine has been retired in favour of
-it (`docs/issue_intra_accession_variance_lost.md` section 17 records why). Concordance: the Rust
-primary is byte-identical to `bench/golden/ERR2028820.pfcrt.primary.fasta` under old-behaviour
-flags, checked by `bench/check_golden.sh`. Offline unit tests pass; network- and
-data-dependent tests are `#[ignore]` by default.
-
-See `docs/issue_intra_accession_variance_lost.md` for the central methodological finding: the
-reference-matching-minority-allele bias, its measurement, and the fix.
-
-## Credits
-
-The Rust walker and intra-host haplotype-recovery method originate from `logan-hypyaeon` PR #4, authored by Andrew ([@as042](https://github.com/as042)), building on the PR #3 Rust port. See `NOTICE` and `docs/` for full provenance.
-
-## Intra-host SNP VCF
-
-`--emit-vcf` writes `<out-dir>/<accession>.vcf` alongside the primary: the on-path
-biallelic sites (intra-host SNPs) with their k-mer-coverage frequency, in query
-coordinates (`CHROM` = gene, `POS` = 1-based position in the CDS). The primary FASTA is
-unchanged. Because every accession is called against the same gene, the VCFs share a
-coordinate frame. Frequencies are `ka:f` ratios, a proxy for allele frequency, and are
-per-site, not phased.
-
-For a cohort, `--emit-snv-table` writes `<out-dir>/snvs.tsv`, one long ("tidy") row per
-`(accession, site, allele)`. This is the output that scales: a gene can be matched by millions
-of runs, and a merged multi-sample VCF would be a million-column near-empty matrix, whereas the
-long table is sparse-native, concatenates across cluster shards, and loads straight into DuckDB
-for per-site summaries and cross-sample queries. Merging the per-accession VCFs into a dense
-matrix is a small-cohort convenience only.
-
-A worked example on the Zika NS5 cohort — an example VCF, the long table with DuckDB queries,
-and (for the small cohort) the merged matrix and a heatmap — is in
-[`docs/vcf_example.md`](docs/vcf_example.md).
+## Credits and license
+
+`logan-walker` and the intra-host haplotype recovery method are by Andrew
+([@as042](https://github.com/as042)). The diversity sieve is
+[kmer-diversity-sieve](https://github.com/stevenweaver/kmer-diversity-sieve). See
+[`NOTICE`](NOTICE). MIT licensed; see [`LICENSE`](LICENSE).

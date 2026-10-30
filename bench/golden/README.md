@@ -1,7 +1,7 @@
 # Golden-truth fixtures
 
-Concordance baselines for the path walker, covering success criteria 2 and 3 of the
-optimization issue (`docs/issue_path_walker_optimization.md`).
+Concordance baselines for `logan-walker`: the primary haplotype each accession must reproduce
+byte for byte under old-behaviour flags. `bench/check_golden.sh` checks them.
 
 ## Current fixtures (recaptured 2026-10-18)
 
@@ -28,7 +28,7 @@ codon that GraphAligner 1.0.19 and 1.0.20 clip (`docs/issue_graphaligner_end_cli
 | `ERR2028820` | PfCRT | `queries/pfcrt_only.fasta` | 1,277,362 | 76 | 356 | 1,274 nt | 202 |
 | `SRR8209082` | HIV-1 pol | `queries/query_hiv1_pol.fasta` | 81,534 | 4,102 | 26,323 | 2,738 nt | 11,825 |
 
-Captured on the unmodified Python walker at commit `81fc1fd`, GraphAligner 1.0.20, BLAST 2.17.0+.
+Captured from the original Python prototype walker, under GraphAligner 1.0.20 and BLAST 2.17.0+.
 The graph statistics above and the `*.golden.json` files are from this capture.
 
 ## Usage
@@ -40,7 +40,7 @@ bench/check_golden.sh              # exit 0 = concordant, 1 = regression
 `check_golden.sh` runs the Rust `logan-walker` under old-behaviour flags and diffs the primary
 byte-for-byte against the `*.primary.fasta` fixtures here (needs `GraphAligner` on `PATH` and S3
 access). Until 2026-10-18 the `ERR2028820.pfcrt` and `SRR8209082.hiv1_pol` fixtures were the
-original Python walker's output at commit `81fc1fd`, and `SRR12363134.candida_auris_erg11` was
+original Python walker's output, and `SRR12363134.candida_auris_erg11` was
 captured from the Rust walker and cross-validated against the Python walker (identical 1,574 nt)
 before that walker was removed. To regenerate a fixture, run the Rust walker with
 `--prune-frac 0.0 --no-prefer-majority --no-emit-alts` under the GraphAligner version in

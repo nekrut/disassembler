@@ -37,3 +37,6 @@ extern/kmer-diversity-sieve/l1_pipeline_serial
 extern/kmer-diversity-sieve/l1_pipeline_threads
 extern/kmer-diversity-sieve/l1_pipeline
 tests/*.rank*.fasta
+
+# setuptools metadata from `pip install -e .`
+*.egg-info/

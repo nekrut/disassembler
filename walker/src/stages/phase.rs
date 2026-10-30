@@ -1,34 +1,23 @@
 //! Step 7: phase forks into co-existing variants.
 //!
-//! Replaces `logan_path_walker.py:238-275` (`phase_superbubbles`). Runs off the graph and
-//! subgraph, NOT the GAF, so it is independent of GraphAligner.
+//! Runs off the graph and subgraph, NOT the GAF, so it is independent of GraphAligner.
 //!
 //! A fork whose branches both clear `ka:f >= min_abund` and `vaf >= min_vaf` represents two
 //! populations genuinely present in one sample. That is the pipeline's whole reason for
 //! working on unitigs rather than contigs, which would have discarded the minor branch.
 //!
-//! # Bug to fix here, not to port
+//! # Strand handling
 //!
-//! The Python version builds its adjacency while discarding the strand fields (`:244-247`):
-//!
-//! ```python
-//! for s1, tgt, s2 in edge_list:   # s1 and s2 thrown away
-//!     outgoing[u].add(tgt)
-//! ```
-//!
-//! Because a bidirected edge is recorded in both endpoints' headers, `A->B` and `B->A` are
-//! the same edge seen twice, and the reconvergence test then reports the fork as its own
-//! merge node. Measured: `fork == merge` on 93.1% of `ERR2028820`'s 202 bubbles and 58.5%
-//! of `SRR8209082`'s 11,825.
+//! An adjacency built while discarding the strand fields gets bubbles wrong. Because a
+//! bidirected edge is recorded in both endpoints' headers, `A->B` and `B->A` are the same
+//! edge seen twice, and the reconvergence test then reports the fork as its own merge node.
+//! Measured on a strand-less adjacency: `fork == merge` on 93.1% of `ERR2028820`'s 202
+//! bubbles and 58.5% of `SRR8209082`'s 11,825.
 //!
 //! `UnitigGraph::targets` keeps the strand bits precisely so this can be done correctly.
-//! Sequence the work: port to byte-identical behaviour first, verify against
-//! `bench/golden/`, then fix the strand handling as a separate reviewable change
-//! with a deliberate fixture regeneration.
 //!
-//! Also unlike the Python version, keep the per-bubble detail. There, only `len(bubbles)`
-//! survives into the summary (`:317`, `:385`), so the quasispecies claim cannot be audited
-//! from the output at all.
+//! Keep the per-bubble detail too. If only the bubble count survives into the summary, the
+//! quasispecies claim cannot be audited from the output at all.
 //!
 //! IN   UnitigGraph, Subgraph
 //! OUT  Vec<Bubble>
@@ -53,12 +42,7 @@ use std::collections::HashMap;
 /// enters one specific *end* of the target. A unitig has two ends, so a neighbour at each is
 /// an ordinary chain, not a choice.
 ///
-/// `logan_path_walker.py:244-247` builds its adjacency while discarding `s1` and `s2`:
-///
-/// ```python
-/// for s1, tgt, s2 in edge_list:   # s1 and s2 thrown away
-///     outgoing[u].add(tgt)
-/// ```
+/// An adjacency that keeps only the target and discards `s1` and `s2` gets this wrong.
 ///
 /// Two consequences. A plain chain `x <- u -> y` reads as a two-way fork. And because Logan
 /// writes every edge into both endpoints' headers, `u -> v` and `v -> u` are the same edge
@@ -72,13 +56,12 @@ use std::collections::HashMap;
 /// each direction recorded exactly once.
 ///
 /// Verified on `ERR2028820`: unitig 2933 carries `L:-:443893:+` and `L:+:1239391:-`, which
-/// the Python version reads as a fork with two branches. Oriented, those are one exit from
+/// a strand-less adjacency reads as a fork with two branches. Oriented, those are one exit from
 /// each end, so `(2933,-)` and `(2933,+)` each have out-degree 1 and there is no fork.
 ///
-/// # Output differs from Python deliberately
+/// # Output differs from a strand-less count deliberately
 ///
-/// This is the behaviour change the plan sequences after a faithful port. The golden
-/// fixtures pin the old numbers and must be regenerated, with the diff reviewed.
+/// The golden fixtures pin the old numbers and must be regenerated, with the diff reviewed.
 pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<Vec<Bubble>> {
     let n = subgraph.nodes.len();
     if n == 0 {
@@ -137,7 +120,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
         if reconverged.is_empty() {
             continue;
         }
-        // Sorted for a deterministic emission order, unlike Python's hash-ordered Counter.
+        // Sorted for a deterministic emission order, which a hash-ordered map would not give.
         // NOT to pick a single winner: this used to take `reconverged[0]` and discard the
         // rest, so a fork with several reconvergence points reported one bubble and silently
         // lost the others, in every orientation, before the dedup below was even reached.
@@ -183,8 +166,8 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
             }
 
             // Coverage share is computed over every branch of this bubble, then the gates are
-            // applied, which matches the Python ordering: a branch filtered out by a gate
-            // still contributed to the total.
+            // applied. The order matters: a branch filtered out by a gate still contributed to
+            // the total.
             let total: f64 = in_bubble
                 .iter()
                 .map(|&b| graph.abundance[unlocal(b).0 as usize] as f64)
@@ -249,7 +232,7 @@ mod tests {
     }
     fn cleanup(s: &Subgraph) { std::fs::remove_file(&s.gfa_path).ok(); }
 
-    /// The exact shape the Python implementation miscounts. Unitig 0 has one neighbour off
+    /// The exact shape a strand-less adjacency miscounts. Unitig 0 has one neighbour off
     /// each end, which is a chain, not a choice.
     #[test]
     fn a_neighbour_at_each_end_is_not_a_fork() {
@@ -344,8 +327,7 @@ mod tests {
     /// Fork `(2,-)` reconverges at both `(2,+)` and `(3,-)`; taking only the smallest meant
     /// `(2,-) -> (3,-)` was never considered, and the mirror direction `(3,+)` picked a
     /// different merge and was then skipped by the dedup, so the diamond appeared in NEITHER
-    /// direction of `bubbles.json`. Found by brute-force search over reversal-closed graphs;
-    /// see review finding 2.1.
+    /// direction of `bubbles.json`. Found by brute-force search over reversal-closed graphs.
     #[test]
     fn a_bubble_whose_directions_disagree_on_the_merge_survives() {
         let c = cfg();
@@ -488,7 +470,7 @@ mod tests {
     }
 }
 
-/// What the orientation fix changes on real data, against the Python counts.
+/// What the orientation fix changes on real data, against the strand-less counts.
 ///
 /// `LOGAN_TEST_DIR=/dir/with/zst cargo test --release -- --ignored --nocapture phase_real`
 #[cfg(test)]
@@ -506,7 +488,7 @@ mod phase_real {
             eprintln!("SKIP: set LOGAN_TEST_DIR");
             return;
         };
-        // (accession, query, python bubble count, python fork==merge count)
+        // (accession, query, strand-less bubble count, strand-less fork==merge count)
         let cases = [
             ("ERR2028820", "../queries/pfcrt_only.fasta", 202usize, 188usize),
             ("SRR8209082", "../queries/query_hiv1_pol.fasta", 11825, 6917),

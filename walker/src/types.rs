@@ -29,9 +29,8 @@ pub enum Orient {
 
 /// The reference coding sequence being searched for.
 pub struct Query {
-    /// File stem, e.g. `query_hiv1_pol`. Used for output filenames, because
-    /// `logan_path_walker.py:410` names the summary from `query_fa.stem`. Keeping this
-    /// identical is what lets the two implementations be diffed.
+    /// File stem, e.g. `query_hiv1_pol`. Used for output filenames: the summary is named
+    /// from the query file's stem, and that name is part of the output contract.
     pub name: String,
     /// First token of the FASTA header, e.g. `pfcrt`. Provenance and logging only.
     pub record_id: String,
@@ -90,8 +89,8 @@ pub struct FetchedUnitigs {
 /// | `seq_offset` | 5.1 MB |
 /// | total | **~43 MB** |
 ///
-/// Against ~897 MB for the Python dict-of-sets, and against 145 MB for the decompressed
-/// text alone. Holding sequences here rather than re-reading the file is what lets
+/// Against ~897 MB measured for a dict-of-sets adjacency, and against 145 MB for the
+/// decompressed text alone. Holding sequences here rather than re-reading the file is what lets
 /// `extract::collect_seqs` be O(nodes kept) instead of O(all unitigs).
 pub struct UnitigGraph {
     pub accession: Accession,
@@ -196,8 +195,7 @@ pub struct Subgraph {
 
 /// Remove the scratch GFA when the subgraph goes out of scope.
 ///
-/// This is the equivalent of the `finally` block at `logan_path_walker.py:327-330`, and it
-/// is more reliable: it runs on every exit path, including early returns and errors.
+/// It runs on every exit path, including early returns and errors.
 ///
 /// It matters because `scratch_dir` is tmpfs, so a leaked file occupies RAM that never
 /// appears in any process's RSS. At ~1 MB for a large subgraph, a 10,000-accession run
@@ -225,8 +223,8 @@ pub struct PathStep {
 /// The single best alignment GraphAligner reported, as GAF columns.
 ///
 /// Note `path_start` and `path_end` are offsets into the *stitched path*, not into the
-/// query. `stitch` slices the assembled sequence with them (`logan_path_walker.py:217-220`),
-/// so mistaking them for query coordinates yields a plausible but wrong haplotype.
+/// query. `stitch` slices the assembled sequence with them, so mistaking them for query
+/// coordinates yields a plausible but wrong haplotype.
 #[derive(Clone)]
 pub struct GafPath {
     pub steps: Vec<PathStep>,
@@ -325,7 +323,7 @@ pub struct AltHaplotype {
 /// One branch of a fork, with its coverage and variant allele frequency.
 ///
 /// A branch is an *oriented* unitig. The same unitig entered from its two ends is two
-/// different branches, which is exactly the distinction the Python implementation loses.
+/// different branches, which is exactly the distinction a strand-less adjacency loses.
 pub struct Branch {
     pub node: UnitigId,
     pub strand: Strand,
@@ -337,8 +335,8 @@ pub struct Branch {
 ///
 /// Gated on `ka:f >= min_abund` and `vaf >= min_vaf`.
 ///
-/// `merge` is meaningful here, unlike in the Python version. There the adjacency drops the
-/// strand fields, so a bidirected edge recorded in both endpoints' headers looks like a
+/// `merge` is meaningful here because orientation is kept. When an adjacency drops the
+/// strand fields, a bidirected edge recorded in both endpoints' headers looks like a
 /// reconvergence and the fork is reported as its own merge node: `fork == merge` on 93.1%
 /// of `ERR2028820`'s bubbles and 58.5% of `SRR8209082`'s. Orientation is what separates
 /// "this unitig has a neighbour at each end", which is an ordinary chain, from "this end of
@@ -402,8 +400,7 @@ pub enum Outcome {
     Failed,
 }
 
-/// Wall time per stage, in seconds. Mirrors the Python `timing` block so the two
-/// implementations can be compared directly.
+/// Wall time per stage, in seconds.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Timing {
     pub stream: f64,

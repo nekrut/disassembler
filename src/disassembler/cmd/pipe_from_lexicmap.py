@@ -1,18 +1,13 @@
 """from-lexicmap: LexicMap tabular stream -> (sieve opt) -> codon MSA + tree.
 
-Composite: lexicmap -> sieve (optional) -> msa. Lexicmap already produces a
-reference-coordinate MSA (`<prefix>.clean.msa.fasta` and friends): every row is
-the reference length, with no gaps and no Ns, because the clean cohort gates
-only let through accessions whose tiled sequence sits on the reference grid
-without an insertion. Empirically, re-running MAFFT --auto on three real
-cohorts (c-auris erg11 collapsed and uncollapsed, SARS-CoV-2 spike collapsed;
-27 to 14,594 sequences) reproduced the lexicmap output byte-for-byte, every
-row and every column. The MSA stage here is therefore a no-op on strict
-clean-cohort data; it is kept in the composite so downstream tools see a
-consistent codon MSA / Newick tree shape regardless of whether a run came in
-through the walker route (where MAFFT does real work) or the LexicMap route.
-For a LexicMap-only run, feeding `<prefix>.clean.msa.fasta` straight to a tree
-builder is equivalent and faster than running this composite.
+Composite: lexicmap -> sieve (optional) -> msa. Lexicmap already writes its
+cohort on the reference grid (`<prefix>.clean.msa.fasta` and friends), with '-'
+at reference positions no HSP covers. Under --require-full-length the clean rows
+are gap-free and MAFFT leaves them unchanged (measured on three cohorts of 27 to
+14,594 sequences), so the MSA stage only adds the tree; with the default
+--min-cov 0.80, rows can carry up to 20% '-' and MAFFT may place those gaps
+differently. The stage is kept so both routes produce the same codon MSA and
+Newick tree shape. See docs/lexicmap.md and docs/codon_msa.md.
 
 Sieve/MSA input defaults to `<prefix>.clean.accessions.fasta` (uncollapsed
 clean cohort, one seq per accession); pass --include-partials to feed

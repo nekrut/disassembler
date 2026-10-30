@@ -1,19 +1,23 @@
 # logan-walker
 
-The native Rust engine of [disassembler](../README.md). Streams Logan cDBG unitigs from S3,
-anchors a reference coding sequence against them, walks the local subgraph, and reconstructs the
-full-length coding haplotypes present in the sample.
+The Rust walker of [disassembler](../README.md). For each SRA accession it streams the Logan
+unitig graph from S3, anchors a reference coding sequence by shared k-mers, walks the local
+subgraph with GraphAligner, and reconstructs the full-length coding haplotypes present in the
+sample. The user documentation, including the full option reference, is
+[`../docs/walker.md`](../docs/walker.md).
 
 ## Build
 
 ```bash
 cargo build --release            # target/release/logan-walker
-cargo test --release             # offline tests (network/data tests are #[ignore])
+cargo test --release             # offline tests; network and data tests are #[ignore]
+cargo clippy --all-targets --release -- -D warnings
 ```
 
-`GraphAligner` must be on `PATH` at run time (bioconda; see [`../environment.yml`](../environment.yml)).
-Rust itself installs via [rustup](https://rustup.rs). Only three runtime crates: `ureq`, `zstd`,
-and `sha2` (tests only).
+GraphAligner 1.0.17b must be on `PATH` at run time (see [`../environment.yml`](../environment.yml)
+and [`../docs/issue_graphaligner_end_clipping.md`](../docs/issue_graphaligner_end_clipping.md)).
+Rust installs via [rustup](https://rustup.rs). Two runtime crates, `ureq` and `zstd`, plus
+`sha2` for tests. The packaged build is on Bioconda as `logan-walker`.
 
 ## Run
 
@@ -21,32 +25,8 @@ and `sha2` (tests only).
 logan-walker -a SRR8209082 -q ../queries/query_hiv1_pol.fasta -o out -f out/reconstructed.fasta
 ```
 
-Key flags (`logan-walker --help` for the full list):
-
-| flag | meaning |
-|---|---|
-| `-a` / `-l` | one accession, or a file listing accessions |
-| `-q` | reference CDS FASTA |
-| `-o` / `-f` | output directory / reconstructed-haplotypes FASTA |
-| `-k` | anchor k-mer size (default 21) |
-| `--prune-frac` | drop unitigs below this fraction of gene depth, then re-align (default 0.01) |
-| `--prefer-majority` | put the majority allele on the primary at biallelic sites (default on) |
-| `--emit-alts` | write intra-host alternative haplotypes to `alt_haplotypes.fasta` (default on) |
-| `--emit-vcf` | write per-accession `<acc>.vcf` of intra-host SNPs (default off) |
-| `--emit-snv-table` | write one long `snvs.tsv` across the run — the cohort output that scales (default off) |
-| `-w` / `--fetch-workers` | compute workers / S3 fetch workers |
-| `--unitigs-cache <DIR>` | read-through cache for compressed unitig payloads; byte-identical to the S3 object. A cache miss falls through to S3 and is written back atomically |
-| `--offline` | refuse the S3 fallback; requires `--unitigs-cache`. A cache miss becomes a hard error naming the accession |
-| `--fetch-only` | fetch every accession into `--unitigs-cache` and exit before the compute stages. `disassembler fetch` is the wrapper |
-
-Reproduce the old one-haplotype-per-accession behaviour with
-`--prune-frac 0.0 --no-prefer-majority --no-emit-alts`.
-
-## Outputs
-
-`reconstructed_haplotypes.fasta` (primaries; override with `-f`), `alt_haplotypes.fasta`,
-`bubbles.json`, a summary JSON, and
-optionally `<acc>.vcf` / `snvs.tsv`.
+`disassembler walker` passes its arguments straight to this binary, and `disassembler
+reconstruct` runs it as its first stage.
 
 ## Source map
 
@@ -56,21 +36,17 @@ src/
   pipeline.rs    two-pool threading and stage wiring   <- read this for the flow
   types.rs       what moves between stages             <- read this for the shapes
   config.rs      tunables
-  io/            accession list + query in; fasta, vcf, snv table, bubbles, summary out
+  error.rs       error type
+  io/            accession list and query in; FASTA, VCF, SNV table, bubbles, summary out
   stages/
-    stream.rs    S3 fetch + streaming zstd decode
-    parse.rs     BCALM2 records -> CSR graph + 2-bit sequences
-    anchor.rs    canonical k-mer anchoring (replaces BLAST)
-    extract.rs   5-hop BFS, sequence collection, GFA emit, prune
+    stream.rs    S3 fetch and streaming zstd decode
+    parse.rs     BCALM2 records -> CSR graph and 2-bit sequences
+    anchor.rs    canonical k-mer anchoring
+    extract.rs   hop-limited BFS, sequence collection, GFA emit, prune
     align.rs     GraphAligner wrapper
-    stitch.rs    path -> haplotype
-    variants.rs  prefer-majority + intra-host alt recovery (SNPs -> alts, vcf, snv table)
+    stitch.rs    path -> haplotype, primary selection in multi-anchor mode
+    variants.rs  prefer-majority and intra-host alternative recovery (alts, VCF, SNV table)
     phase.rs     bubble detection (bubbles.json)
 ```
 
-The walker reconstructs haplotypes; to codon-align them and build a tree, feed
-`reconstructed.fasta` to `disassembler msa`, or run the whole thing in one command with
-`disassembler reconstruct` (see [`../docs/codon_msa.md`](../docs/codon_msa.md)).
-
-See [`../docs/`](../docs/) for the design plan, as-built notes, the variance-loss
-investigation, the codon-MSA step, and the VCF / contig experiments.
+The golden concordance gate for this crate is [`../bench/check_golden.sh`](../bench/check_golden.sh).

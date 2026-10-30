@@ -2,7 +2,7 @@
 
 **Conducted**: September 11, 2026  
 **Target Codebase**: `walker/src/stages/anchor.rs`, `walker/src/config.rs`, `walker/src/stages/extract.rs`  
-**Experiment Harness**: `harness.py` (not committed; paths below are from the original upstream layout)  
+**Experiment Harness**: [`harness.py`](harness.py) (its input paths, under `work/`, are from the repository the study was run in and need adjusting here); figures from [`generate_figures.py`](generate_figures.py)  
 **Figures**: `bench/simulated_kmer_sensitivity/figures/`
 
 ---

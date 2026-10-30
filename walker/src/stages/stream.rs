@@ -1,8 +1,7 @@
 //! Step 1: fetch one accession's unitigs from the Logan S3 bucket.
 //!
-//! Replaces `logan_path_walker.py:45-67` (`stream_unitigs`), which shells out to
-//! `curl … | zstd -dc`, writes the decompressed file to disk, and then reads the whole
-//! file back a third time purely to count `>` characters for a reporting field.
+//! No `curl … | zstd -dc` to a decompressed file on disk that is then read back: only the
+//! compressed bytes are held, and a streaming decoder runs over them.
 //!
 //! Measured on this hardware: 6.9 MB/s single stream, 17.4 MB/s aggregate across 8 parallel
 //! range requests, which is where the link saturates. A median accession is ~71 MB compressed,

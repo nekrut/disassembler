@@ -1,2 +1,0 @@
-[console_scripts]
-disassembler = disassembler.cli:main

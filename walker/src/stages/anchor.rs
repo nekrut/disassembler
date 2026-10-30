@@ -1,8 +1,8 @@
 //! Step 3: find the unitigs that carry the query gene.
 //!
-//! Replaces `logan_path_walker.py:69-99` (`find_anchors_blast`), which writes a BLAST
-//! database of every unitig to disk and runs megablast against it. That is the single
-//! largest stage in the Python walker, 5.8 s of a 14.6 s accession.
+//! Shared canonical k-mers, not a BLAST database of every unitig written to disk and
+//! searched with megablast. Under BLAST that was the single largest stage, 5.8 s of a
+//! 14.6 s accession.
 //!
 //! Validated 2026-09-10 across 10 accessions, 3 organisms, 3 genes, by running the full
 //! downstream on each anchor set and comparing haplotype SHA-256:
@@ -241,10 +241,6 @@ pub fn index_query_set(cfg: &Config, queries: &[Query]) -> Result<QueryIndex> {
 /// A unitig is an anchor when it shares at least `cfg.min_shared_kmers` canonical k-mers
 /// with the query. Counting matched *positions*, not distinct k-mers, to match the Python
 /// implementation the anchor-recall study validated against.
-///
-/// Replaces `find_anchors_blast` (`logan_path_walker.py:69-99`), which writes a BLAST
-/// database of the whole accession to disk. That is the largest stage in the Python walker
-/// at 5.8 s of a 14.6 s accession.
 ///
 /// # The hot loop
 ///
@@ -629,9 +625,9 @@ mod tests {
 }
 
 /// Cross-validation against the independent Python implementation used for the anchor-recall
-/// study (`scratchpad/kmer_anchor.py`, canonical 31-mers via `min(m, revcomp(m))`). The
-/// expected counts come from that study's recorded output, so a mismatch means the two
-/// implementations disagree about what a canonical k-mer is.
+/// study (canonical 31-mers via `min(m, revcomp(m))`). The expected counts come from that
+/// study's recorded output, so a mismatch means the two implementations disagree about what
+/// a canonical k-mer is.
 ///
 /// Run from the crate directory: `cargo test --release -- --ignored --nocapture`
 #[cfg(test)]
@@ -676,8 +672,8 @@ mod python_concordance {
 }
 
 /// Cross-validation against the Python anchor-recall study. Those anchor counts were
-/// produced by an independent implementation (`scratchpad/kmer_anchor.py`) and then used to
-/// decide that k-mer anchoring is viable, so the two must agree exactly.
+/// produced by an independent implementation and then used to decide that k-mer anchoring
+/// is viable, so the two must agree exactly.
 ///
 /// `LOGAN_TEST_ZST=/path/to/ERR2028820.unitigs.fa.zst cargo test --release -- --ignored --nocapture`
 #[cfg(test)]

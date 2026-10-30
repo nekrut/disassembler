@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""lexicmap_streamer.py: Streaming multi-HSP coordinate tiling, codon QC, and haplotype collapsing.
+"""lexicmap: streaming multi-HSP coordinate tiling, codon QC, and haplotype collapsing.
 
 Streams LexicMap tabular search results directly from usegalaxy.org (over HTTP API),
 a local TSV file, or standard input (stdin).
@@ -49,31 +49,29 @@ Outputs generated:
   - <out-prefix>.clean.a2m                   (A2M formatted MSA for protein language models / EVcouplings)
 
 Note on the FASTA/MSA outputs:
-  Clean full-length tiling drops any HSP block that would need an insertion relative to the
-  reference, so every row in .clean.msa.fasta, .clean.accessions.fasta and .clean.a2m is the
-  reference length, with no gaps and no Ns. That makes these files already a reference-coordinate
-  MSA, not an unaligned FASTA. Re-running MAFFT --auto on three real cohorts (c-auris erg11
-  collapsed and uncollapsed, SARS-CoV-2 spike collapsed; 27 to 14,594 sequences) reproduced the
-  lexicmap output byte-for-byte, every row and every column, so `disassembler msa` is a no-op on
-  this output. The composite `disassembler from-lexicmap` still runs it, for parity with the
-  walker route; a LexicMap-only pipeline can feed .clean.msa.fasta straight to a tree builder.
+  Every row is projected onto the reference grid, so .clean.msa.fasta, .clean.accessions.fasta
+  and .clean.a2m are already column-aligned, reference-length files. Reference positions no HSP
+  covers, or that an HSP aligns to a gap, are written as '-': with the default --min-cov 0.80 a
+  clean row can be up to 20% '-'. Under --require-full-length, clean rows are gap-free, and
+  re-running MAFFT on three such cohorts (27 to 14,594 sequences) reproduced them byte for byte.
+  See docs/lexicmap.md.
 
 Examples:
   # Stream directly from a Galaxy dataset ID over HTTP:
-  python/lexicmap_streamer.py \\
+  disassembler lexicmap \\
       -q queries/markers/zika_ns5.fasta \\
       -d f9cad7b01a47213500416a19986dca5c \\
       -o out/zika_lexicmap
 
   # Stream from a local LexicMap tabular file:
-  python/lexicmap_streamer.py \\
+  disassembler lexicmap \\
       -q queries/query_hiv1_pol.fasta \\
       -f /data/hiv1_pol_lexicmap.tsv \\
       -o out/hiv1_pol
 
   # Pipe directly from a compressed file or stream via STDIN:
-  zcat /data/lexicmap_output.tsv.gz | python/lexicmap_streamer.py \\
-      -q queries/master/pfcrt.fasta \\
+  zcat /data/lexicmap_output.tsv.gz | disassembler lexicmap \\
+      -q queries/pfcrt_only.fasta \\
       -f - \\
       -o out/pfcrt
 """

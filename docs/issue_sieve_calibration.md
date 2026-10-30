@@ -1,16 +1,20 @@
 # The k-mer diversity sieve is calibrated for archives, not for gene cohorts
 
 **Status:** characterised 2026-09-21; wrapper defaults revised 2026-09-23 after cross-cohort
-topology measurements. `disassemble.py` now defaults `--sieve-threshold 0.005 --sieve-sketch 256`
-instead of the sieve binary's own archive-scale defaults; the sieve binary is unchanged.
-`--sieve` itself remains OFF by default.
+topology measurements. `disassembler` now defaults to `--sieve-threshold 0.005 --sieve-sketch 256`
+(`--threshold` and `--sketch` on `disassembler sieve`) instead of the sieve binary's own
+archive-scale defaults; the sieve binary is unchanged. `--sieve` itself remains off by default.
+For the user-facing summary, see [`sieve.md`](sieve.md).
+
+This record was written against the original single-script driver, `disassemble.py`, which the
+`disassembler` CLI has since replaced; the sieve flags kept their names in the composites.
 
 `--sieve` collapses a nine-accession Zika NS5 cohort to a single haplotype at its default
 threshold, discarding the only lineage in the set that carries a non-negligible branch length.
 This is not a defect in the sieve. It is operating exactly as specified, and its specification
 targets a regime roughly ten times more divergent than an intra-species gene cohort.
 
-Two separate things go wrong, and only one of them is reachable from `disassemble.py`.
+Two separate things go wrong, and at the time only one of them was reachable from the wrapper.
 
 ---
 
@@ -23,7 +27,7 @@ Two separate things go wrong, and only one of them is reachable from `disassembl
 | Cause 2 | the default 64-position MinHash sketch cannot resolve novelty finer than `1/64`, i.e. ~0.05% divergence, whatever `tau` is set to |
 | Governing relation | **`d ~ tau / (2k)`**, independent of gene length |
 | Working setting here | `--threshold 0.005 --sketch 256`, which is lossless on the test cohort |
-| Blocker | `disassemble.py` does not expose `--sketch`, so only half the fix is reachable |
+| Blocker (since fixed) | the wrapper did not expose `--sketch`, so only half the fix was reachable |
 | Not a defect in | the sieve's correctness, its cost, or its behaviour on the archive-scale data it was built for |
 
 ---
@@ -234,7 +238,7 @@ So the sieve is worth keeping. It is the gene-scale regime that sits outside its
 
 ---
 
-## 9. What was reachable from disassemble.py, and what changed
+## 9. What was reachable from the wrapper, and what changed
 
 The sieve binary accepts eleven flags:
 
@@ -243,7 +247,7 @@ The sieve binary accepts eleven flags:
 --outlier-sd --sketch --threads --threshold --warmup
 ```
 
-At the time this doc was first written, `disassemble.py` exposed only `--threshold` (as
+At the time this doc was first written, the wrapper exposed only `--threshold` (as
 `--sieve-threshold`) and `--min-len` (as `--sieve-min-len`), hardcoded `--max-n-frac 0.05` and
 `--warmup 2000`, and left `--sketch`, `--k`, `--threads`, `--limit`, `--outlier-sd`
 unreachable. `--sieve-threshold` on its own could not fix a gene-scale cohort: lowering `tau`
@@ -258,14 +262,14 @@ without the flag is byte-for-byte the same as before. `--k`, `--threads`, `--lim
 
 ## 10. Options considered
 
-1. **Expose `--sieve-sketch`.** ✅ Done, defaulted to 256 alongside `--sieve-threshold 0.005`.
+1. **Expose `--sieve-sketch`.** Done: defaulted to 256 alongside `--sieve-threshold 0.005`.
    The reasoning: a naive user who flips `--sieve` on without tuning should get a
    topology-preserving configuration on the cohort sizes this pipeline targets, not the
    archive-scale collapse the sieve binary defaults produce. The defaults are opt-out through
    the same flags.
-2. **Leave the sieve default-off.** ✅ Unchanged; `--sieve` is still OFF by default.
+2. **Leave the sieve default-off.** Unchanged: `--sieve` is still OFF by default.
 3. **Derive `tau` from the cohort** rather than accepting a constant: measure pairwise
-   divergence on a sample of the reconstructions and set `tau ~ 2*k*d_min`. Not done — the new
+   divergence on a sample of the reconstructions and set `tau ~ 2*k*d_min`. Not done: the new
    defaults get the common cases right, and self-tuning would add machinery for a case that
    would still need cohort-specific review.
 

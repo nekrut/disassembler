@@ -3,13 +3,13 @@
 //! IN   Summary
 //! OUT  reconstructed.fasta, bubbles.json, <query>_walker_summary.json
 //!
-//! `reconstructed.fasta` is consumed by `build_walker_codon_msa.py`, which feeds MAFFT and
-//! FastTree and then HyphAeon, so its record format must match what the Python walker emits
-//! byte for byte (`logan_path_walker.py:380`).
+//! `reconstructed.fasta` is consumed by `disassembler msa`, which feeds MAFFT and FastTree,
+//! so its record format is a fixed contract: downstream parsers read it, and the
+//! `bench/golden/` fixtures are this file verbatim.
 //!
 //! JSON is written by hand rather than through serde. The shapes are small and fixed, and
 //! matching Python's `json.dump(..., indent=2)` layout exactly matters more here than
-//! convenience, because the two summaries are meant to be diffable.
+//! convenience, because summaries are meant to be diffable.
 
 use crate::error::Result;
 use crate::pipeline::Summary;
@@ -51,9 +51,10 @@ fn esc(s: &str) -> String {
     out
 }
 
-/// One record per reconstructed haplotype, in the order accessions completed.
+/// One record per reconstructed haplotype, in input order: `pipeline::run` sorts results by
+/// `AccessionResult::index` before they reach here, so the file is byte-reproducible.
 ///
-/// Header format is fixed by `logan_path_walker.py:380`:
+/// Header format is part of the output contract (downstream parsers, `bench/golden/`):
 /// `>{id} cov={cov:.3f} pident={pident:.1f} nodes={n}`, sequence on a single line.
 ///
 /// The identity key is `pident=` when it was measured on this haplotype's own alignment and
@@ -97,7 +98,7 @@ pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
 
 /// Recovered second alleles, one record per biallelic site.
 ///
-/// Deliberately a **separate file** from `reconstructed.fasta`. `build_walker_codon_msa.py`
+/// Deliberately a **separate file** from `reconstructed.fasta`. `disassembler msa`
 /// feeds that one straight into MAFFT, FastTree and HyPhy, and every sequence there becomes
 /// an independent taxon. Two records from one sample are not two independent observations,
 /// and HyPhy has no way to express "this one is 31% of that sample", so folding these in
@@ -150,9 +151,8 @@ pub fn write_alts(summary: &Summary, path: &Path) -> Result<()> {
 
 /// Full per-bubble detail: fork, merge, and every branch with orientation, coverage and VAF.
 ///
-/// This file has no Python counterpart. There, `phase_superbubbles` computes all of this and
-/// then `logan_path_walker.py:317` keeps only `len(bubbles)`, so a reported quasispecies
-/// figure cannot be checked by anyone. See `docs/issue_intra_accession_variance_lost.md`.
+/// With only a bubble count, a reported quasispecies figure could not be checked by anyone.
+/// See `docs/issue_intra_accession_variance_lost.md`.
 pub fn write_bubbles(summary: &Summary, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -290,11 +290,8 @@ fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<(
 
 /// Per-accession counts and stage timings.
 ///
-/// Top-level shape matches `logan_path_walker.py:412`, as do the per-result field names, so
-/// the two files can be diffed directly. The `timing` block deliberately does not: Python
-/// reports `stream`/`blast`/`subgraph`/`walk`, which do not map one to one onto the seven
-/// stages here. `blast` corresponds to `anchor`, and Python's `subgraph` spans what is split
-/// here into `parse` and `extract`.
+/// The top-level shape and the per-result field names are kept stable, so summaries can be
+/// diffed directly.
 pub fn write_summary(summary: &Summary, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {

@@ -30,7 +30,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Build the GraphAligner command line. Mirrors `logan_path_walker.py:174-177` exactly.
+/// Build the GraphAligner command line. These are the arguments the `bench/golden/` fixtures
+/// were captured with, so a change here can move the output.
 ///
 /// `query_fa` is the FASTA to align: the temp `.fa` that `run` writes next to the GAF, never
 /// the user's file itself; see `run` for why.
@@ -50,8 +51,8 @@ pub fn command(bin: &Path, cfg: &Config, subgraph: &Subgraph, query_fa: &Path, g
 }
 
 /// Resolve the binary, preferring an explicit path then `PATH`.
-/// Mirrors `find_bin` at `logan_path_walker.py:36-43`, but fails loudly instead of returning
-/// the bare name and letting the spawn produce a confusing "No such file or directory".
+/// Fails loudly instead of returning the bare name and letting the spawn produce a confusing
+/// "No such file or directory".
 pub fn resolve_binary(cfg: &Config) -> Result<PathBuf> {
     let name = &cfg.graphaligner_bin;
     let candidate = Path::new(name);
@@ -85,9 +86,8 @@ pub fn resolve_binary(cfg: &Config) -> Result<PathBuf> {
 ///
 /// Returns `Ok(HashMap::new())` when the tool ran cleanly but found no alignment against any
 /// reference — the caller reads that as `Outcome::NoPath`. A crash is an `Err`, never folded
-/// into that case: an empty GFA makes GraphAligner abort with SIGABRT, and in the Python
-/// walker that exception is caught per accession at `:392` so the process still exits 0
-/// having reconstructed nothing.
+/// into that case: an empty GFA makes GraphAligner abort with SIGABRT, and folding that into
+/// no-path would let the process exit 0 having reconstructed nothing.
 ///
 /// A nodeless subgraph short-circuits before spawning, since handing GraphAligner an empty
 /// graph is a known abort rather than a question worth asking.
@@ -289,8 +289,7 @@ pub fn parse_gaf_multi(
 /// Parse the GAF GraphAligner emits and return the best alignment.
 ///
 /// Column 6 is the path, e.g. `>860013>579233<27101`. The best row is the one with the most
-/// residue matches (column 10), chosen with a stable sort so ties keep file order, matching
-/// `logan_path_walker.py:193`.
+/// residue matches (column 10), chosen with a stable sort so ties keep file order.
 pub fn parse_gaf(gaf_bytes: &[u8], expect: &str) -> Result<Option<GafPath>> {
     let text = std::str::from_utf8(gaf_bytes)
         .map_err(|e| Error::Usage(format!("GAF is not valid UTF-8: {e}")))?;
@@ -427,7 +426,7 @@ mod tests {
         assert_eq!(g.steps[0].node, 2);
     }
 
-    /// Ties keep file order, matching Python's stable `sorted(..., reverse=True)`.
+    /// Ties keep file order: the sort is stable.
     #[test]
     fn ties_keep_file_order() {
         let gaf = "q\t10\t0\t10\t+\t>7\t10\t0\t10\t500\t600\t60\n\

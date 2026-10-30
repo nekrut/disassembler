@@ -1,8 +1,7 @@
 """reconstruct: accessions + query CDS -> haplotypes -> (sieve, opt) -> codon MSA + tree.
 
-Composite: walker -> sieve (optional) -> msa. Equivalent to the old
-`python/disassemble.py`. Anything after a literal `--` is passed straight through
-to logan-walker.
+Composite: walker -> sieve (optional) -> msa. Anything after a literal `--` is
+passed straight through to logan-walker.
 """
 
 from __future__ import annotations

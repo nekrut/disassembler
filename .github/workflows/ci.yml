@@ -48,8 +48,6 @@ jobs:
           python-version: "3.11"
       - name: Install disassembler (editable)
         run: pip install -e .
-      # Skips cleanly when `requests` is absent, which it is on this runner: the module
-      # imports it at scope. Runs for real wherever the harvester's deps are installed.
       - name: Run lexicmap tests
         run: python3 tests/test_lexicmap.py
       - name: Run harvest tests

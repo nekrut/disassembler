@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 /// Read accessions, one per line. Blank lines and `#` comments are skipped.
 ///
-/// Duplicates are kept, not collapsed, to match `logan_path_walker.py:352-354`. They are
-/// counted and reported, because each duplicate costs a full download.
+/// Duplicates are kept, not collapsed, because collapsing them would change the output
+/// record set. They are counted and reported, because each duplicate costs a full download.
 ///
 /// Note the shipped lists carry duds: `DRR000252`, `DRR028850`, `DRR028861`, `DRR006432`
 /// and `DRR006471` all fail to reconstruct. Reconstruction yield and throughput are
@@ -24,8 +24,7 @@ pub fn read_accession_list(path: &Path) -> Result<Vec<Accession>> {
     let mut out = Vec::new();
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
-        // Python tests `startswith("#")` on the untrimmed line. Trimming first is more
-        // forgiving and treats an indented comment as a comment.
+        // Trimming first is forgiving and treats an indented comment as a comment.
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -83,11 +82,10 @@ pub fn validate_accession(s: &str, source: &str) -> Result<()> {
 
 /// Read the reference CDS.
 ///
-/// Takes the first record, matching `logan_path_walker.py:183`
-/// (`next(SeqIO.parse(query_fa, "fasta"))`), but unlike Python it says so out loud when
-/// there are more. A multi-record query is a real hazard here: the Galaxy kmindex and
-/// LexicMap wrappers silently use only the first sequence too (tools-iuc #8388), so a
-/// multi-FASTA query produces results for one gene while looking like it covered several.
+/// Takes the first record, and says so out loud when there are more. A multi-record query
+/// is a real hazard here: the Galaxy kmindex and LexicMap wrappers silently use only the
+/// first sequence too (tools-iuc #8388), so a multi-FASTA query produces results for one
+/// gene while looking like it covered several.
 ///
 /// The sequence is uppercased and stripped of whitespace, so downstream k-mer code needs
 /// no case folding.
@@ -149,8 +147,8 @@ pub fn read_query(path: &Path) -> Result<Query> {
     }
 
     // Everything downstream is codon-based, so a frame violation matters. Warn rather than
-    // reject: the walker itself is frame-agnostic, and it is build_walker_codon_msa.py that
-    // ultimately depends on this.
+    // reject: the walker itself is frame-agnostic, and it is the codon MSA (`disassembler
+    // msa`) that ultimately depends on this.
     if seq.len() % 3 != 0 {
         eprintln!(
             "[warn] {}: length {} is not a multiple of 3; codon analysis downstream expects a CDS",
@@ -320,7 +318,7 @@ mod tests {
         std::fs::remove_file(p).ok();
     }
 
-    /// Duplicates are kept, matching Python, because collapsing them would change the
+    /// Duplicates are kept, because collapsing them would change the
     /// output record set. They are only warned about.
     #[test]
     fn keeps_duplicates() {
@@ -359,8 +357,8 @@ mod tests {
         std::fs::remove_file(p).ok();
     }
 
-    /// The summary filename is derived from the file stem in Python
-    /// (`logan_path_walker.py:410`), so `name` must be the stem, not the record id.
+    /// The summary filename is derived from the file stem, so `name` must be the stem, not
+    /// the record id.
     #[test]
     fn name_is_the_file_stem_not_the_record_id() {
         let p = tmp("query_hiv1_pol.fasta", b">pol\nACGTAC\n");

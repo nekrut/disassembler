@@ -1,16 +1,14 @@
 disassembler
-=============
-
-This repository is a decoupled extraction of the Logan cDBG path-walking
-component from https://github.com/nekrut/logan-hypyaeon.
+============
 
 The native Rust walker (walker/) and the intra-accession haplotype-recovery
-work originate from logan-hypyaeon PR #4 ("Haplotype recovery"), authored by
-Andrew (@as042), which built on the PR #3 Rust port. The reference Python
-prototype (the now-removed `logan_path_walker.py`) and the design/measurement documents
-under docs/ likewise originate from that project.
+method were written by Andrew (@as042), building on an earlier Rust port
+of a Python prototype path walker. Both were developed in an earlier
+repository; their history was squashed into a single import commit here, and the
+design and measurement record that matters for users is kept under docs/
+(see docs/issue_intra_accession_variance_lost.md and
+docs/issue_graphaligner_end_clipping.md).
 
-The upstream history was squashed into a single import commit here. Original
-authorship and the full investigation record are preserved in the upstream
-repository and in docs/ (see docs/upstream_pr4_description.md,
-docs/issue_intra_accession_variance_lost.md, docs/rust_walker_as_built.md).
+The k-mer diversity sieve under extern/kmer-diversity-sieve is a separate project,
+https://github.com/stevenweaver/kmer-diversity-sieve, included as a git submodule
+under its own license.

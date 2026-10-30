@@ -1,5 +1,6 @@
 # Toolchain for the walker's external binaries and the downstream codon MSA / tree step.
-# Rust itself is not here — install via rustup (https://rustup.rs) and build walker/ with cargo.
+# Rust itself is not here: install it via rustup (https://rustup.rs) and build walker/ with cargo.
+# For a packaged install instead, see docs/packaging.md (conda install -c bioconda disassembler).
 #
 #   conda env create -f environment.yml    # or: mamba env create -f environment.yml
 #   conda activate disassembler
@@ -24,7 +25,7 @@ dependencies:
   - blast=2.16.0
   - zstd=1.5.6
   - python=3.12
-  # Python deps for the reference walker, codon builder, and benchmark harness.
+  # Python deps for the disassembler package and the benchmark scripts.
   - biopython
   - requests
   - zstandard

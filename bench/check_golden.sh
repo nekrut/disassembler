@@ -20,10 +20,9 @@
 # whole graph, so its unpruned route depends on the anchoring implementation and on the
 # GraphAligner version (1.0.17b and 1.0.20 take different routes), and GraphAligner is not
 # deterministic on a graph that size with more than one thread. It is therefore not
-# byte-reproducible across implementations. See
-# docs/rust_walker_as_built.md section 7 and docs/issue_intra_accession_variance_lost.md
-# section 15. Its primary is stabilised by the default pruning, which this old-behaviour gate
-# turns off on purpose.
+# byte-reproducible across implementations. See the Reproducibility section of docs/walker.md
+# and docs/issue_intra_accession_variance_lost.md. Its primary is stabilised by the default
+# pruning, which this old-behaviour gate turns off on purpose.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.."; pwd)"
 WALKER="${LOGAN_WALKER_BIN:-$ROOT/walker/target/release/logan-walker}"

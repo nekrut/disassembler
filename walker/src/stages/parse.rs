@@ -1,9 +1,8 @@
 //! Step 2: single streaming pass over the unitig file.
 //!
-//! Replaces the first pass of `logan_path_walker.py:108-126`, which builds three unbounded
-//! dicts keyed by every unitig in the accession before the anchors are consulted at all
-//! (`:128`). That is the memory defect behind the 21.3 GB out-of-memory event: measured
-//! ~700 bytes per unitig, against ~114 bytes on disk.
+//! Builds a compact CSR rather than unbounded dicts keyed by every unitig in the accession
+//! before the anchors are consulted at all. Those dicts were the memory defect behind the
+//! 21.3 GB out-of-memory event: measured ~700 bytes per unitig, against ~114 bytes on disk.
 //!
 //! A record looks like:
 //!
@@ -14,19 +13,17 @@
 //!
 //! `L:` tokens reference the bare integer id, not the accession-prefixed one. Edges are
 //! bidirected and each edge appears in *both* endpoints' headers, which is what the strand
-//! bits are for. Dropping them is what makes `phase_superbubbles` mistake one edge read
-//! twice for a reconvergence.
+//! bits are for. Dropping them is what makes bubble detection mistake one edge read twice
+//! for a reconvergence.
 //!
 //! # Why everything happens in this one pass
 //!
-//! The Python walker traverses the file three times (count at `:62-67`, index at `:108`,
-//! sequences at `:138`). Here adjacency, abundance and 2-bit sequences are all extracted
-//! while the bytes stream past, so the decompressed text is never held and the file is
-//! decoded exactly once. Sequences cost 17.2 MB packed for `ERR2028820`, which is far
-//! cheaper than either holding 145 MB of text or decoding a second time later.
+//! One pass, not three (count, index, sequences): adjacency, abundance and 2-bit sequences
+//! are all extracted while the bytes stream past, so the decompressed text is never held
+//! and the file is decoded exactly once. Sequences cost 17.2 MB packed for `ERR2028820`,
+//! which is far cheaper than either holding 145 MB of text or decoding a second time later.
 //!
-//! No regex. The Python parser is already regex-free; the cost there is the data structure
-//! and the interpreter, not the tokenizer.
+//! No regex. The cost of parsing this format is the data structure, not the tokenizer.
 //!
 //! IN   accession, streaming zstd decoder
 //! OUT  UnitigGraph (~43 MB for 1.28M unitigs)

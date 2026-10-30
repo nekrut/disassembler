@@ -46,15 +46,15 @@
 //! # Why two pools and not one
 //!
 //! Fetch is bandwidth-bound and saturates around 8 concurrent streams at 17.4 MB/s.
-//! Compute is CPU-bound and wants one worker per core. `logan_path_walker.py` conflates
-//! them behind a single `--workers`, which is part of why `--workers 16` was so
-//! destructive: it multiplied memory 16x while buying no extra bandwidth.
+//! Compute is CPU-bound and wants one worker per core. Conflating them behind a single
+//! `--workers` makes `--workers 16` destructive: it multiplies memory 16x while buying no
+//! extra bandwidth.
 //!
 //! # Why the channel is bounded, and what the bound actually is
 //!
 //! Fetch threads block once the queue is full, so a fast network cannot outrun slow compute
-//! and pile up buffers without limit. The Python `ThreadPoolExecutor` had no such limit,
-//! which is how a single run reached 21.3 GB and took the machine down with it.
+//! and pile up buffers without limit. An unbounded thread pool has no such limit, which is
+//! how a single run reached 21.3 GB and took the machine down with it.
 //!
 //! This file used to claim the ceiling was "capacity times the largest retained buffer".
 //! **That is wrong, by a factor of five at the defaults.** A compressed buffer is resident in
@@ -251,9 +251,9 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
         drop(result_tx);
 
         // ---- collector (this thread) ------------------------------------
-        // Report each accession as it lands. The Python walker prints a per-accession line
-        // and so must this: a run that quietly reconstructs nothing looks identical to a
-        // successful one otherwise, which is exactly how the int/str regression hid.
+        // Report each accession as it lands, one line each: a run that quietly reconstructs
+        // nothing looks identical to a successful one otherwise, which is exactly how the
+        // int/str regression hid.
         let mut done = 0usize;
         result_rx
             .into_iter()
@@ -264,8 +264,8 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
             .collect::<Vec<_>>()
     });
 
-    // Progress is reported as each accession lands, which is what the Python walker did and
-    // what makes a stalled run visible. The *stored* order is the input order, so every
+    // Progress is reported as each accession lands, which is what makes a stalled run
+    // visible. The *stored* order is the input order, so every
     // output file is byte-reproducible across runs and `--sieve`'s representative is chosen
     // by the list the user supplied rather than by which S3 fetch happened to win.
     let mut results = results;
@@ -282,7 +282,7 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
     })
 }
 
-/// One line per finished accession, mirroring `logan_path_walker.py:386-390`.
+/// One line per finished accession.
 fn report(done: usize, total: usize, r: &AccessionResult) {
     match r.outcome {
         Outcome::Success => {
@@ -475,7 +475,7 @@ fn run_one(
     let subgraph_nodes = subgraph.nodes.len();
 
     // phase does not depend on the GAF, so it is computed regardless of whether a path was
-    // found. This differs from Python, where a no_path accession reports no bubbles.
+    // found, and a no_path accession still reports its bubbles.
     let t = Instant::now();
     let bubbles = stages::phase::phase(cfg, &graph, &subgraph)?;
     timing.phase = t.elapsed().as_secs_f64();
@@ -747,7 +747,7 @@ fn run_one(
     timing.stitch += t.elapsed().as_secs_f64();
     timing.total = t_start.elapsed().as_secs_f64();
 
-    // Matches `logan_path_walker.py:312`: a path that failed the coverage gate is no_path.
+    // A path that failed the coverage gate is no_path.
     let haplotype = haplotypes.first().cloned();
     let outcome = if !haplotypes.is_empty() {
         Outcome::Success
@@ -782,7 +782,7 @@ mod ordering_tests {
     /// `--sieve`'s representative is the first record of the *input*, not of a race.
     #[test]
     fn sorting_on_index_restores_input_order() {
-        // The measured completion order from the nine-accession Zika run in the review.
+        // The measured completion order from a nine-accession Zika run.
         let input = [
             "SRR6251963", "SRR6251966", "SRR6251967", "SRR6251969", "SRR6251973",
             "SRR6251979", "SRR6251984", "SRR6251992", "SRR6251993",
