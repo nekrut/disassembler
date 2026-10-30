@@ -29,7 +29,7 @@ src/disassembler/         Python package; `disassembler <sub>` dispatches to:
   cmd/msa.py                reference-guided in-frame codon MSA + FastTree
   cmd/pipe_reconstruct.py   composite: walker -> (sieve) -> msa
   cmd/pipe_from_kmindex.py  composite: harvest -> stratify -> reconstruct
-  cmd/pipe_from_lexicmap.py composite: lexicmap -> (sieve) -> msa
+  cmd/pipe_from_lexicmap.py composite: lexicmap -> (sieve) -> msa (msa is a no-op on strict clean-cohort output; see §lexicmap)
 extern/                   git submodules: kmer-diversity-sieve
 queries/                  reference coding sequences (pfcrt, hiv1_pol, 26 markers, master panel)
 bench/                    golden fixtures, check_golden.sh concordance gate, k-mer sensitivity sims
@@ -390,6 +390,19 @@ disassembler from-lexicmap \
     -f /data/hiv1_pol_lexicmap.tsv.gz \
     -o out/hiv1_pol --sieve
 ```
+
+> **Note on the MSA step.** `disassembler lexicmap` already emits a reference-coordinate MSA
+> (`<prefix>.clean.msa.fasta`, `<prefix>.clean.accessions.fasta`, `<prefix>.clean.a2m`): every
+> row is the reference length, with no gaps and no Ns, because the clean cohort gates only pass
+> accessions whose tiled sequence sits on the reference grid without an insertion. Re-running
+> MAFFT on three real cohorts (c-auris `erg11` collapsed and uncollapsed, SARS-CoV-2 spike
+> collapsed; 27 to 14,594 sequences) reproduced the lexicmap output byte-for-byte, every row and
+> every column. So the MSA stage of `disassembler from-lexicmap` is a no-op on strict clean-cohort
+> data; it is kept in the composite so a user who writes one downstream script against
+> `disassembler from-...` gets a consistent codon MSA + Newick tree shape regardless of whether
+> they came in through the walker route (where MAFFT does real work on per-accession
+> reconstructions) or the LexicMap route. For a LexicMap-only run, feeding the clean MSA directly
+> to a tree builder (or using the sieved MSA for figures) is equivalent and faster.
 
 ### Outputs Generated
 

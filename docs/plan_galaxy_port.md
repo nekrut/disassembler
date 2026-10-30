@@ -1,6 +1,6 @@
 # Plan: port disassembler to Galaxy
 
-Status (2026-10-17): the six Galaxy tool wrappers are drafted and pass their tests locally (section 2). The Bioconda packages (section 1) and the `.ga` workflows (section 3) are not built yet. Section 5 tracks what is left.
+Status (2026-10-27): the three Bioconda packages (section 1) are published at `0.1.0`, and the six Galaxy tool wrappers (section 2) pass all fifteen planemo tests against those real packages. The `.ga` workflows (section 3) are not built yet. Section 5 tracks what is left.
 
 Goal: expose the disassembler suite as a set of Galaxy tools and workflows so a user can go from a kmindex planetary query (or a LexicMap tabular search) to a codon MSA and tree without leaving Galaxy. This document is the port's shopping list: the Bioconda packages that have to exist, the Galaxy tools that wrap them, and the knobs each tool exposes.
 
@@ -104,7 +104,7 @@ Six tools cover both arms of the workflow. One existing subcommand (`fetch`) doe
 
 Convention used below: "exposed" means the flag appears in the tool XML as a user-visible param. "Not exposed" means the wrapper sets it from Galaxy context, hardcodes it, or omits it entirely.
 
-The wrappers are drafted in a fork of `galaxyproject/tools-iuc` (`as042/tools-iuc`, branch `disassembler`, directory `tools/disassembler/`), which is where they will be submitted. They share a `macros.xml` and publish as a Tool Shed suite (`suite_disassembler`). Fifteen planemo tests pass on Galaxy 25.1 against the working tree. They have not run against real Bioconda packages, which do not exist yet. The walker tests stream about 2 MB from the public Logan bucket, so they need network access. Every Python tool's version command is `disassembler --version`; the walker's is `logan-walker --version`.
+The wrappers are drafted in a fork of `galaxyproject/tools-iuc` (`as042/tools-iuc`, branch `disassembler`, directory `tools/disassembler/`), which is where they will be submitted. They share a `macros.xml` and publish as a Tool Shed suite (`suite_disassembler`). Fifteen planemo tests pass on Galaxy 25.1 with `--conda_dependency_resolution` against the published `disassembler 0.1.0` and `logan-walker 0.1.0` Bioconda packages. The walker tests stream about 2 MB from the public Logan bucket, so they need network access. Every Python tool's version command is `disassembler --version`; the walker's is `logan-walker --version`. The MSA tool overrides the `disassembler` package's unpinned MAFFT run-dep with `mafft=7.526` and `fasttree=2.2.0`, because MAFFT 7.525 segfaults on the `--add` reference-anchoring path and the Bioconda recipe did not pin a floor; the override lives in a `msa_requirements` macro and tracks what `environment.yml` has always tested under.
 
 ### 2.1 `disassembler_harvest`
 
@@ -370,7 +370,7 @@ A reasonable sequence; none of the steps block the next past where noted. The qu
 3. **Done: `graphaligner ==1.0.17b`** (section 4). `bench/golden/` was recaptured under it on 2026-10-18 (the gated fixtures gained their final base, and the gate now fails under 1.0.20), and `environment.yml` and the CI golden job were switched from 1.0.20.
 4. `nekrut/disassembler` is public (done 2026-10-18), so Bioconda can download it. Tag `logan-walker 0.1.0` (tag `logan-walker-v0.1.0`) from a commit that includes the section 1.7 changes and step 3. Recipe drafted 2026-10-18 with `graphaligner ==1.0.17b`; its source checksum is filled in once the tag exists. **Blocks steps 5 and 6.**
 5. Tag `disassembler 0.1.0` (tag `v0.1.0`), from the same commit. Recipe drafted 2026-10-18; its checksum is also filled in once the tag exists. Submit it in one Bioconda PR with the step 2 and step 4 recipes, so they build in dependency order.
-6. **Drafted.** The six tool XMLs are in `as042/tools-iuc`, branch `disassembler`, `tools/disassembler/` (section 2). Remaining: change the requirement versions if the tags from steps 4 and 5 differ from `0.1.0`, add authors to the suite's citation, and re-run `planemo test` with normal dependency resolution once the packages from steps 2, 4 and 5 exist. Decomposing `msa` (section 4) is a later follow-up.
+6. **Done.** The six tool XMLs are in `as042/tools-iuc`, branch `disassembler`, `tools/disassembler/` (section 2). All fifteen planemo tests pass with `--conda_dependency_resolution` against the real Bioconda `disassembler 0.1.0` and `logan-walker 0.1.0` packages. The MSA wrapper's `mafft`/`fasttree` pin (section 2) was added at the same time. Remaining before submission to tools-iuc: add authors to the suite's citation. Decomposing `msa` (section 4) is a later follow-up. Also follow-up (not blocking): tighten the Bioconda `disassembler` recipe to pin `mafft >=7.526` so a stock install no longer picks up the 7.525 `--add` segfault.
 7. Author the three `.ga` workflow files, wiring the disassembler tools together with IUC `mafft`, IUC `fasttree`, and (per section 4) `bcftools merge` where appropriate.
 8. Submit tools and workflows to the IUC (`tools-iuc`) and IWC (`iwc`) repositories respectively, following their house styles.
 

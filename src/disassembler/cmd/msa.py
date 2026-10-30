@@ -74,13 +74,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "msa",
         help="Codon MSA + FastTree GTR phylogeny from reconstructed haplotypes.",
         description=(
-            "MAFFT --keeplength --addfragments against the reference CDS, then FastTree GTR."
+            "MAFFT --keeplength --addfragments against the reference CDS, then FastTree GTR. "
+            "Intended for walker output, which is per-accession reconstructions in their own "
+            "coordinates. On strict clean-cohort lexicmap output the MAFFT pass is a no-op "
+            "(every row is already reference-length and reproduces byte-for-byte), so a "
+            "LexicMap-only pipeline can skip this subcommand and feed .clean.msa.fasta "
+            "straight to the tree builder of choice."
         ),
     )
     p.add_argument("--ref", "-r", required=True, help="Reference in-frame CDS FASTA")
     p.add_argument(
         "--input", "-i", required=True,
-        help="Reconstructed haplotypes FASTA (walker output)",
+        help="Reconstructed haplotypes FASTA (walker output), or any ref-length clean "
+             "lexicmap cohort FASTA. See the subcommand description.",
     )
     p.add_argument("--out-aln", "-a", required=True, help="Output codon MSA FASTA")
     p.add_argument("--out-tree", "-t", required=True, help="Output Newick tree")

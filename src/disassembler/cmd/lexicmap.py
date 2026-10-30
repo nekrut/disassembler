@@ -48,6 +48,16 @@ Outputs generated:
   - <out-prefix>.summary.json                (quantiles, cohort breakdown, multi-HSP rescue counts)
   - <out-prefix>.clean.a2m                   (A2M formatted MSA for protein language models / EVcouplings)
 
+Note on the FASTA/MSA outputs:
+  Clean full-length tiling drops any HSP block that would need an insertion relative to the
+  reference, so every row in .clean.msa.fasta, .clean.accessions.fasta and .clean.a2m is the
+  reference length, with no gaps and no Ns. That makes these files already a reference-coordinate
+  MSA, not an unaligned FASTA. Re-running MAFFT --auto on three real cohorts (c-auris erg11
+  collapsed and uncollapsed, SARS-CoV-2 spike collapsed; 27 to 14,594 sequences) reproduced the
+  lexicmap output byte-for-byte, every row and every column, so `disassembler msa` is a no-op on
+  this output. The composite `disassembler from-lexicmap` still runs it, for parity with the
+  walker route; a LexicMap-only pipeline can feed .clean.msa.fasta straight to a tree builder.
+
 Examples:
   # Stream directly from a Galaxy dataset ID over HTTP:
   python/lexicmap_streamer.py \\
