@@ -17,15 +17,21 @@ Core capabilities:
      Translates in-frame CDS (NCBI Code 11 or Standard), detects premature internal stop
      codons (e.g. Sanger am3 amber mutants, sequencing errors, or out-of-frame projections),
      and audits exact codon coordinates.
-  3. Four-tier cohort partitioning:
-     - Tier 1: Clean Full-Length (coverage >= min_coverage, 0 premature stops)
-     - Tier 2: Clean Partial (min_coverage_partial <= coverage < min_coverage, 0 stops)
+  3. Cohort partitioning (tiers numbered as written to the ledger):
+     - Tier 1: Clean Full-Length (coverage >= min_coverage, 0 premature stops, no frameshift)
+     - Tier 2: Clean Partial (min_coverage_partial <= coverage < min_coverage, same rules)
+     - Tier 5: Flagged Frameshift (reading frame shifted for >= FRAMESHIFT_MIN_SPAN bases)
      - Tier 3: Flagged Premature Stops (stops > max_stops)
      - Tier 4: Low-Coverage Fragments (coverage < min_coverage_partial)
+     Indels are read from the aligned qseq/sseq. In-frame deletions stay in the row as '-' and
+     count as covered; insertions have no column, so they are recorded instead (ledger, FASTA
+     headers, haplotype table). Indels within INDEL_EDGE_WINDOW bases of an HSP end are
+     reported but not trusted.
   4. Online haplotype collapser:
      Collapses clean full-length sequences without holding the input, calls nucleotide and
      amino acid mutations, classifies mutation impact (WT, WT_partial, Synonymous, Missense,
-     Nonsense), and outputs clean MSAs, mutation frequency tables, and complete cohort ledgers.
+     Nonsense, InFrameIndel, Frameshift), and outputs clean MSAs, mutation frequency tables,
+     and complete cohort ledgers. A haplotype is its row plus its trusted indels.
 
      Memory is O(distinct clean full-length haplotypes), NOT O(1): `clean_full_haps`,
      `clean_full_pident_sum` and `clean_full_samples` are keyed by the full merged sequence,
@@ -51,10 +57,11 @@ Outputs generated:
 Note on the FASTA/MSA outputs:
   Every row is projected onto the reference grid, so .clean.msa.fasta, .clean.accessions.fasta
   and .clean.a2m are already column-aligned, reference-length files. Reference positions no HSP
-  covers, or that an HSP aligns to a gap, are written as '-': with the default --min-cov 0.80 a
-  clean row can be up to 20% '-'. Under --require-full-length, clean rows are gap-free, and
-  re-running MAFFT on three such cohorts (27 to 14,594 sequences) reproduced them byte for byte.
-  See docs/lexicmap.md.
+  covers, or that the sample deletes, are written as '-': with the default --min-cov 0.80 a
+  clean row can be up to 20% '-' plus its deletions. Under --require-full-length the only '-'
+  in a clean row are in-frame deletions; on three cohorts without any, re-running MAFFT
+  reproduced the rows byte for byte. Insertions have no column; they are listed in the ledger,
+  the FASTA headers and the haplotype table instead. See docs/lexicmap.md.
 
 Examples:
   # Stream directly from a Galaxy dataset ID over HTTP:
@@ -83,9 +90,11 @@ import math
 import json
 import time
 import argparse
+import bisect
 import urllib.request
 from pathlib import Path
 from collections import Counter, defaultdict
+from typing import NamedTuple
 
 from disassembler.validators import (
     fraction,
@@ -253,17 +262,68 @@ def resolve_dataset_state(dataset_id: str, base_url: str = "https://usegalaxy.or
     except Exception:
         return None
 
-def merge_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverage: float):
+# An indel this close to either end of its HSP is not trusted. LexicMap can close an alignment
+# with a forced gap a few bases from where the contig or the extension stops: on the C. auris
+# ERG11 panel, three runs from three studies share a 1-nt insertion 3 aligned bases from the start
+# of their HSP. Such an indel is still reported (marked "(edge)"), but it never sends an accession
+# to the frameshift tier, never counts as covered, and never splits a haplotype.
+INDEL_EDGE_WINDOW = 10
+
+# A shift of the reading frame counts as a frameshift only if it lasts this many reference bases,
+# or never ends. Indels that cancel each other sooner (net length a multiple of 3) are usually how
+# an aligner writes a divergent stretch: on H. pylori babA, sabA and vacA most such clusters close
+# within 5-20 bases, while real frameshifts (long-read homopolymer deletions in C. auris, the oipA
+# phase-variation repeat) stay shifted for hundreds of bases or to the end of the gene.
+FRAMESHIFT_MIN_SPAN = 30
+
+
+class Indel(NamedTuple):
+    """One insertion or deletion in the sample, relative to the reference."""
+    kind: str    # "ins" or "del"
+    pos: int     # 0-based: a deletion starts here; an insertion sits between pos-1 and pos
+    length: int
+    bases: str   # inserted bases, or the reference bases deleted
+    edge: bool   # within INDEL_EDGE_WINDOW aligned bases of its HSP's end
+
+    def notation(self) -> str:
+        """1-based, HGVS-like: `685_686insT`, `2316_2321del`, `709del`."""
+        if self.kind == "ins":
+            s = f"{self.pos}_{self.pos + 1}ins{self.bases}"
+        elif self.length == 1:
+            s = f"{self.pos + 1}del"
+        else:
+            s = f"{self.pos + 1}_{self.pos + self.length}del"
+        return s + "(edge)" if self.edge else s
+
+
+class Tiling(NamedTuple):
+    seq: str             # reference-length row; '-' where no base was placed
+    covered: int         # positions carrying a base, plus positions of trusted deletions
+    mean_pident: float   # over the positions carrying a base
+    single_ge_min_cov: bool
+    single_full: bool
+    indels: list         # Indel, in reference order
+
+
+def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverage: float) -> Tiling:
     """
-    Merges all qualifying HSPs of an accession onto the reference coordinate system.
+    Tiles all qualifying HSPs of an accession onto the reference coordinate system.
     Overlapping positions between HSPs are resolved by selecting the base from
-    the HSP with higher pident.
+    the HSP with higher pident (the first HSP wins a tie).
+
+    Indels are read from the aligned qseq/sseq: a run of '-' in qseq is an insertion in the
+    sample (its bases have no reference position, so they are left out of `seq`), and a run of
+    '-' in sseq is a deletion (written into `seq` as '-'). An indel is kept only when its own HSP
+    supplied the positions it affects: both flanks of an insertion, every position of a
+    deletion. Otherwise another HSP's bases are what the row shows there.
     """
-    grid = [None] * ref_len
+    grid = [None] * ref_len   # (base, pident, index of the HSP that supplied it)
+    spans = {}                # HSP index -> (first query position, one past the last)
+    raw = []                  # (HSP index, kind, pos, length, bases)
     single_ge_min_cov = False
     single_full = False
 
-    for pident, qcov, qstart, qend, qseq, sseq in hsps:
+    for k, (pident, qcov, qstart, qend, qseq, sseq) in enumerate(hsps):
         if pident < min_pident:
             continue
         if qcov >= (min_coverage * 100.0):
@@ -272,23 +332,155 @@ def merge_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_covera
             single_full = True
 
         q_pos = qstart - 1
-        for qc, sc in zip(qseq, sseq):
-            if qc != '-':
+        if '-' not in qseq and '-' not in sseq:
+            # Most HSPs carry no gap at all; skip the indel bookkeeping for them.
+            for sc in sseq:
                 if 0 <= q_pos < ref_len:
                     ex = grid[q_pos]
                     if ex is None or pident > ex[1]:
-                        grid[q_pos] = (sc.upper(), pident)
+                        grid[q_pos] = (sc.upper(), pident, k)
                 q_pos += 1
+            spans[k] = (qstart - 1, q_pos)
+            continue
+        ins, dele, del_start = [], [], 0
+        for qc, sc in zip(qseq, sseq):
+            if qc == '-':
+                if dele:
+                    raw.append((k, "del", del_start, len(dele), "".join(dele).upper()))
+                    dele = []
+                ins.append(sc)
+                continue
+            if ins:
+                raw.append((k, "ins", q_pos, len(ins), "".join(ins).upper()))
+                ins = []
+            if sc == '-':
+                if not dele:
+                    del_start = q_pos
+                dele.append(qc)
+            elif dele:
+                raw.append((k, "del", del_start, len(dele), "".join(dele).upper()))
+                dele = []
+            if 0 <= q_pos < ref_len:
+                ex = grid[q_pos]
+                if ex is None or pident > ex[1]:
+                    grid[q_pos] = (sc.upper(), pident, k)
+            q_pos += 1
+        if dele:
+            raw.append((k, "del", del_start, len(dele), "".join(dele).upper()))
+        if ins:
+            raw.append((k, "ins", q_pos, len(ins), "".join(ins).upper()))
+        spans[k] = (qstart - 1, q_pos)
 
-    # Mean identity over the positions that actually carry a subject base. The numerator must
-    # use the same non-gap positions as `covered_bases`; summing pident over gap positions too
-    # (subject deletions, where x[0] == '-') inflates the mean and can push it above 100%.
-    covered = [x for x in grid if x is not None and x[0] != '-']
-    covered_bases = len(covered)
-    mean_pid = (sum(x[1] for x in covered) / covered_bases) if covered_bases > 0 else 0.0
+    def supplied_by(p, k):
+        return 0 <= p < ref_len and grid[p] is not None and grid[p][2] == k
+
+    indels = []
+    for k, kind, pos, length, bases in raw:
+        first, end = spans[k]
+        if kind == "ins":
+            owned = supplied_by(pos - 1, k) and supplied_by(pos, k)
+            margin = min(pos - first, end - pos)
+        else:
+            owned = all(supplied_by(p, k) for p in range(pos, pos + length))
+            margin = min(pos - first, end - (pos + length))
+        if owned:
+            indels.append(Indel(kind, pos, length, bases, margin < INDEL_EDGE_WINDOW))
+    indels.sort(key=lambda e: e.pos)
+
+    # Mean identity over the positions that actually carry a subject base. Summing pident over
+    # gap positions too (subject deletions, where x[0] == '-') inflates the mean and can push it
+    # above 100%.
+    based = [x for x in grid if x is not None and x[0] != '-']
+    mean_pid = (sum(x[1] for x in based) / len(based)) if based else 0.0
+    # A trusted deletion is a stretch of the reference the sample aligned across and lacks; it
+    # counts as covered, so --require-full-length does not reject an accession for carrying one.
+    covered = len(based) + sum(e.length for e in indels if e.kind == "del" and not e.edge)
     merged_seq = "".join(grid[i][0] if grid[i] is not None else '-' for i in range(ref_len))
 
-    return merged_seq, covered_bases, mean_pid, single_ge_min_cov, single_full
+    return Tiling(merged_seq, covered, mean_pid, single_ge_min_cov, single_full, indels)
+
+
+def merge_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverage: float):
+    """`tile_accession_hsps` without the indel record. Returns the row, the number of positions
+    carrying a base (deletions not counted), the mean identity, and the two single-HSP flags."""
+    t = tile_accession_hsps(hsps, ref_len, min_pident, min_coverage)
+    based = sum(1 for c in t.seq if c != '-')
+    return t.seq, based, t.mean_pident, t.single_ge_min_cov, t.single_full
+
+
+def split_by_frame(indels: list) -> tuple:
+    """
+    Splits an accession's trusted indels by their effect on the reading frame.
+
+    Walks them in reference order, tracking the frame offset (net indel length mod 3). Returns
+    (in_frame, shifted): `in_frame` are indels that leave the frame intact, alone or as part of a
+    cluster that restores it within FRAMESHIFT_MIN_SPAN reference bases; `shifted` are the indels
+    of every stretch that stays out of frame for longer, or to the end of the gene. An accession
+    with anything in `shifted` has a frameshift. Edge indels are in neither list.
+    """
+    in_frame, shifted, cluster = [], [], []
+    offset = start = 0
+    for e in sorted((e for e in indels if not e.edge), key=lambda e: e.pos):
+        new = (offset + (e.length if e.kind == "ins" else -e.length)) % 3
+        if offset == 0 and new == 0:
+            in_frame.append(e)
+            continue
+        if offset == 0:
+            start, cluster = e.pos, []
+        cluster.append(e)
+        offset = new
+        if offset == 0:
+            (in_frame if e.pos - start < FRAMESHIFT_MIN_SPAN else shifted).extend(cluster)
+            cluster = []
+    shifted.extend(cluster)
+    return in_frame, shifted
+
+
+def find_internal_stops_with_indels(seq: str, ref_len: int, indels: list,
+                                    codon_table: dict = CODON_TABLE_11) -> list:
+    """
+    `find_internal_stops` on the sample's own coding sequence: trusted in-frame deletions are
+    removed and trusted in-frame insertions spliced back in, so a stop codon formed across an
+    indel is found, including one inside a short stretch that a cluster of indels shifts out of
+    frame and back. Positions are still reported as 1-based reference codon numbers. Untrusted
+    indels and those of a lasting frameshift are left as the row shows them.
+    """
+    applied, _shifted = split_by_frame(indels)
+    if not applied:
+        return find_internal_stops(seq, ref_len, codon_table)
+    # Build the sample sequence from slices of the row. `pieces` records where each piece
+    # starts in the sample and in the reference, so a codon can be mapped back.
+    parts, starts, pieces = [], [], []
+    sample_len, cur = 0, 0
+    for e in applied:
+        if e.pos > cur:
+            parts.append(seq[cur:e.pos])
+            starts.append(sample_len)
+            pieces.append((cur, False))
+            sample_len += e.pos - cur
+            cur = e.pos
+        if e.kind == "ins":
+            parts.append(e.bases)
+            starts.append(sample_len)
+            pieces.append((e.pos, True))
+            sample_len += e.length
+        else:
+            cur = max(cur, e.pos + e.length)
+    parts.append(seq[cur:ref_len])
+    starts.append(sample_len)
+    pieces.append((cur, False))
+    # 'N' never translates to a stop, which is how an uncovered '-' was always treated.
+    sample = "".join(parts).replace('-', 'N')
+
+    stops = {c for c, aa in codon_table.items() if aa == '*'}
+    stop_positions = []
+    for i in range(0, len(sample) - 3, 3):
+        if sample[i:i + 3] in stops:
+            j = bisect.bisect_right(starts, i) - 1
+            ref_start, is_insertion = pieces[j]
+            ref_pos = ref_start if is_insertion else ref_start + (i - starts[j])
+            stop_positions.append(ref_pos // 3 + 1)
+    return stop_positions
 
 def stream_lexicmap_to_msa(
     ref_path: str,
@@ -312,9 +504,9 @@ def stream_lexicmap_to_msa(
     Main streaming pipeline:
     - Streams rows, groups by accession, merges multi-HSP alignments
     - Partitions cohort into:
-        1. Clean Full-Length (cov >= min_coverage, 0 internal stops)
-        2. Clean Partial (min_coverage_partial <= cov < min_coverage, 0 stops)
-        3. Flagged (internal stops, frameshifts, or low coverage)
+        1. Clean Full-Length (cov >= min_coverage, 0 internal stops, no frameshift)
+        2. Clean Partial (min_coverage_partial <= cov < min_coverage, same rules)
+        3-5. Flagged (internal stops, low coverage, or a frameshift)
     - Writes clean MSAs, flagged audit FASTA/TSV, and complete cohort ledger.
     """
     ref_name, ref_header, ref_seq = load_reference(ref_path)
@@ -437,13 +629,16 @@ def stream_lexicmap_to_msa(
     f_flagged_tsv = open(f"{out_prefix}.flagged.tsv", "w", encoding="utf-8")
     f_cohort_tsv = open(f"{out_prefix}.cohort_ledger.tsv", "w", encoding="utf-8")
 
-    f_flagged_tsv.write("accession\tcoverage\tmean_pident\tflag\tn_stops\tstop_codons\thsps_merged\n")
-    f_cohort_tsv.write("accession\tcoverage\tmean_pident\tstatus\ttier\tn_stops\tstop_codons\thsps_merged\n")
+    f_flagged_tsv.write("accession\tcoverage\tmean_pident\tflag\tn_stops\tstop_codons\thsps_merged\tindels\n")
+    f_cohort_tsv.write("accession\tcoverage\tmean_pident\tstatus\ttier\tn_stops\tstop_codons\thsps_merged\tindels\n")
 
-    # Tracking & State
+    # Tracking & State. A clean haplotype is keyed by its row AND its trusted indels: an
+    # insertion has no column in the row, so two accessions that differ only by one would
+    # otherwise collapse into a single haplotype (usually the wild type).
     clean_full_haps = Counter()
     clean_full_pident_sum = defaultdict(float)
     clean_full_samples = defaultdict(list)
+    hap_indels = {}   # haplotype key -> its trusted Indel list
 
     all_covs = []
     all_pids = []
@@ -459,6 +654,8 @@ def stream_lexicmap_to_msa(
     count_clean_partial = 0
     count_flagged_stops = 0
     count_flagged_low_cov = 0
+    count_flagged_frameshift = 0
+    count_clean_full_with_indels = 0
     total_rescued_multihsp = 0
     total_single_hsp_full = 0
 
@@ -477,7 +674,8 @@ def stream_lexicmap_to_msa(
 
     def process_accession_block(acc, hsps):
         nonlocal total_accessions, count_clean_full, count_clean_partial
-        nonlocal count_flagged_stops, count_flagged_low_cov
+        nonlocal count_flagged_stops, count_flagged_low_cov, count_flagged_frameshift
+        nonlocal count_clean_full_with_indels
         nonlocal total_rescued_multihsp, total_single_hsp_full
         nonlocal cov_ge_50_count, cov_ge_50_stops
 
@@ -495,17 +693,23 @@ def stream_lexicmap_to_msa(
 
         total_accessions += 1
 
-        merged_seq, covered_bases, mean_pid, single_ge_cov, single_full = merge_accession_hsps(
-            hsps, ref_len, min_pident, min_coverage
-        )
+        tiling = tile_accession_hsps(hsps, ref_len, min_pident, min_coverage)
+        merged_seq, mean_pid = tiling.seq, tiling.mean_pident
+        single_ge_cov, single_full = tiling.single_ge_min_cov, tiling.single_full
 
-        cov = covered_bases / ref_len
+        cov = tiling.covered / ref_len
         all_covs.append(cov)
         if cov > 0:
             all_pids.append(mean_pid)
 
+        trusted = [e for e in tiling.indels if not e.edge]
+        _in_frame, frameshifts = split_by_frame(tiling.indels)
+        indel_str = ",".join(e.notation() for e in tiling.indels) if tiling.indels else "None"
+        indel_tag = f" indels={indel_str}" if tiling.indels else ""
+
         # Check premature stop codons in coding body
-        stop_codons = find_internal_stops(merged_seq, ref_len) if ref_is_cds else []
+        stop_codons = (find_internal_stops_with_indels(merged_seq, ref_len, tiling.indels)
+                       if ref_is_cds else [])
         n_stops = len(stop_codons)
         stop_str = ",".join(str(p) for p in stop_codons) if stop_codons else "None"
 
@@ -516,8 +720,14 @@ def stream_lexicmap_to_msa(
 
         # Stratify accession. With --require-full-length, the clean full-length tier requires
         # complete coverage of the reference (every position tiled), not merely min_coverage.
+        # A frameshift is judged on the indels themselves: the row stays on the reference grid,
+        # so it never shows one as a run of stop codons. Only a shift lasting
+        # FRAMESHIFT_MIN_SPAN bases counts. --allow-frameshift-alts waives that tier only;
+        # premature stops still flag.
         full_cov = 1.0 if full_length_only else min_coverage
-        if cov >= full_cov and (n_stops <= max_internal_stops or allow_frameshifts):
+        stops_ok = n_stops <= max_internal_stops
+        frame_ok = not frameshifts or allow_frameshifts
+        if cov >= full_cov and stops_ok and frame_ok:
             status = "CLEAN_FULL_LENGTH"
             tier = 1
             count_clean_full += 1
@@ -525,37 +735,48 @@ def stream_lexicmap_to_msa(
                 total_single_hsp_full += 1
             if not single_ge_cov:
                 total_rescued_multihsp += 1
+            if trusted:
+                count_clean_full_with_indels += 1
 
-            clean_full_haps[merged_seq] += 1
-            clean_full_pident_sum[merged_seq] += mean_pid
-            samples = clean_full_samples[merged_seq]
+            key = (merged_seq, tuple(e.notation() for e in trusted))
+            clean_full_haps[key] += 1
+            clean_full_pident_sum[key] += mean_pid
+            hap_indels.setdefault(key, trusted)
+            samples = clean_full_samples[key]
             if len(samples) < sample_cap and acc not in samples:
                 samples.append(acc)
 
-            f_clean_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_FULL_LENGTH\n{merged_seq}\n")
-            f_clean_exp_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_FULL_LENGTH\n{merged_seq}\n")
+            f_clean_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_FULL_LENGTH{indel_tag}\n{merged_seq}\n")
+            f_clean_exp_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_FULL_LENGTH{indel_tag}\n{merged_seq}\n")
 
-        elif cov >= min_coverage_partial and (n_stops <= max_internal_stops or allow_frameshifts):
+        elif cov >= min_coverage_partial and stops_ok and frame_ok:
             status = "CLEAN_PARTIAL"
             tier = 2
             count_clean_partial += 1
-            f_clean_exp_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_PARTIAL\n{merged_seq}\n")
+            f_clean_exp_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_PARTIAL{indel_tag}\n{merged_seq}\n")
 
-        elif n_stops > max_internal_stops and not allow_frameshifts:
+        elif not frame_ok:
+            status = "FLAGGED_FRAMESHIFT"
+            tier = 5
+            count_flagged_frameshift += 1
+            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=FRAMESHIFT{indel_tag}\n{merged_seq}\n")
+            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tFRAMESHIFT\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
+
+        elif not stops_ok:
             status = "FLAGGED_PREMATURE_STOPS"
             tier = 3
             count_flagged_stops += 1
-            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=PREMATURE_STOPS stops={n_stops} codons={stop_str}\n{merged_seq}\n")
-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tPREMATURE_STOPS\t{n_stops}\t{stop_str}\t{len(hsps)}\n")
+            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=PREMATURE_STOPS stops={n_stops} codons={stop_str}{indel_tag}\n{merged_seq}\n")
+            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tPREMATURE_STOPS\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
 
-        else:  # cov < min_coverage_partial and no stops
+        else:  # cov < min_coverage_partial, within the stop and frame rules
             status = "LOW_COVERAGE_FRAGMENT"
             tier = 4
             count_flagged_low_cov += 1
-            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=LOW_COVERAGE\n{merged_seq}\n")
-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tLOW_COVERAGE\t0\tNone\t{len(hsps)}\n")
+            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=LOW_COVERAGE{indel_tag}\n{merged_seq}\n")
+            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tLOW_COVERAGE\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
 
-        f_cohort_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\t{status}\t{tier}\t{n_stops}\t{stop_str}\t{len(hsps)}\n")
+        f_cohort_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\t{status}\t{tier}\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
 
     try:
         while True:
@@ -706,10 +927,12 @@ def stream_lexicmap_to_msa(
     print(f"    1. Clean Full-Length Cohort   : {count_clean_full:,} accessions ({pct_of_total(count_clean_full):.2f}% of total)")
     print(f"       - Multi-HSP rescued        : {total_rescued_multihsp:,} accessions")
     print(f"       - Single-HSP full-length   : {total_single_hsp_full:,} accessions")
-    print(f"    2. Clean Partials (50%-80% cov): {count_clean_partial:,} accessions")
+    print(f"    2. Clean Partials ({min_coverage_partial:.0%}-{min_coverage:.0%} cov): {count_clean_partial:,} accessions")
     print(f"       --> Combined Clean Cohort  : {count_clean_full + count_clean_partial:,} accessions ({pct_of_total(count_clean_full + count_clean_partial):.2f}%)")
     print(f"    3. Flagged for Premature Stops: {count_flagged_stops:,} accessions")
-    print(f"    4. Low-Coverage Fragments (<50%): {count_flagged_low_cov:,} accessions")
+    print(f"    4. Low-Coverage Fragments (<{min_coverage_partial:.0%}): {count_flagged_low_cov:,} accessions")
+    print(f"    5. Flagged for Frameshifts    : {count_flagged_frameshift:,} accessions")
+    print(f"    Clean full-length with in-frame indels: {count_clean_full_with_indels:,} accessions")
     print(f"    Coverage Distribution (All)   : p10={cov_stats['p10']:.2f}, median={med_cov:.2f}, p90={cov_stats['p90']:.2f}")
     print(f"    Identity Distribution (All)   : p10={pid_stats['p10']:.1f}%, median={med_pid:.1f}%, p90={pid_stats['p90']:.1f}%")
 
@@ -733,7 +956,7 @@ def stream_lexicmap_to_msa(
 
     # Compute Shannon entropy
     shannon_entropy = 0.0
-    for seq, count in sorted_haplotypes:
+    for _key, count in sorted_haplotypes:
         p = count / count_clean_full if count_clean_full > 0 else 0
         if p > 0:
             shannon_entropy -= p * math.log2(p)
@@ -756,18 +979,20 @@ def stream_lexicmap_to_msa(
             f_fa_compat.write(s)
 
         _w(f">REFERENCE_{ref_name} len={ref_len} count={count_clean_full} type=reference\n{ref_seq}\n")
-        for rank, (seq, count) in enumerate(sorted_haplotypes, 1):
+        for rank, ((seq, indels), count) in enumerate(sorted_haplotypes, 1):
             freq = count / count_clean_full if count_clean_full > 0 else 0
-            is_wt = (seq == ref_seq)
+            is_wt = (seq == ref_seq and not indels)
             tag = "WT" if is_wt else f"variant_rank_{rank}"
-            _w(f">haplotype_{rank:05d} count={count} freq={freq:.5f} tag={tag}\n{seq}\n")
+            # An insertion has no column, so the row alone cannot show it; the header does.
+            indel_tag = f" indels={','.join(indels)}" if indels else ""
+            _w(f">haplotype_{rank:05d} count={count} freq={freq:.5f} tag={tag}{indel_tag}\n{seq}\n")
 
     # Write A2M
     if write_a2m:
         with open(f"{out_prefix}.clean.a2m", "w", encoding="utf-8") as f_a2m, open(f"{out_prefix}.a2m", "w", encoding="utf-8") as f_a2m_compat:
             for f in [f_a2m, f_a2m_compat]:
                 f.write(f">{ref_name}/1-{ref_len}\n{ref_seq}\n")
-                for rank, (seq, count) in enumerate(sorted_haplotypes, 1):
+                for rank, ((seq, _indels), count) in enumerate(sorted_haplotypes, 1):
                     f.write(f">hap_{rank}_count_{count}/1-{ref_len}\n{seq}\n")
 
     # Write Haplotype TSV
@@ -789,18 +1014,22 @@ def stream_lexicmap_to_msa(
         ]
         _wt("\t".join(headers) + "\n")
 
-        for rank, (seq, count) in enumerate(sorted_haplotypes, 1):
+        for rank, (key, count) in enumerate(sorted_haplotypes, 1):
+            seq, indel_strs = key
+            indels = hap_indels[key]
             freq = count / count_clean_full if count_clean_full > 0 else 0
-            mean_pid = clean_full_pident_sum[seq] / count if count > 0 else 0
-            cov_pct = sum(1 for c in seq if c != '-') / ref_len * 100.0
+            mean_pid = clean_full_pident_sum[key] / count if count > 0 else 0
+            deleted = sum(e.length for e in indels if e.kind == "del")
+            cov_pct = (sum(1 for c in seq if c != '-') + deleted) / ref_len * 100.0
 
             nt_muts = []
             for i, (r_char, h_char) in enumerate(zip(ref_seq, seq)):
                 if h_char != '-' and h_char != r_char:
                     nt_muts.append(f"{i+1}{r_char}>{h_char}")
+            nt_muts.extend(indel_strs)
 
             aa_muts = []
-            if seq == ref_seq:
+            if seq == ref_seq and not indels:
                 mut_class = "WT"
             elif ref_is_cds:
                 h_aa = translate_nt(seq)
@@ -808,7 +1037,16 @@ def stream_lexicmap_to_msa(
                     if h_a != '-' and h_a != r_a:
                         aa_muts.append(f"{r_a}{r_idx+1}{h_a}")
 
-                if not aa_muts and not nt_muts:
+                if indels:
+                    # The class reports the most severe change. A frameshift only reaches the
+                    # clean tiers under --allow-frameshift-alts.
+                    if any(a.endswith("*") for a in aa_muts):
+                        mut_class = "Nonsense"
+                    elif split_by_frame(indels)[1]:
+                        mut_class = "Frameshift"
+                    else:
+                        mut_class = "InFrameIndel"
+                elif not aa_muts and not nt_muts:
                     # NOT "WT": `seq == ref_seq` was ruled out above, so this sequence
                     # matches the reference everywhere it is COVERED and differs only
                     # where it is not. Labelling it WT made this table disagree with
@@ -832,7 +1070,7 @@ def stream_lexicmap_to_msa(
             nt_mut_str = ",".join(nt_muts) if nt_muts else "WT"
             aa_mut_str = ",".join(aa_muts) if aa_muts else (
                 "WT" if mut_class in ("WT", "WT_partial", "Synonymous") else "NA")
-            samples_str = ",".join(clean_full_samples[seq])
+            samples_str = ",".join(clean_full_samples[key])
 
             row_data = [
                 f"haplotype_{rank:05d}",
@@ -877,19 +1115,21 @@ def stream_lexicmap_to_msa(
             "clean_partial": count_clean_partial,
             "combined_clean_cohort": count_clean_full + count_clean_partial,
             "flagged_premature_stops": count_flagged_stops,
-            "flagged_low_coverage": count_flagged_low_cov
+            "flagged_low_coverage": count_flagged_low_cov,
+            "flagged_frameshift": count_flagged_frameshift
         },
         "recovery_metrics": {
             "multi_hsp_rescued_accessions": total_rescued_multihsp,
             "single_hsp_full_length_accessions": total_single_hsp_full,
+            "clean_full_length_with_indels": count_clean_full_with_indels,
             "premature_stop_rate_pct_at_50cov": round(stop_rate_ge_50, 2)
         },
         "coverage_quantiles": cov_stats,
         "pident_quantiles": pid_stats,
         "clean_unique_haplotypes": len(sorted_haplotypes),
         "shannon_entropy_bits": round(shannon_entropy, 4),
-        "wildtype_count": clean_full_haps.get(ref_seq, 0),
-        "wildtype_fraction": round(clean_full_haps.get(ref_seq, 0) / count_clean_full, 6) if count_clean_full > 0 else 0,
+        "wildtype_count": clean_full_haps.get((ref_seq, ()), 0),
+        "wildtype_fraction": round(clean_full_haps.get((ref_seq, ()), 0) / count_clean_full, 6) if count_clean_full > 0 else 0,
         "top_10_haplotypes": top_preview,
         "runtime_seconds": round(total_time, 2)
     }
@@ -898,7 +1138,7 @@ def stream_lexicmap_to_msa(
     print(f"     [✓] Clean MSA FASTA       : {msa_clean_fasta} ({len(sorted_haplotypes) + 1} sequences)")
     print(f"     [✓] Clean Full Accessions : {out_prefix}.clean.accessions.fasta ({count_clean_full:,} accessions)")
     print(f"     [✓] Clean Expanded (>=50%): {out_prefix}.clean_expanded.accessions.fasta ({count_clean_full + count_clean_partial:,} accessions)")
-    print(f"     [✓] Flagged Accessions    : {out_prefix}.flagged.accessions.fasta ({count_flagged_stops + count_flagged_low_cov:,} accessions)")
+    print(f"     [✓] Flagged Accessions    : {out_prefix}.flagged.accessions.fasta ({count_flagged_stops + count_flagged_low_cov + count_flagged_frameshift:,} accessions)")
     print(f"     [✓] Flagged Audit Table   : {out_prefix}.flagged.tsv")
     print(f"     [✓] Complete Cohort Ledger: {out_prefix}.cohort_ledger.tsv ({total_accessions:,} rows)")
     print(f"     [✓] Summary JSON          : {summary_json_path}")
@@ -961,8 +1201,10 @@ def add_parser(subparsers):
                         help="Maximum premature stop codons tolerated in the CDS body before "
                              "an accession is flagged out of the clean cohort (default: 0).")
     parser.add_argument("--allow-frameshift-alts", action="store_true",
-                        help="Let accessions with indels/frameshifts that produce premature "
-                             "stops into the clean cohort anyway. Off by default.")
+                        help="Let accessions whose tiled sequence carries a frameshifting "
+                             "indel into the clean tiers instead of FLAGGED_FRAMESHIFT (a "
+                             "reading-frame shift lasting 30 or more bases). "
+                             "Premature stops still flag. Off by default.")
     parser.add_argument("--require-full-length", action="store_true",
                         help="Require 100%% reference coverage (every position tiled) for the "
                              "clean full-length tier, instead of the --min-cov threshold. "

@@ -2,11 +2,11 @@
 
 Composite: lexicmap -> sieve (optional) -> msa. Lexicmap already writes its
 cohort on the reference grid (`<prefix>.clean.msa.fasta` and friends), with '-'
-at reference positions no HSP covers. Under --require-full-length the clean rows
-are gap-free and MAFFT leaves them unchanged (measured on three cohorts of 27 to
-14,594 sequences), so the MSA stage only adds the tree; with the default
---min-cov 0.80, rows can carry up to 20% '-' and MAFFT may place those gaps
-differently. The stage is kept so both routes produce the same codon MSA and
+at reference positions no HSP covers and at in-frame deletions. Under
+--require-full-length the only gaps are those deletions, and rows without one come
+through MAFFT unchanged (measured on three cohorts of 27 to 14,594 sequences), so
+there the MSA stage mostly adds the tree; with the default --min-cov 0.80, rows can
+carry up to 20% '-' and MAFFT may place those gaps differently. The stage is kept so both routes produce the same codon MSA and
 Newick tree shape. See docs/lexicmap.md and docs/codon_msa.md.
 
 Sieve/MSA input defaults to `<prefix>.clean.accessions.fasta` (uncollapsed
@@ -140,8 +140,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                             "before an accession is flagged out of the clean cohort "
                             "(default: 0).")
     g_lex.add_argument("--allow-frameshift-alts", action="store_true",
-                       help="Let accessions with indels/frameshifts that produce "
-                            "premature stops into the clean cohort anyway. Off by default.")
+                       help="Let accessions whose tiled sequence carries a frameshifting "
+                            "indel into the clean tiers instead of FLAGGED_FRAMESHIFT (a "
+                            "reading-frame shift lasting 30 or more bases). "
+                            "Premature stops still flag. Off by default.")
     g_lex.add_argument("--require-full-length", action="store_true",
                        help="Require 100%% reference coverage (every position tiled) for "
                             "the clean full-length tier, instead of the --min-cov "

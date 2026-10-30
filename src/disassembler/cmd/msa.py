@@ -76,8 +76,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "Intended for walker output, which is per-accession reconstructions in their own "
             "coordinates. Every row must be on the reference's strand: MAFFT does not "
             "reverse-complement. lexicmap output is already on the reference grid; under "
-            "lexicmap --require-full-length its rows are gap-free and MAFFT leaves them "
-            "unchanged, so only the tree is new. See docs/codon_msa.md."
+            "lexicmap --require-full-length its only gaps are in-frame deletions, and rows "
+            "without one come through MAFFT unchanged. See docs/codon_msa.md."
         ),
     )
     p.add_argument("--ref", "-r", required=True, help="Reference in-frame CDS FASTA")

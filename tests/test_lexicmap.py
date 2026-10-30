@@ -389,5 +389,185 @@ class TestMutationClassification(unittest.TestCase):
         self.assertNotIn("WT", [c for c in classes if c == "WT"])
 
 
+# 60 nt CDS: ATG, 18 sense codons, TAA. Long enough to place an indel more than
+# INDEL_EDGE_WINDOW aligned bases from either end of its HSP.
+CDS60 = "ATG" + "GCTGAAAAACCCGGTTTCCATGACATCAGCCTGTGGCGTACCGTACAGAACTAC" + "TAA"
+
+
+def _ins(after, bases):
+    """(qseq, sseq) for CDS60 with `bases` inserted after 0-based position `after`."""
+    return (CDS60[:after + 1] + "-" * len(bases) + CDS60[after + 1:],
+            CDS60[:after + 1] + bases + CDS60[after + 1:])
+
+
+def _del(start, length):
+    """(qseq, sseq) for CDS60 with `length` bases deleted from 0-based `start`."""
+    return CDS60, CDS60[:start] + "-" * length + CDS60[start + length:]
+
+
+class TestIndels(unittest.TestCase):
+    """Insertions and deletions read from the aligned qseq/sseq. Before this, the tiling dropped
+    inserted bases silently and the stop scan skipped codons containing a deletion, so a 1-nt
+    insertion came out CLEAN_FULL_LENGTH / WT."""
+
+    def setUp(self):
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.dir_path = Path(self.test_dir.name)
+        self.ref = self.dir_path / "cds60.fasta"
+        self.ref.write_text(f">cds60\n{CDS60}\n")
+        self.assertEqual(len(CDS60), 60)
+        self.assertEqual(lms.find_internal_stops(CDS60, 60), [])
+
+    def tearDown(self):
+        self.test_dir.cleanup()
+
+    def _run(self, rows, name, **kw):
+        """rows: list of (accession, pident, qseq, sseq), each one full-length HSP."""
+        lines = ["sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq"]
+        for acc, pid, qseq, sseq in rows:
+            lines.append(f"{acc}\t{pid}\t100.0\t1\t60\t{qseq}\t{sseq}")
+        tsv = self.dir_path / f"{name}.tsv"
+        tsv.write_text("\n".join(lines) + "\n")
+        prefix = str(self.dir_path / name)
+        summary = lms.stream_lexicmap_to_msa(ref_path=str(self.ref), file_path=str(tsv),
+                                             out_prefix=prefix, **kw)
+        ledger = {}
+        with open(f"{prefix}.cohort_ledger.tsv") as fh:
+            header = fh.readline().rstrip("\n").split("\t")
+            for line in fh:
+                row = dict(zip(header, line.rstrip("\n").split("\t")))
+                ledger[row["accession"]] = row
+        with open(f"{prefix}.clean.haplotypes.tsv") as fh:
+            header = fh.readline().rstrip("\n").split("\t")
+            haps = [dict(zip(header, line.rstrip("\n").split("\t"))) for line in fh]
+        return summary, ledger, haps, prefix
+
+    def test_notation(self):
+        self.assertEqual(lms.Indel("ins", 685, 1, "T", False).notation(), "685_686insT")
+        self.assertEqual(lms.Indel("del", 2315, 6, "ACGTAC", False).notation(), "2316_2321del")
+        self.assertEqual(lms.Indel("del", 708, 1, "C", True).notation(), "709del(edge)")
+
+    def test_one_nt_insertion_is_a_frameshift_not_wild_type(self):
+        qseq, sseq = _ins(29, "G")
+        _, ledger, _, _ = self._run([("SRR1", 98.4, qseq, sseq)], "ins1")
+        self.assertEqual(ledger["SRR1"]["status"], "FLAGGED_FRAMESHIFT")
+        self.assertEqual(ledger["SRR1"]["tier"], "5")
+        self.assertEqual(ledger["SRR1"]["indels"], "30_31insG")
+
+    def test_one_nt_deletion_is_a_frameshift(self):
+        qseq, sseq = _del(30, 1)
+        _, ledger, _, _ = self._run([("SRR1", 98.3, qseq, sseq)], "del1")
+        self.assertEqual(ledger["SRR1"]["status"], "FLAGGED_FRAMESHIFT")
+        self.assertEqual(ledger["SRR1"]["indels"], "31del")
+
+    def test_in_frame_deletion_counts_as_covered_under_require_full_length(self):
+        # The TAC1B case: a real two-codon deletion used to be read as missing coverage, so
+        # --require-full-length demoted every carrier to the partial tier.
+        qseq, sseq = _del(30, 6)
+        _, ledger, haps, _ = self._run([("SRR1", 100.0, qseq, sseq)], "del6",
+                                       full_length_only=True)
+        self.assertEqual(ledger["SRR1"]["status"], "CLEAN_FULL_LENGTH")
+        self.assertEqual(ledger["SRR1"]["coverage"], "1.0000")
+        self.assertEqual(ledger["SRR1"]["indels"], "31_36del")
+        self.assertEqual(haps[0]["mutation_class"], "InFrameIndel")
+        self.assertIn("31_36del", haps[0]["nt_mutations"].split(","))
+        self.assertEqual(haps[0]["coverage_pct"], "100.00")
+
+    def test_in_frame_insertion_is_its_own_haplotype(self):
+        qseq, sseq = _ins(29, "GCA")
+        summary, ledger, haps, prefix = self._run(
+            [("WT1", 100.0, CDS60, CDS60), ("INS", 100.0, qseq, sseq), ("WT2", 100.0, CDS60, CDS60)],
+            "ins3")
+        self.assertEqual(ledger["INS"]["status"], "CLEAN_FULL_LENGTH")
+        self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 3)
+        self.assertEqual(summary["clean_unique_haplotypes"], 2)
+        self.assertEqual(summary["wildtype_count"], 2)
+        by_class = {h["mutation_class"]: h for h in haps}
+        self.assertEqual(by_class["WT"]["count"], "2")
+        self.assertEqual(by_class["InFrameIndel"]["count"], "1")
+        self.assertEqual(by_class["InFrameIndel"]["nt_mutations"], "30_31insGCA")
+        # The rows are identical (an insertion has no column); the header tells them apart.
+        msa = Path(f"{prefix}.clean.msa.fasta").read_text().split(">")[1:]
+        self.assertEqual(len(msa), 3)
+        rows = [rec.split("\n", 1)[1].strip() for rec in msa[1:]]
+        self.assertEqual(rows[0], rows[1])
+        self.assertTrue(any("indels=30_31insGCA" in rec.split("\n", 1)[0] for rec in msa))
+
+    def test_stop_codon_formed_by_an_insertion_is_found(self):
+        qseq, sseq = _ins(29, "TAA")
+        _, ledger, _, _ = self._run([("SRR1", 95.2, qseq, sseq)], "insstop")
+        self.assertEqual(ledger["SRR1"]["status"], "FLAGGED_PREMATURE_STOPS")
+        self.assertEqual(ledger["SRR1"]["stop_codons"], "11")
+
+    def test_edge_indel_is_reported_but_not_trusted(self):
+        qseq, sseq = _ins(4, "T")   # 5 aligned bases before it, under INDEL_EDGE_WINDOW
+        summary, ledger, _, _ = self._run(
+            [("EDGE", 99.0, qseq, sseq), ("WT", 100.0, CDS60, CDS60)], "edge")
+        self.assertEqual(ledger["EDGE"]["status"], "CLEAN_FULL_LENGTH")
+        self.assertEqual(ledger["EDGE"]["indels"], "5_6insT(edge)")
+        self.assertEqual(summary["clean_unique_haplotypes"], 1)
+        self.assertEqual(summary["wildtype_count"], 2)
+
+    def test_allow_frameshift_alts_waives_only_the_frameshift_tier(self):
+        qseq, sseq = _ins(29, "G")
+        stop = CDS60[:30] + "TAG" + CDS60[33:]
+        _, ledger, haps, _ = self._run(
+            [("FS", 98.4, qseq, sseq), ("STOP", 98.3, CDS60, stop)], "allowfs",
+            allow_frameshifts=True)
+        self.assertEqual(ledger["FS"]["status"], "CLEAN_FULL_LENGTH")
+        self.assertEqual(haps[0]["mutation_class"], "Frameshift")
+        self.assertEqual(ledger["STOP"]["status"], "FLAGGED_PREMATURE_STOPS")
+
+    @staticmethod
+    def _ins_then_del(after, base, del_at):
+        """(qseq, sseq): `base` inserted after `after`, and the base at `del_at` deleted."""
+        q = CDS60[:after + 1] + "-" + CDS60[after + 1:]
+        s = CDS60[:after + 1] + base + CDS60[after + 1:del_at] + "-" + CDS60[del_at + 1:]
+        return q, s
+
+    def test_split_by_frame(self):
+        ins, dele = lms.Indel("ins", 30, 1, "G", False), lms.Indel("del", 35, 1, "G", False)
+        self.assertEqual(lms.split_by_frame([ins, dele]), ([ins, dele], []))
+        far = lms.Indel("del", 30 + lms.FRAMESHIFT_MIN_SPAN, 1, "G", False)
+        self.assertEqual(lms.split_by_frame([ins, far]), ([], [ins, far]))
+        self.assertEqual(lms.split_by_frame([ins]), ([], [ins]))
+        three = lms.Indel("del", 40, 3, "GTG", False)
+        self.assertEqual(lms.split_by_frame([three]), ([three], []))
+        self.assertEqual(lms.split_by_frame([lms.Indel("ins", 30, 1, "G", True)]), ([], []))
+
+    def test_indels_that_restore_the_frame_quickly_are_not_a_frameshift(self):
+        # The H. pylori babA case: +1 then -1 a few bases later. The aligner's way of writing a
+        # divergent stretch, not a broken gene.
+        qseq, sseq = self._ins_then_del(29, "G", 35)
+        _, ledger, haps, _ = self._run([("SRR1", 98.3, qseq, sseq)], "comp")
+        self.assertEqual(ledger["SRR1"]["status"], "CLEAN_FULL_LENGTH")
+        self.assertEqual(ledger["SRR1"]["indels"], "30_31insG,36del")
+        self.assertEqual(haps[0]["mutation_class"], "InFrameIndel")
+
+    def test_stop_inside_a_briefly_shifted_stretch_is_found(self):
+        # Inserting T before AGC reads TAG in the sample's own frame.
+        qseq, sseq = self._ins_then_del(29, "T", 35)
+        _, ledger, _, _ = self._run([("SRR1", 98.3, qseq, sseq)], "compstop")
+        self.assertEqual(ledger["SRR1"]["status"], "FLAGGED_PREMATURE_STOPS")
+        self.assertEqual(ledger["SRR1"]["stop_codons"], "11")
+
+    def test_a_shift_restored_only_after_the_span_is_a_frameshift(self):
+        qseq, sseq = self._ins_then_del(11, "G", 12 + lms.FRAMESHIFT_MIN_SPAN)
+        _, ledger, _, _ = self._run([("SRR1", 98.3, qseq, sseq)], "longshift")
+        self.assertEqual(ledger["SRR1"]["status"], "FLAGGED_FRAMESHIFT")
+
+    def test_an_indel_counts_only_where_its_hsp_supplied_the_row(self):
+        qseq, sseq = _del(30, 1)
+        wt = (99.0, 100.0, 1, 60, CDS60, CDS60)
+        gapped = (90.0, 100.0, 1, 60, qseq, sseq)
+        t = lms.tile_accession_hsps([wt, gapped], 60, 60.0, 0.8)
+        self.assertEqual(t.indels, [])
+        self.assertEqual(t.seq, CDS60)
+        t = lms.tile_accession_hsps([(99.0, 100.0, 1, 60, qseq, sseq), (90.0, 100.0, 1, 60, CDS60, CDS60)],
+                                    60, 60.0, 0.8)
+        self.assertEqual([e.notation() for e in t.indels], ["31del"])
+        self.assertEqual(t.covered, 60)
+
+
 if __name__ == "__main__":
     unittest.main()

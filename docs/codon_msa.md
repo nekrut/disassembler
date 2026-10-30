@@ -99,10 +99,10 @@ versus the walker's `-t` (GraphAligner).
 
 `disassembler lexicmap` writes its clean cohort on the reference's coordinate grid already
 (see [`lexicmap.md`](lexicmap.md#outputs)). With `--require-full-length`, every row is
-reference-length and gap-free, and re-running MAFFT on three such cohorts (27 to 14,594
-sequences) reproduced the input byte for byte, so on that output the MSA stage only adds the
-tree. With the default `--min-cov 0.80`, rows can carry `-` at uncovered reference positions,
-and MAFFT may place those gaps differently. `from-lexicmap` runs `msa` in both cases so that
+reference-length and its only gaps are in-frame deletions (whole codons of `-`). Rows without a
+deletion come through MAFFT unchanged: on three cohorts of 27 to 14,594 sequences, re-running
+MAFFT reproduced them byte for byte. With the default `--min-cov 0.80`, rows can also carry `-`
+at uncovered reference positions, and MAFFT may place gaps differently. `from-lexicmap` runs `msa` in both cases so that
 both routes produce the same output shape.
 
 ## A worked cohort
