@@ -35,6 +35,7 @@ mod config;
 mod error;
 mod io;
 mod pipeline;
+mod scratch;
 mod stages;
 mod types;
 
@@ -80,6 +81,9 @@ TUNING:
                                   rejoin the main route [default: 100]
     -t, --threads <N>             Threads per GraphAligner invocation, at least 1 [default: 1;
                                   above 1 is not reproducible, see Config]
+        --graphaligner <PATH>     GraphAligner executable [default: GraphAligner on PATH].
+                                  Checked once at startup; results are validated against
+                                  1.0.17b
     -w, --workers <N>             Compute workers, at least 1 [default: 8]
         --fetch-workers <N>       Fetch workers, at least 1 [default: 8]
 
@@ -105,6 +109,11 @@ INTRA-HOST VARIANTS:
                                   path. Errors still fail the run. Without it, a run that
                                   reconstructs nothing exits non-zero, so a wrapper cannot
                                   mistake an empty shard for a good one
+
+SCRATCH:
+        --scratch-dir <DIR>       Where the run's private scratch directory is made; it is
+                                  removed when the run ends or is interrupted [default:
+                                  /dev/shm where it exists, else the system temp directory]
 
 OFFLINE / CACHE:
         --unitigs-cache <DIR>     Read-through cache for compressed unitig payloads.
@@ -137,6 +146,8 @@ struct Args {
     query: Vec<PathBuf>,
     out_dir: PathBuf,
     out_fasta: PathBuf,
+    /// `--scratch-dir`: where the run's private scratch directory is made (see scratch.rs).
+    scratch_base: Option<PathBuf>,
     /// Exit 0 even when nothing was reconstructed. Off by default: a shard that
     /// reconstructs nothing is a failure a scheduler needs to see.
     allow_empty: bool,
@@ -150,6 +161,7 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
         query: Vec::new(),
         out_dir: PathBuf::from("walker_output"),
         out_fasta: PathBuf::from("reconstructed_haplotypes.fasta"),
+        scratch_base: None,
         allow_empty: false,
         cfg: Config::default(),
     };
@@ -201,9 +213,8 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             "-t" | "--threads" => args.cfg.graphaligner_threads = at_least_one("--threads", &value()?)?,
             "-w" | "--workers" => args.cfg.compute_workers = at_least_one("--workers", &value()?)?,
             "--fetch-workers" => args.cfg.fetch_workers = at_least_one("--fetch-workers", &value()?)?,
-            "--scratch-dir" => {
-                args.cfg.scratch_dir = PathBuf::from(value()?);
-            }
+            "--scratch-dir" => args.scratch_base = Some(PathBuf::from(value()?)),
+            "--graphaligner" => args.cfg.graphaligner_bin = value()?,
             // The prune sweep is the reason this flag exists, so it validates its range
             // rather than just parsing.
             // A boolean, so it consumes no value and must not fall through to `value()`.
@@ -313,14 +324,9 @@ fn at_least_one(flag: &str, raw: &str) -> error::Result<usize> {
 /// panics on it.
 #[cfg(unix)]
 fn default_sigpipe() {
-    extern "C" {
-        fn signal(signum: i32, handler: usize) -> usize;
-    }
-    const SIGPIPE: i32 = 13; // Linux, macOS and the BSDs
-    const SIG_DFL: usize = 0;
     // SAFETY: called once at startup, before any thread is spawned.
     unsafe {
-        signal(SIGPIPE, SIG_DFL);
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
@@ -386,7 +392,7 @@ fn check_fetch(ok: usize, negatives: usize, errors: usize, allow_empty: bool) ->
     Ok(())
 }
 
-fn real_main(args: Args) -> error::Result<()> {
+fn real_main(mut args: Args) -> error::Result<()> {
     // ---- validate offline / cache flag combinations -----------------------
     if args.cfg.offline && args.cfg.unitigs_cache.is_none() {
         return Err(error::Error::Usage(
@@ -472,6 +478,24 @@ fn real_main(args: Args) -> error::Result<()> {
 
     // Unwrap the query set for the full pipeline. The guard above ensures it is Some here.
     let queries = queries.expect("queries is Some when not --fetch-only");
+
+    // Checked before any download. GraphAligner used to be looked up per accession, after
+    // its unitigs were fetched and parsed, so a missing binary failed each one in turn.
+    let bin = stages::align::resolve_binary(&args.cfg)?;
+    let version = stages::align::version(&bin)?;
+    eprintln!("[logan-walker] GraphAligner: {version} ({})", bin.display());
+    if !version.contains("1.0.17b") {
+        eprintln!(
+            "[warn] the walker is validated against GraphAligner 1.0.17b; 1.0.19 and later \
+             clip the query's last base (docs/issue_graphaligner_end_clipping.md)"
+        );
+    }
+    args.cfg.graphaligner_bin = bin.to_string_lossy().into_owned();
+
+    // Removed when `scratch` goes out of scope at the end of this function, or on a signal.
+    let scratch = scratch::Scratch::create(args.scratch_base.as_deref())?;
+    scratch.remove_on_signal()?;
+    args.cfg.scratch_dir = scratch.path().to_path_buf();
     if queries.len() > 1 {
         eprintln!(
             "[logan-walker] multi-anchor mode: {} references from {} -q file(s); each \
@@ -485,31 +509,29 @@ fn real_main(args: Args) -> error::Result<()> {
     let summary = pipeline::run(&args.cfg, accessions, &queries)?;
 
     // ---- OUT of the pipeline ----------------------------------------------
-    std::fs::create_dir_all(&args.out_dir)?;
-    io::output::write_fasta(&summary, &args.out_fasta)?;
-    io::output::write_bubbles(&summary, &args.out_dir.join("bubbles.json"))?;
+    std::fs::create_dir_all(&args.out_dir).map_err(error::file_err("create", &args.out_dir))?;
+    io::output::write_fasta(&summary, &args.out_fasta).map_err(|e| e.at("write", &args.out_fasta))?;
+    let bubbles = args.out_dir.join("bubbles.json");
+    io::output::write_bubbles(&summary, &bubbles).map_err(|e| e.at("write", &bubbles))?;
     // One alignment pass per accession, shared by both writers.
     if args.cfg.emit_vcf || args.cfg.emit_snv_table {
         let sites = io::output::snv_sites_all(&summary, &queries);
         if args.cfg.emit_vcf {
-            io::output::write_vcfs(&summary, &queries, &args.out_dir, &sites)?;
+            io::output::write_vcfs(&summary, &queries, &args.out_dir, &sites)
+                .map_err(|e| e.at("write VCFs in", &args.out_dir))?;
         }
         if args.cfg.emit_snv_table {
-            io::output::write_snv_table(
-                &summary,
-                &queries,
-                &args.out_dir.join("snvs.tsv"),
-                &sites,
-            )?;
+            let snvs = args.out_dir.join("snvs.tsv");
+            io::output::write_snv_table(&summary, &queries, &snvs, &sites)
+                .map_err(|e| e.at("write", &snvs))?;
         }
     }
     if args.cfg.emit_alts {
-        io::output::write_alts(&summary, &args.out_dir.join("alt_haplotypes.fasta"))?;
+        let alts = args.out_dir.join("alt_haplotypes.fasta");
+        io::output::write_alts(&summary, &alts).map_err(|e| e.at("write", &alts))?;
     }
-    io::output::write_summary(
-        &summary,
-        &args.out_dir.join(format!("{}_walker_summary.json", queries[0].name)),
-    )?;
+    let summary_path = args.out_dir.join(format!("{}_walker_summary.json", queries[0].name));
+    io::output::write_summary(&summary, &summary_path).map_err(|e| e.at("write", &summary_path))?;
 
     println!(
         "[logan-walker] {}/{} accessions reconstructed",

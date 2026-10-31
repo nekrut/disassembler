@@ -24,39 +24,26 @@ from pathlib import Path
 from disassembler.textio import open_text
 from disassembler.validators import fraction, positive_int
 
-MAMBA_PREFIX = Path(os.environ.get("MAMBA_ROOT_PREFIX", str(Path.home() / "micromamba")))
-CODON_ENV_BIN = MAMBA_PREFIX / "envs" / "codon" / "bin"
-
-
 def find_bin(name: str, *aliases: str) -> str:
-    """Resolve a tool to an executable path. PATH wins; the `codon` env is a fallback.
+    """Resolve a tool on PATH.
 
     `aliases` are alternative spellings of the same tool, tried in order. bioconda ships
     FastTree under both `fasttree` and `FastTree` depending on the build.
 
     Raises rather than returning the bare name so an unresolvable tool fails here with
     a message naming it, instead of surfacing as a FileNotFoundError from subprocess
-    after the expensive stages have already run.
+    after the expensive stages have already run. There is no fallback location: the one
+    there was (a `codon` env under ~/micromamba) belonged to one old setup.
     """
     names = (name, *aliases)
     for n in names:
         found = shutil.which(n)
         if found:
             return found
-    for n in names:
-        fallback = shutil.which(str(CODON_ENV_BIN / n))
-        if fallback:
-            print(
-                f"[*] {n}: not on PATH, falling back to {fallback} "
-                f"(environment.yml pins do not describe this binary)",
-                file=sys.stderr,
-            )
-            return fallback
     spellings = " or ".join(repr(n) for n in names)
     raise FileNotFoundError(
-        f"{spellings} not found on PATH or in {CODON_ENV_BIN}. "
-        f"Activate the `disassembler` env (environment.yml pins mafft and fasttree), "
-        f"or put {name} on PATH."
+        f"{spellings} not found on PATH. Activate the `disassembler` env "
+        f"(environment.yml pins mafft and fasttree), or put {name} on PATH."
     )
 
 

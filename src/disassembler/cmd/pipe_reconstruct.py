@@ -7,8 +7,6 @@ passed straight through to logan-walker.
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -334,19 +332,14 @@ def run(args) -> int:
               "reconstructed.sieved.fasta.", file=sys.stderr)
 
     if not args.skip_tree:
-        # Preflight MAFFT and FastTree before the expensive walk stage. Same spellings
-        # and fallback as `msa.find_bin`.
-        codon_env_bin = Path(os.environ.get("MAMBA_ROOT_PREFIX",
-                                            str(Path.home() / "micromamba"))) / "envs" / "codon" / "bin"
+        # Preflight MAFFT and FastTree before the expensive walk stage, the same lookup
+        # `msa.find_bin` does.
         for names, why in ((("mafft",), "the codon MSA"),
                            (("fasttree", "FastTree"), "the ML tree")):
-            on_path = any(shutil.which(n) for n in names)
-            in_codon_env = any(os.access(codon_env_bin / n, os.X_OK) for n in names)
-            if not (on_path or in_codon_env):
-                return _die(
-                    f"{names[0]} not on PATH or in {codon_env_bin} (needed for {why}). "
-                    f"Activate the `disassembler` env, or --skip-tree."
-                )
+            try:
+                msa_cmd.find_bin(*names)
+            except FileNotFoundError as e:
+                return _die(f"{e} It is needed for {why}; or pass --skip-tree.")
 
     if args.sieve and not resolve_sieve(args.sieve_bin):
         return _die(

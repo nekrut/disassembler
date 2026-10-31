@@ -348,7 +348,9 @@ pub struct Config {
     pub max_compressed_bytes: u64,
 
     // ---- io ----
-    /// Where per-accession GFA and GAF files go. Should be a tmpfs; payloads are ~38 KB and <1 KB.
+    /// Where per-accession GFA, GAF and query files go; payloads are ~38 KB and <1 KB. `main`
+    /// points it at the run's private directory (see scratch.rs), so this default is only what
+    /// tests get.
     pub scratch_dir: PathBuf,
     /// GraphAligner executable, resolved on PATH if not absolute.
     pub graphaligner_bin: String,
@@ -436,7 +438,7 @@ impl Default for Config {
             fetch_connect_timeout_secs: 15,
             fetch_attempts: 3,
             max_compressed_bytes: 1024 * 1024 * 1024,
-            scratch_dir: PathBuf::from("/dev/shm/logan-walker"),
+            scratch_dir: std::env::temp_dir().join("logan-walker-test"),
             graphaligner_bin: String::from("GraphAligner"),
             unitigs_cache: None,
             offline: false,

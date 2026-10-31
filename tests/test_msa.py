@@ -151,6 +151,26 @@ class TestMsaCoverageGate(unittest.TestCase):
     def test_identity_ignores_gaps_and_ambiguity(self):
         self.assertEqual(self.msa.identity_to_reference("ACGTACGT", "ACGA--NT"), 4 / 5)
 
+    def test_tools_are_found_on_path_only(self):
+        # A `codon` env under $MAMBA_ROOT_PREFIX used to be a silent fallback; it belonged to
+        # one old setup and could pick up a MAFFT environment.yml does not pin.
+        prefix = self.work / "mamba"
+        codon_bin = prefix / "envs" / "codon" / "bin"
+        codon_bin.mkdir(parents=True)
+        (codon_bin / "clustalo").write_text("#!/bin/sh\n")
+        (codon_bin / "clustalo").chmod(0o755)
+        old = os.environ.get("MAMBA_ROOT_PREFIX")
+        os.environ["MAMBA_ROOT_PREFIX"] = str(prefix)
+        try:
+            with self.assertRaisesRegex(FileNotFoundError, "'clustalo' not found on PATH"):
+                self.msa.find_bin("clustalo")
+        finally:
+            if old is None:
+                del os.environ["MAMBA_ROOT_PREFIX"]
+            else:
+                os.environ["MAMBA_ROOT_PREFIX"] = old
+        self.assertTrue(self.msa.find_bin("mafft").endswith("/mafft"), "the PATH stub is found")
+
     def test_real_bases(self):
         self.assertEqual(self.msa.real_bases("ACGTacgt-NnRY."), 8)
 

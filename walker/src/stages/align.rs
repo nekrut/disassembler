@@ -24,7 +24,7 @@
 //! OUT  GafPath
 
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::{file_err, Error, Result};
 use crate::types::{GafPath, Orient, PathStep, Query, Subgraph};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -50,36 +50,63 @@ pub fn command(bin: &Path, cfg: &Config, subgraph: &Subgraph, query_fa: &Path, g
     cmd
 }
 
-/// Resolve the binary, preferring an explicit path then `PATH`.
-/// Fails loudly instead of returning the bare name and letting the spawn produce a confusing
-/// "No such file or directory".
+/// Resolve the binary: `--graphaligner` as given if it has a directory part, otherwise
+/// searched on `PATH`. Fails loudly instead of returning the bare name and letting the spawn
+/// produce a confusing "No such file or directory". There is no hardcoded fallback location:
+/// the one there was (`/data/staging/codon_env/bin`) belonged to a single old machine.
 pub fn resolve_binary(cfg: &Config) -> Result<PathBuf> {
     let name = &cfg.graphaligner_bin;
     let candidate = Path::new(name);
     if candidate.components().count() > 1 || candidate.is_absolute() {
-        return if candidate.is_file() {
+        return if is_executable(candidate) {
             Ok(candidate.to_path_buf())
         } else {
-            Err(Error::Usage(format!("GraphAligner not found at {name}")))
+            Err(Error::Usage(format!("GraphAligner not found, or not executable, at {name}")))
         };
     }
     let path = std::env::var_os("PATH").ok_or_else(|| Error::Usage("PATH is unset".into()))?;
     for dir in std::env::split_paths(&path) {
         let p = dir.join(name);
-        if p.is_file() {
+        if is_executable(&p) {
             return Ok(p);
         }
     }
-    if name == "GraphAligner" {
-        let staging_bin = PathBuf::from("/data/staging/codon_env/bin/GraphAligner");
-        if staging_bin.is_file() {
-            return Ok(staging_bin);
-        }
-    }
     Err(Error::Usage(format!(
-        "{name} is not on PATH. The walker shells out to GraphAligner; install it or set \
-         Config::graphaligner_bin to an absolute path."
+        "{name} is not on PATH. The walker shells out to GraphAligner (bioconda \
+         graphaligner=1.0.17b); install it, or pass --graphaligner <PATH>."
     )))
+}
+
+fn is_executable(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        p.is_file()
+    }
+}
+
+/// `GraphAligner --version`, first line. Fails if the binary does not run at all (a missing
+/// shared library, the wrong architecture), which is better found at startup than on the
+/// first accession.
+pub fn version(bin: &Path) -> Result<String> {
+    let out = Command::new(bin)
+        .arg("--version")
+        .output()
+        .map_err(|e| Error::Usage(format!("cannot run GraphAligner at {}: {e}", bin.display())))?;
+    let text = String::from_utf8_lossy(if out.stdout.is_empty() { &out.stderr } else { &out.stdout });
+    match text.lines().next().map(str::trim).filter(|l| !l.is_empty()) {
+        Some(line) if out.status.success() => Ok(line.to_string()),
+        _ => Err(Error::Usage(format!(
+            "GraphAligner at {} did not report a version ({}): {}",
+            bin.display(),
+            out.status,
+            text.trim()
+        ))),
+    }
 }
 
 /// Run GraphAligner and parse its GAF output, one best alignment per reference in the pool.
@@ -136,7 +163,11 @@ pub fn run(
         // Byte-compat path: exactly one Query whose source file holds exactly one record.
         // Every existing golden fixture is this. The source is copied byte for byte, so
         // GraphAligner reads exactly what it read when it was handed `query.path` itself.
-        std::fs::copy(&queries[0].path, &query_fa)?;
+        // Read through `read_input`, which returns a plain file's bytes unchanged and
+        // decompresses a gzipped one: a plain copy handed GraphAligner gzip bytes under a
+        // `.fa` name, and it found no alignment, so every accession came back no_path.
+        let bytes = crate::io::input::read_input(&queries[0].path, "query")?;
+        std::fs::write(&query_fa, bytes).map_err(file_err("write", &query_fa))?;
     } else {
         // Merged pool: one `>record_id\n<seq>\n` block per query, in input order.
         // This is written even for a single Query whose source file has extra records,
@@ -151,7 +182,7 @@ pub fn run(
             body.extend_from_slice(&q.seq);
             body.push(b'\n');
         }
-        std::fs::write(&query_fa, &body)?;
+        std::fs::write(&query_fa, &body).map_err(file_err("write", &query_fa))?;
         if queries.len() > 1 {
             let names: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
             eprintln!(
@@ -207,7 +238,7 @@ pub fn run(
         Err(e) => {
             let _ = std::fs::remove_file(gaf_out);
             let _ = std::fs::remove_file(&query_fa);
-            return Err(Error::Io(e));
+            return Err(file_err("read", gaf_out)(e));
         }
     };
     if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
@@ -490,7 +521,26 @@ mod tests {
     fn absolute_path_that_does_not_exist_is_reported_as_such() {
         let cfg = Config { graphaligner_bin: "/nope/GraphAligner".into(), ..Config::default() };
         let e = resolve_binary(&cfg).expect_err("should fail").to_string();
-        assert!(e.contains("not found at"), "{e}");
+        assert!(e.contains("not found, or not executable, at /nope/GraphAligner"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_is_not_executable_is_refused_and_a_version_is_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("logan_align_ver_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ga = dir.join("GraphAligner");
+        std::fs::write(&ga, "#!/bin/sh\necho 'GraphAligner bioconda 1.0.17b-'\n").unwrap();
+        let cfg = Config { graphaligner_bin: ga.to_string_lossy().into_owned(), ..Config::default() };
+        std::fs::set_permissions(&ga, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(resolve_binary(&cfg).is_err(), "a non-executable file is not GraphAligner");
+        std::fs::set_permissions(&ga, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = resolve_binary(&cfg).unwrap();
+        assert_eq!(version(&bin).unwrap(), "GraphAligner bioconda 1.0.17b-");
+        std::fs::write(&ga, "#!/bin/sh\nexit 3\n").unwrap();
+        assert!(version(&bin).is_err(), "a binary that does not run is found at startup");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- parse_gaf_multi (multi-anchor) ----
@@ -615,14 +665,21 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
         };
         let gaf = dir.join("ACC.sub.gaf");
 
-        let got = run(&cfg, &sub, std::slice::from_ref(&q), &gaf).unwrap();
+        // Plain, then the same file gzipped: GraphAligner reads plain FASTA only, and was
+        // once handed the gzip bytes under a `.fa` name, which it read as no alignment.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, src_bytes).unwrap();
+        for stored in [src_bytes.to_vec(), gz.finish().unwrap()] {
+            std::fs::write(&q.path, &stored).unwrap();
+            let got = run(&cfg, &sub, std::slice::from_ref(&q), &gaf).unwrap();
 
-        let seen_name = std::fs::read_to_string(dir.join("seen_name")).unwrap();
-        assert!(seen_name.trim_end().ends_with(".fa"), "GraphAligner was handed {seen_name:?}");
-        assert_eq!(std::fs::read(dir.join("seen.fa")).unwrap(), src_bytes,
-                   "a single-record query must reach GraphAligner byte for byte");
-        assert!(got.contains_key("pol"));
-        assert!(!dir.join("ACC.sub.queries.fa").exists(), "the temp query was left behind");
+            let seen_name = std::fs::read_to_string(dir.join("seen_name")).unwrap();
+            assert!(seen_name.trim_end().ends_with(".fa"), "GraphAligner was handed {seen_name:?}");
+            assert_eq!(std::fs::read(dir.join("seen.fa")).unwrap(), src_bytes,
+                       "a single-record query must reach GraphAligner byte for byte, decompressed");
+            assert!(got.contains_key("pol"));
+            assert!(!dir.join("ACC.sub.queries.fa").exists(), "the temp query was left behind");
+        }
 
         drop(sub);
         let _ = std::fs::remove_dir_all(&dir);

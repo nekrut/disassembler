@@ -11,11 +11,15 @@ path = "src/main.rs"
 
 # Deliberately minimal. Concurrency is std::thread plus a bounded
 # std::sync::mpsc::sync_channel behind an Arc<Mutex<Receiver>>; summary.json and bubbles.json
-# are written by hand in io/output.rs rather than through serde. Only the S3 streaming and
-# decompression in stages/stream.rs, and reading gzipped inputs in io/input.rs (flate2, on its
-# pure-Rust miniz_oxide backend, so no system zlib), pull in crates.
+# are written by hand in io/output.rs rather than through serde. Crates are pulled in only for
+# the S3 streaming and decompression in stages/stream.rs; reading gzipped inputs in io/input.rs
+# (flate2, on its pure-Rust miniz_oxide backend, so no system zlib); and the run's scratch
+# directory in scratch.rs, removed on SIGTERM (signal-hook) and swept by PID (libc, already a
+# dependency of the others).
 [dependencies]
 flate2 = "1.1.10"
+libc = "0.2.189"
+signal-hook = "0.4.5"
 ureq = "3.4.1"
 zstd = "0.14.0"
 

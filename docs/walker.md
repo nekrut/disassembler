@@ -37,8 +37,10 @@ logan-walker -a SRR8209082 -q queries/query_hiv1_pol.fasta -o out -f out/hiv1_po
 disassembler walker -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika --emit-snv-table
 ```
 
-GraphAligner 1.0.17b must be on `PATH` (see
+GraphAligner 1.0.17b must be on `PATH`, or named with `--graphaligner <PATH>` (see
 [`issue_graphaligner_end_clipping.md`](issue_graphaligner_end_clipping.md) for why that version).
+The walker checks it once at startup, before downloading anything, logs its version, and warns
+if it is not 1.0.17b.
 `disassembler` finds the walker through `--walker-bin`, then `DISASSEMBLER_WALKER_BIN`, then
 `PATH`, then `walker/target/release/logan-walker` in a source checkout.
 
@@ -147,7 +149,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `-q, --query <FASTA>` | | reference CDS, plain or gzipped; repeatable, and more than one record switches on multi-anchor mode |
 | `-o, --out-dir <DIR>` | `walker_output` | output directory |
 | `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | primary haplotypes |
-| `--scratch-dir <DIR>` | `/dev/shm/logan-walker` | per-accession GFA and GAF files (not shown by `--help`) |
+| `--scratch-dir <DIR>` | `/dev/shm`, else the system temp directory | where the run's private scratch directory is made (see [Scratch files](#scratch-files)) |
 | `--allow-empty` | off | exit 0 when no accession was reconstructed because nothing was found; errors still fail (see [Exit status](#exit-status)) |
 
 ### Anchoring, fetching and walking
@@ -161,6 +163,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `--fetch-workers <N>` | `8` | parallel S3 downloads (bandwidth saturates around 8); at least 1 |
 | `-w, --workers <N>` | `8` | compute workers (see [Memory](#memory) before raising); at least 1 |
 | `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
+| `--graphaligner <PATH>` | `GraphAligner` on `PATH` | the GraphAligner executable |
 | `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover |
 | `--primary-metric <M>` | `matched` | multi-anchor primary selection: `matched`, `cov`, `pident` or `cov_x_pident` |
 | `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables |
@@ -204,13 +207,20 @@ multiply. `-w 16 --fetch-workers 16`, for example, allows 36 buffers.
 
 ## Scratch files
 
-Each accession's subgraph GFA, alignment GAF and a temporary copy of the reference go to
-`--scratch-dir`, default `/dev/shm/logan-walker`. That is tmpfs, so the files use RAM. Their names
-carry the process ID and a per-task counter, so concurrent runs can share the directory, and they
-are removed as each accession finishes. Set `LOGAN_KEEP_SCRATCH=1` to keep them for debugging.
+Each accession's subgraph GFA, alignment GAF and a temporary copy of the reference are written to
+a scratch directory while it is aligned. Every run makes its own, `logan-walker.<pid>.<suffix>`
+with mode 0700, under `--scratch-dir`. The default is `/dev/shm`, which is tmpfs, so the files use
+RAM; where it does not exist (macOS), the system temp directory is used instead. The files are
+removed as each accession finishes, and the directory is removed when the run ends, including
+on SIGINT, SIGTERM or SIGHUP. A run killed outright (SIGKILL, or the out-of-memory killer)
+cannot clean up, so the next run with the same `--scratch-dir` removes any directory whose
+process no longer exists. Set `LOGAN_KEEP_SCRATCH=1` to keep the directory for debugging.
 
-On a shared machine or inside a container, set `--scratch-dir` to a private directory: `/dev/shm`
-is shared by every user on the host and is only 64 MB in a default Docker container.
+Before 0.1.1 every run shared `/dev/shm/logan-walker`: created by one user, it failed other
+users' runs with a bare "permission denied", and an interrupted run left its files there,
+holding RAM until reboot.
+
+`/dev/shm` is only 64 MB in a default Docker container; point `--scratch-dir` elsewhere there.
 
 ## Reproducibility
 

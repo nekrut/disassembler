@@ -1,6 +1,7 @@
 //! Error type for the walker.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub enum Error {
@@ -8,6 +9,9 @@ pub enum Error {
     /// so a run shows exactly how far the flow gets.
     NotImplemented(&'static str),
     Io(std::io::Error),
+    /// A file operation failed, naming the file. A bare `Io` did not: a scratch directory
+    /// another user had created failed every accession with an unexplained EACCES.
+    File { op: &'static str, path: PathBuf, source: std::io::Error },
     /// Network or S3 failure while streaming unitigs.
     Fetch { accession: String, detail: String },
     /// zstd frame could not be decoded.
@@ -37,6 +41,14 @@ pub enum Error {
 }
 
 impl Error {
+    /// Say which file an I/O error was about: `Io` becomes `File`, anything else is kept.
+    pub fn at(self, op: &'static str, path: &Path) -> Error {
+        match self {
+            Error::Io(source) => Error::File { op, path: path.to_path_buf(), source },
+            e => e,
+        }
+    }
+
     /// Process exit code: 3 when every accession errored, 1 for everything else.
     pub fn exit_code(&self) -> u8 {
         match self {
@@ -51,6 +63,7 @@ impl fmt::Display for Error {
         match self {
             Error::NotImplemented(what) => write!(f, "not implemented: {what}"),
             Error::Io(e) => write!(f, "io error: {e}"),
+            Error::File { op, path, source } => write!(f, "cannot {op} {}: {source}", path.display()),
             Error::Fetch { accession, detail } => write!(f, "[{accession}] fetch failed: {detail}"),
             Error::Decompress { accession, detail } => {
                 write!(f, "[{accession}] decompress failed: {detail}")
@@ -102,6 +115,12 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// `map_err` adapter for a raw `io::Error` about `path`.
+pub fn file_err(op: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> Error {
+    let path = path.to_path_buf();
+    move |source| Error::File { op, path, source }
+}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {

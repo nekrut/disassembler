@@ -290,15 +290,39 @@ pub fn write_gfa(
         });
     }
 
-    std::fs::create_dir_all(&cfg.scratch_dir)?;
+    std::fs::create_dir_all(&cfg.scratch_dir)
+        .map_err(crate::error::file_err("create", &cfg.scratch_dir))?;
     let gfa_path = cfg.scratch_dir.join(format!("{}.sub.gfa", scratch_stem(&graph.accession)));
-    let file = std::fs::File::create(&gfa_path)?;
+    // A failed write (a full tmpfs) removes the partial file instead of leaving it behind.
+    let n_edges = write_gfa_file(cfg, graph, &nodes, &seqs, &gfa_path).map_err(|e| {
+        let _ = std::fs::remove_file(&gfa_path);
+        crate::error::file_err("write", &gfa_path)(e)
+    })?;
+
+    Ok(Subgraph {
+        accession: graph.accession.clone(),
+        nodes,
+        seqs,
+        gfa_path,
+        n_edges,
+    })
+}
+
+/// The GFA bytes for `write_gfa`. Returns the number of `L` lines.
+fn write_gfa_file(
+    cfg: &Config,
+    graph: &UnitigGraph,
+    nodes: &[UnitigId],
+    seqs: &[Vec<u8>],
+    gfa_path: &std::path::Path,
+) -> std::io::Result<usize> {
+    let file = std::fs::File::create(gfa_path)?;
     let mut w = BufWriter::with_capacity(1 << 16, file);
 
     // Membership test for "is this edge target inside the subgraph". `nodes` is sorted, so a
     // bitset keyed by unitig id is both smaller and faster than a binary search per edge.
     let mut inside = vec![0u64; graph.n_unitigs.div_ceil(64)];
-    for &id in &nodes {
+    for &id in nodes {
         inside[(id >> 6) as usize] |= 1u64 << (id & 63);
     }
     // An edge target may point past the graph in a malformed (non-reciprocal) input. Valid
@@ -319,7 +343,7 @@ pub fn write_gfa(
 
     let overlap = cfg.graph_k.saturating_sub(1);
     let mut n_edges = 0usize;
-    for &id in &nodes {
+    for &id in nodes {
         for &packed in graph.edges(id) {
             let (target, src_fwd, dst_fwd) = parse::unpack_edge(packed);
             if !is_inside(target) {
@@ -335,14 +359,7 @@ pub fn write_gfa(
         }
     }
     w.flush()?;
-
-    Ok(Subgraph {
-        accession: graph.accession.clone(),
-        nodes,
-        seqs,
-        gfa_path,
-        n_edges,
-    })
+    Ok(n_edges)
 }
 
 #[cfg(test)]
