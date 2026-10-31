@@ -478,6 +478,59 @@ pub struct AccessionResult {
     /// Single-anchor runs leave this empty so `summary.json` stays byte-identical to the
     /// pre-multi-anchor shape.
     pub candidates: Vec<CandidateReport>,
+    /// Share of the graph's unitigs in the extracted neighbourhood
+    /// (`extract::subgraph_fraction`). `None` when nothing was extracted.
+    pub subgraph_fraction: Option<f64>,
+    /// `subgraph_fraction` is above `Config::subgraph_fraction_guard`. Until 0.1.1 this was
+    /// only a warning on stderr, which nothing downstream of a large run reads.
+    pub provisional: bool,
+    /// What the depth-based prune did. `None` when it did not run: `--prune-frac 0`, or no
+    /// first-pass haplotype to measure the depth on. Until 0.1.1 this too was stderr only.
+    pub prune: Option<PruneReport>,
+}
+
+/// How the second, pruned alignment pass ended for one accession.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneResult {
+    /// Realigned on the pruned subgraph, and that result replaced the first.
+    Applied,
+    /// Every unitig cleared the floor.
+    NothingToRemove,
+    /// No unitig cleared the floor, so pruning would have removed the whole subgraph.
+    WouldEmpty,
+    /// The realignment spanned less of the reference than the first; the first stands.
+    RefusedShorterSpan,
+    /// The realignment produced no haplotype; the first stands.
+    RefusedNoHaplotype,
+}
+
+impl PruneResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::NothingToRemove => "nothing_to_remove",
+            Self::WouldEmpty => "would_empty",
+            Self::RefusedShorterSpan => "refused_shorter_span",
+            Self::RefusedNoHaplotype => "refused_no_haplotype",
+        }
+    }
+}
+
+/// The prune pass for one accession, as `summary.json` reports it.
+#[derive(Debug, Clone)]
+pub struct PruneReport {
+    pub result: PruneResult,
+    /// Median `ka:f` on the first-pass route: the gene's depth.
+    pub depth: f32,
+    /// Unitigs below this `ka:f` are removed.
+    pub floor: f32,
+    /// Subgraph unitigs before the prune, and how many cleared the floor.
+    pub unitigs: usize,
+    pub unitigs_kept: usize,
+    /// Reference span `[start, end)` of the first-pass alignment.
+    pub unpruned_span: (usize, usize),
+    /// Reference span of the realignment, when one produced a haplotype.
+    pub pruned_span: Option<(usize, usize)>,
 }
 
 impl AccessionResult {
@@ -505,6 +558,9 @@ impl AccessionResult {
             error,
             anchor_used: None,
             candidates: Vec::new(),
+            subgraph_fraction: None,
+            provisional: false,
+            prune: None,
         }
     }
 }

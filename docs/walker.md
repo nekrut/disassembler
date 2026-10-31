@@ -105,13 +105,26 @@ must now span as much of the reference as the unpruned one (see `--prune-frac` b
 | `-f` (default `reconstructed_haplotypes.fasta`) | always | one primary per reconstructed accession, `>ACC_primary cov=… pident=… nodes=…` (plus `anchor=` in multi-anchor mode) |
 | `<out-dir>/alt_haplotypes.fasta` | unless `--no-emit-alts` | intra-host alternatives, `>ACC_altN …` with their VAF and fork, at most 32 per accession |
 | `<out-dir>/bubbles.json` | always | bubbles in the local subgraph |
-| `<out-dir>/<query stem>_walker_summary.json` | always | per-accession status, metrics and candidates |
+| `<out-dir>/<query stem>_walker_summary.json` | always | versions, references and settings, then per-accession status, metrics, candidates and decisions (below) |
 | `<out-dir>/<ACC>.vcf` | `--emit-vcf` | intra-host SNVs of one accession, written only when it has at least one (a VCF an earlier run left for an accession with none is removed) |
 | `<out-dir>/snvs.tsv` | `--emit-snv-table` | one row per (accession, site, allele) across the run |
 
 `cov` is the walked length over the reference length, and `pident` the identity of the
 alignment. When a haplotype's identity was inherited from the route before an allele was spliced
 in, the header says `inherited_pident=` instead.
+
+The summary JSON starts with what produced it: `logan_walker` and `graphaligner` (versions),
+`references` (each record's id and length), and `settings` (every option that changes which
+accessions are processed or what they produce). Each accession then records two decisions that
+earlier versions only printed:
+
+- `subgraph_fraction` is the extracted neighbourhood's share of the graph's unitigs, and
+  `provisional` is true when it is above the guard (1%), the condition the walker warns about.
+- `prune` is how the pruning pass ended (`null` when it did not run): `outcome` is `applied`,
+  `nothing_to_remove`, `would_empty`, `refused_shorter_span` or `refused_no_haplotype`, with the
+  gene's depth, the floor, the unitigs kept, and the reference span of each alignment.
+
+The run's last lines count the prune outcomes and the provisional results.
 
 VCF positions are 1-based positions in the reference CDS (`CHROM` is the gene). In a
 single-reference run every accession's VCF therefore shares one coordinate frame; in a
@@ -133,6 +146,11 @@ cohort. `--unitigs-cache DIR` reads `<DIR>/<ACC>.unitigs.fa.zst` when present an
 downloads it and writes it there (atomically, so a killed run never leaves a partial file).
 `--offline` refuses the S3 fallback and turns a cache miss into an error naming the accession.
 Cached files are byte-identical to the S3 objects.
+
+The cache is the only thing that writes unitigs to disk, and it keeps every file it downloads:
+the 20,000-accession SARS-CoV-2 run left about 100 GB. Without it, each file is held in memory
+until it is parsed and then dropped, so a run needs RAM (see [Memory](#memory)) but almost no
+disk.
 
 ```bash
 # Fill the cache, no analysis (wraps logan-walker --fetch-only)

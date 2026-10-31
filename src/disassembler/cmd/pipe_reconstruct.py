@@ -394,10 +394,18 @@ def run(args) -> int:
     if n_recon == 0:
         return _die("no haplotypes reconstructed; nothing to align.")
 
+    sieved = out / "reconstructed.sieved.fasta"
+    stem = msa_ref.stem
+    aln = out / f"{stem}_codon_msa.fasta"
+    tree = out / f"{stem}_fasttree.nwk"
+    # The walker has just rewritten the reconstruction, so a sieved copy an earlier run left in
+    # this --out-dir no longer matches it. With --sieve this run writes it again; kept, it sat
+    # beside fresh results as if this run had made it.
+    sieved.unlink(missing_ok=True)
+
     # ---- optional sieve ----------------------------------------------------
     msa_input = recon
     if args.sieve and not args.skip_tree:
-        sieved = out / "reconstructed.sieved.fasta"
         # The default --sieve-min-len is 95% of the shortest walker reference: each primary
         # was reconstructed against its own anchor, which need not be the MSA reference.
         min_len = args.sieve_min_len
@@ -419,13 +427,14 @@ def run(args) -> int:
         msa_input = sieved
 
     if args.skip_tree:
+        # Nor does an MSA or tree an earlier run left, which would otherwise sit beside this
+        # exit 0 as if this run had made it.
+        for stale in (aln, tree):
+            stale.unlink(missing_ok=True)
         print("[reconstruct] --skip-tree: done after reconstruction.")
         return 0
 
     # ---- stage 2: codon MSA + FastTree ------------------------------------
-    stem = msa_ref.stem
-    aln = out / f"{stem}_codon_msa.fasta"
-    tree = out / f"{stem}_fasttree.nwk"
     print(f"[reconstruct] 2/2 codon MSA + tree: --input {msa_input} --out-aln {aln} "
           f"--out-tree {tree}", flush=True)
     msa_args = stage_args(

@@ -95,7 +95,7 @@ needs `GraphAligner`, `MAFFT` and `FastTree` on `PATH`.
 | `--sieve` and `--sieve-*` | off | optional diversity thinning |
 | `--mafft-threads <N>` | `8` | MAFFT threads |
 | `--msa-min-cov <F>` | `0.70` | MSA entry gate |
-| `--skip-tree` | off | stop after the walker; no sieve, MSA or tree |
+| `--skip-tree` | off | stop after the walker; no sieve, MSA or tree (and an MSA or tree an earlier run left in `-o` is removed) |
 
 Any other walker flag goes after a literal `--`, for example
 `disassembler reconstruct ... -- --primary-metric pident --hops 7`. `reconstruct` sets the
@@ -107,6 +107,10 @@ runs in multi-anchor mode, and `reconstruct` says which record the MSA aligns ag
 first record of the first `-q`, unless `--msa-reference` names another). The sieve's default
 `--min-len` is 95% of the shortest reference record, because each primary is reconstructed
 against its own anchor.
+
+Each run removes `reconstructed.sieved.fasta` from an earlier run, since it no longer matches the
+reconstruction the walker has just rewritten; with `--sieve`, this run's is written again.
+`from-kmindex` ends in `reconstruct`, so the same applies there.
 
 `--msa-min-cov` gates only the MSA stage. The walker has its own `--min-cov` (default `0.85`)
 that decides which reconstructions exist at all, and `reconstruct` never sets it: lowering

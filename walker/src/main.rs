@@ -364,6 +364,39 @@ fn main() -> ExitCode {
 /// accession must not sink a 10,000-accession shard. With none, the run fails, unless
 /// `allow_empty` and every accession was a negative (nothing found, not an error). A run
 /// in which every accession errored fails with its own exit code, whatever `allow_empty`.
+/// A line each for the prune outcomes and the provisional results, which `summary.json`
+/// records per accession, so a large run's log says how often each happened.
+fn decision_lines(results: &[types::AccessionResult], guard: f64) -> Vec<String> {
+    use types::PruneResult as P;
+    let mut lines = Vec::new();
+    let parts: Vec<String> = [
+        (P::Applied, "applied"),
+        (P::RefusedShorterSpan, "refused (realignment spans less of the reference)"),
+        (P::RefusedNoHaplotype, "refused (realignment gave no haplotype)"),
+        (P::NothingToRemove, "nothing to remove"),
+        (P::WouldEmpty, "skipped (would have removed every unitig)"),
+    ]
+    .into_iter()
+    .filter_map(|(want, label)| {
+        let n = results.iter().filter(|r| r.prune.as_ref().map(|p| p.result) == Some(want)).count();
+        (n > 0).then(|| format!("{n} {label}"))
+    })
+    .collect();
+    if !parts.is_empty() {
+        lines.push(format!("[logan-walker] prune: {}", parts.join(", ")));
+    }
+    let provisional = results.iter().filter(|r| r.provisional).count();
+    if provisional > 0 {
+        lines.push(format!(
+            "[logan-walker] {provisional} of {} results provisional: neighbourhood above {:.2}% \
+             of the graph",
+            results.len(),
+            guard * 100.0
+        ));
+    }
+    lines
+}
+
 fn check_run(results: &[types::AccessionResult], allow_empty: bool) -> error::Result<()> {
     let total = results.len();
     let success = results.iter().filter(|r| r.outcome == types::Outcome::Success).count();
@@ -542,12 +575,17 @@ fn real_main(mut args: Args) -> error::Result<()> {
         io::output::write_alts(&summary, &alts).map_err(|e| e.at("write", &alts))?;
     }
     let summary_path = args.out_dir.join(format!("{}_walker_summary.json", queries[0].name));
-    io::output::write_summary(&summary, &summary_path).map_err(|e| e.at("write", &summary_path))?;
+    let run = io::output::RunInfo { graphaligner: &version, cfg: &args.cfg, queries: &queries };
+    io::output::write_summary(&summary, &run, &summary_path)
+        .map_err(|e| e.at("write", &summary_path))?;
 
     println!(
         "[logan-walker] {}/{} accessions reconstructed",
         summary.success, summary.total
     );
+    for line in decision_lines(&summary.results, args.cfg.subgraph_fraction_guard) {
+        println!("{line}");
+    }
 
     // Per-accession failures are collected rather than propagated, which is what lets one bad
     // accession not sink a 10,000-accession shard. The cost is that a run where *every*
@@ -560,7 +598,7 @@ fn real_main(mut args: Args) -> error::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{at_least_one, check_fetch, check_run, parse_args};
+    use super::{at_least_one, check_fetch, check_run, decision_lines, parse_args};
     use crate::error::Error;
     use crate::types::{AccessionResult, Outcome};
 
@@ -574,6 +612,25 @@ mod tests {
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn decision_lines_count_each_outcome_and_skip_the_absent_ones() {
+        use crate::types::{PruneReport, PruneResult};
+        let prune = |result| Some(PruneReport {
+            result, depth: 100.0, floor: 5.0, unitigs: 10, unitigs_kept: 4,
+            unpruned_span: (0, 30), pruned_span: None,
+        });
+        let mut r = run_of(&[Outcome::Success, Outcome::Success, Outcome::Success, Outcome::NoPath]);
+        r[0].prune = prune(PruneResult::Applied);
+        r[1].prune = prune(PruneResult::Applied);
+        r[2].prune = prune(PruneResult::RefusedShorterSpan);
+        r[1].provisional = true;
+        assert_eq!(decision_lines(&r, 0.01), vec![
+            "[logan-walker] prune: 2 applied, 1 refused (realignment spans less of the reference)",
+            "[logan-walker] 1 of 4 results provisional: neighbourhood above 1.00% of the graph",
+        ]);
+        assert!(decision_lines(&run_of(&[Outcome::NoAnchors]), 0.01).is_empty());
     }
 
     #[test]

@@ -665,9 +665,10 @@ mod real_data_collect {
         eprintln!("  round-tripped {checked} sequences byte-for-byte");
         assert_eq!(checked, graph.n_unitigs, "record count mismatch");
 
-        // And the subgraph path specifically.
+        // And the subgraph path specifically. 422 nodes is the k=31 subgraph (the recall
+        // study's, above); the default -k has since moved to 21.
         let query = read_query(Path::new("../queries/pfcrt_only.fasta")).unwrap();
-        let cfg = Config::default();
+        let cfg = Config { k: 31, ..Config::default() };
         let idx = anchor::index_query(&cfg, &query).unwrap();
         let a = anchor::find(&cfg, &graph, &idx).unwrap();
         let nodes = expand(&cfg, &graph, &a).unwrap();

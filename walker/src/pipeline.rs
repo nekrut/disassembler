@@ -94,7 +94,10 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::stages;
-use crate::types::{Accession, AccessionResult, FetchedUnitigs, GafPath, Outcome, Query, Timing};
+use crate::types::{
+    Accession, AccessionResult, FetchedUnitigs, GafPath, Outcome, PruneReport, PruneResult, Query,
+    Timing,
+};
 use std::time::Instant;
 
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -542,18 +545,23 @@ fn run_one(
             error: None,
             anchor_used: None,
             candidates: Vec::new(),
+            subgraph_fraction: None,
+            provisional: false,
+            prune: None,
         });
     }
 
     let t = Instant::now();
     let nodes = stages::extract::expand(cfg, &graph, &anchors)?;
-    if stages::extract::exceeds_guard(cfg, &graph, &nodes) {
+    let subgraph_fraction = stages::extract::subgraph_fraction(&graph, &nodes);
+    let provisional = stages::extract::exceeds_guard(cfg, &graph, &nodes);
+    if provisional {
         eprintln!(
             "[{}] WARNING: 5-hop neighbourhood is {:.2}% of the graph ({} of {} unitigs), \
              above the {:.2}% guard. The haplotype is likely under-determined; treat this \
              accession's result as provisional.",
             graph.accession,
-            stages::extract::subgraph_fraction(&graph, &nodes) * 100.0,
+            subgraph_fraction * 100.0,
             nodes.len(),
             graph.n_unitigs,
             cfg.subgraph_fraction_guard * 100.0
@@ -693,6 +701,7 @@ fn run_one(
     // If the second pass finds no haplotype, or one spanning less of the reference (see
     // `pruned_covers_as_much`), the first pass's result stands. Pruning can improve an
     // accession and cannot break one. The cost is one extra alignment.
+    let mut prune: Option<PruneReport> = None;
     if cfg.prune_frac > 0.0 {
         if let (Some(path), Some(_)) = (&final_path, &haplotype) {
             let depth = stages::extract::path_depth(&graph, &path.steps);
@@ -716,8 +725,20 @@ fn run_one(
                 .filter(|&&id| graph.abundance[id as usize] >= floor)
                 .count();
 
+            let unpruned_span = (path.query_start, path.query_end);
+            let report = |result, pruned_span| PruneReport {
+                result,
+                depth,
+                floor,
+                unitigs: before,
+                unitigs_kept: surviving,
+                unpruned_span,
+                pruned_span,
+            };
+
             match prune_outcome(surviving, before) {
                 PruneOutcome::WouldEmpty => {
+                prune = Some(report(PruneResult::WouldEmpty, None));
                 // Pruning to nothing is not a prune. Keep the unpruned subgraph, which is the
                 // same "never a regression" rule the failed-realign branch below applies.
                 eprintln!(
@@ -727,6 +748,7 @@ fn run_one(
                 );
                 }
                 PruneOutcome::NothingToRemove => {
+                prune = Some(report(PruneResult::NothingToRemove, None));
                 eprintln!(
                     "[{}] prune: depth {:.0}x, floor {:.1}x, nothing to remove",
                     graph.accession, depth, floor
@@ -751,8 +773,10 @@ fn run_one(
                     None => None,
                 };
                 timing.align += t.elapsed().as_secs_f64();
+                let pruned_span = second.as_ref().map(|(p, _)| (p.query_start, p.query_end));
                 match second {
                     Some((p, h)) if pruned_covers_as_much(path, &p) => {
+                        prune = Some(report(PruneResult::Applied, pruned_span));
                         eprintln!(
                             "[{}] prune: depth {:.0}x, floor {:.1}x, {} of {} unitigs kept; \
                              realigned, min coverage on the route now {:.1}x",
@@ -768,6 +792,12 @@ fn run_one(
                         subgraph = pruned;
                     }
                     rejected => {
+                        let result = if rejected.is_some() {
+                            PruneResult::RefusedShorterSpan
+                        } else {
+                            PruneResult::RefusedNoHaplotype
+                        };
+                        prune = Some(report(result, pruned_span));
                         match rejected {
                             Some((p, _)) => eprintln!(
                                 "[{}] prune: depth {:.0}x, floor {:.1}x; the realigned route \
@@ -871,6 +901,9 @@ fn run_one(
         error: None,
         anchor_used: anchor_used_for_output,
         candidates: candidate_reports,
+        subgraph_fraction: Some(subgraph_fraction),
+        provisional,
+        prune,
     })
 }
 

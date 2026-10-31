@@ -218,6 +218,24 @@ class TestReconstruct(_Stubs):
         self.assertEqual(rc, 0, log)
         self.assertEqual((out / "gene_codon_msa.fasta").read_text().count(">"), 3)
 
+    def test_skip_tree_removes_an_earlier_runs_derived_outputs(self):
+        # A full run, then --skip-tree into the same directory: the earlier MSA, tree and
+        # sieved copy no longer match the reconstruction the walker has just rewritten.
+        accs = self.work / "accs.txt"
+        accs.write_text("SRR1\nSRR2\n")
+        out = self.work / "out"
+        argv = ["reconstruct", "-l", str(accs), "-q", str(self.ref), "-o", str(out),
+                "--walker-bin", str(self.walker)]
+        rc, log = _run(argv)
+        self.assertEqual(rc, 0, log)
+        stale = [out / "gene_codon_msa.fasta", out / "gene_fasttree.nwk",
+                 out / "reconstructed.sieved.fasta"]
+        stale[2].write_text(f">old\n{REF}\n")
+        self.assertTrue(all(p.is_file() for p in stale))
+        rc, log = _run(argv + ["--skip-tree"])
+        self.assertEqual(rc, 0, log)
+        self.assertTrue((out / "reconstructed.fasta").is_file())
+        self.assertEqual([p.name for p in stale if p.exists()], [])
 
     def test_gzipped_query_and_accession_list(self):
         import gzip

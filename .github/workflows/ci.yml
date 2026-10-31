@@ -66,7 +66,7 @@ jobs:
         run: python3 tests/test_sieve_integration.py
 
   golden:
-    name: golden concordance (manual)
+    name: golden concordance and data-backed tests (manual)
     # Needs GraphAligner and network access to the Logan S3 bucket, so it is not on the
     # every-push path. Trigger it from the Actions tab (Run workflow) when the walk changes.
     if: github.event_name == 'workflow_dispatch'
@@ -80,10 +80,34 @@ jobs:
         with:
           environment-name: gaa
           create-args: >-
-            -c conda-forge -c bioconda graphaligner=1.0.17b
+            -c conda-forge -c bioconda graphaligner=1.0.17b zstd
       - name: Build walker
         run: cargo build --release
         working-directory: walker
       - name: Golden concordance
         shell: bash -el {0}
         run: bench/check_golden.sh
+      # The walker's #[ignore] tests check it against real Logan files and recorded
+      # measurements. Without their data they skip themselves and still pass, which is how
+      # three of them stayed broken from the -k default change until 0.1.1, so a SKIP fails
+      # this step. `cross_check` only writes a GFA for inspection and asserts nothing.
+      - name: Data-backed walker tests
+        # Independent of the golden check above, so it runs even when that fails.
+        if: ${{ !cancelled() }}
+        shell: bash -el {0}
+        working-directory: walker
+        run: |
+          set -o pipefail
+          data="$RUNNER_TEMP/logan"
+          printf 'ERR2028820\nSRR8209082\n' > "$RUNNER_TEMP/accessions.txt"
+          target/release/logan-walker --fetch-only -l "$RUNNER_TEMP/accessions.txt" \
+            --unitigs-cache "$data" -o "$RUNNER_TEMP/fetch"
+          zstd -dc "$data/ERR2028820.unitigs.fa.zst" > "$RUNNER_TEMP/ERR2028820.unitigs.fa"
+          LOGAN_TEST_ZST="$data/ERR2028820.unitigs.fa.zst" LOGAN_TEST_DIR="$data" \
+            LOGAN_TEST_PLAIN="$RUNNER_TEMP/ERR2028820.unitigs.fa" \
+            cargo test --release -- --ignored --nocapture --test-threads 1 --skip cross_check \
+            2>&1 | tee "$RUNNER_TEMP/ignored.log"
+          if grep -n "SKIP:" "$RUNNER_TEMP/ignored.log"; then
+            echo "a data-backed test skipped itself (lines above); it was not checked" >&2
+            exit 1
+          fi

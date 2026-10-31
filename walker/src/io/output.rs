@@ -11,6 +11,7 @@
 //! keeping one exact layout (two-space indent, fields always in the same order) matters more
 //! here than convenience, because summaries are meant to be diffable.
 
+use crate::config::Config;
 use crate::error::Result;
 use crate::pipeline::Summary;
 use crate::types::{AccessionResult, Outcome, Query, Strand};
@@ -195,6 +196,52 @@ pub fn write_bubbles(summary: &Summary, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_run_info(w: &mut impl Write, run: &RunInfo) -> Result<()> {
+    let c = run.cfg;
+    writeln!(w, "  \"logan_walker\": \"{}\",", env!("CARGO_PKG_VERSION"))?;
+    writeln!(w, "  \"graphaligner\": \"{}\",", esc(run.graphaligner))?;
+    writeln!(w, "  \"references\": [")?;
+    for (i, q) in run.queries.iter().enumerate() {
+        writeln!(
+            w,
+            "    {{\"id\": \"{}\", \"length\": {}}}{}",
+            esc(&q.record_id),
+            q.seq.len(),
+            if i + 1 == run.queries.len() { "" } else { "," }
+        )?;
+    }
+    writeln!(w, "  ],")?;
+    // Everything that changes which accessions are processed or what they produce. Workers,
+    // timeouts and paths change neither, and are left out.
+    let settings: [(&str, String); 19] = [
+        ("k", c.k.to_string()),
+        ("graph_k", c.graph_k.to_string()),
+        ("min_shared_kmers", c.min_shared_kmers.to_string()),
+        ("hops", c.hops.to_string()),
+        ("subgraph_fraction_guard", format!("{:?}", c.subgraph_fraction_guard)),
+        ("max_size_mb", (c.max_compressed_bytes / (1024 * 1024)).to_string()),
+        ("min_cov", format!("{:?}", c.min_cov)),
+        ("primary_metric", format!("\"{}\"", c.primary_metric.as_str())),
+        ("prune_frac", format!("{:?}", c.prune_frac)),
+        ("prefer_majority", c.prefer_majority.to_string()),
+        ("min_abund", format!("{:?}", c.min_abund)),
+        ("min_abund_frac", format!("{:?}", c.min_abund_frac)),
+        ("min_vaf", format!("{:?}", c.min_vaf)),
+        ("alt_max_detour", c.alt_max_detour.to_string()),
+        ("max_alts", c.max_alts.to_string()),
+        ("indel_alts", c.allow_indel_alts.to_string()),
+        ("max_alt_indel", c.max_alt_indel.to_string()),
+        ("allow_frameshift_alts", c.allow_frameshift_alts.to_string()),
+        ("graphaligner_threads", c.graphaligner_threads.to_string()),
+    ];
+    writeln!(w, "  \"settings\": {{")?;
+    for (i, (k, v)) in settings.iter().enumerate() {
+        writeln!(w, "    \"{k}\": {v}{}", if i + 1 == settings.len() { "" } else { "," })?;
+    }
+    writeln!(w, "  }},")?;
+    Ok(())
+}
+
 fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<()> {
     writeln!(w, "    {{")?;
     writeln!(w, "      \"acc\": \"{}\",", esc(&r.accession))?;
@@ -202,6 +249,11 @@ fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<(
     writeln!(w, "      \"n_unitigs\": {},", r.n_unitigs)?;
     writeln!(w, "      \"n_anchors\": {},", r.n_anchors)?;
     writeln!(w, "      \"subgraph_nodes\": {},", r.subgraph_nodes)?;
+    match r.subgraph_fraction {
+        Some(f) => writeln!(w, "      \"subgraph_fraction\": {f:.6},")?,
+        None => writeln!(w, "      \"subgraph_fraction\": null,")?,
+    }
+    writeln!(w, "      \"provisional\": {},", r.provisional)?;
     if r.haplotypes.is_empty() {
         writeln!(w, "      \"reconstructed\": [],")?;
     } else {
@@ -272,6 +324,28 @@ fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<(
         }
         writeln!(w, "      ],")?;
     }
+    match &r.prune {
+        None => writeln!(w, "      \"prune\": null,")?,
+        Some(p) => {
+            let span = |s: Option<(usize, usize)>| match s {
+                Some((a, b)) => format!("[{a}, {b}]"),
+                None => "null".to_string(),
+            };
+            writeln!(
+                w,
+                "      \"prune\": {{\"outcome\": \"{}\", \"depth\": {:.1}, \"floor\": {:.1}, \
+                 \"unitigs\": {}, \"unitigs_kept\": {}, \"unpruned_span\": {}, \
+                 \"pruned_span\": {}}},",
+                p.result.as_str(),
+                p.depth,
+                p.floor,
+                p.unitigs,
+                p.unitigs_kept,
+                span(Some(p.unpruned_span)),
+                span(p.pruned_span)
+            )?;
+        }
+    }
     if let Some(e) = &r.error {
         writeln!(w, "      \"error\": \"{}\",", esc(e))?;
     }
@@ -290,11 +364,24 @@ fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<(
     Ok(())
 }
 
-/// Per-accession counts and stage timings.
+/// What produced a summary: the versions, the references, and the settings that change
+/// results.
+///
+/// 0.1.1 changes primaries (`--primary-metric matched`, the header fix, the prune coverage
+/// rule), so a summary has to say which walker and which settings wrote it; until 0.1.1 one
+/// on disk could not.
+pub struct RunInfo<'a> {
+    /// GraphAligner's own `--version` line.
+    pub graphaligner: &'a str,
+    pub cfg: &'a Config,
+    pub queries: &'a [Query],
+}
+
+/// Provenance, then per-accession counts, decisions and stage timings.
 ///
 /// The top-level shape and the per-result field names are kept stable, so summaries can be
-/// diffed directly.
-pub fn write_summary(summary: &Summary, path: &Path) -> Result<()> {
+/// diffed directly. Fields are only ever added.
+pub fn write_summary(summary: &Summary, run: &RunInfo, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -302,6 +389,7 @@ pub fn write_summary(summary: &Summary, path: &Path) -> Result<()> {
     }
     let mut w = BufWriter::new(std::fs::File::create(path)?);
     writeln!(w, "{{")?;
+    write_run_info(&mut w, run)?;
     writeln!(w, "  \"total\": {},", summary.total)?;
     writeln!(w, "  \"success\": {},", summary.success)?;
     writeln!(w, "  \"results\": [")?;
@@ -928,6 +1016,9 @@ mod vcf_tests {
             error: None,
             anchor_used: None,
             candidates: Vec::new(),
+            subgraph_fraction: None,
+            provisional: false,
+            prune: None,
         }
     }
 
@@ -1078,7 +1169,57 @@ mod identity_label_tests {
                 error: None,
                 anchor_used: None,
                 candidates: Vec::new(),
+                subgraph_fraction: None,
+                provisional: false,
+                prune: None,
             }],
+        }
+    }
+
+    /// `write_summary` with a fixed provenance block.
+    fn write_summary(s: &Summary, p: &std::path::Path) -> crate::error::Result<()> {
+        let cfg = crate::config::Config::default();
+        let queries = [crate::types::Query {
+            name: "gene".into(), record_id: "gene".into(), seq: b"ACGT".to_vec(),
+            path: std::path::PathBuf::from("gene.fa"), n_records: 1,
+        }];
+        let run = super::RunInfo { graphaligner: "GraphAligner bioconda 1.0.17b-0", cfg: &cfg,
+                                   queries: &queries };
+        super::write_summary(s, &run, p)
+    }
+
+    /// The versions and settings, and the per-accession guard and prune decisions that used
+    /// to reach only stderr.
+    #[test]
+    fn summary_json_records_provenance_and_decisions() {
+        use crate::types::{PruneReport, PruneResult};
+        let mut s = summary(hap("ACC_primary", false), vec![]);
+        s.results[0].subgraph_fraction = Some(0.161189);
+        s.results[0].provisional = true;
+        s.results[0].prune = Some(PruneReport {
+            result: PruneResult::RefusedShorterSpan, depth: 1700.0, floor: 17.0,
+            unitigs: 4976, unitigs_kept: 1734, unpruned_span: (0, 3821),
+            pruned_span: Some((424, 3821)),
+        });
+        let p = tmp("summary_provenance.json");
+        write_summary(&s, &p).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        for want in [
+            concat!("\"logan_walker\": \"", env!("CARGO_PKG_VERSION"), "\""),
+            "\"graphaligner\": \"GraphAligner bioconda 1.0.17b-0\"",
+            "{\"id\": \"gene\", \"length\": 4}",
+            "\"primary_metric\": \"matched\"",
+            "\"prune_frac\": 0.01",
+            "\"min_abund\": 5.0",
+            "\"max_size_mb\": 1024",
+            "\"subgraph_fraction\": 0.161189",
+            "\"provisional\": true",
+            "\"prune\": {\"outcome\": \"refused_shorter_span\", \"depth\": 1700.0, \"floor\": 17.0, \
+             \"unitigs\": 4976, \"unitigs_kept\": 1734, \"unpruned_span\": [0, 3821], \
+             \"pruned_span\": [424, 3821]}",
+        ] {
+            assert!(out.contains(want), "missing {want}: {out}");
         }
     }
 
@@ -1164,7 +1305,7 @@ mod identity_label_tests {
             },
         ];
         let p = tmp("summary_candidates.json");
-        super::write_summary(&s, &p).unwrap();
+        write_summary(&s, &p).unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
         assert!(out.contains("\"candidates\""), "missing candidates field: {out}");
         assert!(out.contains("\"record_id\": \"Wuhan\""), "loser reference missing: {out}");
@@ -1184,7 +1325,7 @@ mod identity_label_tests {
         let s = summary(hap("ACC_primary", false), vec![]);
         assert!(s.results[0].candidates.is_empty(), "test setup: expected empty candidates");
         let p = tmp("summary_no_candidates.json");
-        super::write_summary(&s, &p).unwrap();
+        write_summary(&s, &p).unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
         assert!(
             !out.contains("\"candidates\""),
