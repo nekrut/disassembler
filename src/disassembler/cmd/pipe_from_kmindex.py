@@ -4,6 +4,11 @@ Composite that chains `harvest`, `stratify` (optional), and `reconstruct` for
 one target at a time. Multi-target work should compose the atomics; this
 convenience wraps the single-target end-to-end path.
 
+Harvest input, exactly one of:
+  --history-id + --collection-id -> fetch the shard collection from Galaxy
+  --shards-dir                   -> read shard JSONs already on disk
+  --skip-harvest                 -> reuse <cohort-dir>/*.scores.json from an earlier run
+
 Accession-list selection after stratify:
   --score-bin ... -> <cohort-dir>/<target>.bins.txt
   (omitted)       -> <cohort-dir>/<target>.accessions.txt   (the raw harvest list)
@@ -13,12 +18,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-import types
 from pathlib import Path
 
 from disassembler.cmd import harvest as harvest_cmd
 from disassembler.cmd import pipe_reconstruct
 from disassembler.cmd import stratify as stratify_cmd
+from disassembler.stage import stage_args
 from disassembler.validators import (
     fraction,
     positive_float,
@@ -51,15 +56,26 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
     # ---- Stage 1: harvest (Galaxy kmindex) --------------------------------
     g_harvest = p.add_argument_group(
-        "Harvest: Galaxy kmindex",
-        description="Pull a kmindex shard collection from a Galaxy history. See "
-                    "`disassembler harvest -h` for the underlying atomic.",
+        "Harvest: kmindex shards",
+        description=(
+            "  Merge kmindex shard results into per-target accession lists. Give\n"
+            "  exactly one of:\n"
+            "    --history-id with --collection-id   fetch the shards from Galaxy\n"
+            "    --shards-dir                        read shards already on disk\n"
+            "    --skip-harvest                      reuse an earlier harvest\n"
+            "  See `disassembler harvest -h` for the underlying atomic.\n"
+        ),
     )
-    g_harvest.add_argument("--history-id", required=True,
+    g_harvest.add_argument("--history-id", default=None,
                            help="Galaxy history ID that contains the kmindex dataset "
-                                "collection to harvest.")
-    g_harvest.add_argument("--collection-id", required=True,
-                           help="Galaxy dataset collection ID for the kmindex query shards.")
+                                "collection to harvest. Needs --collection-id.")
+    g_harvest.add_argument("--collection-id", default=None,
+                           help="Galaxy dataset collection ID for the kmindex query shards. "
+                                "Needs --history-id.")
+    g_harvest.add_argument("--shards-dir", default=None,
+                           help="Directory of kmindex shard JSON files already on disk, "
+                                "instead of fetching them from Galaxy. Every regular file "
+                                "directly in it is read as a shard, whatever its name.")
     g_harvest.add_argument("--base-url", default="https://usegalaxy.org",
                            help="Galaxy instance URL "
                                 "(default: https://usegalaxy.org).")
@@ -75,9 +91,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                                 "stratified accession lists "
                                 "(default: <out-dir>/cohort).")
     g_harvest.add_argument("--skip-harvest", action="store_true",
-                           help="Reuse existing <cohort-dir>/*.scores.json instead of "
-                                "calling Galaxy. Combine with --offline and a pre-warmed "
-                                "--unitigs-cache for a fully offline kmindex -> tree run.")
+                           help="Reuse existing <cohort-dir>/*.scores.json from an earlier "
+                                "harvest instead of harvesting again. Combine with --offline "
+                                "and a pre-warmed --unitigs-cache for a fully offline "
+                                "kmindex -> tree run.")
 
     # ---- Stage 2: stratify (optional) -------------------------------------
     g_stratify = p.add_argument_group(
@@ -252,12 +269,27 @@ def run(args) -> int:
     if scrub_err:
         print(f"from-kmindex: {scrub_err}", file=sys.stderr)
         return 1
-    # API key file: only relevant when we're actually going to hit Galaxy.
-    if not args.skip_harvest:
-        key_err = validate_api_key_file(args.api_key_file)
-        if key_err:
-            print(f"from-kmindex: {key_err}", file=sys.stderr)
-            return 1
+    # Harvest source, also checked before anything runs.
+    harvest_flags = [f for f, v in (("--history-id", args.history_id),
+                                   ("--collection-id", args.collection_id),
+                                   ("--shards-dir", args.shards_dir)) if v]
+    if args.skip_harvest:
+        if harvest_flags:
+            print(f"from-kmindex: {', '.join(harvest_flags)} cannot be combined with "
+                  f"--skip-harvest, which reuses an earlier harvest.", file=sys.stderr)
+            return 2
+    else:
+        _mode, mode_err = harvest_cmd._validate_mode(args)
+        if mode_err:
+            print(f"from-kmindex: {mode_err} (or --skip-harvest to reuse an earlier "
+                  f"harvest).", file=sys.stderr)
+            return 2
+        # API key file: only relevant when we're actually going to hit Galaxy.
+        if not args.shards_dir:
+            key_err = validate_api_key_file(args.api_key_file)
+            if key_err:
+                print(f"from-kmindex: {key_err}", file=sys.stderr)
+                return 1
 
     out_dir = Path(args.out_dir)
     cohort_dir = Path(args.cohort_dir) if args.cohort_dir else out_dir / "cohort"
@@ -274,9 +306,11 @@ def run(args) -> int:
         print(f"[from-kmindex] 1/3 harvest skipped: reusing {len(existing)} "
               f"*.scores.json in {cohort_dir}", flush=True)
     else:
-        harvest_ns = types.SimpleNamespace(
+        harvest_ns = stage_args(
+            harvest_cmd,
             history_id=args.history_id,
             collection_id=args.collection_id,
+            shards_dir=args.shards_dir,
             base_url=args.base_url,
             api_key_file=args.api_key_file,
             out_dir=str(cohort_dir),
@@ -289,7 +323,8 @@ def run(args) -> int:
 
     # ---- 2/3 stratify (optional) ------------------------------------------
     if args.score_bins:
-        stratify_ns = types.SimpleNamespace(
+        stratify_ns = stage_args(
+            stratify_cmd,
             out_dir=str(cohort_dir),
             score_bins=args.score_bins,
         )
@@ -315,8 +350,8 @@ def run(args) -> int:
 
     # ---- 3/3 reconstruct --------------------------------------------------
     print(f"[from-kmindex] 3/3 reconstruct -> {out_dir}", flush=True)
-    reconstruct_ns = types.SimpleNamespace(
-        accession=None,
+    reconstruct_ns = stage_args(
+        pipe_reconstruct,
         accession_list=str(acc_list),
         query=args.query,
         msa_reference=args.msa_reference,

@@ -83,11 +83,30 @@ disassembler from-kmindex \
     --target zika_ns5 -q queries/markers/zika_ns5.fasta -o out/zika_ns5
 ```
 
+The shards come from exactly one of three places:
+
+| flags | harvest |
+|---|---|
+| `--history-id` and `--collection-id` | fetches the shard collection from Galaxy |
+| `--shards-dir <DIR>` | reads shard JSON files already on disk, as `harvest --shards-dir` does |
+| `--skip-harvest` | none: reuses the `*.scores.json` an earlier run left in `--cohort-dir` |
+
 Harvest output goes to `--cohort-dir` (default `<out-dir>/cohort`), and `--target` picks which
-target's list is reconstructed. `--skip-harvest` reuses the `*.scores.json` already in
-`--cohort-dir` instead of calling Galaxy. `--harvest-workers` is harvest's `--download-workers`.
-The walker, sieve and MSA options are the same as `reconstruct`'s (see
-[`codon_msa.md`](codon_msa.md#disassembler-reconstruct)).
+target's list is reconstructed. `--harvest-workers` is harvest's `--download-workers`. The
+walker, sieve and MSA options are the same as `reconstruct`'s (see
+[`codon_msa.md`](codon_msa.md#disassembler-reconstruct)). For a run that never touches the
+network, harvest from `--shards-dir` (or `--skip-harvest`) and walk with `--offline` and a
+pre-filled `--unitigs-cache`:
+
+```bash
+disassembler from-kmindex --skip-harvest --cohort-dir out/zika_ns5/cohort \
+    --target zika_ns5 -q queries/markers/zika_ns5.fasta -o out/zika_ns5 \
+    --unitigs-cache cache/ --offline
+```
+
+Before 0.1.1, `from-kmindex` crashed in every harvest with an `AttributeError` (it did not pass
+harvest's `--shards-dir` setting), and it required the two Galaxy IDs even with
+`--skip-harvest`.
 
 ## Scale
 

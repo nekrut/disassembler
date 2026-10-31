@@ -22,13 +22,13 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-import types
 from pathlib import Path
 
 from disassembler.cmd import lexicmap as lexicmap_cmd
 from disassembler.cmd import msa as msa_cmd
 from disassembler.cmd import sieve as sieve_cmd
 from disassembler.resolve import resolve_sieve
+from disassembler.stage import stage_args
 
 
 from disassembler.validators import (
@@ -261,7 +261,8 @@ def run(args) -> int:
 
     # ---- 1/3 lexicmap ------------------------------------------------------
     print(f"[from-lexicmap] 1/3 lexicmap -> {prefix}.*", flush=True)
-    lex_ns = types.SimpleNamespace(
+    lex_ns = stage_args(
+        lexicmap_cmd,
         ref=args.ref,
         dataset=args.dataset,
         file=args.file,
@@ -336,7 +337,8 @@ def run(args) -> int:
     msa_min_cov = args.msa_min_cov
     if msa_min_cov is None:
         msa_min_cov = round(min(0.70, gate - GATE_MARGIN), 6)
-    msa_ns = types.SimpleNamespace(
+    msa_ns = stage_args(
+        msa_cmd,
         ref=args.ref,
         input=str(msa_input),
         out_aln=str(aln),

@@ -10,13 +10,13 @@ import argparse
 import os
 import shutil
 import sys
-import types
 from pathlib import Path
 
 from disassembler.cmd import msa as msa_cmd
 from disassembler.cmd import sieve as sieve_cmd
 from disassembler.cmd import walker as walker_cmd
 from disassembler.resolve import resolve_sieve, resolve_walker
+from disassembler.stage import stage_args
 from disassembler.validators import (
     fasta_has_record,
     fraction,
@@ -420,7 +420,8 @@ def run(args) -> int:
     tree = out / f"{stem}_fasttree.nwk"
     print(f"[reconstruct] 2/2 codon MSA + tree: --input {msa_input} --out-aln {aln} "
           f"--out-tree {tree}", flush=True)
-    msa_args = types.SimpleNamespace(
+    msa_args = stage_args(
+        msa_cmd,
         ref=str(msa_ref),
         input=str(msa_input),
         out_aln=str(aln),
