@@ -32,14 +32,24 @@ directory, where `<gene>` is the reference file's stem.
   fragment. Gaps and N do not count, so a LexicMap row, which is reference-length with `-`
   wherever no hit reached, is measured by what it covers.
 
-`msa` prints QC on the way through: how many sequences passed the coverage gate, the final taxa
-count, the alignment length and the codon count. For a coding reference the alignment length is
-an exact multiple of three. MAFFT and FastTree are found on `PATH`.
+- **Orientation.** MAFFT does not reverse-complement its inputs, and `--keeplength` fits any
+  input to the reference's length, so a haplotype on the other strand used to align as noise
+  and exit 0. Each haplotype is now compared with the reference and its reverse complement by
+  shared 15-mers, and reverse-complemented if it matches the reverse strand. Walker output is
+  always in query orientation already; the case this catches is a FASTA assembled another way,
+  such as a CDS annotated on the minus strand of a circular genome. On four real cohorts every
+  row shared at least 896 15-mers with its reference's strand and at most 23 with the other.
+- **Identity check.** After MAFFT, each row's identity to the reference is measured over the
+  columns where both have a base. Same-gene cohorts measured 0.88 or more (HIV-1 *pol*,
+  SARS-CoV-2 spike, C. auris FKS1, H. pylori *vacA*); a row on the wrong strand, or from another
+  gene, aligns at 0.40 to 0.50. Rows under `--min-identity` (default `0.60`) are named in a
+  warning, and if the median is under it, `msa` fails without writing the alignment. `0`
+  turns the check off.
 
-**Orientation.** MAFFT does not reverse-complement its inputs. Every haplotype must be on the
-same strand as the reference CDS. Walker output always is, because the walker reports
-haplotypes in query orientation; a FASTA assembled some other way (for example a CDS annotated
-on the minus strand of a circular genome) must be oriented before it reaches `msa`.
+`msa` prints QC on the way through: how many sequences passed the coverage gate, how many were
+reverse-complemented, the median and lowest identity to the reference, the final taxa count,
+the alignment length and the codon count. For a coding reference the alignment length is an
+exact multiple of three. MAFFT and FastTree are found on `PATH`.
 
 ## Running it
 
@@ -62,7 +72,7 @@ disassembler msa \
   --out-tree out/zika/zika_ns5_fasttree.nwk
 ```
 
-`msa` reads only the first record of `--ref`.
+`msa` aligns against the first record of `--ref`, and warns when the file holds more.
 
 ## `disassembler reconstruct`
 
@@ -90,6 +100,12 @@ Any other walker flag goes after a literal `--`, for example
 `disassembler reconstruct ... -- --primary-metric pident --hops 7`. `reconstruct` sets the
 walker's `-f` (so later stages can find the FASTA) and keeps `-t` at 1 (GraphAligner is not
 reproducible with more threads).
+
+With more than one reference record, from several `-q` or one multi-record file, the walker
+runs in multi-anchor mode, and `reconstruct` says which record the MSA aligns against (the
+first record of the first `-q`, unless `--msa-reference` names another). The sieve's default
+`--min-len` is 95% of the shortest reference record, because each primary is reconstructed
+against its own anchor.
 
 `--msa-min-cov` gates only the MSA stage. The walker has its own `--min-cov` (default `0.85`)
 that decides which reconstructions exist at all, and `reconstruct` never sets it: lowering

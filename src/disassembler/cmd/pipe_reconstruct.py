@@ -19,6 +19,7 @@ from disassembler.resolve import resolve_sieve, resolve_walker
 from disassembler.stage import stage_args
 from disassembler.validators import (
     fasta_has_record,
+    fasta_record_lengths,
     fraction,
     positive_float,
     positive_int,
@@ -158,7 +159,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                               "resolution of the novelty estimator at 1/m.")
     g_sieve.add_argument("--sieve-min-len", type=positive_int, default=None,
                          help="Minimum sequence length gate for the sieve "
-                              "(default: auto = 95%% of the first -q record's length).")
+                              "(default: auto = 95%% of the shortest -q record's length).")
     g_sieve.add_argument("--sieve-bin", default=None,
                          help="Explicit path to the kmer-diversity-sieve l1_pipeline_serial "
                               "binary (auto-discovered otherwise).")
@@ -293,9 +294,13 @@ def run(args) -> int:
     msa_ref = Path(args.msa_reference) if args.msa_reference else queries[0]
     if not args.skip_tree and not msa_ref.is_file():
         return _die(f"MSA reference not found: {msa_ref}")
-    if len(queries) > 1 and not args.skip_tree and args.msa_reference is None:
-        print(f"[reconstruct] multi-anchor: MSA reference defaults to first -q ({msa_ref}); "
-              f"pass --msa-reference to override.", flush=True)
+    # Multi-anchor mode is any reference set of more than one record, from several -q or from
+    # one multi-record file; the notice used to fire only for several -q.
+    references = [r for q in queries for r in fasta_record_lengths(q)]
+    if len(references) > 1 and not args.skip_tree and args.msa_reference is None:
+        print(f"[reconstruct] multi-anchor: {len(references)} references. The MSA aligns "
+              f"against the first record of the first -q ({references[0][0]} in {msa_ref}); "
+              f"pass --msa-reference to choose another.", flush=True)
 
     # Unitigs cache sanity: must be a directory if it exists; must exist under
     # --offline. The walker enforces most of this too, but checking here fails
@@ -396,12 +401,18 @@ def run(args) -> int:
     msa_input = recon
     if args.sieve and not args.skip_tree:
         sieved = out / "reconstructed.sieved.fasta"
-        # The default --sieve-min-len is sized on the reference the MSA stage measures
-        # the haplotypes against; with a single -q that is the query itself.
+        # The default --sieve-min-len is 95% of the shortest walker reference: each primary
+        # was reconstructed against its own anchor, which need not be the MSA reference.
+        min_len = args.sieve_min_len
+        if min_len is None:
+            rid, length = min(references, key=lambda r: r[1])
+            min_len = int(length * 0.95)
+            if len(references) > 1:
+                print(f"[reconstruct] sieve --min-len {min_len}: 95% of the shortest "
+                      f"reference ({rid}, {length} nt).", flush=True)
         rc = sieve_cmd.sieve_run(
             recon, sieved,
-            ref=msa_ref,
-            min_len=args.sieve_min_len,
+            min_len=min_len,
             threshold=args.sieve_threshold,
             sketch=args.sieve_sketch,
             sieve_bin=args.sieve_bin,

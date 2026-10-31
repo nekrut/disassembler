@@ -37,12 +37,12 @@ disassembler sieve -i out/zika/reconstructed.fasta -o out/zika/sieved.fasta \
 | `--sieve` | | off | enable the stage |
 | `--sieve-threshold <F>` | `--threshold` | `0.005` | novelty threshold tau. A sequence is promoted only if `1 - maxJaccard >= tau` against the promoted set, so a **higher** tau collapses **more** |
 | `--sieve-sketch <M>` | `--sketch` | `256` | MinHash sketch size. Novelty finer than `1/M` cannot be resolved |
-| `--sieve-min-len <N>` | `--min-len` | 95% of the reference length | minimum sequence length. The 5% margin is there because reconstructions are often a few bases shorter than the reference |
+| `--sieve-min-len <N>` | `--min-len` | 95% of the shortest reference record | minimum sequence length. The 5% margin is there because reconstructions are often a few bases shorter than the reference; the shortest record, because in multi-anchor mode each primary is reconstructed against its own reference |
 | `--sieve-max-gap-frac <F>` (`from-lexicmap` only) | `--max-gap-frac` | `0.05`; derived in `from-lexicmap` (below) | the largest share of a sequence that may be gaps (`-`) or other non-ACGT characters |
 | `--sieve-bin <PATH>` | `--sieve-bin` | discovered | path to `l1_pipeline_serial` (from `PATH`, or a build in `extern/kmer-diversity-sieve`) |
 
 The atomic `sieve` takes the reference through `--ref`, used only to derive `--min-len` from its
-first record.
+shortest record. `reconstruct` and `from-kmindex` derive it from every `-q` record.
 
 ### Before the sieve runs
 

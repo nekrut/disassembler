@@ -404,15 +404,15 @@ fn real_main(args: Args) -> error::Result<()> {
     //
     // Multi-anchor is auto-enabled when the collected reference set has more than one
     // record, from any combination: several -q files, one multi-record file, or both.
-    // The single-file/single-record legacy path stays byte-identical (uses `read_query`,
-    // which fires the tools-iuc #8388 warning). Any wider intake uses `read_query_set`.
+    // The single-file/single-record legacy path stays byte-identical (uses `read_query`).
+    // Any wider intake uses `read_query_set`, and is announced below.
     let queries: Option<Vec<crate::types::Query>> = if args.cfg.fetch_only {
         None
     } else {
         if args.query.is_empty() {
             return Err(error::Error::Usage("--query is required".into()));
         }
-        // Try the legacy single-file path first for its warning + n_records semantics.
+        // Try the legacy single-file path first for its n_records semantics.
         // If that file turns out to hold more than one record, re-load through
         // read_query_set so the whole pool goes into anchor union / align fan-out.
         Some(if args.query.len() == 1 {
@@ -472,6 +472,15 @@ fn real_main(args: Args) -> error::Result<()> {
 
     // Unwrap the query set for the full pipeline. The guard above ensures it is Some here.
     let queries = queries.expect("queries is Some when not --fetch-only");
+    if queries.len() > 1 {
+        eprintln!(
+            "[logan-walker] multi-anchor mode: {} references from {} -q file(s); each \
+             accession's primary is the reference chosen by --primary-metric {}",
+            queries.len(),
+            args.query.len(),
+            args.cfg.primary_metric.as_str()
+        );
+    }
 
     let summary = pipeline::run(&args.cfg, accessions, &queries)?;
 

@@ -214,7 +214,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                               "resolution of the novelty estimator at 1/m.")
     g_sieve.add_argument("--sieve-min-len", type=positive_int, default=None,
                          help="Minimum sequence length gate for the sieve "
-                              "(default: auto = 95%% of the first -q record's length).")
+                              "(default: auto = 95%% of the shortest -q record's length).")
     g_sieve.add_argument("--sieve-bin", default=None,
                          help="Explicit path to the kmer-diversity-sieve l1_pipeline_serial "
                               "binary (auto-discovered otherwise).")

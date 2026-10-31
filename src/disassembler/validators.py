@@ -77,6 +77,21 @@ def fasta_has_record(path: str) -> int:
     return n
 
 
+def fasta_record_lengths(path) -> list[tuple[str, int]]:
+    """`(id, residues)` for every record in a FASTA, in file order. The id is the first word
+    of the header; whitespace inside sequence lines is not counted."""
+    records: list[tuple[str, int]] = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith(">"):
+                words = line[1:].split()
+                records.append((words[0] if words else "", 0))
+            elif records:
+                rid, n = records[-1]
+                records[-1] = (rid, n + len("".join(line.split())))
+    return records
+
+
 def validate_unitigs_cache(path: str | None, *, offline: bool) -> str | None:
     """Return an error string if `--unitigs-cache DIR` is misconfigured, else None.
 

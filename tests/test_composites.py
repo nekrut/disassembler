@@ -38,16 +38,17 @@ class _Stubs(unittest.TestCase):
         self.ref = self.work / "gene.fasta"
         self.ref.write_text(f">gene\n{REF}\n")
 
-        # Writes the reference as every accession's primary and records its argv.
+        # Writes the first record of the first -q as every accession's primary, and records
+        # its argv.
         self.walker = self.work / "fake_walker.sh"
         self.walker.write_text(
             "#!/usr/bin/env bash\n"
             'echo "$@" > "$(dirname "$0")/walker_argv.txt"\n'
             "fasta=''; q=''; acc=''; list=''\n"
             'while [ $# -gt 0 ]; do case "$1" in\n'
-            '  -f) fasta="$2"; shift 2;; -q) q="$2"; shift 2;;\n'
+            '  -f) fasta="$2"; shift 2;; -q) [ -z "$q" ] && q="$2"; shift 2;;\n'
             '  -a) acc="$2"; shift 2;; -l) list="$2"; shift 2;; *) shift;; esac; done\n'
-            'seq=$(grep -v ">" "$q" | tr -d "\\n")\n'
+            "seq=$(awk '/^>/{n++; next} n==1' \"$q\" | tr -d '\\n')\n"
             '{ [ -n "$acc" ] && echo "$acc"; [ -n "$list" ] && cat "$list"; } |\n'
             '  while read -r a; do [ -n "$a" ] && printf ">%s_primary\\n%s\\n" "$a" "$seq"; done'
             ' > "$fasta"\n'
@@ -197,6 +198,34 @@ class TestReconstruct(_Stubs):
                         "-o", str(out), "--walker-bin", str(self.walker)])
         self.assertEqual(rc, 0, log)
         self.assertEqual((out / "gene_codon_msa.fasta").read_text().count(">"), 3)
+
+
+    def test_a_multi_record_query_is_multi_anchor(self):
+        # One -q file with two records: the notice used to need two -q flags, and the sieve's
+        # floor was 95% of record 1 whatever the other references' lengths.
+        import sys
+        from disassembler.cmd import sieve
+        panel = self.work / "panel.fasta"
+        panel.write_text(f">gene\n{REF}\n>short\n{REF[:9]}\n")
+        seen = {}
+
+        def fake_sieve(src, dst, **kw):
+            seen.update(kw)
+            Path(dst).write_text(Path(src).read_text())
+            return 0
+
+        real = sieve.sieve_run
+        sieve.sieve_run = fake_sieve
+        try:
+            rc, log = _run(["reconstruct", "-a", "SRR1", "-q", str(panel),
+                            "-o", str(self.work / "out"), "--walker-bin", str(self.walker),
+                            "--sieve", "--sieve-bin", sys.executable])
+        finally:
+            sieve.sieve_run = real
+        self.assertEqual(rc, 0, log)
+        self.assertIn("multi-anchor: 2 references. The MSA aligns against the first record of "
+                      "the first -q (gene in", log)
+        self.assertEqual(seen["min_len"], int(9 * 0.95), "95% of the shortest reference")
 
 
 class TestFromLexicmap(_Stubs):

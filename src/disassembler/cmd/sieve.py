@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from disassembler.resolve import resolve_sieve
-from disassembler.validators import fraction, positive_int
+from disassembler.validators import fasta_record_lengths, fraction, positive_int
 
 # The binary's completeness gate (`--max-n-frac`) counts every character other than A/C/G/T,
 # '-' included. Walker rows carry no gaps, so there 5% is a sequence-quality gate. A LexicMap
@@ -29,22 +29,26 @@ from disassembler.validators import fraction, positive_int
 DEFAULT_MAX_GAP_FRAC = 0.05
 
 
-def first_record_len(path: Path):
-    """Residues in the FIRST record of a FASTA, plus the number of records.
+def auto_min_len(ref: Path) -> int | None:
+    """95% of the shortest record in `ref`, or None (with the reason printed) if it has none.
 
-    The walker aligns only record 1, so sizing --min-len against every record
-    would turn a multi-record query into a rejection floor above every reconstruction.
+    The shortest, not the first: with several references (a multi-anchor panel), each
+    accession's primary is reconstructed against whichever one won, so a floor sized on
+    record 1 could drop every reconstruction won by a shorter reference.
     """
-    n = 0
-    records = 0
-    with path.open() as fh:
-        for line in fh:
-            if line.startswith(">"):
-                records += 1
-                continue
-            if records == 1:
-                n += len(line.strip())
-    return n, records
+    records = [r for r in fasta_record_lengths(ref) if r[1] > 0]
+    if not records:
+        print(f"sieve: {ref}: no record with sequence; cannot derive --min-len.",
+              file=sys.stderr)
+        return None
+    rid, length = min(records, key=lambda r: r[1])
+    if len(records) > 1:
+        print(f"[sieve] {ref} has {len(records)} records; sizing --min-len on the shortest "
+              f"({rid}, {length} nt).", flush=True)
+    # Reconstructions are typically a few bases shorter than the reference (the walk may
+    # not reach the exact termini). Defaulting to the exact query length would then drop
+    # every haplotype, so the auto-default takes a 5% haircut.
+    return int(length * 0.95)
 
 
 def byte_exact_dedup(src: Path, dst: Path) -> tuple[int, int]:
@@ -137,7 +141,7 @@ def sieve_run(
 ) -> int:
     """Run the sieve on `input_fasta`, concatenate rank shards to `output_fasta`.
 
-    If `min_len` is None: derived as int(0.95 * first_record_len(ref)). One of
+    If `min_len` is None: derived as 95% of the shortest record in `ref`. One of
     `min_len` or `ref` must be given. Exact duplicates are removed before the binary runs
     (see `byte_exact_dedup`); `max_gap_frac` is passed to it as `--max-n-frac`.
 
@@ -158,19 +162,9 @@ def sieve_run(
             print("sieve: pass --min-len, or --ref to derive it from the query.",
                   file=sys.stderr)
             return 2
-        cds_len, n_records = first_record_len(ref)
-        if n_records > 1:
-            print(f"[sieve] warn: {ref} has {n_records} records; sizing --min-len on "
-                  f"the first one ({cds_len} nt), which is the record the walker "
-                  f"aligns. One gene per query.", file=sys.stderr)
-        if cds_len == 0:
-            print(f"sieve: {ref}: first record has no sequence; cannot derive --min-len.",
-                  file=sys.stderr)
+        min_len = auto_min_len(ref)
+        if min_len is None:
             return 2
-        # Reconstructions are typically a few bases shorter than the reference (the walk
-        # may not reach the exact termini). Defaulting to the exact query length would
-        # then drop every haplotype, so the auto-default takes a 5% haircut.
-        min_len = int(cds_len * 0.95)
 
     input_fasta = Path(input_fasta)
     output_fasta = Path(output_fasta)
@@ -247,7 +241,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("-o", "--output", required=True, help="Output (promoted) FASTA")
     p.add_argument("--min-len", type=positive_int, default=None,
                    help="Minimum sequence length gate. Default: auto = 95%% of the "
-                        "first record in --ref.")
+                        "shortest record in --ref.")
     p.add_argument("--ref", default=None,
                    help="Reference CDS FASTA, used only to auto-derive --min-len "
                         "when --min-len is not given.")

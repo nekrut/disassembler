@@ -292,6 +292,26 @@ class TestSieveRun(unittest.TestCase):
         self.assertRegex(out, r"LOW-QUAL \(partial\) : 3 ")
 
 
+class TestAutoMinLen(unittest.TestCase):
+    """The auto --min-len is 95% of the shortest reference record, not of record 1."""
+
+    def test_sized_on_the_shortest_record(self):
+        from disassembler.cmd import sieve as sieve_cmd
+        with tempfile.TemporaryDirectory() as d:
+            ref = Path(d) / "panel.fasta"
+            ref.write_text(">long\n" + "A" * 1000 + "\n>short\n" + "C" * 400 + "\n" + "C" * 400 + "\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(sieve_cmd.auto_min_len(ref), 760)
+            self.assertIn("2 records; sizing --min-len on the shortest (short, 800 nt)",
+                          buf.getvalue())
+            ref.write_text(">only\n" + "A" * 1000 + "\n")
+            self.assertEqual(sieve_cmd.auto_min_len(ref), 950)
+            ref.write_text(">empty\n")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(sieve_cmd.auto_min_len(ref))
+
+
 class TestFromLexicmapGates(unittest.TestCase):
     """from-lexicmap derives the sieve's gap limit and the MSA gate from its cohort gate.
 

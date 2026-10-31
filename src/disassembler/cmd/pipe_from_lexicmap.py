@@ -170,7 +170,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                               "resolution of the novelty estimator at 1/m.")
     g_sieve.add_argument("--sieve-min-len", type=positive_int, default=None,
                          help="Minimum sequence length gate for the sieve (default: auto "
-                              "= 95%% of the reference CDS length).")
+                              "= 95%% of the reference CDS length; of the shortest record, "
+                              "if the reference FASTA has several).")
     g_sieve.add_argument("--sieve-max-gap-frac", type=fraction, default=None,
                          help="Sieve completeness gate: drop a row whose share of gaps ('-') "
                               "or other non-ACGT characters exceeds this. Default: 1 - the "

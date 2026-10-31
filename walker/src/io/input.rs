@@ -80,12 +80,11 @@ pub fn validate_accession(s: &str, source: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read the reference CDS.
+/// Read the reference CDS: the first record, with `n_records` saying how many the file holds.
 ///
-/// Takes the first record, and says so out loud when there are more. A multi-record query
-/// is a real hazard here: the Galaxy kmindex and LexicMap wrappers silently use only the
-/// first sequence too (tools-iuc #8388), so a multi-FASTA query produces results for one
-/// gene while looking like it covered several.
+/// It does not warn about the others. `main` sends a file with more than one record to
+/// [`read_query_set`] instead, which uses all of them (multi-anchor mode); a warning here
+/// that only the first was used was printed on exactly the runs that used every record.
 ///
 /// The sequence is uppercased and stripped of whitespace, so downstream k-mer code needs
 /// no case folding.
@@ -127,16 +126,6 @@ pub fn read_query(path: &Path) -> Result<Query> {
             path.display()
         )));
     }
-    if records.len() > 1 {
-        eprintln!(
-            "[warn] {}: {} records present, using only the first ({:?}). \
-             One gene per query: see tools-iuc #8388.",
-            path.display(),
-            records.len(),
-            records[0].0
-        );
-    }
-
     let n_records = records.len();
     let (record_id, seq) = records.swap_remove(0);
     if seq.is_empty() {
