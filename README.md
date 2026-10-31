@@ -93,6 +93,11 @@ disassembler from-lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.
 Every command has `--help`. The composites group their options by stage and pass anything after
 a literal `--` to the walker.
 
+Every input file (FASTA references and haplotypes, accession lists, LexicMap tables, kmindex
+shards) can be plain or gzip-compressed. Compression is recognised from the file's first bytes,
+not its name, so a Galaxy `dataset_<id>.dat` works either way, and so does a pipe such as
+`<(zcat hits.tsv.gz)`. zstd-compressed input is refused with a message; decompress it first.
+
 ## Documentation
 
 How to use it:

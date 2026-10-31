@@ -7,6 +7,7 @@ Tests:
   - 4-tier cohort partitioning
   - Online haplotype collapsing and mutation classification
   - Streaming from file and stdin
+  - Input opening (gzip by content, pipes), Galaxy dataset state, API key order
 """
 
 import gzip
@@ -567,6 +568,163 @@ class TestIndels(unittest.TestCase):
                                     60, 60.0, 0.8)
         self.assertEqual([e.notation() for e in t.indels], ["31del"])
         self.assertEqual(t.covered, 60)
+
+
+
+TABLE = ("sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+         "SRR10\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
+         "SRR11\t91.7\t100.0\t1\t12\tATGGCTGAATAA\tATGGTTGAATAA\n")
+
+
+class TestOpenTable(unittest.TestCase):
+    """One opener (`textio.text_stream`) for files, stdin, pipes and Galaxy downloads; gzip
+    decided by content."""
+
+    def read(self, raw):
+        from disassembler.textio import text_stream
+        return text_stream(raw).read()
+
+    def test_plain_and_gzip(self):
+        import io
+        self.assertEqual(self.read(io.BytesIO(TABLE.encode())), TABLE)
+        self.assertEqual(self.read(io.BytesIO(gzip.compress(TABLE.encode()))), TABLE)
+
+    def test_a_pipe_loses_nothing_to_the_gzip_check(self):
+        # The old check reopened the path to look at the first bytes, which emptied a pipe
+        # (`-f <(zcat x)`) before it was read, compressed or not.
+        import os
+        for payload in (TABLE.encode(), gzip.compress(TABLE.encode())):
+            r, w = os.pipe()
+            os.write(w, payload)
+            os.close(w)
+            with os.fdopen(r, "rb") as fh:
+                self.assertEqual(self.read(fh), TABLE)
+
+    def test_a_stream_without_peek_is_buffered(self):
+        import io
+
+        class Raw(io.RawIOBase):  # like an HTTP response body
+            def __init__(self, data):
+                self.data = io.BytesIO(data)
+
+            def readable(self):
+                return True
+
+            def readinto(self, b):
+                return self.data.readinto(b)
+
+        self.assertEqual(self.read(Raw(gzip.compress(TABLE.encode()))), TABLE)
+
+    def test_open_text_names_the_file_it_refuses(self):
+        from disassembler.textio import open_text
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.fasta"
+            p.write_bytes(b"\x28\xb5\x2f\xfd" + b"\0" * 16)
+            with self.assertRaisesRegex(ValueError, "x.fasta: zstd-compressed"):
+                open_text(p)
+
+    def test_zstd_is_named_not_garbled(self):
+        import io
+        from disassembler.textio import text_stream
+        with self.assertRaisesRegex(ValueError, "zstd-compressed"):
+            text_stream(io.BytesIO(b"\x28\xb5\x2f\xfd" + b"\0" * 16))
+
+
+class TestGalaxyDataset(unittest.TestCase):
+    """`-d`: only an `ok` dataset is read. The state lookup and the download are stubbed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.ref = self.dir / "gene.fasta"
+        self.ref.write_text(">gene\nATGGCTGAATAA\n")
+        self.real = (lms.resolve_dataset_state, lms.get_galaxy_stream)
+        self.downloaded = False
+
+        def fake_stream(*a, **k):
+            import io
+            self.downloaded = True
+            return io.BytesIO(gzip.compress(TABLE.encode()))
+
+        lms.get_galaxy_stream = fake_stream
+
+    def tearDown(self):
+        lms.resolve_dataset_state, lms.get_galaxy_stream = self.real
+        self.tmp.cleanup()
+
+    def run_with_state(self, state):
+        import contextlib
+        import io
+        from disassembler.stage import stage_args
+        if isinstance(state, Exception):
+            def fake_state(*a, **k):
+                raise state
+        else:
+            def fake_state(*a, **k):
+                return state
+        lms.resolve_dataset_state = fake_state
+        ns = stage_args(lms, ref=str(self.ref), dataset="f2db41e1fa331b3e",
+                        out_prefix=str(self.dir / "out") + "/")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = lms.run(ns)
+        return rc, err.getvalue()
+
+    def test_an_ok_dataset_is_read_gzipped_or_not(self):
+        rc, err = self.run_with_state("ok")
+        self.assertEqual(rc, 0, err)
+        clean = (self.dir / "out" / "gene.clean.accessions.fasta").read_text()
+        self.assertEqual(clean.count(">"), 2)
+
+    def test_a_gzipped_reference(self):
+        self.ref.write_bytes(gzip.compress(b">gene\nATGGCTGAATAA\n"))
+        rc, err = self.run_with_state("ok")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue((self.dir / "out" / "gene.clean.accessions.fasta").is_file())
+
+    def test_a_queued_dataset_is_a_temporary_failure_not_a_success(self):
+        for state in ("queued", "running", "new", "paused"):
+            rc, err = self.run_with_state(state)
+            self.assertEqual(rc, lms.EX_TEMPFAIL, state)
+            self.assertIn(f"is '{state}', not finished yet", err)
+        self.assertFalse(self.downloaded, "nothing may be streamed from an unfinished dataset")
+        self.assertFalse((self.dir / "out").exists())
+
+    def test_a_failed_dataset_is_an_error(self):
+        rc, err = self.run_with_state("error")
+        self.assertEqual(rc, 1)
+        self.assertIn("in state 'error'; only an 'ok' dataset can be read", err)
+        self.assertFalse(self.downloaded)
+
+    def test_an_unreadable_state_is_an_error_not_ignored(self):
+        rc, err = self.run_with_state(RuntimeError("could not read the state: HTTP Error 403"))
+        self.assertEqual(rc, 1)
+        self.assertIn("HTTP Error 403", err)
+        self.assertFalse(self.downloaded)
+
+
+class TestGalaxyApiKeyOrder(unittest.TestCase):
+    """--api-key, then --api-key-file, then $GALAXY_API_KEY: the help's order, and harvest's."""
+
+    def test_order(self):
+        import os
+        from disassembler.cmd import harvest
+        with tempfile.TemporaryDirectory() as d:
+            key_file = Path(d) / "key.txt"
+            key_file.write_text("from-file\n")
+            old = os.environ.get("GALAXY_API_KEY")
+            os.environ["GALAXY_API_KEY"] = "from-env"
+            try:
+                self.assertEqual(lms.get_galaxy_api_key("literal", str(key_file)), "literal")
+                self.assertEqual(lms.get_galaxy_api_key(None, str(key_file)), "from-file")
+                self.assertEqual(harvest.get_galaxy_api_key(str(key_file)), "from-file")
+                self.assertEqual(lms.get_galaxy_api_key(None, None), "from-env")
+                self.assertEqual(harvest.get_galaxy_api_key(None), "from-env")
+            finally:
+                if old is None:
+                    del os.environ["GALAXY_API_KEY"]
+                else:
+                    os.environ["GALAXY_API_KEY"] = old
 
 
 if __name__ == "__main__":

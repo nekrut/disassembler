@@ -126,6 +126,20 @@ class TestMsaCoverageGate(unittest.TestCase):
         self.assertEqual(rc, 0, log)
         self.assertIn("2 records; aligning against the first (gene", log)
 
+    def test_gzipped_reference_and_input(self):
+        import gzip
+        ref = self.work / "ref.dat"  # not named .gz: gzip is decided by content
+        inp = self.work / "in.dat"
+        ref.write_bytes(gzip.compress(f">gene\n{GENE}\n".encode()))
+        inp.write_bytes(gzip.compress(f">a\n{GENE}\n>b\n{GENE}\n".encode()))
+        from disassembler.stage import stage_args
+        ns = stage_args(self.msa, ref=str(ref), input=str(inp),
+                        out_aln=str(self.work / "aln.fasta"),
+                        out_tree=str(self.work / "tree.nwk"), mafft_threads=1)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.msa.run(ns), 0)
+        self.assertEqual((self.work / "aln.fasta").read_text().count(">"), 3)
+
     def test_orientation(self):
         fwd = self.msa.kmer_set(GENE)
         rev = self.msa.kmer_set(self.msa.revcomp(GENE))

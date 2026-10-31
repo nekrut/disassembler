@@ -48,8 +48,8 @@ class _Stubs(unittest.TestCase):
             'while [ $# -gt 0 ]; do case "$1" in\n'
             '  -f) fasta="$2"; shift 2;; -q) [ -z "$q" ] && q="$2"; shift 2;;\n'
             '  -a) acc="$2"; shift 2;; -l) list="$2"; shift 2;; *) shift;; esac; done\n'
-            "seq=$(awk '/^>/{n++; next} n==1' \"$q\" | tr -d '\\n')\n"
-            '{ [ -n "$acc" ] && echo "$acc"; [ -n "$list" ] && cat "$list"; } |\n'
+            "seq=$(gzip -dcf \"$q\" | awk '/^>/{n++; next} n==1' | tr -d '\\n')\n"
+            '{ [ -n "$acc" ] && echo "$acc"; [ -n "$list" ] && gzip -dcf "$list"; } |\n'
             '  while read -r a; do [ -n "$a" ] && printf ">%s_primary\\n%s\\n" "$a" "$seq"; done'
             ' > "$fasta"\n'
         )
@@ -200,6 +200,18 @@ class TestReconstruct(_Stubs):
         self.assertEqual((out / "gene_codon_msa.fasta").read_text().count(">"), 3)
 
 
+    def test_gzipped_query_and_accession_list(self):
+        import gzip
+        q = self.work / "gene.fa"  # gzipped, but not named .gz
+        q.write_bytes(gzip.compress(f">gene\n{REF}\n".encode()))
+        accs = self.work / "accs.txt"
+        accs.write_bytes(gzip.compress(b"SRR1\nSRR2\n"))
+        out = self.work / "out"
+        rc, log = _run(["reconstruct", "-l", str(accs), "-q", str(q),
+                        "-o", str(out), "--walker-bin", str(self.walker)])
+        self.assertEqual(rc, 0, log)
+        self.assertEqual((out / "gene_codon_msa.fasta").read_text().count(">"), 3)
+
     def test_a_multi_record_query_is_multi_anchor(self):
         # One -q file with two records: the notice used to need two -q flags, and the sieve's
         # floor was 95% of record 1 whatever the other references' lengths.
@@ -243,6 +255,24 @@ class TestFromLexicmap(_Stubs):
         self.assertEqual(rc, 0, log)
         self.assertEqual((out / "gene_codon_msa.fasta").read_text().count(">"), 3)
         self.assertTrue((out / "gene_fasttree.nwk").is_file())
+
+    def test_a_queued_dataset_stops_before_a_stale_cohort(self):
+        # lexicmap used to return 0 for a queued dataset having written nothing, and
+        # from-lexicmap then aligned whatever cohort an earlier run had left.
+        from disassembler.cmd import lexicmap
+        out = self.work / "out"
+        out.mkdir()
+        (out / "lexicmap.clean.accessions.fasta").write_text(f">stale\n{REF}\n")
+        real = lexicmap.resolve_dataset_state
+        lexicmap.resolve_dataset_state = lambda *a, **k: "queued"
+        try:
+            rc, log = _run(["from-lexicmap", "-q", str(self.ref), "-d", "f2db41e1fa331b3e",
+                            "-o", str(out)])
+        finally:
+            lexicmap.resolve_dataset_state = real
+        self.assertEqual(rc, lexicmap.EX_TEMPFAIL, log)
+        self.assertIn("is 'queued', not finished yet", log)
+        self.assertFalse((out / "gene_codon_msa.fasta").exists())
 
 
 if __name__ == "__main__":

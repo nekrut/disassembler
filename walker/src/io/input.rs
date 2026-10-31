@@ -16,8 +16,39 @@ use std::path::{Path, PathBuf};
 /// Note the shipped lists carry duds: `DRR000252`, `DRR028850`, `DRR028861`, `DRR006432`
 /// and `DRR006471` all fail to reconstruct. Reconstruction yield and throughput are
 /// different measurements and should be reported separately.
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// The bytes of a user's input file (a query FASTA, an accession list), gunzipped if it is
+/// gzip. Decided by the first bytes, never by a `.gz` name, the same rule as the Python
+/// side's `disassembler.textio`. zstd is refused with a message rather than read as text.
+/// `what` names the input in errors.
+pub fn read_input(path: &Path, what: &str) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| Error::Usage(format!("cannot read {what} {}: {e}", path.display())))?;
+    if bytes.starts_with(&ZSTD_MAGIC) {
+        return Err(Error::Usage(format!(
+            "{what} {} is zstd-compressed; only plain and gzip-compressed input is read. \
+             Decompress it first (zstd -d)",
+            path.display()
+        )));
+    }
+    if !bytes.starts_with(&GZIP_MAGIC) {
+        return Ok(bytes);
+    }
+    // MultiGzDecoder, so a file of several gzip members (bgzip, or `cat a.gz b.gz`) is read
+    // whole rather than stopping after the first.
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::MultiGzDecoder::new(&bytes[..]), &mut out)
+        .map_err(|e| {
+            Error::Usage(format!("{what} {}: corrupt gzip data: {e}", path.display()))
+        })?;
+    Ok(out)
+}
+
 pub fn read_accession_list(path: &Path) -> Result<Vec<Accession>> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
+    let bytes = read_input(path, "accession list")?;
+    let text = String::from_utf8(bytes).map_err(|e| {
         Error::Usage(format!("cannot read accession list {}: {e}", path.display()))
     })?;
 
@@ -89,8 +120,7 @@ pub fn validate_accession(s: &str, source: &str) -> Result<()> {
 /// The sequence is uppercased and stripped of whitespace, so downstream k-mer code needs
 /// no case folding.
 pub fn read_query(path: &Path) -> Result<Query> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::Usage(format!("cannot read query {}: {e}", path.display())))?;
+    let bytes = read_input(path, "query")?;
 
     let mut records: Vec<(String, Vec<u8>)> = Vec::new();
     let mut header: Option<String> = None;
@@ -188,9 +218,7 @@ pub fn read_query_set(paths: &[PathBuf]) -> Result<Vec<Query>> {
     }
     let mut out: Vec<Query> = Vec::new();
     for path in paths {
-        let bytes = std::fs::read(path).map_err(|e| {
-            Error::Usage(format!("cannot read query {}: {e}", path.display()))
-        })?;
+        let bytes = read_input(path, "query")?;
 
         let mut records: Vec<(String, Vec<u8>)> = Vec::new();
         let mut header: Option<String> = None;
@@ -464,6 +492,55 @@ mod tests {
         let multi = tmp("dup_multi.fasta", b">x\nAAA\n>x\nCCC\n");
         assert!(read_query_set(std::slice::from_ref(&multi)).is_err());
         for p in [a, b, multi] { std::fs::remove_file(p).ok(); }
+    }
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// Gzip is decided by content: these files are not named `.gz`.
+    #[test]
+    fn gzipped_inputs_read_like_plain_ones() {
+        let list = tmp("gz_list.txt", &gz(b"SRR8209082\nDRR000252\n"));
+        assert_eq!(read_accession_list(&list).unwrap(), vec!["SRR8209082", "DRR000252"]);
+
+        let q = tmp("gz_query.fasta", &gz(b">pol\nATGGCTTAA\n"));
+        let query = read_query(&q).unwrap();
+        assert_eq!((query.record_id.as_str(), &query.seq[..]), ("pol", &b"ATGGCTTAA"[..]));
+
+        let set = tmp("gz_set.fasta", &gz(b">a\nATGGCTTAA\n>b\nATGAAATAA\n"));
+        let ids: Vec<String> = read_query_set(std::slice::from_ref(&set))
+            .unwrap()
+            .into_iter()
+            .map(|q| q.record_id)
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        for p in [list, q, set] { std::fs::remove_file(p).ok(); }
+    }
+
+    /// `cat a.gz b.gz`, or bgzip's blocks: every member is read, not just the first.
+    #[test]
+    fn every_gzip_member_is_read() {
+        let mut both = gz(b"SRR8209082\n");
+        both.extend(gz(b"DRR000252\n"));
+        let p = tmp("gz_members.txt", &both);
+        assert_eq!(read_accession_list(&p).unwrap(), vec!["SRR8209082", "DRR000252"]);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn zstd_and_corrupt_gzip_are_named() {
+        let z = tmp("zst_query.fasta", &zstd::encode_all(&b">pol\nATG\n"[..], 3).unwrap());
+        let err = read_query(&z).err().expect("zstd is refused").to_string();
+        assert!(err.contains("zstd-compressed"), "{err}");
+        let mut bad = gz(b"SRR8209082\n");
+        bad.truncate(12);
+        let b = tmp("bad_gz.txt", &bad);
+        let err = read_accession_list(&b).expect_err("corrupt gzip").to_string();
+        assert!(err.contains("corrupt gzip"), "{err}");
+        for p in [z, b] { std::fs::remove_file(p).ok(); }
     }
 
     #[test]

@@ -20,7 +20,6 @@ cohort's own coverage gate, so neither stage silently drops rows lexicmap admitt
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -91,9 +90,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     g_lex.add_argument("--api-key", default=None,
                        help="Galaxy API key as a literal string. If unset, read from "
                             "--api-key-file, then $GALAXY_API_KEY, then /tmp/gxy.txt.")
-    g_lex.add_argument("--api-key-file", default="/tmp/gxy.txt",
-                       help="Path to a file whose contents are the Galaxy API key "
-                            "(default: /tmp/gxy.txt). Ignored if --api-key is set.")
+    g_lex.add_argument("--api-key-file", default=None,
+                       help="Path to a file whose contents are the Galaxy API key. Used "
+                            "before $GALAXY_API_KEY; with neither, /tmp/gxy.txt is read. "
+                            "Ignored if --api-key is set.")
     g_lex.add_argument("--min-cov", type=fraction, default=0.80,
                        help="Clean full-length cohort gate: minimum fraction of the "
                             "reference an accession's merged HSPs must cover "
@@ -216,16 +216,20 @@ def run(args) -> int:
     if not Path(args.ref).is_file():
         print(f"from-lexicmap: reference FASTA not found: {args.ref}", file=sys.stderr)
         return 1
-    if fasta_has_record(args.ref) == 0:
+    try:
+        n_records = fasta_has_record(args.ref)
+    except (OSError, ValueError) as e:
+        print(f"from-lexicmap: cannot read the reference FASTA: {e}", file=sys.stderr)
+        return 1
+    if n_records == 0:
         print(f"from-lexicmap: reference FASTA has no records (no `>` header lines): "
               f"{args.ref}. Point -q at a CDS FASTA, not an empty or non-FASTA file.",
               file=sys.stderr)
         return 1
 
-    # Galaxy API key file: only validate when streaming from a dataset AND we're
-    # actually going to fall back to the file (matches get_galaxy_api_key's
-    # resolution order in lexicmap.py: --api-key > env var > file).
-    if args.dataset and not args.api_key and not os.environ.get("GALAXY_API_KEY"):
+    # Galaxy API key file: only validate when streaming from a dataset and the file is the
+    # key that will be used (get_galaxy_api_key in lexicmap.py: --api-key > file > env var).
+    if args.dataset and not args.api_key:
         key_err = validate_api_key_file(args.api_key_file)
         if key_err:
             print(f"from-lexicmap: {key_err}", file=sys.stderr)

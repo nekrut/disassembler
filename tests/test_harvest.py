@@ -20,9 +20,10 @@ except ImportError as e:  # pragma: no cover - environment-dependent
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, text=""):
+    def __init__(self, status_code=200, text="", content=None):
         self.status_code = status_code
         self.text = text
+        self.content = text.encode() if content is None else content
 
 
 class FakeSession:
@@ -77,6 +78,13 @@ class TestFetchShard(unittest.TestCase):
         sess = FakeSession([ConnectionError("no route")])
         self.assertIsNone(hk.fetch_shard(("s", "d"), "http://x", sess))
         self.assertEqual(sess.calls, hk.ATTEMPTS)
+
+    def test_a_gzipped_shard_dataset_is_decompressed(self):
+        import gzip
+        body = gzip.compress(b'{"shard": {"target": {"SRR1": 0.9}}}')
+        sess = FakeSession([FakeResponse(200, "\ufffd", content=body)])
+        self.assertEqual(hk.fetch_shard(("s", "d"), "http://x", sess),
+                         {"shard": {"target": {"SRR1": 0.9}}})
 
     def test_a_late_success_still_returns_data(self):
         sess = FakeSession([
@@ -212,6 +220,15 @@ class TestHarvestLocal(unittest.TestCase):
         self.assertTrue((self.out / "pfcrt.scores.json").is_file())
         self.assertTrue((self.out / "UNION.accessions.txt").is_file())
         self.assertTrue((self.out / "summary.json").is_file())
+
+    def test_gzipped_shard_files_are_read_whatever_they_are_called(self):
+        import gzip
+        import json as _json
+        (self.shards / "dataset_1.dat").write_bytes(
+            gzip.compress(_json.dumps({"idx": {"pfcrt": {"SRR1": 0.4}}}).encode()))
+        self._write_shard("s2.json", {"idx": {"pfcrt": {"SRR2": 0.9}}})
+        per_target = hk.harvest_local(self.shards, self.out)
+        self.assertEqual(dict(per_target["pfcrt"]), {"SRR1": 0.4, "SRR2": 0.9})
 
     def test_accession_order_matches_api_mode(self):
         # Sorted by score descending, same as harvest_collection.

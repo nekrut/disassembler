@@ -284,7 +284,11 @@ def run(args) -> int:
     for q in queries:
         if not q.is_file():
             return _die(f"query not found: {q}")
-        if fasta_has_record(str(q)) == 0:
+        try:
+            n_records = fasta_has_record(str(q))
+        except (OSError, ValueError) as e:
+            return _die(f"cannot read -q: {e}")
+        if n_records == 0:
             return _die(
                 f"query FASTA has no records (no `>` header lines): {q}. Point "
                 f"-q at a CDS FASTA, not an empty or non-FASTA file."

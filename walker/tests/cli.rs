@@ -111,6 +111,24 @@ fn every_accession_erroring_exits_3_even_with_allow_empty() {
     }
 }
 
+/// A gzipped query and accession list, not named `.gz`, give the same run as plain ones.
+#[test]
+fn gzipped_query_and_list_are_read() {
+    use std::io::Write;
+    let fx = Fixture::new("gzip", 3);
+    for name in ["q.fasta", "accs.txt"] {
+        let path = fx.dir.join(name);
+        let plain = std::fs::read(&path).unwrap();
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(&plain).unwrap();
+        std::fs::write(&path, e.finish().unwrap()).unwrap();
+    }
+    let (code, err) = fx.code("cache", &["--allow-empty"]);
+    assert_eq!(code, 0, "{err}");
+    let summary = std::fs::read_to_string(fx.dir.join("out").join("q_walker_summary.json")).unwrap();
+    assert_eq!(summary.matches("\"status\": \"no_anchors\"").count(), 3, "{summary}");
+}
+
 #[test]
 fn zero_workers_is_a_usage_error_not_a_hang() {
     let fx = Fixture::new("workers", 6);

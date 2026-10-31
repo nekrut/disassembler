@@ -78,10 +78,19 @@ as `qcovHSP >= 80%`, even though together they cover all of it.
 A LexicMap search table, run with all columns on (`lexicmap search --all`, or *Output all
 columns* in Galaxy) so that `qseq` and `sseq` are present. It can come from:
 
-- a local file (`-f`), plain or gzipped (gzip is detected from the content, not the name);
+- a local file or a pipe (`-f`, including `-f <(zcat hits.tsv.gz)`);
 - standard input (`-f -`);
 - a Galaxy dataset streamed over the API (`-d <dataset id>`, with `--base-url`). The API key
-  comes from `--api-key`, `--api-key-file`, `$GALAXY_API_KEY` or `/tmp/gxy.txt`.
+  comes from `--api-key`, then `--api-key-file`, then `$GALAXY_API_KEY`, then `/tmp/gxy.txt`.
+  Only a dataset in state `ok` is read. One still being produced (`queued`, `running`, `new`,
+  `paused` and the like) exits 75 (`EX_TEMPFAIL`), so a script can try again later; one in
+  any other state (`error`, for example) exits 1.
+
+Any of them can be plain or gzip-compressed; gzip is detected from the content, not the name.
+A zstd-compressed table is refused with a message, so decompress it first
+(`zstd -dc hits.tsv.zst | disassembler lexicmap -f - ...`). Before 0.1.1, gzip was only
+recognised in a local file, a pipe lost its contents to that check, and a queued Galaxy dataset
+exited 0 having written nothing.
 
 All rows for one accession must be contiguous in the input; `lexicmap` stops with an error
 naming the accession if one reappears later.
@@ -155,7 +164,7 @@ for coverage that lexicmap already accepted.
 
 | flag | default | meaning |
 |---|---|---|
-| `-q, -r, --query, --ref <FASTA>` | | reference in-frame CDS (first record only) |
+| `-q, -r, --query, --ref <FASTA>` | | reference in-frame CDS, plain or gzipped (first record only) |
 | `-d, --dataset <ID>` | | Galaxy dataset to stream; exclusive with `-f` |
 | `-f, -i, --file, --input <FILE>` | | local table, gzipped table, or `-` for stdin |
 | `-o, --out-prefix, --out-dir <PATH>` | `msa/<reference stem>` | output prefix or directory |

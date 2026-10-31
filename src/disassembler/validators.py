@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 
+from disassembler.textio import open_text
+
 
 def fraction(s: str) -> float:
     """A float in [0.0, 1.0]. For coverage fractions, VAF, prune fractions, LSH tau."""
@@ -68,9 +70,10 @@ def positive_float(s: str) -> float:
 
 
 def fasta_has_record(path: str) -> int:
-    """Count `>` lines in a FASTA file. Zero means the file exists but is header-empty."""
+    """Count `>` lines in a FASTA file, plain or gzipped. Zero means the file exists but is
+    header-empty."""
     n = 0
-    with open(path) as f:
+    with open_text(path) as f:
         for line in f:
             if line.startswith(">"):
                 n += 1
@@ -78,10 +81,10 @@ def fasta_has_record(path: str) -> int:
 
 
 def fasta_record_lengths(path) -> list[tuple[str, int]]:
-    """`(id, residues)` for every record in a FASTA, in file order. The id is the first word
-    of the header; whitespace inside sequence lines is not counted."""
+    """`(id, residues)` for every record in a FASTA, plain or gzipped, in file order. The id is
+    the first word of the header; whitespace inside sequence lines is not counted."""
     records: list[tuple[str, int]] = []
-    with open(path) as f:
+    with open_text(path) as f:
         for line in f:
             if line.startswith(">"):
                 words = line[1:].split()

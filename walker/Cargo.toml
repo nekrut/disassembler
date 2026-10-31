@@ -12,8 +12,10 @@ path = "src/main.rs"
 # Deliberately minimal. Concurrency is std::thread plus a bounded
 # std::sync::mpsc::sync_channel behind an Arc<Mutex<Receiver>>; summary.json and bubbles.json
 # are written by hand in io/output.rs rather than through serde. Only the S3 streaming and
-# decompression in stages/stream.rs pull in crates.
+# decompression in stages/stream.rs, and reading gzipped inputs in io/input.rs (flate2, on its
+# pure-Rust miniz_oxide backend, so no system zlib), pull in crates.
 [dependencies]
+flate2 = "1.1.10"
 ureq = "3.4.1"
 zstd = "0.14.0"
 

@@ -33,6 +33,7 @@ from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
 
+from disassembler.textio import decode_bytes, read_text
 from disassembler.validators import positive_int, validate_api_key_file
 
 ATTEMPTS = 5
@@ -108,8 +109,9 @@ def fetch_shard(item, base_url, sess):
         retry_after = 0.0
         try:
             r = sess.get(url, params={"raw": "true"}, timeout=30)
-            if r.status_code == 200 and r.text.strip():
-                return json.loads(r.text)
+            # The raw bytes, so a gzipped shard dataset is decompressed rather than garbled.
+            if r.status_code == 200 and r.content.strip():
+                return json.loads(decode_bytes(r.content))
             last = f"HTTP {r.status_code}"
             if r.status_code == 429:
                 rate_limited = True
@@ -248,7 +250,7 @@ def harvest_local(shards_dir, out_dir):
             print(f"    Merged {i}/{len(shard_files)} shards in {elapsed:.1f}s "
                   f"({rate:.1f} shards/s)...", flush=True)
         try:
-            d = json.loads(path.read_text())
+            d = json.loads(read_text(path))
         except Exception as e:
             n_failed += 1
             print(f"    [!] shard {path.name}: {type(e).__name__}: {e}",

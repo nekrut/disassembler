@@ -42,7 +42,8 @@ disassembler sieve -i out/zika/reconstructed.fasta -o out/zika/sieved.fasta \
 | `--sieve-bin <PATH>` | `--sieve-bin` | discovered | path to `l1_pipeline_serial` (from `PATH`, or a build in `extern/kmer-diversity-sieve`) |
 
 The atomic `sieve` takes the reference through `--ref`, used only to derive `--min-len` from its
-shortest record. `reconstruct` and `from-kmindex` derive it from every `-q` record.
+shortest record. The input and `--ref` can be gzip-compressed; the wrapper decompresses the input
+into the deduplicated copy it hands the binary, which reads only plain FASTA. `reconstruct` and `from-kmindex` derive it from every `-q` record.
 
 ### Before the sieve runs
 

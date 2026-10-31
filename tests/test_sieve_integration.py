@@ -252,6 +252,20 @@ class TestSieveRun(unittest.TestCase):
         self.assertIn("dedup: 2120 -> 24 records", log)
         self.assertEqual(n, 24, "all four common and all 20 new sequences are promoted")
 
+    def test_a_gzipped_input_gives_the_same_output(self):
+        import gzip
+        rc, n_plain, log = self._run(self.fixture)
+        self.assertEqual(rc, 0, log)
+        plain = (self.work / "out.fasta").read_text()
+        src = self.work / "in.dat"
+        src.write_bytes(gzip.compress("".join(f">{h}\n{s}\n" for h, s in self.fixture).encode()))
+        out = self.work / "out_gz.fasta"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = self.sieve.sieve_run(src, out, min_len=100, sieve_bin=str(SIEVE_BIN))
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertEqual(out.read_text(), plain)
+
     def test_duplicates_keep_the_first_copy(self):
         seq = self.fixture[0][1]
         rc, n, log = self._run([("first", seq), ("second", seq)])
@@ -306,6 +320,9 @@ class TestAutoMinLen(unittest.TestCase):
             self.assertIn("2 records; sizing --min-len on the shortest (short, 800 nt)",
                           buf.getvalue())
             ref.write_text(">only\n" + "A" * 1000 + "\n")
+            self.assertEqual(sieve_cmd.auto_min_len(ref), 950)
+            import gzip
+            ref.write_bytes(gzip.compress(b">only\n" + b"A" * 1000 + b"\n"))
             self.assertEqual(sieve_cmd.auto_min_len(ref), 950)
             ref.write_text(">empty\n")
             with contextlib.redirect_stderr(io.StringIO()):

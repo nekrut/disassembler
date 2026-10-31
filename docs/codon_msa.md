@@ -72,7 +72,8 @@ disassembler msa \
   --out-tree out/zika/zika_ns5_fasttree.nwk
 ```
 
-`msa` aligns against the first record of `--ref`, and warns when the file holds more.
+`msa` aligns against the first record of `--ref`, and warns when the file holds more. Both
+`--ref` and `--input` can be plain or gzip-compressed (recognised from the content).
 
 ## `disassembler reconstruct`
 

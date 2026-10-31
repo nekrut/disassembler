@@ -21,6 +21,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from disassembler.textio import open_text
 from disassembler.validators import fraction, positive_int
 
 MAMBA_PREFIX = Path(os.environ.get("MAMBA_ROOT_PREFIX", str(Path.home() / "micromamba")))
@@ -201,7 +202,15 @@ def run(args) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    ref_records = list(SeqIO.parse(ref_p, "fasta"))
+    # A missing, zstd-compressed or binary input ends in one line, not a traceback.
+    try:
+        with open_text(ref_p) as fh:
+            ref_records = list(SeqIO.parse(fh, "fasta"))
+        with open_text(in_p) as fh:
+            input_records = list(SeqIO.parse(fh, "fasta"))
+    except (OSError, ValueError) as e:
+        print(f"Error: cannot read the reference or input FASTA: {e}", file=sys.stderr)
+        return 1
     if not ref_records:
         print(f"Error: no records found in reference FASTA {ref_p}", file=sys.stderr)
         return 1
@@ -214,7 +223,6 @@ def run(args) -> int:
     if ref_len % 3 != 0:
         print(f"[warn] Reference CDS length {ref_len} is not divisible by 3!", file=sys.stderr)
 
-    input_records = list(SeqIO.parse(in_p, "fasta"))
     if not input_records:
         print(f"Error: no records found in input FASTA {in_p}", file=sys.stderr)
         return 1

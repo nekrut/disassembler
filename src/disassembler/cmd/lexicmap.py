@@ -85,7 +85,6 @@ Examples:
 
 import os
 import sys
-import gzip
 import math
 import json
 import time
@@ -96,6 +95,7 @@ from pathlib import Path
 from collections import Counter, defaultdict
 from typing import NamedTuple
 
+from disassembler.textio import open_text, text_stream
 from disassembler.validators import (
     fraction,
     non_negative_int,
@@ -125,18 +125,21 @@ CODON_TABLE_11 = {
 }
 
 def get_galaxy_api_key(api_key: str = None, key_file: str = None) -> str:
-    """Resolves Galaxy API key from CLI, environment, or default credentials file."""
+    """The Galaxy API key: --api-key, then --api-key-file, then $GALAXY_API_KEY, then
+    /tmp/gxy.txt, the order the help gives and `harvest` uses. The environment variable used
+    to win over an explicitly named file."""
     if api_key:
         return api_key.strip()
-    if os.environ.get("GALAXY_API_KEY"):
-        return os.environ["GALAXY_API_KEY"].strip()
     if key_file and Path(key_file).exists():
         return Path(key_file).read_text().strip()
+    if os.environ.get("GALAXY_API_KEY"):
+        return os.environ["GALAXY_API_KEY"].strip()
     default_tmp = Path("/tmp/gxy.txt")
     if default_tmp.exists():
         return default_tmp.read_text().strip()
     raise RuntimeError(
-        "Galaxy API key not found. Provide --api-key, set GALAXY_API_KEY, or write /tmp/gxy.txt."
+        "Galaxy API key not found. Provide --api-key or --api-key-file, set GALAXY_API_KEY, "
+        "or write /tmp/gxy.txt."
     )
 
 def translate_nt(seq: str, codon_table: dict = CODON_TABLE_11) -> str:
@@ -203,7 +206,7 @@ def load_reference(fasta_path: str):
     header = ""
     seq_parts = []
     n_records = 0
-    with open(path, "r") as f:
+    with open_text(path) as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -233,34 +236,53 @@ def load_reference(fasta_path: str):
     ref_name = header.split()[0] if header else path.stem
     return ref_name, header, ref_seq
 
-def is_gzip(path: str) -> bool:
-    """True when the file starts with the gzip magic bytes.
-
-    Decided by content, not by a `.gz` suffix: the name is the caller's to choose, and a
-    Galaxy dataset arrives as `dataset_<uuid>.dat` whether or not it is compressed.
-    """
-    with open(path, "rb") as fh:
-        return fh.read(2) == b"\x1f\x8b"
-
 def get_galaxy_stream(dataset_id: str, base_url: str = "https://usegalaxy.org", api_key: str = None, key_file: str = None):
     """Opens a buffered HTTP streaming connection to Galaxy dataset display endpoint."""
     key = get_galaxy_api_key(api_key, key_file)
     url = f"{base_url.rstrip('/')}/api/datasets/{dataset_id}/display"
     req = urllib.request.Request(url, headers={"x-api-key": key})
-    response = urllib.request.urlopen(req, timeout=120)
-    return response
+    try:
+        return urllib.request.urlopen(req, timeout=120)
+    except OSError as e:
+        raise RuntimeError(f"could not download Galaxy dataset {dataset_id} from "
+                           f"{base_url}: {e}") from e
+
+# Galaxy dataset states that mean "not finished yet", as opposed to "failed".
+GALAXY_PENDING_STATES = {"new", "upload", "queued", "running", "paused", "setting_metadata",
+                         "deferred"}
+
+
+class DatasetNotReady(RuntimeError):
+    """The Galaxy dataset is still being produced. `run` exits EX_TEMPFAIL (75) for it, so a
+    script can tell "try again later" from a failure."""
+
 
 def resolve_dataset_state(dataset_id: str, base_url: str = "https://usegalaxy.org", api_key: str = None, key_file: str = None):
-    """Checks the live state of a Galaxy dataset."""
+    """The live state of a Galaxy dataset. Raises if it cannot be read: proceeding without it
+    used to stream whatever a running or failed job had left."""
+    key = get_galaxy_api_key(api_key, key_file)
+    url = f"{base_url.rstrip('/')}/api/datasets/{dataset_id}"
+    req = urllib.request.Request(url, headers={"x-api-key": key})
     try:
-        key = get_galaxy_api_key(api_key, key_file)
-        url = f"{base_url.rstrip('/')}/api/datasets/{dataset_id}"
-        req = urllib.request.Request(url, headers={"x-api-key": key})
         with urllib.request.urlopen(req, timeout=30) as res:
-            data = json.loads(res.read())
-            return data.get("state")
-    except Exception:
-        return None
+            return json.loads(res.read()).get("state")
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"could not read the state of Galaxy dataset {dataset_id} at "
+                           f"{base_url}: {e}") from e
+
+
+def check_dataset_ready(dataset_id: str, state) -> None:
+    """Raise unless the dataset is `ok`. Only `queued` was caught before, and it returned
+    exit 0 having written nothing, so `from-lexicmap` went on to a stale cohort; any other
+    state was streamed as if it were finished."""
+    if state == "ok":
+        return
+    if state in GALAXY_PENDING_STATES:
+        raise DatasetNotReady(f"Galaxy dataset {dataset_id} is '{state}', not finished yet. "
+                              f"Rerun once it is 'ok'.")
+    raise ValueError(f"Galaxy dataset {dataset_id} is in state '{state}'; only an 'ok' "
+                     f"dataset can be read.")
+
 
 # An indel this close to either end of its HSP is not trusted. LexicMap can close an alignment
 # with a forced gap a few bases from where the contig or the extension stops: on the C. auris
@@ -488,7 +510,7 @@ def stream_lexicmap_to_msa(
     file_path: str = None,
     base_url: str = "https://usegalaxy.org",
     api_key: str = None,
-    api_key_file: str = "/tmp/gxy.txt",
+    api_key_file: str = None,
     min_coverage: float = 0.80,
     min_coverage_partial: float = 0.50,
     min_pident: float = 60.0,
@@ -515,12 +537,8 @@ def stream_lexicmap_to_msa(
     ref_aa = translate_nt(ref_seq) if ref_is_cds else ""
 
     if dataset_id:
-        ds_state = resolve_dataset_state(dataset_id, base_url, api_key, api_key_file)
-        if ds_state and ds_state != "ok":
-            print(f"[!] Warning: Galaxy dataset {dataset_id} is in state '{ds_state}' (not 'ok').")
-            if ds_state == "queued":
-                print("    Job is still queued on Galaxy. Skipping for now.")
-                return {"status": "queued", "dataset_id": dataset_id}
+        check_dataset_ready(dataset_id,
+                            resolve_dataset_state(dataset_id, base_url, api_key, api_key_file))
 
     print("=" * 80)
     print(" LexicMapStreamer: Multi-HSP Coordinate Tiler & Cohort Partitioner")
@@ -532,21 +550,21 @@ def stream_lexicmap_to_msa(
 
     if dataset_id:
         print(f" Input Source       : Streaming Galaxy dataset: {dataset_id} ({base_url})")
-        stream = get_galaxy_stream(dataset_id, base_url, api_key, api_key_file)
-        is_http = True
+        raw = get_galaxy_stream(dataset_id, base_url, api_key, api_key_file)
     elif file_path == "-":
         print(" Input Source       : Reading from STDIN")
-        stream = sys.stdin
-        is_http = False
+        raw = sys.stdin.buffer
     elif file_path:
         print(f" Input Source       : Local file: {file_path}")
-        if is_gzip(file_path):
-            stream = gzip.open(file_path, "rt", encoding="utf-8")
-        else:
-            stream = open(file_path, "r", encoding="utf-8")
-        is_http = False
+        raw = open(file_path, "rb")
     else:
         raise ValueError("Must specify either --dataset or --file.")
+    try:
+        stream = text_stream(raw)
+    except Exception:
+        if raw is not sys.stdin.buffer:
+            raw.close()
+        raise
 
     if not out_prefix:
         out_dir = Path("msa")
@@ -565,8 +583,6 @@ def stream_lexicmap_to_msa(
         header_line = stream.readline()
         if not header_line:
             raise ValueError("Input stream was empty or did not contain a header line.")
-        if is_http and isinstance(header_line, bytes):
-            header_line = header_line.decode("utf-8")
         header_line = header_line.strip()
         if header_line and not (header_line.startswith("#") and "\t" not in header_line):
             break
@@ -786,8 +802,6 @@ def stream_lexicmap_to_msa(
             line = stream.readline()
             if not line:
                 break
-            if is_http and isinstance(line, bytes):
-                line = line.decode("utf-8")
             line = line.strip()
             if not line:
                 continue
@@ -899,7 +913,7 @@ def stream_lexicmap_to_msa(
                 )
 
     finally:
-        if hasattr(stream, "close"):
+        if raw is not sys.stdin.buffer:
             stream.close()
         f_clean_fa.close()
         f_clean_exp_fa.close()
@@ -1182,9 +1196,10 @@ def add_parser(subparsers):
     parser.add_argument("--api-key", type=str, default=None,
                         help="Galaxy API key as a literal string. If unset, the key is read "
                              "from --api-key-file, then $GALAXY_API_KEY, then /tmp/gxy.txt.")
-    parser.add_argument("--api-key-file", type=str, default="/tmp/gxy.txt",
-                        help="Path to a file whose contents are the Galaxy API key "
-                             "(default: /tmp/gxy.txt). Ignored if --api-key is set.")
+    parser.add_argument("--api-key-file", type=str, default=None,
+                        help="Path to a file whose contents are the Galaxy API key. Used "
+                             "before $GALAXY_API_KEY; with neither, /tmp/gxy.txt is read. "
+                             "Ignored if --api-key is set.")
     parser.add_argument("--min-cov", type=fraction, default=0.80,
                         help="Clean full-length cohort gate: fraction of the reference an "
                              "accession's merged HSPs must cover (default: 0.80 = 80%%). "
@@ -1234,6 +1249,9 @@ def add_parser(subparsers):
     parser.set_defaults(func=run)
 
 
+EX_TEMPFAIL = 75  # sysexits.h: temporary failure, try again later
+
+
 def run(args) -> int:
     if not args.dataset and not args.file:
         print("lexicmap: must specify either -d/--dataset <GALAXY_ID> or -f/-i/--file <PATH> "
@@ -1246,33 +1264,41 @@ def run(args) -> int:
               f"construction.", file=sys.stderr)
         return 2
 
-    # Galaxy API key file: only validate when streaming from a dataset AND we're
-    # actually going to fall back to the file (--api-key and $GALAXY_API_KEY both
-    # win first, matching get_galaxy_api_key's resolution order).
-    if args.dataset and not args.api_key and not os.environ.get("GALAXY_API_KEY"):
+    # Galaxy API key file: only validate when streaming from a dataset and the file is the
+    # key that will be used (only --api-key wins over it, as in get_galaxy_api_key).
+    if args.dataset and not args.api_key:
         key_err = validate_api_key_file(args.api_key_file)
         if key_err:
             print(f"lexicmap: {key_err}", file=sys.stderr)
             return 1
 
-    summary = stream_lexicmap_to_msa(
-        ref_path=args.ref,
-        dataset_id=args.dataset,
-        file_path=args.file,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        api_key_file=args.api_key_file,
-        min_coverage=args.min_cov,
-        min_coverage_partial=args.min_cov_partial,
-        min_pident=args.min_pident,
-        max_internal_stops=args.max_internal_stops,
-        allow_frameshifts=args.allow_frameshift_alts,
-        full_length_only=args.require_full_length,
-        max_records=args.max_records,
-        sample_cap=args.samples_per_haplotype,
-        out_prefix=args.out_prefix,
-        write_a2m=not args.no_a2m,
-    )
+    try:
+        summary = stream_lexicmap_to_msa(
+            ref_path=args.ref,
+            dataset_id=args.dataset,
+            file_path=args.file,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            api_key_file=args.api_key_file,
+            min_coverage=args.min_cov,
+            min_coverage_partial=args.min_cov_partial,
+            min_pident=args.min_pident,
+            max_internal_stops=args.max_internal_stops,
+            allow_frameshifts=args.allow_frameshift_alts,
+            full_length_only=args.require_full_length,
+            max_records=args.max_records,
+            sample_cap=args.samples_per_haplotype,
+            out_prefix=args.out_prefix,
+            write_a2m=not args.no_a2m,
+        )
+    except DatasetNotReady as e:
+        print(f"lexicmap: {e}", file=sys.stderr)
+        return EX_TEMPFAIL
+    # Input problems (a missing or empty file, a bad table, an unreadable Galaxy dataset, a
+    # missing API key) end in one line naming the cause, not a traceback.
+    except (ValueError, OSError, RuntimeError) as e:
+        print(f"lexicmap: {e}", file=sys.stderr)
+        return 1
 
     # Empty-cohort hard-fail: a wrapping workflow should treat "no clean accessions
     # streamed" as failure, not as a good run with an empty output. Mirrors the

@@ -27,7 +27,7 @@ completes, but each throttled shard waits 30 to 60 seconds. Raise it for a self-
 
 In local mode, every regular file directly in `--shards-dir` is read as a shard, whatever its
 name (hidden files are skipped). A file that is not valid JSON counts as a failed shard and is
-named in the log.
+named in the log. Shards, local or fetched from Galaxy, can be gzip-compressed.
 
 Outputs, written to `-o`:
 

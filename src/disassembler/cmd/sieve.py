@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 from disassembler.resolve import resolve_sieve
+from disassembler.textio import open_text
 from disassembler.validators import fasta_record_lengths, fraction, positive_int
 
 # The binary's completeness gate (`--max-n-frac`) counts every character other than A/C/G/T,
@@ -56,7 +57,8 @@ def byte_exact_dedup(src: Path, dst: Path) -> tuple[int, int]:
 
     Returns (n_in, n_out). Headers are kept verbatim from the first copy; sequences are
     compared upper-cased with line breaks removed, so line wrapping does not keep two copies
-    apart. Empty records are dropped.
+    apart. Empty records are dropped. `src` may be gzipped; `dst` is always plain, which is
+    how the sieve binary, which reads only plain FASTA, gets a gzipped input.
 
     A later identical copy has novelty 0 and is never promoted, so dropping it loses nothing.
     What duplicates do change is admission: each copy adds a zero to the binary's running
@@ -83,7 +85,7 @@ def byte_exact_dedup(src: Path, dst: Path) -> tuple[int, int]:
             fout.writelines(seq_lines)
             n_out += 1
 
-    with src.open() as fin, dst.open("w") as fout:
+    with open_text(src) as fin, dst.open("w") as fout:
         for line in fin:
             if line.startswith(">"):
                 _emit(fout)
@@ -162,7 +164,11 @@ def sieve_run(
             print("sieve: pass --min-len, or --ref to derive it from the query.",
                   file=sys.stderr)
             return 2
-        min_len = auto_min_len(ref)
+        try:
+            min_len = auto_min_len(ref)
+        except (OSError, ValueError) as e:
+            print(f"sieve: cannot read --ref: {e}", file=sys.stderr)
+            return 1
         if min_len is None:
             return 2
 
@@ -178,7 +184,11 @@ def sieve_run(
     # The binary runs on a deduplicated copy, written beside the output and removed after.
     deduped = output_fasta.with_name(f".tmp_{output_fasta.stem}.deduped.{os.getpid()}.fasta")
     try:
-        n_in, n_unique = byte_exact_dedup(input_fasta, deduped)
+        try:
+            n_in, n_unique = byte_exact_dedup(input_fasta, deduped)
+        except (OSError, ValueError) as e:
+            print(f"sieve: cannot read the input FASTA: {e}", file=sys.stderr)
+            return 1
         if n_unique == 0:
             print(f"sieve: {input_fasta} has no sequences.", file=sys.stderr)
             return 1

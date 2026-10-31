@@ -143,8 +143,8 @@ Options that are on by default are turned off with a `--no-…` form.
 | flag | default | meaning |
 |---|---|---|
 | `-a, --accession <ACC>` | | one SRA accession |
-| `-l, --accession-list <FILE>` | | file with one accession per line |
-| `-q, --query <FASTA>` | | reference CDS; repeatable, and more than one record switches on multi-anchor mode |
+| `-l, --accession-list <FILE>` | | file with one accession per line, plain or gzipped |
+| `-q, --query <FASTA>` | | reference CDS, plain or gzipped; repeatable, and more than one record switches on multi-anchor mode |
 | `-o, --out-dir <DIR>` | `walker_output` | output directory |
 | `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | primary haplotypes |
 | `--scratch-dir <DIR>` | `/dev/shm/logan-walker` | per-accession GFA and GAF files (not shown by `--help`) |
