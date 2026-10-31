@@ -75,8 +75,9 @@ TUNING:
         --min-shared-kmers <N>    Anchor threshold, validated 1..=5 [default: 3]
         --max-size-mb <N>         Maximum compressed SRA size in MB [default: 1024]
         --prune-frac <F>          Drop unitigs below this fraction of the gene's depth and
-                                  realign, removing the aligner's reference bias. 0.0
-                                  disables it [default: 0.01]
+                                  realign, removing the aligner's reference bias. The
+                                  realignment is kept only if it spans as much of the
+                                  reference. 0.0 disables it [default: 0.01]
         --alt-max-detour <N>      Unitigs an alternative allele may traverse before it must
                                   rejoin the main route [default: 100]
     -t, --threads <N>             Threads per GraphAligner invocation, at least 1 [default: 1;
@@ -434,7 +435,13 @@ fn real_main(mut args: Args) -> error::Result<()> {
     };
 
     let accessions = match (&args.accession, &args.accession_list) {
-        (Some(a), _) => {
+        // `-a` used to win silently, so a run meant for a whole list did one accession.
+        (Some(_), Some(_)) => {
+            return Err(error::Error::Usage(
+                "give --accession or --accession-list, not both".into(),
+            ))
+        }
+        (Some(a), None) => {
             // The list path has always validated; `-a` did not, though the value reaches the
             // same URL and the same two filesystem paths.
             io::input::validate_accession(a, "--accession")?;

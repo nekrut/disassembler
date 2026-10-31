@@ -239,6 +239,28 @@ fn a_killed_runs_scratch_is_swept_by_the_next_run() {
     assert_eq!(run_dirs(&base), Vec::<PathBuf>::new());
 }
 
+/// `-a` alongside `-l` used to win silently, so a run meant for a list did one accession.
+#[test]
+fn an_accession_and_a_list_together_are_refused() {
+    let fx = Fixture::new("both", 3);
+    let (code, err) = fx.code("cache", &["-a", "SRRFAKE0"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("not both"), "{err}");
+}
+
+/// A repeated accession is processed once, so it cannot produce two `>ACC_primary` records.
+#[test]
+fn a_duplicated_accession_is_processed_once() {
+    let fx = Fixture::new("dupes", 2);
+    std::fs::write(fx.dir.join("accs.txt"), "SRRFAKE0\nSRRFAKE1\nSRRFAKE0\n").unwrap();
+    let (code, err) = fx.code("cache", &["--allow-empty"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("1 duplicate accession(s)"), "{err}");
+    let summary = std::fs::read_to_string(fx.dir.join("out").join("q_walker_summary.json")).unwrap();
+    assert_eq!(summary.matches("\"acc\": \"SRRFAKE0\"").count(), 1, "{summary}");
+    assert!(summary.contains("\"total\": 2"), "{summary}");
+}
+
 #[test]
 fn zero_workers_is_a_usage_error_not_a_hang() {
     let fx = Fixture::new("workers", 6);

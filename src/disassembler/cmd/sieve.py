@@ -177,8 +177,12 @@ def sieve_run(
     output_fasta.parent.mkdir(parents=True, exist_ok=True)
 
     emit_prefix = output_fasta.with_suffix("")
+
+    def shards() -> list[Path]:
+        return sorted(output_fasta.parent.glob(f"{emit_prefix.name}.rank*.fasta"))
+
     # Clear any stale shards from a previous run so the concat glob can't pick them up.
-    for stale in output_fasta.parent.glob(f"{emit_prefix.name}.rank*.fasta"):
+    for stale in shards():
         stale.unlink()
 
     # The binary runs on a deduplicated copy, written beside the output and removed after.
@@ -213,16 +217,19 @@ def sieve_run(
         ]
         print(f"[sieve] {' '.join(cmd)}", flush=True)
         rc = subprocess.run(cmd).returncode
-    finally:
-        deduped.unlink(missing_ok=True)
-    if rc != 0:
-        print(f"sieve: kmer-diversity-sieve exited {rc}", file=sys.stderr)
-        return rc
+        if rc != 0:
+            print(f"sieve: kmer-diversity-sieve exited {rc}", file=sys.stderr)
+            return rc
 
-    rank_files = sorted(output_fasta.parent.glob(f"{emit_prefix.name}.rank*.fasta"))
-    with output_fasta.open("w") as fh:
-        for rf in rank_files:
-            fh.write(rf.read_text())
+        with output_fasta.open("w") as fh:
+            for rf in shards():
+                fh.write(rf.read_text())
+    finally:
+        # The binary writes its result as <output>.rank*.fasta shards; the output is their
+        # concatenation. The shards used to be left beside it, a second copy of every record.
+        deduped.unlink(missing_ok=True)
+        for rf in shards():
+            rf.unlink(missing_ok=True)
 
     n_out = sum(1 for line in output_fasta.open() if line.startswith(">"))
     print(f"[sieve] {n_in} -> {n_out} haplotypes "

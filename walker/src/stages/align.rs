@@ -307,6 +307,8 @@ pub fn parse_gaf_multi(
         }
         out.insert(name, GafPath {
             steps,
+            query_start: num(2)?,
+            query_end: num(3)?,
             path_len: num(6)?,
             path_start: num(7)?,
             path_end: num(8)?,
@@ -377,6 +379,8 @@ pub fn parse_gaf(gaf_bytes: &[u8], expect: &str) -> Result<Option<GafPath>> {
 
     Ok(Some(GafPath {
         steps,
+        query_start: num(2)?,
+        query_end: num(3)?,
         path_len: num(6)?,
         path_start: num(7)?,
         path_end: num(8)?,

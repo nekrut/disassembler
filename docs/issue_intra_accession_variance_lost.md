@@ -106,7 +106,11 @@ That number does not exist before an alignment and cannot be taken from the anch
 `SRR8209082`'s anchors have a median `ka:f` of 70x against a true 14,500x, because
 `--min-shared-kmers 3` admits thousands of shallow incidental matches. So the walker aligns once
 to measure depth, drops unitigs below `prune_frac` of it, and aligns again. If the second
-alignment fails, the first pass's haplotype stands.
+alignment fails, or spans less of the reference than the first, the first pass's haplotype
+stands. The second condition arrived in 0.1.1: removing a low-depth stretch can cut the gene's
+route in two, and GraphAligner then reports the pieces as separate alignments. On `ERR6343483`
+(SARS-CoV-2 spike, 1,700x) the pruned alignment covered reference bases 424-3821 instead of
+0-3821, and the primary lost 425 nt while still passing `--min-cov`.
 
 ```
 SRR8209082 (HIV-1 pol, 14,500x)   nodes  aligns    cov   min ka:f  under 1% of depth

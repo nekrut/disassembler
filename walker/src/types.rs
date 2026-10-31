@@ -226,10 +226,15 @@ pub struct PathStep {
 ///
 /// Note `path_start` and `path_end` are offsets into the *stitched path*, not into the
 /// query. `stitch` slices the assembled sequence with them, so mistaking them for query
-/// coordinates yields a plausible but wrong haplotype.
+/// coordinates yields a plausible but wrong haplotype. `query_start` and `query_end` are the
+/// query coordinates.
 #[derive(Clone)]
 pub struct GafPath {
     pub steps: Vec<PathStep>,
+    /// GAF column 3: where on the reference the alignment starts.
+    pub query_start: usize,
+    /// GAF column 4: where on the reference it ends (exclusive).
+    pub query_end: usize,
     /// GAF column 7.
     pub path_len: usize,
     /// GAF column 8.
@@ -240,6 +245,14 @@ pub struct GafPath {
     pub num_matches: usize,
     /// GAF column 11, alignment block length. `pident = num_matches / aln_len`.
     pub aln_len: usize,
+}
+
+impl GafPath {
+    /// Reference bases the alignment spans. Unlike the haplotype's length, an indel in the
+    /// sample does not change it; an alignment that stops short does.
+    pub fn query_span(&self) -> usize {
+        self.query_end.saturating_sub(self.query_start)
+    }
 }
 
 // ---------------------------------------------------------------------------

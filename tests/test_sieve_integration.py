@@ -266,6 +266,14 @@ class TestSieveRun(unittest.TestCase):
         self.assertEqual(rc, 0, buf.getvalue())
         self.assertEqual(out.read_text(), plain)
 
+    def test_only_the_output_is_left_behind(self):
+        # The binary's out.rank*.fasta shards used to stay beside out.fasta, a second copy
+        # of every promoted record.
+        rc, n, log = self._run(self.fixture)
+        self.assertEqual(rc, 0, log)
+        self.assertGreater(n, 0)
+        self.assertEqual(sorted(p.name for p in self.work.iterdir()), ["in.fasta", "out.fasta"])
+
     def test_duplicates_keep_the_first_copy(self):
         seq = self.fixture[0][1]
         rc, n, log = self._run([("first", seq), ("second", seq)])

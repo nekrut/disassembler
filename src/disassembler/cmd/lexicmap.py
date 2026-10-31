@@ -1235,9 +1235,16 @@ def add_parser(subparsers):
                         help="Maximum representative accessions listed per collapsed haplotype "
                              "in <prefix>.clean.haplotypes.tsv (default: 10). Does not affect "
                              "the .accessions.fasta outputs.")
-    parser.add_argument("-o", "--out-prefix", "--out-dir", dest="out_prefix", type=str, default=None,
-                        help="Output prefix, or a directory (all lexicmap outputs land at "
-                             "<prefix>.*, default: msa/<ref_name>).")
+    out = parser.add_mutually_exclusive_group()
+    out.add_argument("-o", "--out-prefix", dest="out_prefix", type=str, default=None,
+                     help="Output prefix: all lexicmap outputs land at <prefix>.*. An existing "
+                          "directory, or a path ending in '/', is taken as --out-dir "
+                          "(default: msa/<ref_name>).")
+    # `--out-dir` was once a third spelling of --out-prefix, so a directory that did not
+    # exist yet became a prefix: `--out-dir out/new` wrote out/new.clean.msa.fasta and the rest.
+    out.add_argument("--out-dir", dest="out_dir", type=str, default=None,
+                     help="Output directory, created if needed: outputs land at "
+                          "<dir>/<ref_name>.*.")
     parser.add_argument("--no-a2m", action="store_true",
                         help="Skip writing the .a2m formatted MSA files "
                              "(<prefix>.clean.a2m and the .a2m compat alias).")
@@ -1288,7 +1295,8 @@ def run(args) -> int:
             full_length_only=args.require_full_length,
             max_records=args.max_records,
             sample_cap=args.samples_per_haplotype,
-            out_prefix=args.out_prefix,
+            out_prefix=(os.path.join(args.out_dir, "") if args.out_dir
+                        else args.out_prefix),
             write_a2m=not args.no_a2m,
         )
     except DatasetNotReady as e:

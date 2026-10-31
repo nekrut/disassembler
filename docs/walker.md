@@ -95,8 +95,8 @@ re-alignment after pruning never matched for a panel with descriptions, such as
 `panels/sarscov2_spike_11strains.fa`, so every accession kept its unpruned result. That
 re-alignment also aligned the whole panel again rather than just the chosen reference. On 30
 accessions of the 20,000-accession SARS-CoV-2 run, applying the pruning changed 17 primaries:
-mostly by one or two bases, as intended, but one lost 425 nt (pruning is kept whenever the
-result still passes `--min-cov`).
+mostly by one or two bases, as intended, but one lost 425 nt. That one is why a pruned result
+must now span as much of the reference as the unpruned one (see `--prune-frac` below).
 
 ## Outputs
 
@@ -106,7 +106,7 @@ result still passes `--min-cov`).
 | `<out-dir>/alt_haplotypes.fasta` | unless `--no-emit-alts` | intra-host alternatives, `>ACC_altN …` with their VAF and fork, at most 32 per accession |
 | `<out-dir>/bubbles.json` | always | bubbles in the local subgraph |
 | `<out-dir>/<query stem>_walker_summary.json` | always | per-accession status, metrics and candidates |
-| `<out-dir>/<ACC>.vcf` | `--emit-vcf` | intra-host SNVs of one accession, written only when it has at least one |
+| `<out-dir>/<ACC>.vcf` | `--emit-vcf` | intra-host SNVs of one accession, written only when it has at least one (a VCF an earlier run left for an accession with none is removed) |
 | `<out-dir>/snvs.tsv` | `--emit-snv-table` | one row per (accession, site, allele) across the run |
 
 `cov` is the walked length over the reference length, and `pident` the identity of the
@@ -156,7 +156,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | flag | default | meaning |
 |---|---|---|
 | `-a, --accession <ACC>` | | one SRA accession |
-| `-l, --accession-list <FILE>` | | file with one accession per line, plain or gzipped |
+| `-l, --accession-list <FILE>` | | file with one accession per line, plain or gzipped; a repeated accession is processed once. Give `-a` or `-l`, not both |
 | `-q, --query <FASTA>` | | reference CDS, plain or gzipped; repeatable, and more than one record switches on multi-anchor mode |
 | `-o, --out-dir <DIR>` | `walker_output` | output directory |
 | `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | primary haplotypes |
@@ -177,7 +177,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `--graphaligner <PATH>` | `GraphAligner` on `PATH` | the GraphAligner executable |
 | `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover |
 | `--primary-metric <M>` | `matched` | multi-anchor primary selection: `matched`, `cov`, `pident` or `cov_x_pident` |
-| `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables |
+| `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables. The re-aligned result is kept only if it spans as much of the reference as the first |
 | `--no-prefer-majority` | | keep the reference-matching allele on the primary at two-allele sites |
 
 ### Intra-host variants

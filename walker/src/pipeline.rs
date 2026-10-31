@@ -94,7 +94,7 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::stages;
-use crate::types::{Accession, AccessionResult, FetchedUnitigs, Outcome, Query, Timing};
+use crate::types::{Accession, AccessionResult, FetchedUnitigs, GafPath, Outcome, Query, Timing};
 use std::time::Instant;
 
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -136,6 +136,22 @@ fn prune_outcome(surviving: usize, before: usize) -> PruneOutcome {
     } else {
         PruneOutcome::Prune
     }
+}
+
+/// Whether a pruned realignment may replace the unpruned one: only if it spans at least as
+/// much of the reference.
+///
+/// Removing a low-depth stretch can cut the gene's route in two. GraphAligner then reports the
+/// pieces as separate alignments, the one with the most matches wins, and the haplotype loses
+/// the other piece while still passing `--min-cov`. Measured on `ERR6343483` (SARS-CoV-2
+/// spike, 1,700x): the unpruned alignment spans reference bases 0-3821; with the 17x floor it
+/// splits into 0-166 and 424-3821, and the primary went from 3,816 nt to 3,391.
+///
+/// The span is in reference coordinates, so the indels pruning exists to correct do not count
+/// against it: removing a spurious insertion or recovering a real deletion changes the
+/// haplotype's length, not the stretch of reference it covers.
+fn pruned_covers_as_much(unpruned: &GafPath, pruned: &GafPath) -> bool {
+    pruned.query_span() >= unpruned.query_span()
 }
 
 /// --fetch-only variant: download every accession into the unitigs cache, no compute stage.
@@ -623,7 +639,7 @@ fn run_one(
     // majority allele and emits second alleles at biallelic sites. See that module for why it
     // replaced the upstream `detour` engine (gap rate and VAF labelling).
     let (mut final_path, mut haplotype, winning_ref): (
-        Option<crate::types::GafPath>,
+        Option<GafPath>,
         Option<crate::types::Haplotype>,
         Option<String>,
     ) = match winner {
@@ -674,8 +690,9 @@ fn run_one(
     //
     // # Never a regression
     //
-    // If the second pass finds no haplotype, the first pass's result stands. Pruning can
-    // improve an accession and cannot break one. The cost is one extra alignment.
+    // If the second pass finds no haplotype, or one spanning less of the reference (see
+    // `pruned_covers_as_much`), the first pass's result stands. Pruning can improve an
+    // accession and cannot break one. The cost is one extra alignment.
     if cfg.prune_frac > 0.0 {
         if let (Some(path), Some(_)) = (&final_path, &haplotype) {
             let depth = stages::extract::path_depth(&graph, &path.steps);
@@ -735,7 +752,7 @@ fn run_one(
                 };
                 timing.align += t.elapsed().as_secs_f64();
                 match second {
-                    Some((p, h)) => {
+                    Some((p, h)) if pruned_covers_as_much(path, &p) => {
                         eprintln!(
                             "[{}] prune: depth {:.0}x, floor {:.1}x, {} of {} unitigs kept; \
                              realigned, min coverage on the route now {:.1}x",
@@ -750,12 +767,21 @@ fn run_one(
                         final_path = Some(p);
                         subgraph = pruned;
                     }
-                    None => {
-                        eprintln!(
-                            "[{}] prune: depth {:.0}x, floor {:.1}x cost the alignment; \
-                             keeping the unpruned result",
-                            graph.accession, depth, floor
-                        );
+                    rejected => {
+                        match rejected {
+                            Some((p, _)) => eprintln!(
+                                "[{}] prune: depth {:.0}x, floor {:.1}x; the realigned route \
+                                 spans reference bases {}-{} of {}, less than the unpruned \
+                                 {}-{}; keeping the unpruned result",
+                                graph.accession, depth, floor, p.query_start, p.query_end,
+                                query.seq.len(), path.query_start, path.query_end
+                            ),
+                            None => eprintln!(
+                                "[{}] prune: depth {:.0}x, floor {:.1}x cost the alignment; \
+                                 keeping the unpruned result",
+                                graph.accession, depth, floor
+                            ),
+                        }
                         // Redo pass 1's subgraph so later stages have it. Cheap: the
                         // sequences are already decoded, only the GFA is rewritten.
                         drop(pruned);
@@ -908,7 +934,7 @@ mod ordering_tests {
 
 #[cfg(test)]
 mod prune_outcome_tests {
-    use super::{prune_outcome, PruneOutcome};
+    use super::{prune_outcome, pruned_covers_as_much, PruneOutcome};
     use crate::config::Config;
     use crate::stages::extract::{depth_floor, prune_nodes};
     use crate::stages::parse;
@@ -929,6 +955,38 @@ mod prune_outcome_tests {
         assert_eq!(prune_outcome(1, 1), PruneOutcome::NothingToRemove);
         // An empty subgraph never reaches a prune, but must not claim one.
         assert_eq!(prune_outcome(0, 0), PruneOutcome::WouldEmpty);
+    }
+
+    fn spanning(query_start: usize, query_end: usize, path_len: usize) -> crate::types::GafPath {
+        crate::types::GafPath {
+            steps: Vec::new(),
+            query_start,
+            query_end,
+            path_len,
+            path_start: 0,
+            path_end: path_len,
+            num_matches: 0,
+            aln_len: 0,
+        }
+    }
+
+    /// `ERR6343483`'s numbers: the pruned route lost the first 424 reference bases, and the
+    /// haplotype was still long enough to pass `--min-cov`.
+    #[test]
+    fn a_pruned_route_that_stops_short_is_refused() {
+        let unpruned = spanning(0, 3821, 3816);
+        assert!(!pruned_covers_as_much(&unpruned, &spanning(424, 3821, 3391)));
+        assert!(!pruned_covers_as_much(&unpruned, &spanning(0, 3820, 3815)), "one base short");
+    }
+
+    /// An indel changes the haplotype's length but not the reference span, so pruning away a
+    /// spurious insertion, or onto a real deletion, is kept.
+    #[test]
+    fn an_indel_is_not_lost_coverage() {
+        let unpruned = spanning(0, 3821, 3822);
+        assert!(pruned_covers_as_much(&unpruned, &spanning(0, 3821, 3816)), "6-nt deletion");
+        assert!(pruned_covers_as_much(&unpruned, &spanning(0, 3821, 3823)), "insertion");
+        assert!(pruned_covers_as_much(&spanning(4, 3820, 3816), &spanning(0, 3821, 3821)), "longer");
     }
 
     /// The case is reachable on real data: a gene sitting entirely under `min_abund`.

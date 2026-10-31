@@ -120,6 +120,15 @@ class TestMsaCoverageGate(unittest.TestCase):
         self.assertIsNone(rows, "a failed identity check must not write the alignment")
         self.assertIn("under --min-identity 0.60", log)
 
+    def test_temp_files_are_removed_when_mafft_is_interrupted(self):
+        # The MAFFT inputs were removed only on the normal path, so a Ctrl-C during MAFFT left
+        # .tmp_* files beside the output.
+        from unittest import mock
+        with mock.patch.object(self.msa.subprocess, "run", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._msa([("full", REF)])
+        self.assertEqual(sorted(p.name for p in self.work.glob(".tmp_*")), [])
+
     def test_a_multi_record_reference_uses_the_first_and_says_so(self):
         rc, log, rows = self._msa([("a", GENE)],
                                   ref_records=[("gene", GENE), ("other", REF)])

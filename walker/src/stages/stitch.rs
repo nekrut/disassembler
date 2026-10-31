@@ -261,6 +261,7 @@ mod tests {
     fn path(steps: &[(Orient, u32)], len: usize, start: usize, end: usize) -> GafPath {
         GafPath {
             steps: steps.iter().map(|&(orient, node)| PathStep { orient, node }).collect(),
+            query_start: 0, query_end: end.saturating_sub(start),
             path_len: len, path_start: start, path_end: end,
             num_matches: 99, aln_len: 100,
         }
@@ -305,6 +306,7 @@ mod tests {
         // hap.cov / hap.pident for ranking. Everything else is placeholder.
         let path = GafPath {
             steps: vec![PathStep { orient: Orient::Forward, node: 1 }],
+            query_start: 0, query_end: 1,
             path_len: 1, path_start: 0, path_end: 1,
             num_matches, aln_len: 1,
         };

@@ -133,9 +133,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                        help="Skip writing the .a2m formatted MSA files "
                             "(<prefix>.clean.a2m and the .a2m compat alias).")
     g_lex.add_argument("--allow-empty", action="store_true",
-                       help="Exit 0 even if the lexicmap clean cohort is empty. Off by "
-                            "default: an empty cohort exits non-zero so a wrapping "
-                            "workflow does not mistake a whole-target miss for a good run.")
+                       help="Exit 0 even if the cohort is empty, skipping the sieve, MSA "
+                            "and tree. Off by default: an empty cohort exits non-zero so a "
+                            "wrapping workflow does not mistake a whole-target miss for a "
+                            "good run.")
 
     # ---- Cohort selection into sieve/MSA ----------------------------------
     g_cohort = p.add_argument_group(
@@ -301,7 +302,15 @@ def run(args) -> int:
     n_cohort = sum(1 for line in cohort.open() if line.startswith(">"))
     print(f"[from-lexicmap] cohort: {n_cohort} sequences from {cohort.name}", flush=True)
     if n_cohort == 0:
-        print("from-lexicmap: cohort is empty; nothing to align.", file=sys.stderr)
+        # lexicmap's own check counts full-length and partial sequences together, so a cohort
+        # of partials alone passes it and is empty here unless --include-partials is given.
+        # This used to exit 1 even with --allow-empty.
+        if args.allow_empty:
+            print("[from-lexicmap] cohort is empty; nothing to align (--allow-empty)",
+                  flush=True)
+            return 0
+        print("from-lexicmap: cohort is empty; nothing to align. Pass --allow-empty to accept "
+              "this as a good run.", file=sys.stderr)
         return 1
 
     msa_input = cohort

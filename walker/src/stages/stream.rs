@@ -196,13 +196,25 @@ impl Fetcher {
         }
 
         // ureq caps read_to_vec at 10 MB by default, which every real accession exceeds.
-        // The limit here doubles as the guard for a missing or lying Content-Length.
+        // The limit here doubles as the guard for a missing or lying Content-Length. ureq
+        // refuses a body that reaches its limit, so the limit is one byte over the cap: a file
+        // of exactly the cap passes, as it does the Content-Length check above.
+        //
+        // Running into the limit is the size cap, not a transient failure. It used to be
+        // retried, downloading up to the cap three times before reporting a fetch error.
         let compressed = resp
             .body_mut()
             .with_config()
-            .limit(self.max_compressed_bytes)
+            .limit(self.max_compressed_bytes.saturating_add(1))
             .read_to_vec()
-            .map_err(|e| FetchAttempt::Transient(format!("body read failed: {e}")))?;
+            .map_err(|e| match e {
+                ureq::Error::BodyExceedsLimit(_) => FetchAttempt::TooLarge(format!(
+                    "compressed size exceeds max_compressed_bytes {} (the server sent no \
+                     Content-Length, so this was found by downloading)",
+                    self.max_compressed_bytes
+                )),
+                e => FetchAttempt::Transient(format!("body read failed: {e}")),
+            })?;
 
         if compressed.is_empty() {
             return Err(FetchAttempt::Transient("empty body".to_string()));
@@ -226,7 +238,8 @@ enum FetchAttempt {
     Permanent(String),
     /// HTTP 404: Logan has no unitigs for this accession. Not an error of the run.
     Missing,
-    /// Content-Length over `--max-size-mb`. Skipped by the user's cap, not an error.
+    /// Over `--max-size-mb`, by Content-Length or, without one, by the bytes read. Skipped by
+    /// the user's cap, not an error.
     TooLarge(String),
 }
 
@@ -368,6 +381,55 @@ mod network_tests {
             started.elapsed() < Duration::from_secs(20),
             "must reject on Content-Length, not after downloading 3.9 GB"
         );
+    }
+}
+
+/// The size cap against a local server, for the case the live test cannot reach: a response
+/// without a Content-Length.
+#[cfg(test)]
+mod size_cap_tests {
+    use super::*;
+    use crate::config::Config;
+    use std::io::{BufRead, BufReader, Write};
+
+    /// Serve one request with `body` and no Content-Length (the body ends when the
+    /// connection closes, as with a chunked or HTTP/1.0 response). Returns the URL.
+    fn serve_without_length(body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            let _ = sock.write_all(&body);
+        });
+        format!("http://127.0.0.1:{port}/u/X/X.unitigs.fa.zst")
+    }
+
+    fn fetcher(cap: u64) -> Fetcher {
+        Fetcher::new(&Config { max_compressed_bytes: cap, ..Config::default() })
+    }
+
+    #[test]
+    fn a_body_over_the_cap_without_content_length_is_too_large_not_transient() {
+        let url = serve_without_length(vec![b'A'; 100]);
+        match fetcher(10).try_once(0, &"X".to_string(), &url) {
+            Err(FetchAttempt::TooLarge(d)) => assert!(d.contains("no Content-Length"), "{d}"),
+            Err(FetchAttempt::Transient(d)) => panic!("retried as transient: {d}"),
+            Err(_) => panic!("wrong failure"),
+            Ok(f) => panic!("accepted {} bytes over a 10-byte cap", f.compressed_len),
+        }
+    }
+
+    #[test]
+    fn a_body_of_exactly_the_cap_is_accepted() {
+        let url = serve_without_length(vec![b'A'; 10]);
+        let got = fetcher(10).try_once(0, &"X".to_string(), &url).ok().expect("refused at the cap");
+        assert_eq!(got.compressed_len, 10);
     }
 }
 

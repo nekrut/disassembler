@@ -115,7 +115,9 @@ disassembler from-lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.
 ```
 
 `-o` is an output prefix: `-o out/hiv1_pol` writes `out/hiv1_pol.*`. An existing directory, or
-a path ending in `/`, writes `<dir>/<reference stem>.*`. `from-lexicmap -o DIR` writes the lexicmap files as
+a path ending in `/`, writes `<dir>/<reference stem>.*`, as `--out-dir <dir>` does whether or not
+the directory exists yet. (Before 0.1.1, `--out-dir` was another spelling of `-o`, so a directory
+that did not exist yet was taken as a prefix.) `from-lexicmap -o DIR` writes the lexicmap files as
 `DIR/lexicmap.*` and the MSA and tree alongside.
 
 ## Outputs
@@ -167,7 +169,8 @@ for coverage that lexicmap already accepted.
 | `-q, -r, --query, --ref <FASTA>` | | reference in-frame CDS, plain or gzipped (first record only) |
 | `-d, --dataset <ID>` | | Galaxy dataset to stream; exclusive with `-f` |
 | `-f, -i, --file, --input <FILE>` | | local table, gzipped table, or `-` for stdin |
-| `-o, --out-prefix, --out-dir <PATH>` | `msa/<reference stem>` | output prefix or directory |
+| `-o, --out-prefix <PATH>` | `msa/<reference stem>` | output prefix, or an existing directory |
+| `--out-dir <DIR>` | | output directory, created if needed; exclusive with `-o` |
 | `--base-url <URL>` | `https://usegalaxy.org` | Galaxy server for `-d` |
 | `--api-key <KEY>` / `--api-key-file <PATH>` | | Galaxy API key, literal or from a file |
 | `--min-cov <F>` | `0.80` | tier 1 coverage gate |

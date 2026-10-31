@@ -569,6 +569,8 @@ fn strand_of(o: Oriented) -> Strand {
 fn copy_coords(p: &GafPath) -> GafPath {
     GafPath {
         steps: Vec::new(),
+        query_start: p.query_start,
+        query_end: p.query_end,
         path_len: p.path_len,
         path_start: p.path_start,
         path_end: p.path_end,
@@ -727,6 +729,8 @@ mod tests {
                 PathStep { orient: Orient::Forward, node: 1 },
                 PathStep { orient: Orient::Forward, node: 3 },
             ],
+            query_start: 0,
+            query_end: 7,
             path_len: 7,
             path_start: 0,
             path_end: 7,

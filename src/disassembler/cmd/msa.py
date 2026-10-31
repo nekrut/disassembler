@@ -223,71 +223,70 @@ def run(args) -> int:
     fwd_kmers, rev_kmers = kmer_set(ref_seq), kmer_set(revcomp(ref_seq))
 
     used_ids = {"Reference"}
+    # MAFFT reads both inputs from files beside the output. They are removed however this
+    # ends; they used to be removed only on the normal path, so an exception or a Ctrl-C
+    # during MAFFT left them behind.
     clean_input_p = out_aln.parent / f".tmp_{in_p.name}.{os.getpid()}"
-    retained = flipped = unoriented = 0
-    with open(clean_input_p, "w") as fh:
-        for r in input_records:
-            seq = str(r.seq).upper()
-            # Count bases, not characters: a lexicmap row is reference-length with '-' where
-            # no HSP reached, so its length passed this gate whatever its coverage.
-            if real_bases(seq) < ref_len * args.msa_min_cov:
-                continue
-            strand = orientation(seq, fwd_kmers, rev_kmers)
-            if strand < 0:
-                seq = revcomp(seq)
-                flipped += 1
-            elif strand == 0:
-                unoriented += 1
-            clean_id = sanitize_id(r.id, used_ids)
-            fh.write(f">{clean_id}\n{seq}\n")
-            retained += 1
-
-    if retained == 0:
-        clean_input_p.unlink(missing_ok=True)
-        print("Error: no sequences passed quality/coverage filtering", file=sys.stderr)
-        return 1
-
-    print(
-        f"[*] {retained}/{len(input_records)} sequences passed coverage filter "
-        f"(>= {args.msa_min_cov*100:.0f}% of the reference in A/C/G/T bases)"
-    )
-    if flipped:
-        print(f"[*] {flipped} of {retained} sequences were on the reference's other strand and "
-              f"were reverse-complemented (MAFFT does not do this itself)")
-    if flipped and flipped == retained:
-        print(f"[warn] every sequence was on the other strand from {ref_rec.id}. That is "
-              f"expected when the reference is a CDS annotated on the minus strand; if the "
-              f"reference itself is the reversed one, its codon frame is wrong.",
-              file=sys.stderr)
-    if unoriented:
-        print(f"[warn] {unoriented} sequence(s) share as many {ORIENT_K}-mers with the "
-              f"reference's reverse complement as with the reference (usually none with "
-              f"either); aligned as given.", file=sys.stderr)
-
     clean_ref_p = out_aln.parent / f".tmp_ref_{ref_p.name}.{os.getpid()}"
-    with open(clean_ref_p, "w") as fh:
-        fh.write(f">Reference\n{str(ref_rec.seq).upper()}\n")
-
-    print("[*] Running MAFFT --keeplength --addfragments...")
-    mafft_cmd = [
-        mafft_bin,
-        "--auto",
-        "--keeplength",
-        "--thread", str(args.mafft_threads),
-        "--addfragments", str(clean_input_p),
-        str(clean_ref_p),
-    ]
-
     # Same temp-then-rename as the tree below: opening out_aln directly truncated it
     # before MAFFT ran, so a MAFFT failure replaced a previously good alignment with
     # an empty file.
     tmp_aln = out_aln.with_name(f".tmp_{out_aln.name}.{os.getpid()}")
     try:
+        retained = flipped = unoriented = 0
+        with open(clean_input_p, "w") as fh:
+            for r in input_records:
+                seq = str(r.seq).upper()
+                # Count bases, not characters: a lexicmap row is reference-length with '-'
+                # where no HSP reached, so its length passed this gate whatever its coverage.
+                if real_bases(seq) < ref_len * args.msa_min_cov:
+                    continue
+                strand = orientation(seq, fwd_kmers, rev_kmers)
+                if strand < 0:
+                    seq = revcomp(seq)
+                    flipped += 1
+                elif strand == 0:
+                    unoriented += 1
+                clean_id = sanitize_id(r.id, used_ids)
+                fh.write(f">{clean_id}\n{seq}\n")
+                retained += 1
+
+        if retained == 0:
+            print("Error: no sequences passed quality/coverage filtering", file=sys.stderr)
+            return 1
+
+        print(
+            f"[*] {retained}/{len(input_records)} sequences passed coverage filter "
+            f"(>= {args.msa_min_cov*100:.0f}% of the reference in A/C/G/T bases)"
+        )
+        if flipped:
+            print(f"[*] {flipped} of {retained} sequences were on the reference's other "
+                  f"strand and were reverse-complemented (MAFFT does not do this itself)")
+        if flipped and flipped == retained:
+            print(f"[warn] every sequence was on the other strand from {ref_rec.id}. That is "
+                  f"expected when the reference is a CDS annotated on the minus strand; if the "
+                  f"reference itself is the reversed one, its codon frame is wrong.",
+                  file=sys.stderr)
+        if unoriented:
+            print(f"[warn] {unoriented} sequence(s) share as many {ORIENT_K}-mers with the "
+                  f"reference's reverse complement as with the reference (usually none with "
+                  f"either); aligned as given.", file=sys.stderr)
+
+        with open(clean_ref_p, "w") as fh:
+            fh.write(f">Reference\n{str(ref_rec.seq).upper()}\n")
+
+        print("[*] Running MAFFT --keeplength --addfragments...")
+        mafft_cmd = [
+            mafft_bin,
+            "--auto",
+            "--keeplength",
+            "--thread", str(args.mafft_threads),
+            "--addfragments", str(clean_input_p),
+            str(clean_ref_p),
+        ]
+
         with open(tmp_aln, "w") as fh:
             res = subprocess.run(mafft_cmd, stdout=fh, stderr=subprocess.PIPE, text=True)
-
-        clean_input_p.unlink(missing_ok=True)
-        clean_ref_p.unlink(missing_ok=True)
 
         if res.returncode != 0:
             print(f"MAFFT failed: {res.stderr}", file=sys.stderr)
@@ -307,7 +306,8 @@ def run(args) -> int:
             return 1
         os.replace(tmp_aln, out_aln)
     finally:
-        Path(tmp_aln).unlink(missing_ok=True)
+        for temp in (clean_input_p, clean_ref_p, tmp_aln):
+            temp.unlink(missing_ok=True)
 
     # Written to a temp and renamed on success: opening out_tree directly truncated it
     # before FastTree ran, so a failure left a 0-byte .nwk that looks like a real output

@@ -191,7 +191,7 @@ pub struct Config {
     /// is not a noise process.
     ///
     /// It does change the sequence that feeds the codon alignment and the selection
-    /// analysis, so `--prefer-majority=false` is the switch to reach for when reproducing an
+    /// analysis, so `--no-prefer-majority` is the switch to reach for when reproducing an
     /// older result. 25 of the 26 accessions it touched moved by 1 to 11 sites and cleanly;
     /// the one exception warns, see `stages::variants::prefer_majority`.
     ///

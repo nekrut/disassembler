@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 /// Read accessions, one per line. Blank lines and `#` comments are skipped.
 ///
-/// Duplicates are kept, not collapsed, because collapsing them would change the output
-/// record set. They are counted and reported, because each duplicate costs a full download.
+/// A duplicate is skipped with a warning; the first copy keeps its place. Kept, each copy was
+/// downloaded and reconstructed again and written under the same `>ACC_primary` id, which
+/// FastTree refuses, and each overwrote the same `<out-dir>/<acc>.vcf`.
 ///
 /// Note the shipped lists carry duds: `DRR000252`, `DRR028850`, `DRR028861`, `DRR006432`
 /// and `DRR006471` all fail to reconstruct. Reconstruction yield and throughput are
@@ -71,11 +72,12 @@ pub fn read_accession_list(path: &Path) -> Result<Vec<Accession>> {
     }
 
     let mut seen = std::collections::HashSet::new();
-    let dupes = out.iter().filter(|a| !seen.insert((*a).clone())).count();
-    if dupes > 0 {
+    let listed = out.len();
+    out.retain(|a| seen.insert(a.clone()));
+    if out.len() < listed {
         eprintln!(
-            "[warn] {} duplicate accession(s) in {}; each is fetched again",
-            dupes,
+            "[warn] {} duplicate accession(s) in {} skipped; each accession is processed once",
+            listed - out.len(),
             path.display()
         );
     }
@@ -352,12 +354,11 @@ mod tests {
         std::fs::remove_file(p).ok();
     }
 
-    /// Duplicates are kept, because collapsing them would change the
-    /// output record set. They are only warned about.
+    /// A repeated accession is processed once, in its first position.
     #[test]
-    fn keeps_duplicates() {
-        let p = tmp("dup.txt", b"SRR8209082\nSRR8209082\n");
-        assert_eq!(read_accession_list(&p).unwrap().len(), 2);
+    fn skips_duplicates() {
+        let p = tmp("dup.txt", b"SRR8209082\nDRR000252\nSRR8209082\n");
+        assert_eq!(read_accession_list(&p).unwrap(), vec!["SRR8209082", "DRR000252"]);
         std::fs::remove_file(p).ok();
     }
 

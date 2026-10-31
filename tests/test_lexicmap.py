@@ -102,6 +102,27 @@ class TestLexicMapStreamer(unittest.TestCase):
         self.assertIn("WT", classes)
         self.assertIn("Missense", classes)
 
+    def test_out_dir_that_does_not_exist_yet_is_a_directory(self):
+        # `--out-dir` was a third spelling of --out-prefix, so `--out-dir out/new` wrote
+        # out/new.clean.msa.fasta beside a directory that was never made.
+        from disassembler import cli
+        tsv = self.dir_path / "hits.tsv"
+        tsv.write_text(
+            "query\tqlen\thits\tsgenome\tsseqid\tqcovGnm\tcls\thsp\tqcovHSP\talenHSP\tpident\tgaps\tqstart\tqend\tsstart\tsend\tqseq\tsseq\n"
+            "test_cds\t12\t1\tSRR002\tu3\t100.0\t1\t1\t100.0\t12\t100.0\t0\t1\t12\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n")
+        out = self.dir_path / "out" / "new"
+        rc = cli.main(["lexicmap", "-q", str(self.ref_fasta), "-f", str(tsv),
+                       "--out-dir", str(out)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.is_dir())
+        self.assertTrue(any(p.name.endswith(".clean.msa.fasta") for p in out.iterdir()))
+        self.assertFalse((self.dir_path / "out" / "new.clean.msa.fasta").exists())
+        # -o keeps its prefix meaning.
+        rc = cli.main(["lexicmap", "-q", str(self.ref_fasta), "-f", str(tsv),
+                       "-o", str(self.dir_path / "pfx")])
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.dir_path / "pfx.clean.msa.fasta").exists())
+
     def test_gzip_is_detected_by_content_not_by_name(self):
         # Galaxy hands every dataset over as dataset_<uuid>.dat, compressed or not.
         tsv = (

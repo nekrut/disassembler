@@ -378,34 +378,21 @@ pub fn write_vcfs(
     std::fs::create_dir_all(out_dir)?;
 
     // The filename is the accession, which `docs/vcf_example.md` documents and the committed
-    // examples rely on, so duplicates in the input list land on one path. Their contents are
-    // for the same accession and so should agree, but say it rather than silently overwrite.
-    {
-        let mut seen = std::collections::HashSet::new();
-        let dupes: Vec<&str> = summary
-            .results
-            .iter()
-            .filter(|r| !seen.insert(r.accession.as_str()))
-            .map(|r| r.accession.as_str())
-            .collect();
-        if !dupes.is_empty() {
-            eprintln!(
-                "[warn] {} duplicate accession(s) in the results ({:?}); each writes \
-                 <out-dir>/<acc>.vcf, so only the last of each survives",
-                dupes.len(),
-                dupes
-            );
-        }
-    }
-
+    // examples rely on. `read_accession_list` drops duplicates, so each path is written once.
     for (r, rows) in summary.results.iter().zip(sites) {
+        let path = out_dir.join(format!("{}.vcf", r.accession));
         if rows.is_empty() {
+            // A VCF an earlier run left in this --out-dir would claim sites this run did not
+            // find, beside a primary that no longer has them.
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
             continue;
         }
 
         let query = reference_of(r, queries);
         let chrom = chrom_of(query);
-        let path = out_dir.join(format!("{}.vcf", r.accession));
         let mut w = BufWriter::new(std::fs::File::create(&path)?);
         write_vcf_header(&mut w, chrom, query.seq.len(), &r.accession)?;
         for row in rows {
@@ -887,7 +874,8 @@ mod banded_equivalence_tests {
 
 #[cfg(test)]
 mod vcf_tests {
-    use super::{align_primary_to_query, chrom_of, reference_of, snv_sites};
+    use super::{align_primary_to_query, chrom_of, reference_of, snv_sites, snv_sites_all, write_vcfs};
+    use crate::pipeline::Summary;
     use crate::types::{
         AccessionResult, AltHaplotype, Haplotype, Outcome, Query, Strand, Timing,
     };
@@ -982,6 +970,26 @@ mod vcf_tests {
         assert_eq!(bases, vec![b'C', b'G'], "both minor alleles present, deduplicated");
         assert_eq!(rows[0].ref_base, b'A');
         assert_eq!(rows[0].ref_ka, 100.0, "RO is the major (=REF) coverage, once");
+    }
+
+    /// A rerun into the same `--out-dir` that finds no sites for an accession removes the VCF
+    /// an earlier run wrote for it, rather than leaving it beside a primary without those sites.
+    #[test]
+    fn a_rerun_without_sites_removes_the_old_vcf() {
+        let dir = std::env::temp_dir().join(format!("logan-vcf-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let q = [query(b"TTTATTT")];
+        let run = |alts: Vec<AltHaplotype>| {
+            let s = Summary { total: 1, success: 1, results: vec![result(b"TTTATTT", alts)] };
+            let sites = snv_sites_all(&s, &q);
+            write_vcfs(&s, &q, &dir, &sites).unwrap();
+        };
+        run(vec![alt(b"TTTGTTT", 0.25, 25.0)]);
+        assert!(dir.join("ACC.vcf").exists(), "the first run found a site");
+        run(Vec::new());
+        assert!(!dir.join("ACC.vcf").exists(), "the second run found none");
+        run(Vec::new()); // and no file to remove is not an error
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Two forks at DIFFERENT positions stay two records.
