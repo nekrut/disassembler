@@ -67,6 +67,11 @@ def sanitize_id(s: str, used: set) -> str:
     return candidate
 
 
+def real_bases(seq: str) -> int:
+    """A, C, G and T in either case; gaps, N and other IUPAC codes do not count."""
+    return sum(map(seq.count, "ACGTacgt"))
+
+
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "msa",
@@ -90,8 +95,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--out-tree", "-t", required=True, help="Output Newick tree")
     p.add_argument("--mafft-threads", type=positive_int, default=8, help="MAFFT threads")
     p.add_argument("--msa-min-cov", type=fraction, default=0.70,
-                   help="Minimum sequence coverage fraction (fraction of reference length "
-                        "a sequence must reach to enter the MSA)")
+                   help="Minimum coverage to enter the MSA: a sequence's A/C/G/T bases, as a "
+                        "fraction of the reference length (default 0.70). Gaps ('-') and N "
+                        "do not count, so a gapped lexicmap row is measured by what it covers.")
     p.set_defaults(func=run)
 
 
@@ -136,7 +142,9 @@ def run(args) -> int:
     retained = 0
     with open(clean_input_p, "w") as fh:
         for r in input_records:
-            if len(r.seq) < ref_len * args.msa_min_cov:
+            # Count bases, not characters: a lexicmap row is reference-length with '-' where
+            # no HSP reached, so its length passed this gate whatever its coverage.
+            if real_bases(str(r.seq)) < ref_len * args.msa_min_cov:
                 continue
             clean_id = sanitize_id(r.id, used_ids)
             fh.write(f">{clean_id}\n{str(r.seq).upper()}\n")
@@ -149,7 +157,7 @@ def run(args) -> int:
 
     print(
         f"[*] {retained}/{len(input_records)} sequences passed coverage filter "
-        f"(>= {args.msa_min_cov*100:.0f}%)"
+        f"(>= {args.msa_min_cov*100:.0f}% of the reference in A/C/G/T bases)"
     )
 
     clean_ref_p = out_aln.parent / f".tmp_ref_{ref_p.name}.{os.getpid()}"

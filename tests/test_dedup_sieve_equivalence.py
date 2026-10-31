@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""test_dedup_sieve_equivalence.py -- byte-exact equivalence of the dedup fast path.
+"""test_dedup_sieve_equivalence.py -- the dedup pass changes nothing below the warmup.
 
-`from-lexicmap` folds byte-exact duplicates out of its per-accession cohort
-before invoking the sieve, because the sieve is a deterministic in-order filter
-that would reject every later copy of an identical sequence as novelty=0
-anyway. This test proves the two paths produce byte-identical sieve output.
+`sieve_run` folds byte-exact duplicates out of its input before invoking the
+sieve. A later identical copy has novelty 0 and is never promoted, so on a cohort
+smaller than the binary's 2000-record admission warmup (as here) the two paths
+produce byte-identical output. Past the warmup they differ on purpose: duplicates
+skew the admission statistics and get new lineages rejected as errors, which is
+why the wrapper deduplicates (tests/test_sieve_integration.py covers that case).
 
 Also records the dedup fold ratio and (loosely) checks the dedup pass itself is
 cheap. Does NOT assert on wall-clock speedup of the sieve (noisy on CI); the
@@ -101,13 +103,13 @@ class TestDedupSieveEquivalence(unittest.TestCase):
         if not FIXTURE.is_file():
             raise unittest.SkipTest("fixture_reconstructed.fasta missing")
         try:
-            from disassembler.cmd.pipe_from_lexicmap import _byte_exact_dedup  # noqa
+            from disassembler.cmd.sieve import byte_exact_dedup  # noqa
         except ImportError as e:
             raise unittest.SkipTest(f"disassembler not importable: {e}")
 
     def setUp(self):
-        from disassembler.cmd.pipe_from_lexicmap import _byte_exact_dedup
-        self.dedup = _byte_exact_dedup
+        from disassembler.cmd.sieve import byte_exact_dedup
+        self.dedup = byte_exact_dedup
         self.work = Path(tempfile.mkdtemp())
         self.fixture = _parse_fasta(FIXTURE)
         self.min_len = int(len(self.fixture[0][1]) * 0.95)

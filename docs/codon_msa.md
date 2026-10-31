@@ -27,8 +27,10 @@ directory, where `<gene>` is the reference file's stem.
   HyPhy) expect it there.
 - **Record IDs are sanitised** to letters, digits and underscores, and made unique, so Newick
   and HyPhy parsers accept them.
-- **Coverage gate.** A haplotype shorter than `--msa-min-cov` (default `0.70`) of the
-  reference length is dropped before alignment rather than aligned as a fragment.
+- **Coverage gate.** A haplotype with fewer A/C/G/T bases than `--msa-min-cov` (default
+  `0.70`) of the reference length is dropped before alignment rather than aligned as a
+  fragment. Gaps and N do not count, so a LexicMap row, which is reference-length with `-`
+  wherever no hit reached, is measured by what it covers.
 
 `msa` prints QC on the way through: how many sequences passed the coverage gate, the final taxa
 count, the alignment length and the codon count. For a coding reference the alignment length is
@@ -104,6 +106,11 @@ deletion come through MAFFT unchanged: on three cohorts of 27 to 14,594 sequence
 MAFFT reproduced them byte for byte. With the default `--min-cov 0.80`, rows can also carry `-`
 at uncovered reference positions, and MAFFT may place gaps differently. `from-lexicmap` runs `msa` in both cases so that
 both routes produce the same output shape.
+
+In `from-lexicmap`, `--msa-min-cov` defaults to `0.70` or the cohort's coverage gate minus
+0.05, whichever is lower (`0.45` with `--include-partials`), so the MSA keeps the rows lexicmap
+admitted. Before 0.1.1 the gate measured row length, which every LexicMap row passes, so it
+never filtered this route at all.
 
 ## A worked cohort
 

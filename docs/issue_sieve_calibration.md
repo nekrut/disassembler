@@ -260,6 +260,11 @@ purpose; the sieve binary is unchanged. `--sieve` itself is still OFF by default
 without the flag is byte-for-byte the same as before. `--k`, `--threads`, `--limit`,
 `--outlier-sd` remain unreachable and are not needed for the gene-scale problem.
 
+**Change (0.1.1):** the hardcoded `--max-n-frac 0.05` is now `--max-gap-frac` on the atomic
+`sieve` and `--sieve-max-gap-frac` in `from-lexicmap`, where it defaults to a value derived
+from the cohort's coverage gate, and the wrapper removes exact duplicates before every sieve
+run rather than only in `from-lexicmap`. See [`sieve.md`](sieve.md#before-the-sieve-runs).
+
 ## 10. Options considered
 
 1. **Expose `--sieve-sketch`.** Done: defaulted to 256 alongside `--sieve-threshold 0.005`.

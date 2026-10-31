@@ -4,27 +4,32 @@ use std::path::PathBuf;
 
 /// How multi-anchor mode ranks per-reference candidates in [`stages::stitch::pick_primary`].
 ///
-/// The default is `Cov`: sort by fraction of the reference covered, break ties on identity,
-/// then on pool order. It maximises how much of each accession's sequence gets walked,
-/// but on a mixed-strain panel (measured on the SARS-CoV-2 spike 11-strain panel) it
-/// concentrates ~70% of primaries on `Omicron_XBB15` — the mid-cluster reference whose
-/// alignment finds long walks in graphs across the archive — even when phylogenetically
-/// closer strains sit in the pool. See `docs/walker.md`.
+/// The default is `Matched`: the fraction of the reference's own bases that the alignment
+/// matched (`num_matches / reference length`), then identity, then pool order. It cannot
+/// exceed 1.0, and it rewards coverage and identity together: a reference loses for every
+/// base of its own the walk misses or mismatches.
 ///
-/// `Pident` swaps the primary and secondary sort keys: highest identity to reference wins,
-/// then coverage. On the same panel, it moves the primary tag onto the strain the graph
-/// route actually matches best, but it may prefer a shorter walk that hits its own
-/// reference cleanly over a fuller walk that hits a moderately-similar reference.
+/// `Cov` ranks on the walked length divided by the reference length, then identity. That
+/// ratio is not capped, so a reference shorter than the sample's gene (one carrying a
+/// deletion the sample lacks) scores above 1.0 and beats an exact match. On the SARS-CoV-2
+/// spike 11-strain panel (20,000-accession run) it put 62% of primaries on `Omicron_XBB15`
+/// and 21% on `Omicron_JN1`, the two shortest references, picking 6,085 of 9,448 primaries on
+/// a ratio above 1.0; `Matched` puts 43% on Delta and 26% on BA.2, the cohort's real mix.
+/// The choice changes the sequence, not just the tag: GraphAligner walks the graph
+/// differently against each reference.
 ///
-/// `CovXPident` orders on `cov * pident/100`, a joint score. Restores full-length runs
-/// as the tie-break winner while letting a large identity gap override a small coverage
-/// advantage. Recommended when both matter and neither dominates.
+/// `Pident` ranks on identity, then the coverage ratio. It agrees with `Matched` on 96.5% of
+/// that run, but it can prefer a truncated walk that matches its reference cleanly over a
+/// full-length one.
+///
+/// `CovXPident` orders on `cov * pident/100`, then cov, then pident.
 ///
 /// Only affects which candidate is tagged as the primary and written to the FASTA. Every
 /// candidate's numbers are emitted in `summary.json` under `"candidates"` regardless, so
 /// a downstream tool can always re-rank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrimaryMetric {
+    Matched,
     Cov,
     Pident,
     CovXPident,
@@ -33,6 +38,7 @@ pub enum PrimaryMetric {
 impl PrimaryMetric {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "matched" => Some(Self::Matched),
             "cov" => Some(Self::Cov),
             "pident" => Some(Self::Pident),
             "cov_x_pident" | "cov-x-pident" => Some(Self::CovXPident),
@@ -41,6 +47,7 @@ impl PrimaryMetric {
     }
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Matched => "matched",
             Self::Cov => "cov",
             Self::Pident => "pident",
             Self::CovXPident => "cov_x_pident",
@@ -407,7 +414,7 @@ impl Default for Config {
             min_abund: 5.0,
             min_vaf: 0.10,
             min_cov: 0.85,
-            primary_metric: PrimaryMetric::Cov,
+            primary_metric: PrimaryMetric::Matched,
             prune_frac: 0.01,
             min_abund_frac: 0.0,
             prefer_majority: true,

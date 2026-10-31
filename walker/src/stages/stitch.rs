@@ -105,6 +105,8 @@ pub fn stitch_steps(
 pub struct Candidate {
     pub record_id: String,
     pub pool_index: usize,
+    /// Length of this reference, the denominator of the `Matched` metric.
+    pub ref_len: usize,
     pub path: Option<GafPath>,
     pub haplotype: Option<Haplotype>,
 }
@@ -112,11 +114,12 @@ pub struct Candidate {
 /// Rank per-reference candidates and pick the winning primary.
 ///
 /// `metric` picks the primary sort key ([`PrimaryMetric`]):
-/// * `Cov` — coverage desc, then pident desc. The legacy ordering; maximises how much of
-///   the accession's sequence gets walked.
-/// * `Pident` — pident desc, then coverage desc. Prefers the reference the walked route
-///   matches most cleanly.
-/// * `CovXPident` — sort by `cov * pident/100`, then cov, then pident. Joint score.
+/// * `Matched` (default): `num_matches / ref_len` desc, then pident desc. The fraction of the
+///   reference's own bases the alignment matched; never above 1.0.
+/// * `Cov`: walked length / reference length desc, then pident desc. Uncapped, so a shorter
+///   reference can win on a ratio above 1.0.
+/// * `Pident`: pident desc, then coverage desc.
+/// * `CovXPident`: `cov * pident/100`, then cov, then pident.
 ///
 /// `stitch` already returns `None` for a candidate whose coverage fell below `min_cov`,
 /// so an under-covered reference is filtered out before it can win regardless of metric.
@@ -128,10 +131,17 @@ pub fn pick_primary(
     candidates: Vec<Candidate>,
     metric: PrimaryMetric,
 ) -> Option<(String, GafPath, Haplotype)> {
-    let mut with_haps: Vec<(usize, String, GafPath, Haplotype)> = candidates
+    let mut with_haps: Vec<(usize, String, GafPath, Haplotype, f64)> = candidates
         .into_iter()
         .filter_map(|c| match (c.path, c.haplotype) {
-            (Some(p), Some(h)) => Some((c.pool_index, c.record_id, p, h)),
+            (Some(p), Some(h)) => {
+                let matched = if c.ref_len > 0 {
+                    p.num_matches as f64 / c.ref_len as f64
+                } else {
+                    0.0
+                };
+                Some((c.pool_index, c.record_id, p, h, matched))
+            }
             _ => None,
         })
         .collect();
@@ -143,6 +153,7 @@ pub fn pick_primary(
         let (ac, ap) = (a.3.cov, a.3.pident);
         let (bc, bp) = (b.3.cov, b.3.pident);
         let primary = match metric {
+            PrimaryMetric::Matched => cmpf(a.4, b.4).then_with(|| cmpf(ap, bp)),
             PrimaryMetric::Cov => cmpf(ac, bc).then_with(|| cmpf(ap, bp)),
             PrimaryMetric::Pident => cmpf(ap, bp).then_with(|| cmpf(ac, bc)),
             PrimaryMetric::CovXPident => {
@@ -153,7 +164,7 @@ pub fn pick_primary(
         };
         primary.then(a.0.cmp(&b.0))
     });
-    with_haps.into_iter().next().map(|(_, name, p, h)| (name, p, h))
+    with_haps.into_iter().next().map(|(_, name, p, h, _)| (name, p, h))
 }
 
 pub fn stitch(
@@ -283,13 +294,19 @@ mod tests {
     // ---- pick_primary (multi-anchor) ----
 
     fn cand(name: &str, pool_index: usize, cov: f64, pident: f64) -> Candidate {
-        // Real GafPath and Haplotype shells: pick_primary reads path only for the winner
-        // (to carry it back out), and hap.cov / hap.pident for ranking. Everything else
-        // is placeholder.
+        cand_m(name, pool_index, cov, pident, 1, 1000)
+    }
+
+    /// `cand` with the alignment's matched-base count and the reference length, which is what
+    /// the `Matched` metric ranks on.
+    fn cand_m(name: &str, pool_index: usize, cov: f64, pident: f64,
+              num_matches: usize, ref_len: usize) -> Candidate {
+        // Real GafPath and Haplotype shells: pick_primary reads path.num_matches and
+        // hap.cov / hap.pident for ranking. Everything else is placeholder.
         let path = GafPath {
             steps: vec![PathStep { orient: Orient::Forward, node: 1 }],
             path_len: 1, path_start: 0, path_end: 1,
-            num_matches: 1, aln_len: 1,
+            num_matches, aln_len: 1,
         };
         let hap = Haplotype {
             id: name.into(),
@@ -305,6 +322,7 @@ mod tests {
         Candidate {
             record_id: name.into(),
             pool_index,
+            ref_len,
             path: Some(path),
             haplotype: Some(hap),
         }
@@ -320,6 +338,7 @@ mod tests {
         let none_cand = Candidate {
             record_id: "a".into(),
             pool_index: 0,
+            ref_len: 1000,
             path: None,
             haplotype: None,
         };
@@ -368,6 +387,7 @@ mod tests {
         cs.push(Candidate {
             record_id: "no_stitch".into(),
             pool_index: 0,
+            ref_len: 1000,
             path: None,
             haplotype: None,
         });
@@ -418,10 +438,45 @@ mod tests {
             cand("second", 5, 0.90, 99.0),
             cand("first",  1, 0.90, 99.0),
         ];
-        for m in [PrimaryMetric::Cov, PrimaryMetric::Pident, PrimaryMetric::CovXPident] {
+        for m in [PrimaryMetric::Matched, PrimaryMetric::Cov, PrimaryMetric::Pident,
+                  PrimaryMetric::CovXPident] {
             assert_eq!(pick_primary(cs.clone(), m).unwrap().0, "first",
                 "metric {m:?} must still fall back to pool order");
         }
+    }
+
+    /// The case that made `Matched` the default. The sample carries the full 1,200 nt gene.
+    /// `exact` is that gene; `short` is the same gene with a 9 nt deletion (1,191 nt), listed
+    /// first in the pool. The walk is 1,200 nt against both, so `Cov` gives `short`
+    /// 1200/1191 = 1.0076 and picks it over the exact match. Both references have every one of
+    /// their own bases matched (1.0), and the 9 extra sample bases lower `short`'s identity to
+    /// 1191/1200, so `Matched` picks `exact`.
+    #[test]
+    fn matched_prefers_the_exact_reference_over_one_with_a_deletion() {
+        let cs = || vec![
+            cand_m("short", 0, 1200.0 / 1191.0, 1191.0 / 1200.0 * 100.0, 1191, 1191),
+            cand_m("exact", 1, 1.0, 100.0, 1200, 1200),
+        ];
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Cov).unwrap().0, "short");
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Matched).unwrap().0, "exact");
+    }
+
+    /// `Pident` can prefer a truncated walk that matches its reference cleanly (measured:
+    /// SRR17435695, 0.999-coverage walk at 99.1% vs a 0.919 walk at 99.4%). `Matched` charges
+    /// the truncated walk for the reference bases it never reached.
+    #[test]
+    fn matched_does_not_prefer_a_truncated_walk() {
+        let cs = || vec![
+            cand_m("full", 0, 0.999, 99.1, 3784, 3822),
+            cand_m("truncated", 1, 0.919, 99.4, 3492, 3822),
+        ];
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Pident).unwrap().0, "truncated");
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Matched).unwrap().0, "full");
+    }
+
+    #[test]
+    fn matched_is_the_default_metric() {
+        assert_eq!(Config::default().primary_metric, PrimaryMetric::Matched);
     }
 
     /// `mean_ka` was hardcoded to 0.0 while being published as `ka=` in every FASTA header

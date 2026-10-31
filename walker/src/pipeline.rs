@@ -506,6 +506,7 @@ fn run_one(
             Ok::<_, crate::error::Error>(stages::stitch::Candidate {
                 record_id: q.record_id.clone(),
                 pool_index,
+                ref_len: q.seq.len(),
                 path,
                 haplotype: hap,
             })

@@ -59,17 +59,31 @@ such as `panels/sarscov2_spike_11strains.fa`:
   `anchor=<reference id>`. Every candidate's numbers are in the summary JSON under
   `"candidates"`, so a downstream tool can re-rank.
 
+The choice matters for more than the tag: GraphAligner walks the graph differently against
+each reference, so the primary's sequence depends on which reference wins.
+
 `--primary-metric` choices:
 
 | metric | ranks by | trade-off |
 |---|---|---|
-| `cov` (default) | coverage, then identity | favours the reference that yields the longest walk; on a mixed-strain panel that need not be the closest strain |
-| `pident` | identity, then coverage | tags the strain the graph matches best, but can prefer a shorter, cleaner walk over a fuller one |
-| `cov_x_pident` | coverage x identity | lets a large identity gap override a small coverage advantage; a reasonable choice when both matter |
+| `matched` (default) | the fraction of the reference's own bases the alignment matched, then identity | never above 1.0; a reference loses for every base of its own the walk misses or mismatches |
+| `cov` | walked length / reference length, then identity | not capped at 1.0, so a reference shorter than the sample's gene (one with a deletion the sample lacks) beats an exact match |
+| `pident` | identity, then coverage | can prefer a truncated walk that matches its reference cleanly over a full-length one |
+| `cov_x_pident` | coverage x identity | inherits `cov`'s bias toward shorter references |
 
-In multi-anchor mode, VCF and `snvs.tsv` positions are in the coordinates of the first reference
-in the pool. The codon MSA needs a single reference; `reconstruct` uses the first `-q` unless
-`--msa-reference` is given.
+`matched` became the default in 0.1.1. With `cov`, the earlier default, a 20,000-accession
+SARS-CoV-2 run on the 11-strain spike panel tagged 62% of primaries Omicron XBB.1.5 and 21%
+JN.1, the two shortest references; `matched` gives 43% Delta and 26% BA.2, the cohort's real
+mix. To reproduce output from a run made before 0.1.1, pass `--primary-metric cov`.
+
+Every reference record needs a distinct id: the walker stops if two records, or two `-q`
+files, share one.
+
+VCF and `snvs.tsv` positions are in the coordinates of the reference each accession's primary
+was reconstructed against: `CHROM` (VCF) and `gene` (`snvs.tsv`) name that reference. In a
+multi-anchor run, compare sites across accessions only within one reference, or map them to a
+common one first. The codon MSA needs a single reference; `reconstruct` uses the first `-q`
+unless `--msa-reference` is given.
 
 ## Outputs
 
@@ -86,9 +100,11 @@ in the pool. The codon MSA needs a single reference; `reconstruct` uses the firs
 alignment. When a haplotype's identity was inherited from the route before an allele was spliced
 in, the header says `inherited_pident=` instead.
 
-VCF positions are 1-based positions in the reference CDS (`CHROM` is the gene), so every
-accession's VCF shares one coordinate frame. Frequencies are `ka:f` abundance ratios at the fork,
-a proxy for allele frequency, per site and not phased. For a cohort, `snvs.tsv` is the output
+VCF positions are 1-based positions in the reference CDS (`CHROM` is the gene). In a
+single-reference run every accession's VCF therefore shares one coordinate frame; in a
+multi-anchor run each uses its own winning reference (see
+[Multi-anchor mode](#multi-anchor-mode)). Frequencies are `ka:f` abundance ratios at the fork, a
+proxy for allele frequency, per site and not phased. For a cohort, `snvs.tsv` is the output
 that scales: it is sparse, concatenates across shards and loads straight into DuckDB, while a
 merged multi-sample VCF becomes a huge, nearly empty matrix. A worked example is in
 [`vcf_example.md`](vcf_example.md).
@@ -146,7 +162,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `-w, --workers <N>` | `8` | compute workers (see [Memory](#memory) before raising) |
 | `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
 | `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover |
-| `--primary-metric <M>` | `cov` | multi-anchor primary selection: `cov`, `pident` or `cov_x_pident` |
+| `--primary-metric <M>` | `matched` | multi-anchor primary selection: `matched`, `cov`, `pident` or `cov_x_pident` |
 | `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables |
 | `--no-prefer-majority` | | keep the reference-matching allele on the primary at two-allele sites |
 

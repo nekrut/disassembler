@@ -54,6 +54,8 @@ jobs:
         run: python3 tests/test_harvest.py
       - name: Run stratify tests
         run: python3 tests/test_stratify.py
+      - name: Run msa tests
+        run: python3 tests/test_msa.py
       # Both sieve tests build extern/kmer-diversity-sieve themselves (cc only) and skip
       # cleanly if the submodule or a compiler is missing.
       - name: Sieve binary concordance

@@ -68,9 +68,9 @@ TUNING:
         --min-abund-frac <F>      Raise the variant floor to this fraction of gene depth,
                                   median ka:f on the walked path [default: 0.0 = off]
         --min-cov <F>             Minimum reference coverage [default: 0.85]
-        --primary-metric <M>      Multi-anchor primary selection: cov | pident |
-                                  cov_x_pident [default: cov]. Ignored in single-anchor
-                                  mode. See config docs for tradeoffs
+        --primary-metric <M>      Multi-anchor primary selection: matched | cov | pident |
+                                  cov_x_pident [default: matched, the fraction of the
+                                  reference's bases matched]. Ignored in single-anchor mode
         --min-shared-kmers <N>    Anchor threshold, validated 1..=5 [default: 3]
         --max-size-mb <N>         Maximum compressed SRA size in MB [default: 1024]
         --prune-frac <F>          Drop unitigs below this fraction of the gene's depth and
@@ -88,7 +88,8 @@ INTRA-HOST VARIANTS:
                                   two-allele sites, instead of the more abundant one
         --no-emit-alts            Do not write alt_haplotypes.fasta
         --emit-vcf                Also write <out-dir>/<acc>.vcf: intra-host SNPs with their
-                                  ka:f frequency, in query coordinates [default: off]
+                                  ka:f frequency, in the coordinates of the reference the
+                                  primary was reconstructed against [default: off]
         --emit-snv-table          Also write <out-dir>/snvs.tsv: one long table of every
                                   intra-host SNP across the run, one row per (accession, site,
                                   allele). The cohort output that scales; load into DuckDB
@@ -176,7 +177,7 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
                 let raw = value()?;
                 args.cfg.primary_metric = PrimaryMetric::parse(&raw).ok_or_else(|| {
                     error::Error::Usage(format!(
-                        "--primary-metric: expected cov | pident | cov_x_pident, got {raw:?}"
+                        "--primary-metric: expected matched | cov | pident | cov_x_pident, got {raw:?}"
                     ))
                 })?;
             }
@@ -410,25 +411,20 @@ fn real_main(args: Args) -> error::Result<()> {
 
     let summary = pipeline::run(&args.cfg, accessions, &queries)?;
 
-    // Downstream writers that still take a single reference use the first query in the pool.
-    // In multi-anchor mode this is only used for coordinate contexts where the collector
-    // records the winning reference per haplotype separately.
-    let query = &queries[0];
-
     // ---- OUT of the pipeline ----------------------------------------------
     std::fs::create_dir_all(&args.out_dir)?;
     io::output::write_fasta(&summary, &args.out_fasta)?;
     io::output::write_bubbles(&summary, &args.out_dir.join("bubbles.json"))?;
     // One alignment pass per accession, shared by both writers.
     if args.cfg.emit_vcf || args.cfg.emit_snv_table {
-        let sites = io::output::snv_sites_all(&summary, query);
+        let sites = io::output::snv_sites_all(&summary, &queries);
         if args.cfg.emit_vcf {
-            io::output::write_vcfs(&summary, query, &args.out_dir, &sites)?;
+            io::output::write_vcfs(&summary, &queries, &args.out_dir, &sites)?;
         }
         if args.cfg.emit_snv_table {
             io::output::write_snv_table(
                 &summary,
-                query,
+                &queries,
                 &args.out_dir.join("snvs.tsv"),
                 &sites,
             )?;
@@ -439,7 +435,7 @@ fn real_main(args: Args) -> error::Result<()> {
     }
     io::output::write_summary(
         &summary,
-        &args.out_dir.join(format!("{}_walker_summary.json", query.name)),
+        &args.out_dir.join(format!("{}_walker_summary.json", queries[0].name)),
     )?;
 
     println!(

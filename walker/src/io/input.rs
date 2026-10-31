@@ -285,6 +285,21 @@ pub fn read_query_set(paths: &[PathBuf]) -> Result<Vec<Query>> {
     if out.is_empty() {
         return Err(Error::Usage("no FASTA records found across the provided -q files".into()));
     }
+    // GraphAligner reports alignments by record id, and the pool is keyed on it from there on.
+    // Two references sharing an id therefore collide: the rows of both were read as one
+    // reference's, which produced cov=4.000 and two candidates both marked selected.
+    let mut seen: std::collections::HashMap<&str, &Path> = std::collections::HashMap::new();
+    for q in &out {
+        if let Some(first) = seen.insert(q.record_id.as_str(), q.path.as_path()) {
+            return Err(Error::Usage(format!(
+                "reference record id {:?} appears more than once ({} and {}); every -q record \
+                 needs a distinct id",
+                q.record_id,
+                first.display(),
+                q.path.display()
+            )));
+        }
+    }
     Ok(out)
 }
 
@@ -443,6 +458,23 @@ mod tests {
         }
         assert!(qs[0].name.ends_with("__wuhan"), "got {}", qs[0].name);
         std::fs::remove_file(p).ok();
+    }
+
+    /// Alignments come back keyed by record id, so two references sharing one collided:
+    /// `cov=4.000` with both candidates marked selected. Same for one file passed twice.
+    #[test]
+    fn set_rejects_a_record_id_used_twice() {
+        let a = tmp("dup_a.fasta", b">spike\nACGTACGTA\n");
+        let b = tmp("dup_b.fasta", b">spike\nACGTACGTAACG\n");
+        let err = match read_query_set(&[a.clone(), b.clone()]) {
+            Ok(_) => panic!("a duplicated record id must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("\"spike\"") && err.contains("more than once"), "got {err}");
+        assert!(read_query_set(&[a.clone(), a.clone()]).is_err());
+        let multi = tmp("dup_multi.fasta", b">x\nAAA\n>x\nCCC\n");
+        assert!(read_query_set(std::slice::from_ref(&multi)).is_err());
+        for p in [a, b, multi] { std::fs::remove_file(p).ok(); }
     }
 
     #[test]

@@ -147,7 +147,9 @@ Runs `lexicmap`, then (with `--sieve`) the sieve, then `msa`, on
 `lexicmap.clean.accessions.fasta`, or on `lexicmap.clean_expanded.accessions.fasta` with
 `--include-partials`. It takes every `lexicmap` option, the `--sieve-*` options (see
 [`sieve.md`](sieve.md)), and `--mafft-threads` / `--msa-min-cov` for the MSA stage (see
-[`codon_msa.md`](codon_msa.md#lexicmap-cohorts)).
+[`codon_msa.md`](codon_msa.md#lexicmap-cohorts)). The sieve's gap limit and the MSA's coverage
+gate default to values derived from the cohort's own coverage gate, so neither stage drops rows
+for coverage that lexicmap already accepted.
 
 ## Options
 

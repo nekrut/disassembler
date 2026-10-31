@@ -12,11 +12,15 @@ Newick tree shape. See docs/lexicmap.md and docs/codon_msa.md.
 Sieve/MSA input defaults to `<prefix>.clean.accessions.fasta` (uncollapsed
 clean cohort, one seq per accession); pass --include-partials to feed
 `<prefix>.clean_expanded.accessions.fasta` instead (adds >=50% partials).
+
+The sieve's gap limit and the MSA's coverage gate default to values derived from that
+cohort's own coverage gate, so neither stage silently drops rows lexicmap admitted.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import types
 from pathlib import Path
@@ -27,50 +31,6 @@ from disassembler.cmd import sieve as sieve_cmd
 from disassembler.resolve import resolve_sieve
 
 
-def _byte_exact_dedup(src: Path, dst: Path) -> tuple[int, int]:
-    """Write to `dst` the first-encountered record per unique sequence from `src`.
-
-    Returns (n_in, n_out). Headers are preserved verbatim from the first copy;
-    sequence lines are compared case-insensitively (upper-cased) with newline
-    whitespace stripped, so cosmetic line-wrapping differences between two
-    otherwise identical sequences are folded together.
-
-    Preserving the ORDER of first occurrence is what makes the subsequent
-    sieve output byte-identical to sieving `src` directly: the sieve is a
-    deterministic in-order filter that would have rejected every later copy
-    of an exact-duplicate sequence as novelty=0 anyway, so folding them out
-    beforehand is observationally equivalent while strictly reducing work.
-    """
-    seen: set[str] = set()
-    n_in = 0
-    n_out = 0
-    header: str | None = None
-    seq_lines: list[str] = []
-
-    def _emit(fout) -> None:
-        nonlocal n_out
-        if header is None:
-            return
-        seq = "".join(seq_lines).replace("\n", "").upper()
-        if seq and seq not in seen:
-            seen.add(seq)
-            fout.write(header)
-            fout.writelines(seq_lines)
-            n_out += 1
-
-    with src.open() as fin, dst.open("w") as fout:
-        for line in fin:
-            if line.startswith(">"):
-                _emit(fout)
-                header = line
-                seq_lines = []
-                n_in += 1
-            else:
-                seq_lines.append(line)
-        _emit(fout)
-    return n_in, n_out
-import os
-
 from disassembler.validators import (
     fasta_has_record,
     fraction,
@@ -79,6 +39,19 @@ from disassembler.validators import (
     positive_int,
     validate_api_key_file,
 )
+
+
+# Slack between lexicmap's coverage gate and the downstream gates derived from it. A trusted
+# deletion counts as covered but is '-' in the row, and an assembly can carry an N, so a row
+# can have slightly fewer real bases than its coverage says.
+GATE_MARGIN = 0.05
+
+
+def cohort_coverage_gate(args) -> float:
+    """The coverage floor of the cohort fed to the sieve and MSA (lexicmap's tier gate)."""
+    if args.include_partials:
+        return args.min_cov_partial
+    return 1.0 if args.require_full_length else args.min_cov
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -198,6 +171,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     g_sieve.add_argument("--sieve-min-len", type=positive_int, default=None,
                          help="Minimum sequence length gate for the sieve (default: auto "
                               "= 95%% of the reference CDS length).")
+    g_sieve.add_argument("--sieve-max-gap-frac", type=fraction, default=None,
+                         help="Sieve completeness gate: drop a row whose share of gaps ('-') "
+                              "or other non-ACGT characters exceeds this. Default: 1 - the "
+                              "cohort's coverage gate + 0.05 (0.25 at the default --min-cov "
+                              "0.80, 0.05 with --require-full-length, 0.55 with "
+                              "--include-partials), so the sieve does not drop rows for the "
+                              "coverage lexicmap already accepted.")
     g_sieve.add_argument("--sieve-bin", default=None,
                          help="Explicit path to the kmer-diversity-sieve l1_pipeline_serial "
                               "binary (auto-discovered otherwise).")
@@ -210,11 +190,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     g_msa.add_argument("--mafft-threads", type=positive_int, default=8,
                        help="Thread count for MAFFT in the MSA stage (default: 8).")
-    g_msa.add_argument("--msa-min-cov", type=fraction, default=0.70,
-                       help="Minimum coverage fraction for a sequence to enter the MSA "
-                            "(default: 0.70). Distinct from lexicmap's --min-cov / "
-                            "--min-cov-partial above; those gate which accessions reach "
-                            "the clean cohort at all.")
+    g_msa.add_argument("--msa-min-cov", type=fraction, default=None,
+                       help="Minimum fraction of the reference a row must cover in A/C/G/T "
+                            "bases to enter the MSA. Default: 0.70, or the cohort's coverage "
+                            "gate - 0.05 if that is lower (0.45 with --include-partials), so "
+                            "the MSA keeps the rows lexicmap admitted. Distinct from "
+                            "lexicmap's --min-cov / --min-cov-partial above; those gate which "
+                            "accessions reach the clean cohort at all.")
     p.set_defaults(func=run)
 
 
@@ -268,6 +250,8 @@ def run(args) -> int:
             sieve_inert.append("--sieve-sketch")
         if args.sieve_min_len is not None:
             sieve_inert.append("--sieve-min-len")
+        if args.sieve_max_gap_frac is not None:
+            sieve_inert.append("--sieve-max-gap-frac")
         if args.sieve_bin is not None:
             sieve_inert.append("--sieve-bin")
         if sieve_inert:
@@ -315,30 +299,24 @@ def run(args) -> int:
         return 1
 
     msa_input = cohort
+    gate = cohort_coverage_gate(args)
 
     # ---- 2/3 sieve (optional) ---------------------------------------------
     if args.sieve:
-        # Byte-exact dedup before the sieve. The sieve is a MinHash/LSH filter
-        # that iterates records in order and keeps a sequence only when its
-        # novelty vs. the already-promoted set is >= tau; a byte-exact later
-        # copy of a sequence has novelty 0 and is always rejected. Folding
-        # those duplicates out ahead of time is observationally equivalent to
-        # the sieve's own fold (see tests/test_dedup_sieve_equivalence.py)
-        # and strictly reduces the sieve's work.
-        deduped = out_dir / f"{cohort.stem}.deduped.fasta"
-        n_in, n_out = _byte_exact_dedup(cohort, deduped)
-        if n_in == 0:
-            print("from-lexicmap: cohort is empty after dedup; nothing to sieve.",
-                  file=sys.stderr)
-            return 1
-        fold = n_in / n_out if n_out else 0.0
-        print(f"[from-lexicmap] dedup: {n_in} -> {n_out} records "
-              f"({fold:.2f}x fold) before sieve", flush=True)
+        # Rows are on the reference grid, '-' wherever no HSP reached, and the sieve's
+        # completeness gate counts '-' as a bad base. At the binary's 5% it dropped up to
+        # 22% of a default cohort and 34% of a SARS-CoV-2 spike cohort lexicmap had admitted.
+        max_gap_frac = args.sieve_max_gap_frac
+        if max_gap_frac is None:
+            max_gap_frac = round(min(1.0, 1.0 - gate + GATE_MARGIN), 6)
+        print(f"[from-lexicmap] 2/3 sieve: --max-gap-frac {max_gap_frac} "
+              f"(cohort coverage gate {gate})", flush=True)
         sieved = out_dir / f"{cohort.stem}.sieved.fasta"
         rc = sieve_cmd.sieve_run(
-            deduped, sieved,
+            cohort, sieved,
             ref=Path(args.ref),
             min_len=args.sieve_min_len,
+            max_gap_frac=max_gap_frac,
             threshold=args.sieve_threshold,
             sketch=args.sieve_sketch,
             sieve_bin=args.sieve_bin,
@@ -355,13 +333,16 @@ def run(args) -> int:
     tree = out_dir / f"{stem}_fasttree.nwk"
     print(f"[from-lexicmap] 3/3 codon MSA + tree: --input {msa_input} --out-aln {aln} "
           f"--out-tree {tree}", flush=True)
+    msa_min_cov = args.msa_min_cov
+    if msa_min_cov is None:
+        msa_min_cov = round(min(0.70, gate - GATE_MARGIN), 6)
     msa_ns = types.SimpleNamespace(
         ref=args.ref,
         input=str(msa_input),
         out_aln=str(aln),
         out_tree=str(tree),
         mafft_threads=args.mafft_threads,
-        msa_min_cov=args.msa_min_cov,
+        msa_min_cov=msa_min_cov,
     )
     rc = msa_cmd.run(msa_ns)
     if rc != 0:

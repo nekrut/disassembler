@@ -38,12 +38,46 @@ disassembler sieve -i out/zika/reconstructed.fasta -o out/zika/sieved.fasta \
 | `--sieve-threshold <F>` | `--threshold` | `0.005` | novelty threshold tau. A sequence is promoted only if `1 - maxJaccard >= tau` against the promoted set, so a **higher** tau collapses **more** |
 | `--sieve-sketch <M>` | `--sketch` | `256` | MinHash sketch size. Novelty finer than `1/M` cannot be resolved |
 | `--sieve-min-len <N>` | `--min-len` | 95% of the reference length | minimum sequence length. The 5% margin is there because reconstructions are often a few bases shorter than the reference |
+| `--sieve-max-gap-frac <F>` (`from-lexicmap` only) | `--max-gap-frac` | `0.05`; derived in `from-lexicmap` (below) | the largest share of a sequence that may be gaps (`-`) or other non-ACGT characters |
 | `--sieve-bin <PATH>` | `--sieve-bin` | discovered | path to `l1_pipeline_serial` (from `PATH`, or a build in `extern/kmer-diversity-sieve`) |
 
 The atomic `sieve` takes the reference through `--ref`, used only to derive `--min-len` from its
-first record. The wrapper always passes the sieve binary `--max-n-frac 0.05`, so a sequence
-with more than 5% non-ACGT characters is dropped as low quality. In `from-lexicmap`, byte-identical
-duplicates are removed (keeping the first) before the sieve runs.
+first record.
+
+### Before the sieve runs
+
+**Duplicates are removed.** Every route removes byte-identical sequences first, keeping the
+first copy, and logs how many it removed. A later copy could never be promoted, but it would
+still feed the binary's admission check, which rejects a sequence as an error when it has far
+more never-seen k-mers than the running mean. Each duplicate adds a zero to that mean, so once
+the binary's 2,000-record warmup is over, a genuinely new lineage looks like an outlier. On four
+C. auris cohorts, the raw input lost 26 to 273 sequences this way; the deduplicated input lost
+none.
+
+**The completeness gate.** The binary drops a sequence shorter than `--min-len`, or one in
+which more than `--max-gap-frac` of the characters are not A, C, G or T. Gaps (`-`) count.
+Walker haplotypes have no gaps, so for them this is a check on N. LexicMap rows are on the
+reference grid, with `-` wherever no hit reached, so the same limit acts as a second coverage
+gate: at 5% it dropped 22% of a default C. auris FKS1 cohort, and a third of the distinct
+haplotypes in a SARS-CoV-2 spike cohort, all rows lexicmap had already accepted.
+`from-lexicmap` therefore derives the limit from the cohort's own coverage gate, as
+`1 - gate + 0.05`:
+
+| cohort fed to the sieve | coverage gate | default `--sieve-max-gap-frac` |
+|---|---|---|
+| default | `--min-cov` (`0.80`) | `0.25` |
+| `--require-full-length` | `1.0` | `0.05` |
+| `--include-partials` | `--min-cov-partial` (`0.50`) | `0.55` |
+
+The extra 0.05 leaves room for in-frame deletions, which count as covered but are `-` in the
+row. To run the atomic `sieve` on a LexicMap cohort, set `--max-gap-frac` the same way. Either
+way, the log says how many sequences the gate dropped, and for which reason.
+
+Keeping partial rows has a cost. The sieve compares k-mer sets, so a partial row looks novel
+next to a full-length one it otherwise matches, and is rarely thinned. On the FKS1 cohort above,
+the sieve promoted the same 391 full-length sequences at either limit, plus 1,284 partial rows
+at 0.25; 154 of those matched a promoted full-length row wherever they had a base. To thin
+harder, use `--require-full-length`, or pass a lower `--sieve-max-gap-frac`.
 
 To build the binary from the submodule (a single C source, so only a C compiler is needed):
 

@@ -84,8 +84,6 @@ collapsing.
   into a preparation tool plus the IUC tools would make each step inspectable and turn
   `--skip-tree` into simply not connecting FastTree. That needs a preparation-only mode in the
   CLI first, so `disassembler_msa` is one tool for now.
-- **Deduplication before the sieve.** `from-lexicmap` removes byte-identical duplicates before
-  the sieve. On Galaxy that is either folded into `disassembler_lexicmap` or a small extra step.
 - **A dedicated Logan Galaxy instance.** usegalaxy.org charges user storage and rate-limits
   API calls. A dedicated instance would make `fetch` worth wrapping and could allow a larger
   default `--max-size-mb`.

@@ -351,18 +351,29 @@ pub fn write_summary(summary: &Summary, path: &Path) -> Result<()> {
 /// itself, so with both flags on every accession paid for two identical alignments. Measured
 /// at 11.1 ms each for pfcrt and 15.7 ms for hiv1_pol, which is 3.1 s of pure duplication on a
 /// 200-accession hiv1_pol panel.
-pub fn snv_sites_all(summary: &Summary, query: &Query) -> Vec<Vec<VcfRow>> {
-    summary.results.iter().map(|r| snv_sites(r, query)).collect()
+pub fn snv_sites_all(summary: &Summary, queries: &[Query]) -> Vec<Vec<VcfRow>> {
+    summary.results.iter().map(|r| snv_sites(r, reference_of(r, queries))).collect()
+}
+
+/// The reference an accession's primary was reconstructed against: in multi-anchor mode the
+/// winning one, named by the primary's `anchor_used`; otherwise the only one. Its coordinates
+/// are the ones the VCF and the long table must use. Writing every accession against the first
+/// reference of the pool put a SNV at `gene:601` down as `othergene 438`.
+fn reference_of<'a>(r: &AccessionResult, queries: &'a [Query]) -> &'a Query {
+    r.anchor_used
+        .as_deref()
+        .or_else(|| r.haplotype.as_ref().and_then(|h| h.anchor_used.as_deref()))
+        .and_then(|rid| queries.iter().find(|q| q.record_id == rid))
+        .unwrap_or(&queries[0])
 }
 
 pub fn write_vcfs(
     summary: &Summary,
-    query: &Query,
+    queries: &[Query],
     out_dir: &Path,
     sites: &[Vec<VcfRow>],
 ) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
-    let chrom = chrom_of(query);
 
     // The filename is the accession, which `docs/vcf_example.md` documents and the committed
     // examples rely on, so duplicates in the input list land on one path. Their contents are
@@ -390,6 +401,8 @@ pub fn write_vcfs(
             continue;
         }
 
+        let query = reference_of(r, queries);
+        let chrom = chrom_of(query);
         let path = out_dir.join(format!("{}.vcf", r.accession));
         let mut w = BufWriter::new(std::fs::File::create(&path)?);
         write_vcf_header(&mut w, chrom, query.seq.len(), &r.accession)?;
@@ -434,7 +447,7 @@ pub fn write_vcfs(
 /// the same values the VCF carries.
 pub fn write_snv_table(
     summary: &Summary,
-    query: &Query,
+    queries: &[Query],
     path: &Path,
     sites: &[Vec<VcfRow>],
 ) -> Result<()> {
@@ -443,10 +456,10 @@ pub fn write_snv_table(
             std::fs::create_dir_all(parent)?;
         }
     }
-    let chrom = chrom_of(query);
     let mut w = BufWriter::new(std::fs::File::create(path)?);
     writeln!(w, "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork")?;
     for (r, rows) in summary.results.iter().zip(sites) {
+        let chrom = chrom_of(reference_of(r, queries));
         for row in rows {
             for &(alt, af, ka_alt) in &row.alts {
                 writeln!(
@@ -872,7 +885,7 @@ mod banded_equivalence_tests {
 
 #[cfg(test)]
 mod vcf_tests {
-    use super::{align_primary_to_query, snv_sites};
+    use super::{align_primary_to_query, chrom_of, reference_of, snv_sites};
     use crate::types::{
         AccessionResult, AltHaplotype, Haplotype, Outcome, Query, Strand, Timing,
     };
@@ -930,6 +943,23 @@ mod vcf_tests {
 
     fn query(seq: &[u8]) -> Query {
         Query { name: "g".into(), record_id: "g".into(), seq: seq.to_vec(), path: PathBuf::from("g.fa"), n_records: 1 }
+    }
+
+    /// Multi-anchor: the VCF and the long table are written in the winning reference's
+    /// coordinates. They used to be written against the first reference of the pool, so a SNV
+    /// at `gene:601` came out as `othergene 438`.
+    #[test]
+    fn variant_writers_use_the_winning_reference() {
+        let first = Query { name: "a".into(), record_id: "first".into(), seq: b"AAAA".to_vec(),
+                            path: PathBuf::from("a.fa"), n_records: 1 };
+        let winner = Query { name: "b".into(), record_id: "winner".into(), seq: b"CCCCCC".to_vec(),
+                             path: PathBuf::from("b.fa"), n_records: 1 };
+        let pool = [first, winner];
+        let mut r = result(b"CCCCCC", Vec::new());
+        assert_eq!(reference_of(&r, &pool).record_id, "first", "single-anchor falls back");
+        r.anchor_used = Some("winner".into());
+        assert_eq!(reference_of(&r, &pool).record_id, "winner");
+        assert_eq!(chrom_of(reference_of(&r, &pool)), "winner");
     }
 
     /// A triallelic on-path fork yields two alt haplotypes that differ from the primary at the
