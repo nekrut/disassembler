@@ -299,8 +299,9 @@ pub struct Config {
     /// `--max-size-mb`. See `peak_compressed_buffers`. Set it explicitly with `-w` once you
     /// know the machine can absorb it; the startup line prints what you chose.
     pub compute_workers: usize,
-    /// Bounded queue depth between fetch and compute. This times the largest retained buffer
-    /// is the hard ceiling on resident memory, and is the whole point of the bounded channel.
+    /// Bounded queue depth between fetch and compute. Bounding it is what stops a fast network
+    /// piling up buffers, but it is only one of three places a compressed buffer waits, and
+    /// the parsed graphs come on top: the bound on resident memory is `max_resident_bytes`.
     pub channel_capacity: usize,
     /// Threads handed to each GraphAligner invocation.
     ///
@@ -399,13 +400,37 @@ impl Config {
     /// `--max-size-mb` cap.
     ///
     /// This is a bound, not a prediction: real accessions are far below the cap (`ERR2028820`
-    /// is 33 MB, the ERG11 panel reaches 343 MB against a 1 GB default). It excludes the CSR
-    /// graphs, which add roughly 43 MB per compute worker, and any transient growth inside
-    /// `read_to_vec` while the receiving `Vec` reallocates.
+    /// is 33 MB, the ERG11 panel reaches 343 MB against a 1 GB default). It excludes the parsed
+    /// graphs (`max_graph_resident_bytes`) and any transient growth inside `read_to_vec` while
+    /// the receiving `Vec` reallocates.
     pub fn max_compressed_resident_bytes(&self) -> u64 {
         (self.peak_compressed_buffers() as u64).saturating_mul(self.max_compressed_bytes)
     }
+
+    /// Worst-case bytes in parsed graphs: one per compute worker, each from an accession at
+    /// the cap. See `GRAPH_PEAK_PER_COMPRESSED_BYTE`.
+    pub fn max_graph_resident_bytes(&self) -> u64 {
+        // A float-to-integer cast saturates, so an unlimited cap stays u64::MAX.
+        (self.compute_workers as f64 * self.max_compressed_bytes as f64
+            * GRAPH_PEAK_PER_COMPRESSED_BYTE) as u64
+    }
+
+    /// Worst-case resident bytes for the run: compressed buffers plus parsed graphs. What the
+    /// startup line prints.
+    pub fn max_resident_bytes(&self) -> u64 {
+        self.max_compressed_resident_bytes().saturating_add(self.max_graph_resident_bytes())
+    }
 }
+
+/// Peak memory of a parsed `UnitigGraph`, per byte of its compressed unitig file.
+///
+/// Measured 2026-10-31 as the process's peak RSS, minus a ~7 MB baseline and the compressed
+/// buffer, one accession per run: 1.24x to 1.62x across seven accessions of 4.8 to 348 MB
+/// (`ERR2028820` 1.25x, `SRR15477033` 1.62x). The parser's arrays grow by doubling and are
+/// not shrunk, so the peak includes their slack and the moment a growing array is copied.
+/// This replaces a fixed ~43 MB per worker, which was the array lengths of one 33 MB
+/// accession; the 348 MB one's graph peaked at 498 MB.
+pub const GRAPH_PEAK_PER_COMPRESSED_BYTE: f64 = 1.7;
 
 impl Default for Config {
     fn default() -> Self {
@@ -500,5 +525,19 @@ mod memory_bound_tests {
     fn an_absurd_cap_saturates_instead_of_wrapping() {
         let cfg = Config { max_compressed_bytes: u64::MAX, ..Config::default() };
         assert_eq!(cfg.max_compressed_resident_bytes(), u64::MAX);
+        assert_eq!(cfg.max_graph_resident_bytes(), u64::MAX);
+        assert_eq!(cfg.max_resident_bytes(), u64::MAX);
+    }
+
+    /// The parsed graphs come on top of the buffers: one per compute worker, up to 1.7x the
+    /// cap each, so the defaults' worst case is ~33.6 GB, not the ~20 GB once printed.
+    #[test]
+    fn the_bound_includes_the_parsed_graphs() {
+        let cfg = Config::default();
+        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        assert!((gib(cfg.max_graph_resident_bytes()) - 8.0 * 1.7).abs() < 1e-6);
+        assert!((gib(cfg.max_resident_bytes()) - 33.6).abs() < 1e-6);
+        let more = Config { compute_workers: 16, ..Config::default() };
+        assert!(more.max_graph_resident_bytes() > cfg.max_graph_resident_bytes());
     }
 }

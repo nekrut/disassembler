@@ -64,10 +64,10 @@ impl Fetcher {
     /// Download one accession's compressed unitig file into memory.
     ///
     /// With `--unitigs-cache`: read from `<dir>/<ACC>.unitigs.fa.zst` if present, otherwise
-    /// (under `--offline`) fail, otherwise download and write back atomically. Cache reads
-    /// bypass the Content-Length gate: the file on disk is trusted, because a truncated
-    /// file could only have arrived from a killed writer, and the atomic rename below
-    /// prevents that.
+    /// (under `--offline`) fail, otherwise download and write back atomically. A cached file's
+    /// contents are trusted, because a truncated file could only have arrived from a killed
+    /// writer, and the atomic rename below prevents that. Its size is not: `--max-size-mb`
+    /// bounds memory, and a cache filled under a higher cap used to be read whole regardless.
     ///
     /// Returns the compressed bytes only. Decompression is `decoder`'s job, and happens in
     /// the compute pool so the fetch thread can immediately start the next transfer.
@@ -75,6 +75,20 @@ impl Fetcher {
         if let Some(dir) = &self.cache_dir {
             let path = cache_path(dir, accession);
             if path.exists() {
+                let len = std::fs::metadata(&path).map(|m| m.len()).map_err(|e| Error::Fetch {
+                    accession: accession.clone(),
+                    detail: format!("cache read {}: {e}", path.display()),
+                })?;
+                if len > self.max_compressed_bytes {
+                    return Err(Error::TooLarge {
+                        accession: accession.clone(),
+                        detail: format!(
+                            "cached file {} is {len} bytes, over max_compressed_bytes {}",
+                            path.display(),
+                            self.max_compressed_bytes
+                        ),
+                    });
+                }
                 let compressed = std::fs::read(&path).map_err(|e| Error::Fetch {
                     accession: accession.clone(),
                     detail: format!("cache read {}: {e}", path.display()),
@@ -374,6 +388,28 @@ mod cache_tests {
         ));
         std::fs::create_dir_all(&dir).expect("create tempdir");
         dir
+    }
+
+    /// `--max-size-mb` bounds memory, so it applies to a cached file as it does to a
+    /// download. A cache filled under a higher cap used to be read whole whatever the cap.
+    #[test]
+    fn a_cached_file_over_the_size_cap_is_too_large() {
+        let dir = tempdir("cap");
+        let bytes = zstd::encode_all(&b">CACHED0002_0\nACGTACGTACGT\n"[..], 3).unwrap();
+        std::fs::write(cache_path(&dir, "CACHED0002"), &bytes).unwrap();
+        let fetcher = |cap: u64| Fetcher::new(&Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            max_compressed_bytes: cap,
+            ..Config::default()
+        });
+        let acc = "CACHED0002".to_string();
+        match fetcher(bytes.len() as u64 - 1).fetch(0, &acc) {
+            Err(Error::TooLarge { detail, .. }) => assert!(detail.contains("cached file"), "{detail}"),
+            other => panic!("expected TooLarge, got {:?}", other.map(|f| f.compressed_len)),
+        }
+        assert_eq!(fetcher(bytes.len() as u64).fetch(0, &acc).unwrap().compressed, bytes);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A cache hit returns the exact bytes on disk. Verified against a preloaded file so

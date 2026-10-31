@@ -42,8 +42,8 @@ pub struct Query {
     /// written out, because GraphAligner would otherwise align every record and the
     /// best-scoring row across all of them would win.
     pub path: PathBuf,
-    /// Records present in `path`. Only the first is used; more than one is a warning at
-    /// read time and changes how `align` invokes GraphAligner.
+    /// Records present in `path`. With more than one, `align` writes out only this Query's
+    /// record instead of copying the file, so GraphAligner aligns just that one.
     pub n_records: usize,
 }
 
@@ -90,7 +90,9 @@ pub struct FetchedUnitigs {
 /// | total | **~43 MB** |
 ///
 /// Against ~897 MB measured for a dict-of-sets adjacency, and against 145 MB for the
-/// decompressed text alone. Holding sequences here rather than re-reading the file is what lets
+/// decompressed text alone. Those are the arrays' lengths; at peak, with the slack the arrays
+/// keep as they grow, a graph measured 1.24x to 1.62x its compressed file across seven
+/// accessions (1.25x here). See `config::GRAPH_PEAK_PER_COMPRESSED_BYTE`. Holding sequences here rather than re-reading the file is what lets
 /// `extract::collect_seqs` be O(nodes kept) instead of O(all unitigs).
 pub struct UnitigGraph {
     pub accession: Accession,

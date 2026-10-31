@@ -29,7 +29,7 @@
 //!  │   └───┬────┘ └───┬────┘        └───┬────┘                            │
 //!  │       │          │                 │                                 │
 //!  │       │   per accession, in order:                                   │
-//!  │       │     stages::parse    -> UnitigGraph (CSR, ~43 MB)            │
+//!  │       │     stages::parse    -> UnitigGraph (CSR, ~1.5x compressed)  │
 //!  │       │     stages::anchor   -> Anchors                              │
 //!  │       │     stages::extract  -> Subgraph + GFA on tmpfs              │
 //!  │       │     stages::align    -> GraphAligner subprocess -> GafPath   │
@@ -71,12 +71,14 @@
 //! ```
 //!
 //! `Config::peak_compressed_buffers` computes that and
-//! `Config::max_compressed_resident_bytes` multiplies it by `--max-size-mb`. At the 1 GB
-//! default cap the worst case is therefore **about 20 GB**, not 4 GB, and the binary prints
-//! the figure at startup so it is visible before the run rather than after the OOM.
+//! `Config::max_compressed_resident_bytes` multiplies it by `--max-size-mb`: at the 1 GB
+//! default cap, **about 20 GB** in compressed buffers, not 4 GB.
 //!
-//! On top of that sit one `UnitigGraph` per compute worker (~43 MB each) and whatever
-//! `read_to_vec` transiently allocates while its `Vec` grows.
+//! On top of that sits one `UnitigGraph` per compute worker, which peaks at up to ~1.6x the
+//! compressed size of its accession (`Config::GRAPH_PEAK_PER_COMPRESSED_BYTE`; it was taken
+//! to be a fixed ~43 MB), and whatever `read_to_vec` transiently allocates while its `Vec`
+//! grows. `Config::max_resident_bytes` adds the graphs: **about 34 GB** at the defaults. The
+//! binary prints it at startup, so it is visible before the run rather than after the OOM.
 //!
 //! The bound is worst case, not typical: it assumes every accession sits at the cap, while
 //! `ERR2028820` is 33 MB and the largest of the ERG11 panel is 343 MB. But the cap is what
@@ -221,8 +223,9 @@ fn unfetched(
     use crate::error::Error;
     match e {
         Error::NoLoganData { .. } => AccessionResult::empty(index, accession, Outcome::NoLoganData, None),
-        Error::TooLarge { .. } => {
-            AccessionResult::empty(index, accession, Outcome::TooLarge, Some(detail))
+        // The bare detail: the report line already says "too_large, skipped by --max-size-mb".
+        Error::TooLarge { detail: d, .. } => {
+            AccessionResult::empty(index, accession, Outcome::TooLarge, Some(d.clone()))
         }
         _ => AccessionResult::failed(index, accession, detail),
     }
@@ -464,10 +467,12 @@ fn compute_worker(
 /// `parse::build` consumes the compressed bytes as a stream and returns everything the rest
 /// of the pipeline needs, so the decompressed text (145 MB for `ERR2028820`, ~1.44 GB for the
 /// largest ERG11 accessions) is never held. After the scope below closes, resident state per
-/// worker is one `UnitigGraph` at ~43 MB.
+/// worker is one `UnitigGraph`: ~43 MB of arrays for `ERR2028820`, up to ~1.6x the
+/// compressed size at peak in general (`Config::GRAPH_PEAK_PER_COMPRESSED_BYTE`).
 ///
-/// Peak is therefore roughly `compressed + graph`, about 76 MB for `ERR2028820`, against
-/// ~199 MB for a design that materialises the decompressed buffer.
+/// Peak is therefore roughly `compressed + graph`: measured at 80 MB for the whole process
+/// on `ERR2028820` (33 MB), and 853 MB on `ERR9831160` (348 MB), against ~199 MB for
+/// `ERR2028820` in a design that materialises the decompressed buffer.
 ///
 /// For the whole-process ceiling, multiplying this by `cfg.compute_workers` is **not**
 /// enough: compressed buffers are also resident in the channel and in blocked fetch workers.

@@ -87,6 +87,17 @@ multi-anchor run, compare sites across accessions only within one reference, or 
 common one first. The codon MSA needs a single reference; `reconstruct` uses the first `-q`
 unless `--msa-reference` is given.
 
+Two bugs in 0.1.0 depended on the reference FASTA's headers. GraphAligner names each result by
+the whole header line, and the walker looked results up by the record id alone, so a header
+with a description (`>pfcrt chloroquine resistance transporter`) never matched. A single-record
+query with such a header came back `no_path` on every accession; in multi-anchor mode, the
+re-alignment after pruning never matched for a panel with descriptions, such as
+`panels/sarscov2_spike_11strains.fa`, so every accession kept its unpruned result. That
+re-alignment also aligned the whole panel again rather than just the chosen reference. On 30
+accessions of the 20,000-accession SARS-CoV-2 run, applying the pruning changed 17 primaries:
+mostly by one or two bases, as intended, but one lost 425 nt (pruning is kept whenever the
+result still passes `--min-cov`).
+
 ## Outputs
 
 | file | when | contents |
@@ -197,13 +208,29 @@ Options that are on by default are turned off with a `--no-…` form.
 A compressed unitig file is held in three places at once: queued in a bounded channel (4 slots,
 not a flag), held by a fetch worker waiting to hand it over (`--fetch-workers`), and held by a
 compute worker for the whole parse (`-w`). At the defaults that is up to 4 + 8 + 8 = 20 files, so
-**20 GB** at the 1 GB `--max-size-mb` cap. On top of that, each compute worker holds its parsed
-graph, roughly 1.3 times the compressed size of the file it is working on.
+**20 GB** at the 1 GB `--max-size-mb` cap.
+
+On top of that, each compute worker builds a parsed graph, which peaks at up to about 1.6 times
+the compressed size of its file. Measured one accession at a time, as peak memory minus the
+process baseline and the compressed file:
+
+| accession | compressed | graph at peak |
+|---|---|---|
+| `ERR6174245` | 4.8 MB | 1.6x |
+| `ERR2028820` | 32.4 MB | 1.25x |
+| `SRR25605386` | 278.6 MB | 1.24x |
+| `SRR15477033` | 289.1 MB | 1.62x |
+| `ERR9831160` | 347.6 MB | 1.43x |
+
+The walker counts each graph at 1.7 times the cap, so the default worst case is 20 GB plus
+8 x 1.7 GB, **33.6 GB**, and it prints the bound for the settings it was given at startup.
+(Before 0.1.1 it counted a fixed 43 MB per graph.)
 
 This is a worst case: it assumes every accession sits at the cap. `ERR2028820` is 33 MB, and the
-largest *C. auris* ERG11 accession tested was 343 MB. The walker prints its buffer bound at
-startup. To contain a run, lower `--max-size-mb` and the two worker counts together, since they
-multiply. `-w 16 --fetch-workers 16`, for example, allows 36 buffers.
+largest *C. auris* ERG11 accession tested was 343 MB. To contain a run, lower `--max-size-mb` and
+the two worker counts together, since they multiply. `-w 16 --fetch-workers 16`, for example,
+allows 36 buffers and 16 graphs. The cap applies to files read from `--unitigs-cache` too: a
+cached file over it is skipped as `too_large`, like a download.
 
 ## Scratch files
 

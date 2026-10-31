@@ -454,15 +454,19 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // printing rather than documenting.
     let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     eprintln!(
-        "[logan-walker] memory bound: up to {} compressed buffers resident \
-         ({} queued + {} fetching + {} parsing) x {} MB cap = {:.1} GB worst case, \
-         plus ~43 MB per compute worker for the CSR graph",
+        "[logan-walker] memory bound: {} compressed buffers ({} queued + {} fetching + {} \
+         parsing) x {} MB cap = {:.1} GB, plus {} parsed graphs at up to {:.1}x their \
+         compressed size = {:.1} GB; {:.1} GB worst case",
         args.cfg.peak_compressed_buffers(),
         args.cfg.channel_capacity,
         args.cfg.fetch_workers,
         args.cfg.compute_workers,
         args.cfg.max_compressed_bytes / (1024 * 1024),
         gb(args.cfg.max_compressed_resident_bytes()),
+        args.cfg.compute_workers,
+        config::GRAPH_PEAK_PER_COMPRESSED_BYTE,
+        gb(args.cfg.max_graph_resident_bytes()),
+        gb(args.cfg.max_resident_bytes()),
     );
 
     // --fetch-only takes the short path: fill the cache and exit. No compute pool, no

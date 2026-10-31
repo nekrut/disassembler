@@ -183,16 +183,13 @@ pub fn run(
             body.push(b'\n');
         }
         std::fs::write(&query_fa, &body).map_err(file_err("write", &query_fa))?;
+        // One record out of a panel is the multi-anchor prune pass realigning the winner, on
+        // every accession; it is expected, so it is not logged.
         if queries.len() > 1 {
             let names: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
             eprintln!(
                 "[{}] multi-anchor: aligning against {} references {:?}",
                 subgraph.accession, queries.len(), names
-            );
-        } else {
-            eprintln!(
-                "[{}] query has {} records; aligning only {:?}",
-                subgraph.accession, queries[0].n_records, queries[0].record_id
             );
         }
     }
@@ -256,11 +253,14 @@ pub fn run(
 /// [`parse_gaf`] applied per record id: rows are grouped by column 1, the one with the most
 /// residue matches (column 10) wins per group, ties keep file order.
 ///
-/// Rows whose query name is not in `expects` are dropped. In practice GraphAligner echoes
-/// exactly the record ids we handed it, so this only kicks in on a name the tool spelled
-/// differently — a case the single-record path handled with a warning. In multi-anchor mode
-/// we do not warn (there is no single "expected" name), but a caller that finds a reference
-/// missing from the returned map knows nothing aligned against it.
+/// A row is matched on the first word of its query name, which is the record id: GraphAligner
+/// names a read by its whole header line, description included. Matching the whole name
+/// dropped every row for a header such as `>pfcrt chloroquine resistance transporter`, so a
+/// single-record query with a description (10 of the 26 in `queries/markers`) came back
+/// `no_path` on every accession, and in multi-anchor mode the prune pass's realignment
+/// against a described panel never matched, so pruning never took effect. Rows for other
+/// names are dropped; a caller that finds a reference missing from the returned map knows
+/// nothing aligned against it.
 pub fn parse_gaf_multi(
     gaf_bytes: &[u8],
     expects: &[&str],
@@ -279,7 +279,7 @@ pub fn parse_gaf_multi(
         if f.len() < 11 {
             continue;
         }
-        let name = f[0];
+        let name = f[0].split_whitespace().next().unwrap_or("");
         if !expected.contains(name) {
             continue;
         }
@@ -590,6 +590,18 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
         assert_eq!(m["wuhan"].num_matches, 50);
     }
 
+    /// GraphAligner names a read by its whole header line. Matching that whole name dropped
+    /// every row for a described header, and the accession came back no_path.
+    #[test]
+    fn a_header_description_does_not_hide_the_row() {
+        let gaf = "pfcrt chloroquine resistance transporter\t10\t0\t10\t+\t>1\t10\t0\t10\t9\t10\t60\n";
+        let m = parse_gaf_multi(gaf.as_bytes(), &["pfcrt"]).unwrap();
+        assert_eq!(m["pfcrt"].num_matches, 9);
+        let other = "pfcrtX extra\t10\t0\t10\t+\t>1\t10\t0\t10\t9\t10\t60\n";
+        assert!(parse_gaf_multi(other.as_bytes(), &["pfcrt"]).unwrap().is_empty(),
+                "the first word must equal the id, not merely start with it");
+    }
+
     /// A row whose path names no nodes is not a usable alignment.
     #[test]
     fn multi_drops_paths_with_no_nodes() {
@@ -643,11 +655,12 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
         std::fs::write(&fake, format!(
             "#!/bin/sh\n\
              while [ $# -gt 0 ]; do case \"$1\" in\n\
-             -f) cp \"$2\" '{d}/seen.fa'; echo \"$2\" > '{d}/seen_name'; shift 2;;\n\
+             -f) cp \"$2\" '{d}/seen.fa'; echo \"$2\" > '{d}/seen_name'; \
+                 name=$(head -1 \"$2\" | cut -c2- | tr -d '\\r'); shift 2;;\n\
              -a) gaf=\"$2\"; shift 2;;\n\
              *) shift;;\n\
              esac; done\n\
-             printf 'pol\\t12\\t0\\t12\\t+\\t>1\\t12\\t0\\t12\\t12\\t12\\t60\\n' > \"$gaf\"\n",
+             printf '%s\\t12\\t0\\t12\\t+\\t>1\\t12\\t0\\t12\\t12\\t12\\t60\\n' \"$name\" > \"$gaf\"\n",
             d = dir.display(),
         )).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();

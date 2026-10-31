@@ -204,9 +204,11 @@ pub fn read_query(path: &Path) -> Result<Query> {
 /// legacy behaviour and warning about the rest), which is what we want on today's single-`-q`
 /// single-record path. `read_query_set` is what runs when the collected reference set is
 /// wider than that — repeated `-q file.fa`, or a multi-record FASTA passed intentionally.
-/// Each returned [`Query`] has `n_records = 1` because it *is* one record from downstream's
-/// point of view; the "one record per Query" contract every stage assumes is preserved by
-/// splitting up-front here.
+/// Each returned [`Query`] holds one record, so the "one record per Query" contract every
+/// stage assumes is preserved by splitting up front here. Its `n_records` is still the count
+/// of records in its file, as the field promises: it used to be 1, which told
+/// `align::run` the file could be handed to GraphAligner as is, so the prune pass's
+/// realignment against the winning reference aligned every record in a panel again.
 ///
 /// Naming: the [`Query::name`] is the file stem when a file holds a single record (matching
 /// `read_query`), and `<stem>__<record_id>` when a file holds several. That keeps the
@@ -295,7 +297,7 @@ pub fn read_query_set(paths: &[PathBuf]) -> Result<Vec<Query>> {
                 record_id,
                 seq,
                 path: path.to_path_buf(),
-                n_records: 1,
+                n_records: n_in_file,
             });
         }
     }
@@ -455,7 +457,7 @@ mod tests {
         // Single-record files use the file stem as the name.
         assert!(qs[0].name.contains("set_a"), "got {}", qs[0].name);
         assert!(qs[1].name.contains("set_b"), "got {}", qs[1].name);
-        // Every emitted Query has n_records = 1 by contract.
+        // Each file holds one record.
         assert!(qs.iter().all(|q| q.n_records == 1));
         for p in [a, b] { std::fs::remove_file(p).ok(); }
     }
@@ -474,6 +476,9 @@ mod tests {
             assert!(q.name.contains("set_multi__"), "got {}", q.name);
         }
         assert!(qs[0].name.ends_with("__wuhan"), "got {}", qs[0].name);
+        // n_records is the file's record count, so align never hands GraphAligner the whole
+        // file for one of its records.
+        assert!(qs.iter().all(|q| q.n_records == 3));
         std::fs::remove_file(p).ok();
     }
 
