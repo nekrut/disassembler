@@ -138,7 +138,9 @@ fn prune_outcome(surviving: usize, before: usize) -> PruneOutcome {
 
 /// --fetch-only variant: download every accession into the unitigs cache, no compute stage.
 ///
-/// Returns `(ok, fail)`. Uses only the fetch pool; the compute pool is not spawned. Each
+/// Returns `(ok, negatives, errors)`: cached, not cached because Logan has no data or the
+/// accession is over the size cap, and not cached because of an error. Uses only the fetch
+/// pool; the compute pool is not spawned. Each
 /// fetch's success side is a no-op beyond writing the cache entry (which `Fetcher::fetch`
 /// already does), and each failure is reported inline. Bounded parallelism is
 /// `cfg.fetch_workers`.
@@ -147,7 +149,7 @@ fn prune_outcome(surviving: usize, before: usize) -> PruneOutcome {
 pub fn run_fetch_only(
     cfg: &Config,
     accessions: Vec<Accession>,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     let total = accessions.len();
     let work: SharedReceiver<(usize, Accession)> = {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -159,7 +161,7 @@ pub fn run_fetch_only(
 
     let fetcher = stages::stream::Fetcher::new(cfg);
     let fetcher = &fetcher;
-    let done = Arc::new(Mutex::new((0usize, 0usize))); // (ok, fail)
+    let done = Arc::new(Mutex::new((0usize, 0usize, 0usize))); // (ok, negatives, errors)
 
     std::thread::scope(|scope| {
         for _ in 0..cfg.fetch_workers {
@@ -175,7 +177,7 @@ pub fn run_fetch_only(
                     Ok(f) => {
                         let mut d = done.lock().unwrap();
                         d.0 += 1;
-                        let progress = d.0 + d.1;
+                        let progress = d.0 + d.1 + d.2;
                         println!(
                             "[{progress}/{total}] {accession}: cached ({} bytes in {:.1}s)",
                             f.compressed_len,
@@ -183,18 +185,47 @@ pub fn run_fetch_only(
                         );
                     }
                     Err(e) => {
+                        let negative = unfetched(index, accession.clone(), e.to_string(), &e)
+                            .outcome
+                            .is_negative();
                         let mut d = done.lock().unwrap();
-                        d.1 += 1;
-                        let progress = d.0 + d.1;
-                        eprintln!("[{progress}/{total}] {accession}: FETCH FAILED: {e}");
+                        if negative {
+                            d.1 += 1;
+                        } else {
+                            d.2 += 1;
+                        }
+                        let progress = d.0 + d.1 + d.2;
+                        if negative {
+                            eprintln!("[{progress}/{total}] {accession}: not cached: {e}");
+                        } else {
+                            eprintln!("[{progress}/{total}] {accession}: FETCH FAILED: {e}");
+                        }
                     }
                 }
             });
         }
     });
 
-    let (ok, fail) = *done.lock().unwrap();
-    Ok((ok, fail))
+    let counts = *done.lock().unwrap();
+    Ok(counts)
+}
+
+/// The result for an accession whose fetch did not return bytes. No Logan data and an
+/// accession over the size cap are negatives; anything else is an error.
+fn unfetched(
+    index: usize,
+    accession: Accession,
+    detail: String,
+    e: &crate::error::Error,
+) -> AccessionResult {
+    use crate::error::Error;
+    match e {
+        Error::NoLoganData { .. } => AccessionResult::empty(index, accession, Outcome::NoLoganData, None),
+        Error::TooLarge { .. } => {
+            AccessionResult::empty(index, accession, Outcome::TooLarge, Some(detail))
+        }
+        _ => AccessionResult::failed(index, accession, detail),
+    }
 }
 
 /// Fan accessions through the two pools and collect results.
@@ -212,6 +243,8 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
     let (fetch_tx, fetch_rx) = sync_channel::<FetchedUnitigs>(cfg.channel_capacity);
     let (result_tx, result_rx) = std::sync::mpsc::channel::<AccessionResult>();
     let fetch_rx: SharedReceiver<FetchedUnitigs> = Arc::new(Mutex::new(fetch_rx));
+    // Kept so an accession that comes back without a result can still be named below.
+    let names = accessions.clone();
     let work: SharedReceiver<(usize, Accession)> = {
         let (tx, rx) = std::sync::mpsc::channel();
         for (i, a) in accessions.into_iter().enumerate() {
@@ -249,6 +282,12 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
             scope.spawn(move || compute_worker(cfg, queries, query_index, rx, tx));
         }
         drop(result_tx);
+        // Only the compute workers may hold the receiving end. While this thread kept a
+        // handle, a compute pool that stopped draining (zero workers, or every worker gone
+        // after the collector below panicked on a closed stdout) left the fetch pool blocked
+        // on a full channel forever, and the scope never joined: the run hung instead of
+        // ending. With the last receiver gone, a blocked `send` fails and the fetcher stops.
+        drop(fetch_rx);
 
         // ---- collector (this thread) ------------------------------------
         // Report each accession as it lands, one line each: a run that quietly reconstructs
@@ -270,6 +309,24 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
     // by the list the user supplied rather than by which S3 fetch happened to win.
     let mut results = results;
     results.sort_by_key(|r| r.index);
+
+    // Every accession must come back with a result, or it vanishes from every output and
+    // from the success count. The pools are built so this cannot happen; if it ever does,
+    // the accession is reported as an error rather than dropped.
+    if results.len() < total {
+        let seen: std::collections::HashSet<usize> = results.iter().map(|r| r.index).collect();
+        for (i, name) in names.into_iter().enumerate() {
+            if !seen.contains(&i) {
+                eprintln!("[{name}] internal error: no result was produced");
+                results.push(AccessionResult::failed(
+                    i,
+                    name,
+                    "internal error: no result was produced".to_string(),
+                ));
+            }
+        }
+        results.sort_by_key(|r| r.index);
+    }
 
     let success = results
         .iter()
@@ -309,6 +366,15 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
         }
         Outcome::NoAnchors => println!("[{done}/{total}] {}: no_anchors", r.accession),
         Outcome::NoPath => println!("[{done}/{total}] {}: no_path", r.accession),
+        Outcome::NoLoganData => println!(
+            "[{done}/{total}] {}: no_logan_data (no Logan unitigs for this accession)",
+            r.accession
+        ),
+        Outcome::TooLarge => println!(
+            "[{done}/{total}] {}: too_large, skipped by --max-size-mb ({})",
+            r.accession,
+            r.error.as_deref().unwrap_or("over the cap")
+        ),
         Outcome::Failed => println!(
             "[{done}/{total}] {}: ERROR: {}",
             r.accession,
@@ -339,8 +405,11 @@ fn fetch_worker(
                 }
             }
             Err(e) => {
-                eprintln!("[{accession}] fetch failed: {e}");
-                let _ = result_tx.send(AccessionResult::failed(index, accession, e.to_string()));
+                let result = unfetched(index, accession, e.to_string(), &e);
+                if result.outcome == Outcome::Failed {
+                    eprintln!("{e}");
+                }
+                let _ = result_tx.send(result);
             }
         }
     }
@@ -804,6 +873,23 @@ mod ordering_tests {
 
         let got: Vec<&str> = results.iter().map(|r| r.accession.as_str()).collect();
         assert_eq!(got, input, "stored order must be the input order");
+    }
+
+    /// No Logan data and the size cap are negatives, so `--allow-empty` can accept them; any
+    /// other fetch failure is an error it never hides.
+    #[test]
+    fn a_fetch_failure_is_classified_by_its_cause() {
+        use crate::error::Error;
+        let acc = || "SRR1".to_string();
+        let cases = [
+            (Error::NoLoganData { accession: acc() }, Outcome::NoLoganData),
+            (Error::TooLarge { accession: acc(), detail: "big".into() }, Outcome::TooLarge),
+            (Error::Fetch { accession: acc(), detail: "HTTP 503".into() }, Outcome::Failed),
+        ];
+        for (e, want) in cases {
+            let r = super::unfetched(7, acc(), e.to_string(), &e);
+            assert_eq!((r.index, r.outcome), (7, want), "{e}");
+        }
     }
 
     /// Every failure path constructs its own result, so the index has to survive all of them.

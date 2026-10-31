@@ -22,6 +22,8 @@ fn outcome_str(o: Outcome) -> &'static str {
         Outcome::Success => "success",
         Outcome::NoAnchors => "no_anchors",
         Outcome::NoPath => "no_path",
+        Outcome::NoLoganData => "no_logan_data",
+        Outcome::TooLarge => "too_large",
         Outcome::Failed => "error",
     }
 }

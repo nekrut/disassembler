@@ -78,10 +78,10 @@ TUNING:
                                   disables it [default: 0.01]
         --alt-max-detour <N>      Unitigs an alternative allele may traverse before it must
                                   rejoin the main route [default: 100]
-    -t, --threads <N>             Threads per GraphAligner invocation [default: 1; above 1
-                                  is not reproducible, see Config]
-    -w, --workers <N>             Compute workers
-        --fetch-workers <N>       Fetch workers [default: 8]
+    -t, --threads <N>             Threads per GraphAligner invocation, at least 1 [default: 1;
+                                  above 1 is not reproducible, see Config]
+    -w, --workers <N>             Compute workers, at least 1 [default: 8]
+        --fetch-workers <N>       Fetch workers, at least 1 [default: 8]
 
 INTRA-HOST VARIANTS:
         --no-prefer-majority      Leave the primary on the reference-matching allele at
@@ -100,9 +100,11 @@ INTRA-HOST VARIANTS:
         --max-alt-indel <N>       Largest length change still treated as an indel allele
                                   rather than a rerouting [default: 30]
 
-        --allow-empty             Exit 0 even if no accession reconstructed. Without it, a
-                                  run that reconstructs nothing exits non-zero, so a wrapper
-                                  cannot mistake an all-failed shard for a good one
+        --allow-empty             Exit 0 when no accession reconstructed because nothing was
+                                  found: no Logan data, over --max-size-mb, no anchors or no
+                                  path. Errors still fail the run. Without it, a run that
+                                  reconstructs nothing exits non-zero, so a wrapper cannot
+                                  mistake an empty shard for a good one
 
 OFFLINE / CACHE:
         --unitigs-cache <DIR>     Read-through cache for compressed unitig payloads.
@@ -117,6 +119,13 @@ OFFLINE / CACHE:
 
     -h, --help                    Print this help
     -V, --version                 Print version
+
+EXIT STATUS:
+    0   at least one accession reconstructed, or (with --allow-empty) none did because
+        nothing was found
+    1   a usage or I/O error, or nothing reconstructed
+    3   every accession failed with an error (fetch, decode, GraphAligner): the run did
+        not work. --allow-empty never turns this into 0
 ";
 
 struct Args {
@@ -189,15 +198,9 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
                 // saturate rather than wrap: an absurd value should mean "no cap", not a tiny one.
                 args.cfg.max_compressed_bytes = mb.saturating_mul(1024 * 1024);
             }
-            "-t" | "--threads" => {
-                args.cfg.graphaligner_threads = value()?.parse().map_err(|e| error::Error::Usage(format!("--threads: {e}")))?;
-            }
-            "-w" | "--workers" => {
-                args.cfg.compute_workers = value()?.parse().map_err(|e| error::Error::Usage(format!("--workers: {e}")))?;
-            }
-            "--fetch-workers" => {
-                args.cfg.fetch_workers = value()?.parse().map_err(|e| error::Error::Usage(format!("--fetch-workers: {e}")))?;
-            }
+            "-t" | "--threads" => args.cfg.graphaligner_threads = at_least_one("--threads", &value()?)?,
+            "-w" | "--workers" => args.cfg.compute_workers = at_least_one("--workers", &value()?)?,
+            "--fetch-workers" => args.cfg.fetch_workers = at_least_one("--fetch-workers", &value()?)?,
             "--scratch-dir" => {
                 args.cfg.scratch_dir = PathBuf::from(value()?);
             }
@@ -295,7 +298,35 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
     Ok(args)
 }
 
+/// A count that must be at least 1. Zero compute workers left nothing to drain the fetch
+/// queue, so `-w 0` hung on six accessions and silently dropped three.
+fn at_least_one(flag: &str, raw: &str) -> error::Result<usize> {
+    match raw.parse::<usize>() {
+        Ok(0) => Err(error::Error::Usage(format!("{flag} must be at least 1, got 0"))),
+        Ok(n) => Ok(n),
+        Err(e) => Err(error::Error::Usage(format!("{flag}: {e}"))),
+    }
+}
+
+/// End quietly when stdout is closed, as other Unix tools do. Rust ignores SIGPIPE, so a
+/// write to a closed pipe (`logan-walker ... | head -1`) returns EPIPE, and `println!`
+/// panics on it.
+#[cfg(unix)]
+fn default_sigpipe() {
+    extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGPIPE: i32 = 13; // Linux, macOS and the BSDs
+    const SIG_DFL: usize = 0;
+    // SAFETY: called once at startup, before any thread is spawned.
+    unsafe {
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    default_sigpipe();
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
     if argv.is_empty() || argv.iter().any(|a| a == "-h" || a == "--help") {
@@ -317,9 +348,42 @@ fn main() -> ExitCode {
 
     if let Err(e) = real_main(args) {
         eprintln!("error: {e}");
-        return ExitCode::FAILURE;
+        return ExitCode::from(e.exit_code());
     }
     ExitCode::SUCCESS
+}
+
+/// Whether a finished run counts as a success. One reconstruction is enough: a bad
+/// accession must not sink a 10,000-accession shard. With none, the run fails, unless
+/// `allow_empty` and every accession was a negative (nothing found, not an error). A run
+/// in which every accession errored fails with its own exit code, whatever `allow_empty`.
+fn check_run(results: &[types::AccessionResult], allow_empty: bool) -> error::Result<()> {
+    let total = results.len();
+    let success = results.iter().filter(|r| r.outcome == types::Outcome::Success).count();
+    let errors = results.iter().filter(|r| r.outcome == types::Outcome::Failed).count();
+    if total == 0 || success > 0 {
+        return Ok(());
+    }
+    if errors == total {
+        return Err(error::Error::AllErrored { total });
+    }
+    if errors > 0 || !allow_empty {
+        return Err(error::Error::NothingReconstructed { total, errors });
+    }
+    Ok(())
+}
+
+/// `--fetch-only` succeeds when every accession is in the cache. `allow_empty` accepts the
+/// ones Logan has no data for or that are over the size cap, never an error.
+fn check_fetch(ok: usize, negatives: usize, errors: usize, allow_empty: bool) -> error::Result<()> {
+    let total = ok + negatives + errors;
+    if errors > 0 && errors == total {
+        return Err(error::Error::AllErrored { total });
+    }
+    if errors > 0 || (negatives > 0 && !allow_empty) {
+        return Err(error::Error::FetchIncomplete { total, errors, negatives });
+    }
+    Ok(())
 }
 
 fn real_main(args: Args) -> error::Result<()> {
@@ -398,12 +462,12 @@ fn real_main(args: Args) -> error::Result<()> {
     // --fetch-only takes the short path: fill the cache and exit. No compute pool, no
     // output files, no query. Success = every accession is in the cache after this.
     if args.cfg.fetch_only {
-        let (ok, fail) = pipeline::run_fetch_only(&args.cfg, accessions)?;
-        eprintln!("[logan-walker --fetch-only] {ok} fetched, {fail} failed");
-        if fail > 0 && !args.allow_empty {
-            return Err(error::Error::NothingReconstructed { total: ok + fail });
-        }
-        return Ok(());
+        let (ok, negatives, errors) = pipeline::run_fetch_only(&args.cfg, accessions)?;
+        eprintln!(
+            "[logan-walker --fetch-only] {ok} fetched, {negatives} not available \
+             (no Logan data or over --max-size-mb), {errors} failed"
+        );
+        return check_fetch(ok, negatives, errors, args.allow_empty);
     }
 
     // Unwrap the query set for the full pipeline. The guard above ensures it is Some here.
@@ -446,9 +510,97 @@ fn real_main(args: Args) -> error::Result<()> {
     // Per-accession failures are collected rather than propagated, which is what lets one bad
     // accession not sink a 10,000-accession shard. The cost is that a run where *every*
     // accession failed used to write a 0-byte FASTA and exit 0, which any scheduler reads as
-    // a good shard. Outputs are already written above, so they stay on disk for inspection.
-    if summary.success == 0 && summary.total > 0 && !args.allow_empty {
-        return Err(error::Error::NothingReconstructed { total: summary.total });
+    // a good shard; until 0.1.1, --allow-empty still did that for a run where every
+    // accession errored. Outputs are already written above, so they stay on disk for
+    // inspection.
+    check_run(&summary.results, args.allow_empty)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{at_least_one, check_fetch, check_run, parse_args};
+    use crate::error::Error;
+    use crate::types::{AccessionResult, Outcome};
+
+    fn run_of(outcomes: &[Outcome]) -> Vec<AccessionResult> {
+        outcomes
+            .iter()
+            .enumerate()
+            .map(|(i, &o)| AccessionResult::empty(i, format!("SRR{i}"), o, None))
+            .collect()
     }
-    Ok(())
+
+    fn argv(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn one_success_is_enough_whatever_else_happened() {
+        let r = run_of(&[Outcome::Failed, Outcome::Success, Outcome::NoAnchors]);
+        assert!(check_run(&r, false).is_ok());
+    }
+
+    #[test]
+    fn allow_empty_accepts_a_run_that_found_nothing() {
+        let r = run_of(&[Outcome::NoAnchors, Outcome::NoPath, Outcome::NoLoganData, Outcome::TooLarge]);
+        assert!(check_run(&r, true).is_ok());
+        assert!(matches!(
+            check_run(&r, false),
+            Err(Error::NothingReconstructed { total: 4, errors: 0 })
+        ));
+    }
+
+    #[test]
+    fn allow_empty_does_not_hide_a_run_where_every_accession_errored() {
+        let r = run_of(&[Outcome::Failed, Outcome::Failed]);
+        for allow_empty in [false, true] {
+            let e = check_run(&r, allow_empty).unwrap_err();
+            assert!(matches!(e, Error::AllErrored { total: 2 }));
+            assert_eq!(e.exit_code(), 3);
+        }
+    }
+
+    #[test]
+    fn allow_empty_does_not_hide_errors_mixed_with_negatives() {
+        let r = run_of(&[Outcome::NoAnchors, Outcome::Failed]);
+        let e = check_run(&r, true).unwrap_err();
+        assert!(matches!(e, Error::NothingReconstructed { total: 2, errors: 1 }));
+        assert_eq!(e.exit_code(), 1);
+    }
+
+    #[test]
+    fn fetch_only_accepts_missing_data_only_with_allow_empty() {
+        assert!(check_fetch(3, 0, 0, false).is_ok());
+        assert!(check_fetch(2, 1, 0, true).is_ok());
+        assert!(matches!(
+            check_fetch(2, 1, 0, false),
+            Err(Error::FetchIncomplete { total: 3, errors: 0, negatives: 1 })
+        ));
+        assert!(matches!(
+            check_fetch(2, 0, 1, true),
+            Err(Error::FetchIncomplete { total: 3, errors: 1, negatives: 0 })
+        ));
+        assert!(matches!(check_fetch(0, 0, 3, true), Err(Error::AllErrored { total: 3 })));
+    }
+
+    #[test]
+    fn fetch_only_partial_failure_does_not_say_reconstructed() {
+        let msg = check_fetch(2, 0, 1, false).unwrap_err().to_string();
+        assert!(msg.starts_with("1 of 3 accessions were not cached"), "{msg}");
+        assert!(!msg.contains("reconstructed"), "{msg}");
+    }
+
+    #[test]
+    fn worker_and_thread_counts_must_be_at_least_one() {
+        for flag in ["-w", "--workers", "--fetch-workers", "-t", "--threads"] {
+            let err = parse_args(&argv(&format!("{flag} 0"))).err().expect(flag);
+            assert!(err.to_string().contains("must be at least 1"), "{flag}: {err}");
+        }
+        let args = parse_args(&argv("-w 2 --fetch-workers 3 -t 1")).unwrap();
+        assert_eq!(
+            (args.cfg.compute_workers, args.cfg.fetch_workers, args.cfg.graphaligner_threads),
+            (2, 3, 1)
+        );
+        assert!(at_least_one("-w", "two").is_err());
+    }
 }

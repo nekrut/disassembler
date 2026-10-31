@@ -397,7 +397,23 @@ pub enum Outcome {
     Success,
     NoAnchors,
     NoPath,
+    /// Logan has no unitigs for this accession (HTTP 404).
+    NoLoganData,
+    /// Skipped by `--max-size-mb`.
+    TooLarge,
     Failed,
+}
+
+impl Outcome {
+    /// Nothing reconstructed, but nothing went wrong either: the data held nothing to find,
+    /// or the user's size cap skipped it. `--allow-empty` accepts a run of these; a
+    /// `Failed` accession is an error it never hides.
+    pub fn is_negative(self) -> bool {
+        matches!(
+            self,
+            Outcome::NoAnchors | Outcome::NoPath | Outcome::NoLoganData | Outcome::TooLarge
+        )
+    }
 }
 
 /// Wall time per stage, in seconds.
@@ -453,10 +469,16 @@ impl AccessionResult {
     /// `index` is the accession's position in the input list. It must survive every failure
     /// path, or a run where some accessions failed would come back partly ordered.
     pub fn failed(index: usize, accession: Accession, error: String) -> Self {
+        Self::empty(index, accession, Outcome::Failed, Some(error))
+    }
+
+    /// A result with nothing reconstructed: a failure, or a negative found before any stage
+    /// ran (no Logan data, over the size cap).
+    pub fn empty(index: usize, accession: Accession, outcome: Outcome, error: Option<String>) -> Self {
         Self {
             index,
             accession,
-            outcome: Outcome::Failed,
+            outcome,
             n_unitigs: 0,
             n_anchors: 0,
             subgraph_nodes: 0,
@@ -465,7 +487,7 @@ impl AccessionResult {
             alts: Vec::new(),
             bubbles: Vec::new(),
             timing: Timing::default(),
-            error: Some(error),
+            error,
             anchor_used: None,
             candidates: Vec::new(),
         }

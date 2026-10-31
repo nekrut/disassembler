@@ -44,7 +44,10 @@ decides the scatter strategy (below). The wrapper:
   multi-anchor tags after the reference file's stem.
 
 A job that reconstructs nothing fails unless `--allow-empty` is set, so a workflow decides
-whether an empty shard is a soft or a hard failure.
+whether an empty shard is a soft or a hard failure. `--allow-empty` accepts only accessions where
+nothing was found (no Logan data, over the size cap, no anchors, no path); a job in which every
+accession errored fails with exit code 3 regardless (see
+[`walker.md`](walker.md#exit-status)).
 
 ## Workflows
 

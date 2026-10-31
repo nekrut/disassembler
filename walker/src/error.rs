@@ -18,10 +18,32 @@ pub enum Error {
     GraphAligner { accession: String, detail: String },
     /// Bad CLI input.
     Usage(String),
-    /// Every accession failed. A per-accession failure is not fatal on its own, but a run
-    /// that reconstructs nothing has produced no usable output and must not look like a
-    /// success to a scheduler. `--allow-empty` opts out.
-    NothingReconstructed { total: usize },
+    /// Logan holds no unitigs for this accession (HTTP 404). A property of the data, like
+    /// finding no anchors, not a failure of the run.
+    NoLoganData { accession: String },
+    /// Over `--max-size-mb`: skipped by the user's own size cap, not a failure.
+    TooLarge { accession: String, detail: String },
+    /// No accession was reconstructed. A per-accession failure is not fatal on its own, but
+    /// a run that reconstructs nothing has produced no usable output and must not look like
+    /// a success to a scheduler. `errors` of the `total` failed outright; the rest found
+    /// nothing (no Logan data, over the size cap, no anchors, no path). `--allow-empty`
+    /// accepts the second kind only.
+    NothingReconstructed { total: usize, errors: usize },
+    /// Every accession failed with an error: the run itself did not work. Exit code 3, so a
+    /// wrapper can tell this from "nothing found", and `--allow-empty` never hides it.
+    AllErrored { total: usize },
+    /// `--fetch-only` left accessions out of the cache.
+    FetchIncomplete { total: usize, errors: usize, negatives: usize },
+}
+
+impl Error {
+    /// Process exit code: 3 when every accession errored, 1 for everything else.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Error::AllErrored { .. } => 3,
+            _ => 1,
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -38,12 +60,43 @@ impl fmt::Display for Error {
                 write!(f, "[{accession}] GraphAligner failed: {detail}")
             }
             Error::Usage(m) => write!(f, "usage error: {m}"),
-            Error::NothingReconstructed { total } => write!(
+            Error::NoLoganData { accession } => {
+                write!(f, "[{accession}] no Logan unitigs for this accession (HTTP 404)")
+            }
+            Error::TooLarge { accession, detail } => {
+                write!(f, "[{accession}] skipped, over --max-size-mb: {detail}")
+            }
+            Error::NothingReconstructed { total, errors: 0 } => write!(
                 f,
-                "0/{total} accessions reconstructed; no output worth keeping. \
-                 Check the log above for per-accession errors, or pass --allow-empty \
-                 if an empty result is acceptable here"
+                "0/{total} accessions reconstructed, and none errored: nothing was found \
+                 (see the log above for why). Pass --allow-empty if an empty result is \
+                 acceptable here"
             ),
+            Error::NothingReconstructed { total, errors } => write!(
+                f,
+                "0/{total} accessions reconstructed, and {errors} of them failed with an \
+                 error (see the log above). --allow-empty accepts accessions where nothing \
+                 was found, not errors"
+            ),
+            Error::AllErrored { total } => write!(
+                f,
+                "all {total} accessions failed with an error (see the log above); the run \
+                 did not work. --allow-empty does not apply to errors"
+            ),
+            Error::FetchIncomplete { total, errors, negatives } => {
+                write!(f, "{} of {total} accessions were not cached", errors + negatives)?;
+                if *errors > 0 {
+                    write!(f, "; {errors} failed with an error (see the log above)")?;
+                }
+                if *negatives > 0 {
+                    write!(
+                        f,
+                        "; {negatives} have no Logan data or are over --max-size-mb \
+                         (--allow-empty accepts these)"
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 }

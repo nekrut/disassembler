@@ -128,6 +128,17 @@ impl Fetcher {
                         detail,
                     })
                 }
+                Err(FetchAttempt::Missing) => {
+                    return Err(Error::NoLoganData {
+                        accession: accession.clone(),
+                    })
+                }
+                Err(FetchAttempt::TooLarge(detail)) => {
+                    return Err(Error::TooLarge {
+                        accession: accession.clone(),
+                        detail,
+                    })
+                }
                 Err(FetchAttempt::Transient(detail)) => {
                     last = detail;
                     if attempt < self.attempts {
@@ -154,11 +165,7 @@ impl Fetcher {
         let status = resp.status().as_u16();
         match status {
             200 => {}
-            404 => {
-                return Err(FetchAttempt::Permanent(
-                    "no Logan unitigs for this accession (HTTP 404)".to_string(),
-                ))
-            }
+            404 => return Err(FetchAttempt::Missing),
             // 4xx other than 404 is our fault and will not improve on retry.
             400..=499 => return Err(FetchAttempt::Permanent(format!("HTTP {status}"))),
             _ => return Err(FetchAttempt::Transient(format!("HTTP {status}"))),
@@ -167,7 +174,7 @@ impl Fetcher {
         // Refuse oversized accessions before transferring them, when the server says how big.
         if let Some(len) = resp.body().content_length() {
             if len > self.max_compressed_bytes {
-                return Err(FetchAttempt::Permanent(format!(
+                return Err(FetchAttempt::TooLarge(format!(
                     "compressed size {len} exceeds max_compressed_bytes {}",
                     self.max_compressed_bytes
                 )));
@@ -201,8 +208,12 @@ impl Fetcher {
 enum FetchAttempt {
     /// Transport error or 5xx. Retry.
     Transient(String),
-    /// 404, oversized, or another 4xx. Retrying cannot help.
+    /// A 4xx other than 404. Retrying cannot help.
     Permanent(String),
+    /// HTTP 404: Logan has no unitigs for this accession. Not an error of the run.
+    Missing,
+    /// Content-Length over `--max-size-mb`. Skipped by the user's cap, not an error.
+    TooLarge(String),
 }
 
 /// Write `bytes` to `<dir>/<ACC>.unitigs.fa.zst` via a tempfile-and-rename so a killed

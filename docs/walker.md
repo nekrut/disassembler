@@ -148,7 +148,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `-o, --out-dir <DIR>` | `walker_output` | output directory |
 | `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | primary haplotypes |
 | `--scratch-dir <DIR>` | `/dev/shm/logan-walker` | per-accession GFA and GAF files (not shown by `--help`) |
-| `--allow-empty` | off | exit 0 even if no accession was reconstructed |
+| `--allow-empty` | off | exit 0 when no accession was reconstructed because nothing was found; errors still fail (see [Exit status](#exit-status)) |
 
 ### Anchoring, fetching and walking
 
@@ -158,8 +158,8 @@ Options that are on by default are turned off with a `--no-…` form.
 | `--min-shared-kmers <N>` | `3` | shared k-mers a unitig needs to be an anchor, 1 to 5 |
 | `--hops <N>` | `5` | hop radius of the subgraph around the anchors |
 | `--max-size-mb <N>` | `1024` | refuse accessions above this compressed size |
-| `--fetch-workers <N>` | `8` | parallel S3 downloads (bandwidth saturates around 8) |
-| `-w, --workers <N>` | `8` | compute workers (see [Memory](#memory) before raising) |
+| `--fetch-workers <N>` | `8` | parallel S3 downloads (bandwidth saturates around 8); at least 1 |
+| `-w, --workers <N>` | `8` | compute workers (see [Memory](#memory) before raising); at least 1 |
 | `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
 | `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover |
 | `--primary-metric <M>` | `matched` | multi-anchor primary selection: `matched`, `cov`, `pident` or `cov_x_pident` |
@@ -229,9 +229,36 @@ is shared by every user on the host and is only 64 MB in a default Docker contai
 
 ## Exit status
 
-A run that reconstructs no accession at all exits non-zero, so a scheduler cannot mistake an
-all-failed shard for a good one; `--allow-empty` makes it exit 0. Individual accessions that fail
-(no Logan record, no anchors, no path) are reported in the summary and do not stop the run.
+Each accession ends with one status, printed as it finishes and recorded in the summary JSON:
+
+| status | meaning | kind |
+|---|---|---|
+| `success` | a primary haplotype was reconstructed | |
+| `no_anchors` | no unitig shares enough k-mers with the reference: the gene is not there | nothing found |
+| `no_path` | anchors were found, but no alignment through the subgraph covers `--min-cov` of the reference | nothing found |
+| `no_logan_data` | Logan has no unitigs for the accession (HTTP 404) | nothing found |
+| `too_large` | over `--max-size-mb`, so skipped before downloading | nothing found |
+| `error` | anything else: a network or cache failure, a corrupt file, GraphAligner crashing | error |
+
+One bad accession does not stop the run, and one success is enough for it to exit 0. When none
+succeeds:
+
+| exit | when |
+|---|---|
+| `0` | every accession found nothing, and `--allow-empty` is set |
+| `1` | every accession found nothing, without `--allow-empty`; or some found nothing and the rest errored |
+| `3` | every accession errored. The run did not work, so `--allow-empty` does not apply |
+
+Usage and I/O errors also exit 1. Until 0.1.1, `--allow-empty` turned every one of these into 0,
+including a run in which GraphAligner failed on every accession, and `no_logan_data` and
+`too_large` were reported as `error`.
+
+With `--fetch-only`, success means every accession is now in the cache. `--allow-empty` accepts
+accessions with no Logan data or over the size cap; any other failure exits 1, or 3 when every
+accession failed.
+
+If the walker's standard output is closed early (`logan-walker ... | head`), the walker stops
+on SIGPIPE, as other Unix tools do. Before 0.1.1 it panicked and then hung.
 
 ## Logan unitig files
 

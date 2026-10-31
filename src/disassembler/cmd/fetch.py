@@ -39,7 +39,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--max-size-mb", type=positive_int, default=None,
                    help="Refuse accessions above this compressed size (walker default 1024)")
     p.add_argument("--allow-empty", action="store_true",
-                   help="Exit 0 even if some accessions fail. Off by default.")
+                   help="Exit 0 even if some accessions could not be cached because Logan "
+                        "has no data for them or they are over --max-size-mb. Any other "
+                        "failure still exits non-zero. Off by default.")
     p.add_argument("--walker-bin", default=None,
                    help="Path to the logan-walker binary")
     p.set_defaults(func=run)
