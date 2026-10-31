@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """test_stratify.py -- unit tests for the cohort stratifier.
 
---score-bin: arbitrary half-open [LO, HI) ranges, no backfill, nonzero scores only.
+--score-bin: arbitrary half-open [LO, HI) ranges (a bin ending at 1.0 includes it), no
+backfill, nonzero scores only. Score files are found by content and name their own target.
 """
 import json
 import sys
@@ -43,7 +44,10 @@ class TestBinStratification(unittest.TestCase):
         self._tmp.cleanup()
 
     def _write_scores(self, scores):
-        (self.out / "t.scores.json").write_text(json.dumps(scores))
+        (self.out / "t.scores.json").write_text(json.dumps({"target": "t", "scores": scores}))
+
+    def _stratify(self, bins):
+        hk.stratify_bins(self.out, bins, hk.find_score_files([self.out]))
 
     def _txt(self):
         return [x for x in (self.out / "t.bins.txt").read_text().splitlines() if x]
@@ -70,7 +74,7 @@ class TestBinStratification(unittest.TestCase):
                 scores[f"{tag}{i:03d}"] = base + 1e-9 + i * (0.04999 / 100)
         self._write_scores(scores)
         bins = [(0.0, 0.05, 10), (0.05, 0.10, 10), (0.10, 0.15, 10)]
-        hk.stratify_bins(self.out, bins)
+        self._stratify(bins)
         got = self._txt()
         self.assertEqual(len(got), 30, f"expected 30 picks, got {len(got)}")
         buckets = {"a": 0, "b": 0, "c": 0}
@@ -83,7 +87,7 @@ class TestBinStratification(unittest.TestCase):
         scores = {f"z{i:02d}": 0.0 for i in range(10)}
         scores.update({f"n{i:02d}": 0.02 + i * 1e-4 for i in range(10)})
         self._write_scores(scores)
-        hk.stratify_bins(self.out, [(0.0, 0.05, 15)])
+        self._stratify([(0.0, 0.05, 15)])
         got = self._txt()
         self.assertEqual(len(got), 10, "should get all 10 nonzeros, no zeros")
         self.assertTrue(all(a.startswith("n") for a in got))
@@ -96,7 +100,7 @@ class TestBinStratification(unittest.TestCase):
         scores = {f"a{i}": 0.01 + i * 1e-3 for i in range(3)}
         scores.update({f"b{i:02d}": 0.06 + i * 1e-4 for i in range(50)})
         self._write_scores(scores)
-        hk.stratify_bins(self.out, [(0.0, 0.05, 10), (0.05, 0.10, 10)])
+        self._stratify([(0.0, 0.05, 10), (0.05, 0.10, 10)])
         s = self._summary()
         self.assertEqual(s["bins"][0]["selected"], 3, "short bin gives what it has")
         self.assertEqual(s["bins"][0]["available"], 3)
@@ -106,7 +110,7 @@ class TestBinStratification(unittest.TestCase):
     def test_output_txt_is_sorted_by_descending_score(self):
         scores = {f"x{i:03d}": 0.01 + i * 1e-3 for i in range(100)}
         self._write_scores(scores)
-        hk.stratify_bins(self.out, [(0.0, 0.15, 5)])
+        self._stratify([(0.0, 0.15, 5)])
         txt = self._txt()
         s = self._summary()
         score_map = {}
@@ -120,18 +124,115 @@ class TestBinStratification(unittest.TestCase):
         scores = {"lo": 0.05, "mid": 0.075, "at_hi": 0.10, "above": 0.12}
         self._write_scores(scores)
         # Bin [0.05, 0.10) must include lo and mid, exclude at_hi and above.
-        hk.stratify_bins(self.out, [(0.05, 0.10, 5)])
+        self._stratify([(0.05, 0.10, 5)])
         self.assertEqual(sorted(self._txt()), ["lo", "mid"])
 
+    def test_a_bin_ending_at_one_includes_a_perfect_score(self):
+        # `0.9:1.0` used to miss every score of exactly 1.0, the strongest hits.
+        self._write_scores({"perfect": 1.0, "high": 0.95, "edge": 0.9, "low": 0.5})
+        self._stratify([(0.9, 1.0, 10)])
+        self.assertEqual(sorted(self._txt()), ["edge", "high", "perfect"])
+        self.assertTrue(hk.in_bin(1.0, 0.9, 1.01), "an upper bound above 1 still works")
+        self.assertFalse(hk.in_bin(0.5, 0.0, 0.5), "below 1.0 bins stay half-open")
+
+    def test_a_bin_ending_at_one_overlaps_one_starting_there(self):
+        with self.assertRaises(ValueError):
+            hk.assert_bins_disjoint([(0.9, 1.0, 1), (1.0, 1.01, 1)])
+        hk.assert_bins_disjoint([(0.5, 0.9, 1), (0.9, 1.0, 1)])
+
     def test_multi_target_writes_per_target_files(self):
-        (self.out / "geneA.scores.json").write_text(json.dumps({f"a{i}": 0.02 + i * 1e-4 for i in range(20)}))
-        (self.out / "geneB.scores.json").write_text(json.dumps({f"b{i}": 0.07 + i * 1e-4 for i in range(20)}))
-        hk.stratify_bins(self.out, [(0.0, 0.05, 5), (0.05, 0.10, 5)])
+        (self.out / "geneA.scores.json").write_text(json.dumps(
+            {"target": "geneA", "scores": {f"a{i}": 0.02 + i * 1e-4 for i in range(20)}}))
+        (self.out / "geneB.scores.json").write_text(json.dumps(
+            {"target": "geneB", "scores": {f"b{i}": 0.07 + i * 1e-4 for i in range(20)}}))
+        self._stratify([(0.0, 0.05, 5), (0.05, 0.10, 5)])
         for target in ("geneA", "geneB"):
             self.assertTrue((self.out / f"{target}.bins.txt").is_file())
             self.assertTrue((self.out / f"{target}.bins.json").is_file())
         combined = json.loads((self.out / "bins_summary.json").read_text())
         self.assertEqual(set(combined.keys()), {"geneA", "geneB"})
+
+
+
+class TestScoreFiles(unittest.TestCase):
+    """Score files are recognised by content, and the target comes from inside them."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, name, obj, gz=False):
+        import gzip
+        data = json.dumps(obj).encode()
+        (self.dir / name).write_bytes(gzip.compress(data) if gz else data)
+        return self.dir / name
+
+    def run_cli(self, *argv):
+        import contextlib
+        import io
+        from disassembler.cli import build_parser
+        ns = build_parser().parse_args(["stratify", *argv])
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = ns.func(ns)
+        return rc, err.getvalue()
+
+    def test_any_name_and_gzip_and_other_files_passed_over(self):
+        self.write("dataset_17.dat", {"target": "ns5", "scores": {"SRR1": 0.9}}, gz=True)
+        self.write("summary.json", {"ns5": {"n": 1, "max_score": 0.9}})
+        self.write("ns5.bins.json", {"target": "ns5", "bins": []})
+        (self.dir / "ns5.accessions.txt").write_text("SRR1\n")
+        found = hk.find_score_files([self.dir])
+        self.assertEqual([(f.target, f.scores) for f in found], [("ns5", {"SRR1": 0.9})])
+
+    def test_finding_nothing_is_an_error(self):
+        (self.dir / "notes.txt").write_text("nothing here\n")
+        rc, err = self.run_cli("-o", str(self.dir), "--score-bin", "0:1:5")
+        self.assertEqual(rc, 1)
+        self.assertIn("no harvest score files", err)
+        self.assertIn("1 other file(s) there are not score files", err)
+
+    def test_a_pre_0_1_1_file_needs_its_target_named(self):
+        old = self.write("ns5.scores.json", {"SRR1": 0.9, "SRR2": 0.4})
+        rc, err = self.run_cli("-o", str(self.dir), "--score-bin", "0:1:5")
+        self.assertEqual(rc, 1)
+        self.assertIn("no target inside", err)
+        out = self.dir / "out"
+        rc, err = self.run_cli("-o", str(out), "--scores", f"ns5={old}", "--score-bin", "0:1:5")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((out / "ns5.bins.txt").read_text().split(), ["SRR1", "SRR2"])
+        rc, err = self.run_cli("-o", str(self.dir), "--target", "gyrA", "--score-bin", "0:1:5")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue((self.dir / "gyrA.bins.txt").is_file(), "the one unnamed file is gyrA")
+
+    def test_target_filters_and_must_exist(self):
+        self.write("a.json", {"target": "geneA", "scores": {"SRR1": 0.9}})
+        self.write("b.json", {"target": "geneB", "scores": {"SRR2": 0.9}})
+        rc, err = self.run_cli("-o", str(self.dir), "--target", "geneB", "--score-bin", "0:1:5")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads((self.dir / "bins_summary.json").read_text()).keys(),
+                         {"geneB"})
+        rc, err = self.run_cli("-o", str(self.dir), "--target", "geneC", "--score-bin", "0:1:5")
+        self.assertEqual(rc, 1)
+        self.assertIn("no score file for target 'geneC'", err)
+
+    def test_bad_targets_are_refused(self):
+        self.write("a.json", {"target": "../evil", "scores": {"SRR1": 0.9}})
+        with self.assertRaisesRegex(ValueError, "cannot be used as a file name"):
+            hk.find_score_files([self.dir])
+        (self.dir / "a.json").unlink()
+        self.write("a.json", {"target": "g", "scores": {"SRR1": 0.9}})
+        self.write("b.json", {"target": "g", "scores": {"SRR2": 0.9}})
+        with self.assertRaisesRegex(ValueError, "in two score files"):
+            hk.find_score_files([self.dir])
+
+    def test_a_named_file_that_is_not_scores_is_an_error_not_skipped(self):
+        p = self.write("summary.json", {"ns5": {"n": 1}})
+        with self.assertRaisesRegex(ValueError, "not a harvest score file"):
+            hk.find_score_files([p])
 
 
 if __name__ == "__main__":

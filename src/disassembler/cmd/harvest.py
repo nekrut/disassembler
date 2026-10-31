@@ -9,8 +9,8 @@ For each shard, in either mode:
   1. Loads its JSON body.
   2. Merges containment scores per target across all shards.
   3. Emits `<target>.accessions.txt` (sorted by score descending) and
-     `<target>.scores.json` per target, plus `UNION.accessions.txt` and
-     `summary.json`.
+     `<target>.scores.json` (`{"target": ..., "scores": {accession: score}}`) per
+     target, plus `UNION.accessions.txt` and `summary.json`.
 
 Stratification into a size-capped cohort is a separate subcommand (`stratify`);
 this one only harvests.
@@ -182,7 +182,8 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
         acc_file = out_dir / f"{target}.accessions.txt"
         score_file = out_dir / f"{target}.scores.json"
         acc_file.write_text("\n".join(accs) + "\n")
-        score_file.write_text(json.dumps(acc_dict, indent=2))
+        # The target goes inside, so stratify never has to read it off the file name.
+        score_file.write_text(json.dumps({"target": target, "scores": acc_dict}, indent=2))
         summary[target] = {
             "n": len(accs),
             "max_score": max(acc_dict.values()) if acc_dict else 0.0,

@@ -7,6 +7,7 @@ every shard failed must not report success.
 """
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -217,7 +218,9 @@ class TestHarvestLocal(unittest.TestCase):
         per_target = hk.harvest_local(self.shards, self.out)
         self.assertEqual(dict(per_target["pfcrt"]), {"SRR1": 0.7, "SRR2": 0.9})
         self.assertTrue((self.out / "pfcrt.accessions.txt").is_file())
-        self.assertTrue((self.out / "pfcrt.scores.json").is_file())
+        self.assertEqual(json.loads((self.out / "pfcrt.scores.json").read_text()),
+                         {"target": "pfcrt", "scores": {"SRR1": 0.7, "SRR2": 0.9}},
+                         "the score file names its own target")
         self.assertTrue((self.out / "UNION.accessions.txt").is_file())
         self.assertTrue((self.out / "summary.json").is_file())
 

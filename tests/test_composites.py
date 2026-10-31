@@ -139,7 +139,7 @@ class TestFromKmindex(_Stubs):
         self.assertEqual(rc, 0, log)
         rc, log = _run(self._argv("--skip-harvest", "--skip-tree"))
         self.assertEqual(rc, 0, log)
-        self.assertIn("harvest skipped: reusing 1 *.scores.json", log)
+        self.assertIn("harvest skipped: reusing the earlier harvest in", log)
 
     def test_galaxy_ids_reach_the_harvest(self):
         # The path that crashed before reaching Galaxy. The fetch itself is stubbed.
@@ -182,10 +182,29 @@ class TestFromKmindex(_Stubs):
         self.assertEqual(rc, 2, log)
         self.assertIn("mutually exclusive", log)
 
-    def test_skip_harvest_with_a_source_is_refused(self):
-        rc, log = _run(self._argv("--skip-harvest", "--shards-dir", str(self.shards)))
-        self.assertEqual(rc, 2, log)
-        self.assertIn("--shards-dir cannot be combined with --skip-harvest", log)
+    def test_skip_harvest_ignores_a_source_with_a_warning(self):
+        # Before 0.1.1 --history-id/--collection-id were required even with --skip-harvest,
+        # so existing scripts pass placeholders; refusing them broke those scripts.
+        rc, log = _run(self._argv("--shards-dir", str(self.shards), "--skip-tree"))
+        self.assertEqual(rc, 0, log)
+        rc, log = _run(self._argv("--skip-harvest", "--history-id", "placeholder",
+                                  "--collection-id", "placeholder", "--skip-tree"))
+        self.assertEqual(rc, 0, log)
+        self.assertIn("--history-id, --collection-id ignored under --skip-harvest", log)
+
+    def test_skip_harvest_with_a_hand_made_pre_0_1_1_score_file(self):
+        # The SARS-CoV-2 walker run's shape: a flat {accession: score} file written by a
+        # script, placeholder Galaxy IDs, and a top bin ending at 1.0.
+        cohort = self.out / "cohort"
+        cohort.mkdir(parents=True)
+        (cohort / "gene.scores.json").write_text(
+            json.dumps({"SRR1": 1.0, "SRR2": 0.95, "SRR3": 0.5}))
+        rc, log = _run(self._argv("--skip-harvest", "--history-id", "placeholder",
+                                  "--collection-id", "placeholder",
+                                  "--score-bin", "0.90:1.00:10", "--skip-tree"))
+        self.assertEqual(rc, 0, log)
+        self.assertEqual((cohort / "gene.bins.txt").read_text().split(), ["SRR1", "SRR2"],
+                         "the perfect score is sampled")
 
 
 class TestReconstruct(_Stubs):

@@ -91,10 +91,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                                 "stratified accession lists "
                                 "(default: <out-dir>/cohort).")
     g_harvest.add_argument("--skip-harvest", action="store_true",
-                           help="Reuse existing <cohort-dir>/*.scores.json from an earlier "
-                                "harvest instead of harvesting again. Combine with --offline "
-                                "and a pre-warmed --unitigs-cache for a fully offline "
-                                "kmindex -> tree run.")
+                           help="Reuse an earlier harvest in --cohort-dir instead of "
+                                "harvesting again. Combine with --offline and a pre-warmed "
+                                "--unitigs-cache for a fully offline kmindex -> tree run.")
 
     # ---- Stage 2: stratify (optional) -------------------------------------
     g_stratify = p.add_argument_group(
@@ -107,9 +106,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     g_stratify.add_argument("--score-bin", action="append", dest="score_bins",
                             metavar="LO:HI:N",
                             help="Custom score bin, repeatable. Sample up to N accessions "
-                                 "with score in the half-open [LO, HI). Nonzero scores "
-                                 "only, no backfill, disjoint. When any --score-bin is "
-                                 "given, reconstruct reads <target>.bins.txt.")
+                                 "with score in the half-open [LO, HI), or [LO, 1.0] when "
+                                 "HI is 1.0. Nonzero scores only, no backfill, disjoint. "
+                                 "When any --score-bin is given, reconstruct reads "
+                                 "<target>.bins.txt.")
     g_stratify.add_argument("--target", required=True,
                             help="Target name to reconstruct from (as produced by "
                                  "`harvest`, e.g. 'ns5' or 'HA'). Selects which per-target "
@@ -274,10 +274,11 @@ def run(args) -> int:
                                    ("--collection-id", args.collection_id),
                                    ("--shards-dir", args.shards_dir)) if v]
     if args.skip_harvest:
+        # A warning, not an error: before 0.1.1 the Galaxy IDs were required even with
+        # --skip-harvest, so existing command lines carry placeholder values for them.
         if harvest_flags:
-            print(f"from-kmindex: {', '.join(harvest_flags)} cannot be combined with "
+            print(f"[from-kmindex] warn: {', '.join(harvest_flags)} ignored under "
                   f"--skip-harvest, which reuses an earlier harvest.", file=sys.stderr)
-            return 2
     else:
         _mode, mode_err = harvest_cmd._validate_mode(args)
         if mode_err:
@@ -297,14 +298,11 @@ def run(args) -> int:
 
     # ---- 1/3 harvest -------------------------------------------------------
     if args.skip_harvest:
-        # Reuse existing scores; no Galaxy call.
-        existing = sorted(cohort_dir.glob("*.scores.json"))
-        if not existing:
-            print(f"from-kmindex: --skip-harvest but no *.scores.json in {cohort_dir}",
-                  file=sys.stderr)
-            return 1
-        print(f"[from-kmindex] 1/3 harvest skipped: reusing {len(existing)} "
-              f"*.scores.json in {cohort_dir}", flush=True)
+        # Reuse an earlier harvest; no Galaxy call. Its files are checked where they are
+        # used: stratify finds the score file by content, and the accession list is
+        # checked below.
+        print(f"[from-kmindex] 1/3 harvest skipped: reusing the earlier harvest in "
+              f"{cohort_dir}", flush=True)
     else:
         harvest_ns = stage_args(
             harvest_cmd,
@@ -326,6 +324,7 @@ def run(args) -> int:
         stratify_ns = stage_args(
             stratify_cmd,
             out_dir=str(cohort_dir),
+            target=args.target,
             score_bins=args.score_bins,
         )
         print(f"[from-kmindex] 2/3 stratify -> {cohort_dir}", flush=True)

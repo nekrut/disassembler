@@ -34,7 +34,7 @@ Outputs, written to `-o`:
 | file | contents |
 |---|---|
 | `<target>.accessions.txt` | every accession the query returned for that target, by containment score, highest first |
-| `<target>.scores.json` | accession to containment score |
+| `<target>.scores.json` | `{"target": ..., "scores": {accession: containment score}}` |
 | `UNION.accessions.txt` | the union across all targets |
 | `summary.json` | per-target counts and maximum score |
 
@@ -43,7 +43,7 @@ multi-record query gives one set of files per record.
 
 ## `disassembler stratify`
 
-`stratify` samples a cohort from the `*.scores.json` files in a harvest directory, by score bin:
+`stratify` samples a cohort from harvest score files, by score bin:
 
 ```bash
 # 30 accessions: 10 from each of three low-score bins
@@ -55,11 +55,23 @@ Each `--score-bin LO:HI:N` selects up to N accessions whose score falls in `[LO,
 evenly across the sorted range.
 
 - **Half-open bins.** Bins can touch without double-counting, and overlapping bins are refused.
-  A bin meant to include a perfect score of 1.0 needs `HI` above 1, for example `0.9:1.01:N`.
+  The exception is the top: a bin ending at 1.0 includes 1.0, the highest containment score, so
+  `0.9:1.0:N` takes perfect matches too. Before 0.1.1 it did not: in the SARS-CoV-2 spike
+  harvest, 274,808 accessions (5.3%) score exactly 1.0, and none could reach the 20,000-accession
+  walker cohort drawn with `0.90:1.00`.
 - **Nonzero scores only.** Zero-score accessions are excluded, so `0.0:0.05:10` samples from
   `(0, 0.05)`.
 - **No backfill.** A bin with fewer than N candidates contributes what it has, and no other bin
   is topped up to compensate.
+
+**Finding the score files.** Each score file names its own target, and `stratify` recognises
+score files by their content, never their names (a Galaxy dataset arrives as `dataset_<id>.dat`).
+By default it reads every file in the `-o` directory and uses the score files among them;
+`--scores PATH` (repeatable) names files or directories instead, plain or gzip-compressed.
+`--target NAME` stratifies only that target. A score file written before 0.1.1, or by hand, is a
+bare `{accession: score}` with no target inside; name it with `--scores NAME=FILE`, or with
+`--target` when it is the only one. Finding no score file is an error, where it used to print a
+warning and exit 0.
 
 Outputs, per target, next to the harvest files: `<target>.bins.txt` (the merged list, by score,
 highest first) and `<target>.bins.json` (per-bin requested, available and selected counts, and
@@ -89,7 +101,7 @@ The shards come from exactly one of three places:
 |---|---|
 | `--history-id` and `--collection-id` | fetches the shard collection from Galaxy |
 | `--shards-dir <DIR>` | reads shard JSON files already on disk, as `harvest --shards-dir` does |
-| `--skip-harvest` | none: reuses the `*.scores.json` an earlier run left in `--cohort-dir` |
+| `--skip-harvest` | none: reuses an earlier harvest in `--cohort-dir` |
 
 Harvest output goes to `--cohort-dir` (default `<out-dir>/cohort`), and `--target` picks which
 target's list is reconstructed. `--harvest-workers` is harvest's `--download-workers`. The
@@ -106,7 +118,10 @@ disassembler from-kmindex --skip-harvest --cohort-dir out/zika_ns5/cohort \
 
 Before 0.1.1, `from-kmindex` crashed in every harvest with an `AttributeError` (it did not pass
 harvest's `--shards-dir` setting), and it required the two Galaxy IDs even with
-`--skip-harvest`.
+`--skip-harvest`. Command lines written for that, with placeholder IDs, still run: under
+`--skip-harvest` the IDs are ignored with a warning. With `--score-bin`, `from-kmindex` passes its
+`--target` to `stratify`, so a hand-made score file in the older shape works without a target
+inside.
 
 ## Scale
 
