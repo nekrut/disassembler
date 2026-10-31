@@ -275,22 +275,53 @@ class TestFromLexicmap(_Stubs):
         self.assertEqual((out / "gene_codon_msa.fasta").read_text().count(">"), 3)
         self.assertTrue((out / "gene_fasttree.nwk").is_file())
 
-    def test_allow_empty_accepts_an_empty_cohort(self):
-        # One partial sequence: lexicmap's clean cohort (full + partial) is not empty, but the
-        # full-length cohort from-lexicmap aligns is. --allow-empty used to exit 1 here anyway.
+    def test_a_run_without_sieve_removes_an_earlier_runs_sieved_cohorts(self):
+        # lexicmap rewrites both cohorts every run, so sieved copies an earlier --sieve run
+        # left are stale; they used to stay beside the fresh MSA.
+        out = self.work / "out"
+        out.mkdir()
+        stale = [out / "lexicmap.clean.accessions.sieved.fasta",
+                 out / "lexicmap.clean_expanded.accessions.sieved.fasta"]
+        for p in stale:
+            p.write_text(f">old\n{REF}\n")
         table = self.work / "hits.tsv"
+        table.write_text(
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            f"SRR10\t100.0\t100.0\t1\t12\t{REF}\t{REF}\n"
+        )
+        rc, log = _run(["from-lexicmap", "-q", str(self.ref), "-f", str(table),
+                        "-o", str(out)])
+        self.assertEqual(rc, 0, log)
+        self.assertTrue((out / "gene_codon_msa.fasta").is_file())
+        self.assertEqual([p.name for p in stale if p.exists()], [])
+
+    def test_allow_empty_accepts_an_empty_cohort(self):
+        table = self.work / "hits.tsv"
+        out = self.work / "out"
+        argv = ["from-lexicmap", "-q", str(self.ref), "-f", str(table), "-o", str(out)]
+        # An earlier run into the same directory made an MSA and a tree.
+        table.write_text(
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            f"SRR10\t100.0\t100.0\t1\t12\t{REF}\t{REF}\n"
+        )
+        rc, log = _run(argv)
+        self.assertEqual(rc, 0, log)
+        self.assertTrue((out / "gene_codon_msa.fasta").is_file())
+        # Now one partial sequence: lexicmap's clean cohort (full + partial) is not empty, but
+        # the full-length cohort from-lexicmap aligns is. --allow-empty used to exit 1 anyway.
         table.write_text(
             "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
             "SRR20\t100.0\t50.0\t1\t6\tATGGCT\tATGGCT\n"
         )
-        out = self.work / "out"
-        argv = ["from-lexicmap", "-q", str(self.ref), "-f", str(table), "-o", str(out)]
         rc, log = _run(argv)
         self.assertEqual(rc, 1, log)
         self.assertIn("cohort is empty", log)
         rc, log = _run(argv + ["--allow-empty"])
         self.assertEqual(rc, 0, log)
+        # The earlier run's MSA and tree no longer describe this cohort, and must not sit
+        # beside an exit 0 as if this run had made them.
         self.assertFalse((out / "gene_codon_msa.fasta").exists())
+        self.assertFalse((out / "gene_fasttree.nwk").exists())
 
     def test_a_queued_dataset_stops_before_a_stale_cohort(self):
         # lexicmap used to return 0 for a queued dataset having written nothing, and

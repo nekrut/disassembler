@@ -8,8 +8,8 @@
 //! `bench/golden/` fixtures are this file verbatim.
 //!
 //! JSON is written by hand rather than through serde. The shapes are small and fixed, and
-//! matching Python's `json.dump(..., indent=2)` layout exactly matters more here than
-//! convenience, because summaries are meant to be diffable.
+//! keeping one exact layout (two-space indent, fields always in the same order) matters more
+//! here than convenience, because summaries are meant to be diffable.
 
 use crate::error::Result;
 use crate::pipeline::Summary;

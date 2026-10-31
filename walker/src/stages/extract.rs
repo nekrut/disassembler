@@ -519,11 +519,11 @@ mod expand_tests {
     }
 }
 
-/// Cross-validation against the Python anchor-recall study's recorded subgraph sizes.
+/// Cross-validation against the anchor-recall study's recorded subgraph sizes.
 ///
 /// `LOGAN_TEST_DIR=/dir/with/*.unitigs.fa.zst cargo test --release -- --ignored --nocapture`
 #[cfg(test)]
-mod python_concordance_expand {
+mod recall_study_subgraphs {
     use super::*;
     use crate::io::input::read_query;
     use crate::stages::{anchor, parse, stream};
@@ -543,7 +543,7 @@ mod python_concordance_expand {
 
     #[test]
     #[ignore]
-    fn matches_python_subgraph_sizes() {
+    fn matches_the_recall_study_subgraph_sizes() {
         let Ok(dir) = std::env::var("LOGAN_TEST_DIR") else {
             eprintln!("SKIP: set LOGAN_TEST_DIR");
             return;
@@ -564,13 +564,15 @@ mod python_concordance_expand {
             let query = read_query(Path::new(qpath)).unwrap();
             eprintln!("{acc} ({} unitigs)", graph.n_unitigs);
             for &(m, want_anchors, want_nodes) in expected {
-                let cfg = Config { min_shared_kmers: m, ..Config::default() };
+                // The study counted canonical 31-mers; the default -k has since moved to 21.
+                let cfg = Config { k: 31, min_shared_kmers: m, ..Config::default() };
                 let idx = anchor::index_query(&cfg, &query).unwrap();
                 let a = anchor::find(&cfg, &graph, &idx).unwrap();
                 let t0 = std::time::Instant::now();
                 let nodes = expand(&cfg, &graph, &a).unwrap();
                 eprintln!(
-                    "  M={:<3} anchors {:>5} (py {:>5})  subgraph {:>6} (py {:>6})  {:>7.4}s  frac {:>7.3}%",
+                    "  M={:<3} anchors {:>5} (study {:>5})  subgraph {:>6} (study {:>6})  {:>7.4}s  \
+                     frac {:>7.3}%",
                     m, a.ids.len(), want_anchors, nodes.len(), want_nodes,
                     t0.elapsed().as_secs_f64(), subgraph_fraction(&graph, &nodes) * 100.0
                 );
@@ -715,7 +717,7 @@ mod gfa_tests {
     /// asserted `30M` without controlling it: had the default moved, the test would have
     /// failed while pointing at the wrong knob.
     #[test]
-    fn matches_the_python_line_format_exactly() {
+    fn writes_the_exact_gfa_line_format() {
         let g = graph(">ACC_0 ka:f:5.3   L:-:1:+  L:+:1:-\nACGT\n>ACC_1 ka:f:9.0   L:+:0:+\nTTGCA\n");
         let cfg = Config { graph_k: 31, ..tmp_cfg("fmt") };
         let got = render(&cfg, &g, vec![0, 1]);

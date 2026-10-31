@@ -239,8 +239,8 @@ pub fn index_query_set(cfg: &Config, queries: &[Query]) -> Result<QueryIndex> {
 /// Scan every unitig, counting shared canonical k-mers.
 ///
 /// A unitig is an anchor when it shares at least `cfg.min_shared_kmers` canonical k-mers
-/// with the query. Counting matched *positions*, not distinct k-mers, to match the Python
-/// implementation the anchor-recall study validated against.
+/// with the query. Counting matched *positions*, not distinct k-mers, as the anchor-recall
+/// study did.
 ///
 /// # The hot loop
 ///
@@ -624,22 +624,22 @@ mod tests {
     }
 }
 
-/// Cross-validation against the independent Python implementation used for the anchor-recall
-/// study (canonical 31-mers via `min(m, revcomp(m))`). The expected counts come from that
+/// Cross-validation against the independent implementation used for the anchor-recall study
+/// (canonical 31-mers via `min(m, revcomp(m))`). The expected counts come from that
 /// study's recorded output, so a mismatch means the two implementations disagree about what
 /// a canonical k-mer is.
 ///
 /// Run from the crate directory: `cargo test --release -- --ignored --nocapture`
 #[cfg(test)]
-mod python_concordance {
+mod recall_study_kmers {
     use super::*;
     use crate::io::input::read_query;
     use std::path::Path;
 
     #[test]
     #[ignore]
-    fn matches_python_canonical_kmer_counts() {
-        // (query file, canonical 31-mer count measured by the Python implementation)
+    fn matches_the_recall_study_kmer_counts() {
+        // (query file, canonical 31-mer count the study recorded)
         let cases = [
             ("../queries/pfcrt_only.fasta", 1245usize),
             ("../queries/query_hiv1_pol.fasta", 2709),
@@ -657,7 +657,7 @@ mod python_concordance {
             let query = read_query(p).expect("read query");
             let idx = index_query(&cfg, &query).expect("index");
             eprintln!(
-                "  {:<44} {} bp -> {} canonical 31-mers (python: {})",
+                "  {:<44} {} bp -> {} canonical 31-mers (study: {})",
                 query.name,
                 query.seq.len(),
                 idx.n_kmers,
@@ -671,13 +671,13 @@ mod python_concordance {
     }
 }
 
-/// Cross-validation against the Python anchor-recall study. Those anchor counts were
+/// Cross-validation against the anchor-recall study. Those anchor counts were
 /// produced by an independent implementation and then used to decide that k-mer anchoring
 /// is viable, so the two must agree exactly.
 ///
 /// `LOGAN_TEST_ZST=/path/to/ERR2028820.unitigs.fa.zst cargo test --release -- --ignored --nocapture`
 #[cfg(test)]
-mod python_concordance_find {
+mod recall_study_anchors {
     use super::*;
     use crate::io::input::read_query;
     use crate::stages::{parse, stream};
@@ -686,7 +686,7 @@ mod python_concordance_find {
 
     #[test]
     #[ignore]
-    fn matches_python_anchor_counts_at_every_threshold() {
+    fn matches_the_recall_study_anchor_counts_at_every_threshold() {
         let Ok(path) = std::env::var("LOGAN_TEST_ZST") else {
             eprintln!("SKIP: set LOGAN_TEST_ZST to ERR2028820.unitigs.fa.zst");
             return;
@@ -711,15 +711,16 @@ mod python_concordance_find {
         let graph = parse::build(&fetched.accession, stream::decoder(&fetched).unwrap()).unwrap();
         let query = read_query(qpath).unwrap();
 
-        // (min_shared_kmers, anchors measured by the Python implementation)
+        // (min_shared_kmers, anchors the study recorded)
         let expected = [(1u32, 104usize), (2, 83), (3, 77), (5, 59), (10, 36)];
         for (m, want) in expected {
-            let cfg = Config { min_shared_kmers: m, ..Config::default() };
+            // The study counted canonical 31-mers; the default -k has since moved to 21.
+            let cfg = Config { k: 31, min_shared_kmers: m, ..Config::default() };
             let idx = index_query(&cfg, &query).unwrap();
             let t0 = std::time::Instant::now();
             let a = find(&cfg, &graph, &idx).unwrap();
             eprintln!(
-                "  M={:<3} anchors {:>5} (python {:>5})  {:.3}s  fraction {:.6}%",
+                "  M={:<3} anchors {:>5} (study {:>5})  {:.3}s  fraction {:.6}%",
                 m,
                 a.ids.len(),
                 want,

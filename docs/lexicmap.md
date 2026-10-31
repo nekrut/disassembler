@@ -162,6 +162,11 @@ Runs `lexicmap`, then (with `--sieve`) the sieve, then `msa`, on
 gate default to values derived from the cohort's own coverage gate, so neither stage drops rows
 for coverage that lexicmap already accepted.
 
+Each run removes the sieved cohorts an earlier run left in `-o`, since they no longer match the
+cohorts lexicmap has just rewritten; with `--sieve`, this run's is written again. An empty cohort
+fails the run unless `--allow-empty` is given. With it, `from-lexicmap` exits 0 without aligning
+and also removes an earlier run's MSA and tree.
+
 ## Options
 
 | flag | default | meaning |

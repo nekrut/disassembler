@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_and_identity_are_computed_as_python_does() {
+    fn coverage_is_span_over_query_and_identity_is_from_the_gaf() {
         let c = cfg(4, 0.0);
         let s = sub(vec![1], vec!["ACGTACGTAC"]);
         let mut p = path(&[(Orient::Forward, 1)], 10, 0, 10);

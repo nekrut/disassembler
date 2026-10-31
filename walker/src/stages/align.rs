@@ -1,7 +1,7 @@
 //! Step 5: GraphAligner.
 //!
-//! This is the one stage that is NOT ported. GraphAligner is an external C++ binary
-//! (bioconda `graphaligner`, ~29 MB) that does seeded, banded, bit-parallel dynamic
+//! This is the one stage the walker does not implement itself. GraphAligner is an external
+//! C++ binary (bioconda `graphaligner`, ~29 MB) that does seeded, banded, bit-parallel dynamic
 //! programming over a bidirected sequence graph. This file is only the wrapper around it.
 //!
 //! Why it stays external:
@@ -622,7 +622,7 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
     }
 
     #[test]
-    fn command_matches_the_python_invocation() {
+    fn the_graphaligner_command_line_is_exact() {
         let cfg = Config { graphaligner_threads: 2, ..Config::default() };
         let sub = Subgraph {
             accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGT".to_vec()],

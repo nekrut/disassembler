@@ -350,7 +350,7 @@ mod tests {
     }
 }
 
-/// Validation against a real Logan file. Ground truth was measured independently in Python:
+/// Validation against a real Logan file. Ground truth was measured independently of this parser:
 /// `ERR2028820` has 1,277,362 unitigs, 2,582,206 `L:` tokens and 68,745,081 bp.
 ///
 /// `LOGAN_TEST_ZST=/path/to/ERR2028820.unitigs.fa.zst cargo test --release -- --ignored --nocapture`

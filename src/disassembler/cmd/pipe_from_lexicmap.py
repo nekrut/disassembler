@@ -291,14 +291,23 @@ def run(args) -> int:
     if rc != 0:
         return rc
 
-    cohort = (
-        Path(f"{prefix}.clean_expanded.accessions.fasta") if args.include_partials
-        else Path(f"{prefix}.clean.accessions.fasta")
-    )
+    full, expanded = (Path(f"{prefix}.clean.accessions.fasta"),
+                      Path(f"{prefix}.clean_expanded.accessions.fasta"))
+    cohort = expanded if args.include_partials else full
+    # lexicmap has just rewritten both cohorts, so a sieved copy of either that an earlier run
+    # left in this --out-dir no longer matches it. This run writes at most one of them again
+    # (with --sieve); kept, the other sat beside fresh results as if this run had made it.
+    for c in (full, expanded):
+        (out_dir / f"{c.stem}.sieved.fasta").unlink(missing_ok=True)
     if not cohort.is_file():
         print(f"from-lexicmap: expected lexicmap cohort not found: {cohort}",
               file=sys.stderr)
         return 1
+    sieved = out_dir / f"{cohort.stem}.sieved.fasta"
+    stem = Path(args.ref).stem
+    aln = out_dir / f"{stem}_codon_msa.fasta"
+    tree = out_dir / f"{stem}_fasttree.nwk"
+
     n_cohort = sum(1 for line in cohort.open() if line.startswith(">"))
     print(f"[from-lexicmap] cohort: {n_cohort} sequences from {cohort.name}", flush=True)
     if n_cohort == 0:
@@ -306,6 +315,10 @@ def run(args) -> int:
         # of partials alone passes it and is empty here unless --include-partials is given.
         # This used to exit 1 even with --allow-empty.
         if args.allow_empty:
+            # Nor does an MSA or tree an earlier run left, which would otherwise sit beside
+            # this exit 0 as if this run had made it.
+            for stale in (aln, tree):
+                stale.unlink(missing_ok=True)
             print("[from-lexicmap] cohort is empty; nothing to align (--allow-empty)",
                   flush=True)
             return 0
@@ -326,7 +339,6 @@ def run(args) -> int:
             max_gap_frac = round(min(1.0, 1.0 - gate + GATE_MARGIN), 6)
         print(f"[from-lexicmap] 2/3 sieve: --max-gap-frac {max_gap_frac} "
               f"(cohort coverage gate {gate})", flush=True)
-        sieved = out_dir / f"{cohort.stem}.sieved.fasta"
         rc = sieve_cmd.sieve_run(
             cohort, sieved,
             ref=Path(args.ref),
@@ -343,9 +355,6 @@ def run(args) -> int:
         print("[from-lexicmap] 2/3 sieve skipped (no --sieve)", flush=True)
 
     # ---- 3/3 codon MSA + FastTree -----------------------------------------
-    stem = Path(args.ref).stem
-    aln = out_dir / f"{stem}_codon_msa.fasta"
-    tree = out_dir / f"{stem}_fasttree.nwk"
     print(f"[from-lexicmap] 3/3 codon MSA + tree: --input {msa_input} --out-aln {aln} "
           f"--out-tree {tree}", flush=True)
     msa_min_cov = args.msa_min_cov

@@ -245,7 +245,7 @@ mod tests {
         let sub = whole(&c, &g);
         let b = phase(&c, &g, &sub).unwrap();
         cleanup(&sub);
-        assert!(b.is_empty(), "python reports a bubble here; oriented, there is no fork");
+        assert!(b.is_empty(), "a strand-less count reports a bubble here; oriented, there is no fork");
     }
 
     /// A real bubble: one end of unitig 0 leads to either 1 or 2, and both reach 3.
@@ -483,7 +483,7 @@ mod phase_real {
 
     #[test]
     #[ignore]
-    fn compares_against_python_bubble_counts() {
+    fn compares_against_strand_less_bubble_counts() {
         let Ok(dir) = std::env::var("LOGAN_TEST_DIR") else {
             eprintln!("SKIP: set LOGAN_TEST_DIR");
             return;
@@ -493,7 +493,7 @@ mod phase_real {
             ("ERR2028820", "../queries/pfcrt_only.fasta", 202usize, 188usize),
             ("SRR8209082", "../queries/query_hiv1_pol.fasta", 11825, 6917),
         ];
-        for (acc, qpath, py_total, py_degenerate) in cases {
+        for (acc, qpath, strandless_total, strandless_degenerate) in cases {
             let Ok(compressed) = std::fs::read(format!("{dir}/{acc}.unitigs.fa.zst")) else {
                 eprintln!("SKIP: no data for {acc}");
                 continue;
@@ -519,8 +519,9 @@ mod phase_real {
             let multi = bubbles.iter().filter(|b| b.branches.len() > 2).count();
             eprintln!(
                 "  {acc}: subgraph {} nodes -> {} bubbles in {:.4}s  \
-                 (python: {} bubbles, {} of them fork==merge)",
-                sub.nodes.len(), bubbles.len(), elapsed.as_secs_f64(), py_total, py_degenerate
+                 (strand-less: {} bubbles, {} of them fork==merge)",
+                sub.nodes.len(), bubbles.len(), elapsed.as_secs_f64(), strandless_total,
+                strandless_degenerate
             );
             eprintln!("     fork==merge: {degenerate}   branches>2: {multi}");
             if let Some(b) = bubbles.first() {
@@ -590,7 +591,7 @@ mod phase_diagnostic {
             let bubbles = phase(&cfg, &graph, &sub).unwrap();
             std::fs::remove_file(&sub.gfa_path).ok();
             eprintln!("{acc}: {n} subgraph nodes");
-            eprintln!("  strand-less 'forks' (>=2 neighbours, what python counts): {strandless_forks}");
+            eprintln!("  strand-less 'forks' (>=2 neighbours, ends not told apart): {strandless_forks}");
             eprintln!("  oriented forks (one end with >=2 exits):                  {oriented_forks}");
             eprintln!("  of those, reconverging + passing coverage/VAF gates:      {}", bubbles.len());
             for b in bubbles.iter().take(12) {
