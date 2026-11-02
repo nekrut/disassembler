@@ -218,7 +218,7 @@ fn write_run_info(w: &mut impl Write, run: &RunInfo) -> Result<()> {
         ("graph_k", c.graph_k.to_string()),
         ("min_shared_kmers", c.min_shared_kmers.to_string()),
         ("hops", c.hops.to_string()),
-        ("subgraph_fraction_guard", format!("{:?}", c.subgraph_fraction_guard)),
+        ("subgraph_nodes_per_base_guard", format!("{:?}", c.subgraph_nodes_per_base_guard)),
         ("max_size_mb", (c.max_compressed_bytes / (1024 * 1024)).to_string()),
         ("min_cov", format!("{:?}", c.min_cov)),
         ("primary_metric", format!("\"{}\"", c.primary_metric.as_str())),

@@ -20,9 +20,10 @@ Core capabilities:
   3. Cohort partitioning (tiers numbered as written to the ledger):
      - Tier 1: Clean Full-Length (coverage >= min_coverage, 0 premature stops, no frameshift)
      - Tier 2: Clean Partial (min_coverage_partial <= coverage < min_coverage, same rules)
-     - Tier 5: Flagged Frameshift (reading frame shifted for >= FRAMESHIFT_MIN_SPAN bases)
-     - Tier 3: Flagged Premature Stops (stops > max_stops)
-     - Tier 4: Low-Coverage Fragments (coverage < min_coverage_partial)
+     - Tier 4: Low-Coverage Fragments (coverage < min_coverage_partial), whatever its frame
+       and stop codons say: too little of the gene is on the grid to judge either
+     - Tier 5: Flagged Frameshift (covered, frame shifted for >= FRAMESHIFT_MIN_SPAN bases)
+     - Tier 3: Flagged Premature Stops (covered, in frame, stops > max_stops)
      Indels are read from the aligned qseq/sseq. In-frame deletions stay in the row as '-' and
      count as covered; insertions have no column, so they are recorded instead (ledger, FASTA
      headers, haplotype table). Indels within INDEL_EDGE_WINDOW bases of an HSP end are
@@ -774,6 +775,20 @@ def stream_lexicmap_to_msa(
             count_clean_partial += 1
             f_clean_exp_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_PARTIAL{indel_tag}\n{merged_seq}\n")
 
+        # Coverage decides before the frame and stop rules do. Below the partial threshold
+        # there is too little of the gene on the grid to tell a real frameshift or a real
+        # premature stop from a gap in the tiling: on the SARS-CoV-2 strict pass, 61,897 of
+        # the 64,034 accessions this reported as frameshifted were fragments at a median
+        # coverage of 0.18. Through 0.1.1-dev the frame and stop rules ran first, so both
+        # flagged tiers were mostly fragments. In this order they mean what they say: covered
+        # well enough to judge, and broken.
+        elif cov < min_coverage_partial:
+            status = "LOW_COVERAGE_FRAGMENT"
+            tier = 4
+            count_flagged_low_cov += 1
+            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=LOW_COVERAGE{indel_tag}\n{merged_seq}\n")
+            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tLOW_COVERAGE\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
+
         elif not frame_ok:
             status = "FLAGGED_FRAMESHIFT"
             tier = 5
@@ -781,19 +796,12 @@ def stream_lexicmap_to_msa(
             f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=FRAMESHIFT{indel_tag}\n{merged_seq}\n")
             f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tFRAMESHIFT\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
 
-        elif not stops_ok:
+        else:  # covered, in frame, so `stops_ok` is false by elimination
             status = "FLAGGED_PREMATURE_STOPS"
             tier = 3
             count_flagged_stops += 1
             f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=PREMATURE_STOPS stops={n_stops} codons={stop_str}{indel_tag}\n{merged_seq}\n")
             f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tPREMATURE_STOPS\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
-
-        else:  # cov < min_coverage_partial, within the stop and frame rules
-            status = "LOW_COVERAGE_FRAGMENT"
-            tier = 4
-            count_flagged_low_cov += 1
-            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=LOW_COVERAGE{indel_tag}\n{merged_seq}\n")
-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tLOW_COVERAGE\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
 
         f_cohort_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\t{status}\t{tier}\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
 
@@ -955,11 +963,19 @@ def stream_lexicmap_to_msa(
 
     warning_msg = None
     if is_divergent:
+        # Name the condition that actually fired. "X and/or Y" used to be printed whichever
+        # one it was, so a cohort tripped by coverage alone read as "Median identity is 99.6%
+        # (< 85%)", which is simply false and sent people looking at the wrong number.
+        fired = []
+        if med_pid < 85.0:
+            fired.append(f"median identity is {med_pid:.1f}% (< 85%)")
+        if med_cov < 0.60:
+            fired.append(f"median coverage is {med_cov:.2f} (< 0.60)")
         warning_msg = (
-            f"DIVERGENT REGIME DETECTED: Median identity is {med_pid:.1f}% (< 85%) and/or "
-            f"median coverage is {med_cov:.2f} (< 0.60) with {stop_rate_ge_50:.1f}% premature stops in >=50% covered accessions. "
+            f"DIVERGENT REGIME DETECTED: {' and '.join(fired)}, with {stop_rate_ge_50:.1f}% premature stops in >=50% covered accessions. "
             f"Reference projection is fragmentary. Clean full-length sequences ({count_clean_full:,}) and clean partials "
-            f"({count_clean_partial:,}) have been safely partitioned from flagged stop-codon projections ({count_flagged_stops:,}). "
+            f"({count_clean_partial:,}) have been partitioned from the flagged tiers: {count_flagged_stops:,} with premature stops "
+            f"and {count_flagged_frameshift:,} with frameshifts. "
             f"For unbiased whole-cohort haplotype assembly on this target, use disassembler (logan-walker)."
         )
         print("\n" + "!" * 80)

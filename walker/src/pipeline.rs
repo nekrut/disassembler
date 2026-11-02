@@ -153,9 +153,25 @@ fn prune_outcome(surviving: usize, before: usize) -> PruneOutcome {
 /// The span is in reference coordinates, so the indels pruning exists to correct do not count
 /// against it: removing a spurious insertion or recovering a real deletion changes the
 /// haplotype's length, not the stretch of reference it covers.
+///
+/// `PRUNE_SPAN_TOLERANCE` keeps the rule from firing on a single terminal codon.
 fn pruned_covers_as_much(unpruned: &GafPath, pruned: &GafPath) -> bool {
-    pruned.query_span() >= unpruned.query_span()
+    pruned.query_span() + PRUNE_SPAN_TOLERANCE >= unpruned.query_span()
 }
+
+/// Reference bases a pruned realignment may lose and still replace the unpruned one.
+///
+/// The rule above was strict through 0.1.0, which meant one terminal base was enough to keep a
+/// reference-biased primary. The 2026-11-01 reruns showed that is not hypothetical: of the
+/// refusals, 33 of 511 in the 20,000-accession SARS-CoV-2 run and 21 of 56 across the obelisk
+/// cohorts gave up three reference bases or fewer, 21 of them exactly one. The losses this rule
+/// exists to catch are nothing like that size: 421 of those 511 lost more than 30 bases, and the
+/// case it was written for lost 424.
+///
+/// Bases at the very end are also the ones a sample is most likely to genuinely disagree with
+/// the reference on, so a strict rule trades a real correction for a codon of reference bias. A
+/// tolerance this small cannot admit a split alignment.
+const PRUNE_SPAN_TOLERANCE: usize = 3;
 
 /// --fetch-only variant: download every accession into the unitigs cache, no compute stage.
 ///
@@ -554,17 +570,23 @@ fn run_one(
     let t = Instant::now();
     let nodes = stages::extract::expand(cfg, &graph, &anchors)?;
     let subgraph_fraction = stages::extract::subgraph_fraction(&graph, &nodes);
-    let provisional = stages::extract::exceeds_guard(cfg, &graph, &nodes);
+    // In multi-anchor mode the pool's references are the same gene at slightly different
+    // lengths, and the guard runs before one of them has won, so the longest stands for the
+    // gene. It is also the most forgiving choice: the largest denominator flags the fewest.
+    let ref_len = queries.iter().map(|q| q.seq.len()).max().unwrap_or(0);
+    let provisional = stages::extract::exceeds_guard(cfg, &nodes, ref_len);
     if provisional {
         eprintln!(
-            "[{}] WARNING: 5-hop neighbourhood is {:.2}% of the graph ({} of {} unitigs), \
-             above the {:.2}% guard. The haplotype is likely under-determined; treat this \
-             accession's result as provisional.",
+            "[{}] WARNING: the 5-hop neighbourhood holds {:.1} unitigs per reference base \
+             ({} unitigs over {} bases, {:.2}% of the graph), above the {:.1} guard. The \
+             haplotype is likely under-determined; treat this accession's result as \
+             provisional.",
             graph.accession,
-            subgraph_fraction * 100.0,
+            stages::extract::nodes_per_ref_base(&nodes, ref_len),
             nodes.len(),
-            graph.n_unitigs,
-            cfg.subgraph_fraction_guard * 100.0
+            ref_len,
+            subgraph_fraction * 100.0,
+            cfg.subgraph_nodes_per_base_guard
         );
     }
     let seqs = stages::extract::collect_seqs(&graph, &nodes)?;
@@ -801,10 +823,13 @@ fn run_one(
                         match rejected {
                             Some((p, _)) => eprintln!(
                                 "[{}] prune: depth {:.0}x, floor {:.1}x; the realigned route \
-                                 spans reference bases {}-{} of {}, less than the unpruned \
-                                 {}-{}; keeping the unpruned result",
+                                 spans reference bases {}-{} of {}, {} short of the unpruned \
+                                 {}-{} and past the {}-base tolerance; keeping the unpruned \
+                                 result",
                                 graph.accession, depth, floor, p.query_start, p.query_end,
-                                query.seq.len(), path.query_start, path.query_end
+                                query.seq.len(),
+                                path.query_span().saturating_sub(p.query_span()),
+                                path.query_start, path.query_end, PRUNE_SPAN_TOLERANCE
                             ),
                             None => eprintln!(
                                 "[{}] prune: depth {:.0}x, floor {:.1}x cost the alignment; \
@@ -1009,7 +1034,22 @@ mod prune_outcome_tests {
     fn a_pruned_route_that_stops_short_is_refused() {
         let unpruned = spanning(0, 3821, 3816);
         assert!(!pruned_covers_as_much(&unpruned, &spanning(424, 3821, 3391)));
-        assert!(!pruned_covers_as_much(&unpruned, &spanning(0, 3820, 3815)), "one base short");
+    }
+
+    /// Up to `PRUNE_SPAN_TOLERANCE` reference bases at an end may go; the next one may not.
+    /// A strict rule refused a prune over a single terminal base on real cohorts.
+    #[test]
+    fn a_pruned_route_may_give_up_a_terminal_codon_but_no_more() {
+        let unpruned = spanning(0, 3821, 3816);
+        for lost in 1..=super::PRUNE_SPAN_TOLERANCE {
+            assert!(pruned_covers_as_much(&unpruned, &spanning(0, 3821 - lost, 3816 - lost)),
+                    "{lost} base(s) short at the 3' end should be kept");
+            assert!(pruned_covers_as_much(&unpruned, &spanning(lost, 3821, 3816 - lost)),
+                    "{lost} base(s) short at the 5' end should be kept");
+        }
+        let over = super::PRUNE_SPAN_TOLERANCE + 1;
+        assert!(!pruned_covers_as_much(&unpruned, &spanning(0, 3821 - over, 3816 - over)),
+                "one base past the tolerance must be refused");
     }
 
     /// An indel changes the haplotype's length but not the reference span, so pruning away a

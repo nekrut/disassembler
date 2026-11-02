@@ -517,6 +517,37 @@ mod expand_tests {
         let nodes = expand(&cfg_hops(1), &g, &anchors(&[0], 6)).unwrap();
         assert!((subgraph_fraction(&g, &nodes) - 2.0 / 6.0).abs() < 1e-9);
     }
+
+    /// The guard measures the neighbourhood against the reference, not against the sample's
+    /// graph, so a targeted library whose graph is almost all target does not trip it.
+    #[test]
+    fn the_guard_is_per_reference_base_not_per_graph() {
+        let g = chain();
+        let nodes = expand(&cfg_hops(1), &g, &anchors(&[0], 6)).unwrap();
+        assert_eq!(nodes.len(), 2);
+        let mut cfg = cfg_hops(1);
+        cfg.subgraph_nodes_per_base_guard = 3.0;
+
+        // 2 unitigs over a 1,000 base reference: a third of a percent of the guard, even
+        // though those 2 unitigs are a third of the whole graph.
+        assert!(!exceeds_guard(&cfg, &nodes, 1_000));
+        // The same 2 unitigs against a 1-base reference are 2.0 per base, still under.
+        assert!(!exceeds_guard(&cfg, &nodes, 1));
+        // Strictly above the guard trips it; exactly at it does not.
+        cfg.subgraph_nodes_per_base_guard = 2.0;
+        assert!(!exceeds_guard(&cfg, &nodes, 1));
+        cfg.subgraph_nodes_per_base_guard = 1.9;
+        assert!(exceeds_guard(&cfg, &nodes, 1));
+    }
+
+    /// A query length of zero would otherwise divide by zero and flag every accession.
+    #[test]
+    fn an_empty_reference_does_not_trip_the_guard() {
+        let g = chain();
+        let nodes = expand(&cfg_hops(1), &g, &anchors(&[0], 6)).unwrap();
+        assert_eq!(nodes_per_ref_base(&nodes, 0), 0.0);
+        assert!(!exceeds_guard(&cfg_hops(1), &nodes, 0));
+    }
 }
 
 /// Cross-validation against the anchor-recall study's recorded subgraph sizes.
@@ -584,10 +615,20 @@ mod recall_study_subgraphs {
     }
 }
 
-/// True when the local neighbourhood covers so much of the graph that the eventual haplotype
-/// is likely under-determined. See `Config::subgraph_fraction_guard` for the calibration.
-pub fn exceeds_guard(cfg: &Config, graph: &UnitigGraph, nodes: &[UnitigId]) -> bool {
-    subgraph_fraction(graph, nodes) > cfg.subgraph_fraction_guard
+/// Unitigs in the neighbourhood per base of the reference. The measure the guard is calibrated
+/// on; see `Config::subgraph_nodes_per_base_guard`.
+pub fn nodes_per_ref_base(nodes: &[UnitigId], ref_len: usize) -> f64 {
+    if ref_len == 0 {
+        0.0
+    } else {
+        nodes.len() as f64 / ref_len as f64
+    }
+}
+
+/// True when the local neighbourhood is tangled enough around the gene that the eventual
+/// haplotype is likely under-determined. See `Config::subgraph_nodes_per_base_guard`.
+pub fn exceeds_guard(cfg: &Config, nodes: &[UnitigId], ref_len: usize) -> bool {
+    nodes_per_ref_base(nodes, ref_len) > cfg.subgraph_nodes_per_base_guard
 }
 
 /// Validation of the 2-bit sequence store against the original text.

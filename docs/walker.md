@@ -118,8 +118,14 @@ The summary JSON starts with what produced it: `logan_walker` and `graphaligner`
 accessions are processed or what they produce). Each accession then records two decisions that
 earlier versions only printed:
 
-- `subgraph_fraction` is the extracted neighbourhood's share of the graph's unitigs, and
-  `provisional` is true when it is above the guard (1%), the condition the walker warns about.
+- `subgraph_fraction` is the extracted neighbourhood's share of the graph's unitigs, reported
+  for information. `provisional` is true when the neighbourhood holds more than 3 unitigs per
+  reference base, the condition the walker warns about: that is how tangled the graph is around
+  the gene, which is what makes a walk ambiguous. Through 0.1.1-dev the guard was
+  `subgraph_fraction` above 1% instead, which only separates anything when the target is a
+  sliver of the sample. On targeted libraries the target is most of the graph, and on the
+  20,000-accession SARS-CoV-2 run that guard flagged 9,440 of 9,448 successes while the 8 it
+  cleared were no better.
 - `prune` is how the pruning pass ended (`null` when it did not run): `outcome` is `applied`,
   `nothing_to_remove`, `would_empty`, `refused_shorter_span` or `refused_no_haplotype`, with the
   gene's depth, the floor, the unitigs kept, and the reference span of each alignment.
@@ -195,7 +201,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `--graphaligner <PATH>` | `GraphAligner` on `PATH` | the GraphAligner executable |
 | `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover |
 | `--primary-metric <M>` | `matched` | multi-anchor primary selection: `matched`, `cov`, `pident` or `cov_x_pident` |
-| `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables. The re-aligned result is kept only if it spans as much of the reference as the first |
+| `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables. The re-aligned result is kept only if it spans as much of the reference as the first, give or take 3 bases: a strict rule refused a prune over one terminal base |
 | `--no-prefer-majority` | | keep the reference-matching allele on the primary at two-allele sites |
 
 ### Intra-host variants

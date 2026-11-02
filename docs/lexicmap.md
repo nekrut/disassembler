@@ -47,13 +47,17 @@ as `qcovHSP >= 80%`, even though together they cover all of it.
    |---|---|---|
    | 1 | `CLEAN_FULL_LENGTH` | coverage at least `--min-cov` (100% under `--require-full-length`), at most `--max-internal-stops` premature stops, no frameshift |
    | 2 | `CLEAN_PARTIAL` | coverage at least `--min-cov-partial`, same stop and frameshift rules |
-   | 5 | `FLAGGED_FRAMESHIFT` | a frameshift (out of frame for 30 or more bases); the indels are listed in the `indels` column |
-   | 3 | `FLAGGED_PREMATURE_STOPS` | more than `--max-internal-stops` premature stops, with their codon positions |
    | 4 | `LOW_COVERAGE_FRAGMENT` | coverage below `--min-cov-partial` |
+   | 5 | `FLAGGED_FRAMESHIFT` | covered, but out of frame for 30 or more bases; the indels are listed in the `indels` column |
+   | 3 | `FLAGGED_PREMATURE_STOPS` | covered and in frame, but more than `--max-internal-stops` premature stops, with their codon positions |
 
-   The rules are applied in that order, so an accession with a frameshift is filed under it
-   whatever its coverage. `--allow-frameshift-alts` waives the frameshift rule; the stop rule
-   still applies. Frameshifts are common in practice and mostly not biology: hits from
+   The rules are applied in that order, so coverage decides first: an accession with too little
+   of the gene tiled is a fragment whatever its frame and stop codons look like, and the two
+   flagged tiers mean "covered well enough to judge, and broken". Through 0.1.1-dev the frame
+   and stop rules came first, which made both flagged tiers mostly fragments: on the
+   SARS-CoV-2 strict pass, 61,897 of the 64,034 accessions reported as frameshifted were
+   fragments at a median coverage of 0.18, where a real shift cannot be told from a gap in the
+   tiling. `--allow-frameshift-alts` waives the frameshift rule; the stop rule still applies. Frameshifts are common in practice and mostly not biology: hits from
    divergent relatives, 1-nt deletions in homopolymers in Nanopore and PacBio runs, and, more
    rarely, real frameshift alleles. `flagged.tsv` lists them with their positions. The frame is
    judged against the reference, so a reference that is itself a pseudogene makes every intact

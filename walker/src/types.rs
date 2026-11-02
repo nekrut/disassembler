@@ -481,8 +481,9 @@ pub struct AccessionResult {
     /// Share of the graph's unitigs in the extracted neighbourhood
     /// (`extract::subgraph_fraction`). `None` when nothing was extracted.
     pub subgraph_fraction: Option<f64>,
-    /// `subgraph_fraction` is above `Config::subgraph_fraction_guard`. Until 0.1.1 this was
-    /// only a warning on stderr, which nothing downstream of a large run reads.
+    /// The neighbourhood holds more unitigs per reference base than
+    /// `Config::subgraph_nodes_per_base_guard`. Until 0.1.1 this was only a warning on stderr,
+    /// which nothing downstream of a large run reads.
     pub provisional: bool,
     /// What the depth-based prune did. `None` when it did not run: `--prune-frac 0`, or no
     /// first-pass haplotype to measure the depth on. Until 0.1.1 this too was stderr only.

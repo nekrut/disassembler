@@ -77,7 +77,8 @@ TUNING:
         --prune-frac <F>          Drop unitigs below this fraction of the gene's depth and
                                   realign, removing the aligner's reference bias. The
                                   realignment is kept only if it spans as much of the
-                                  reference. 0.0 disables it [default: 0.01]
+                                  reference, give or take a terminal codon. 0.0 disables it
+                                  [default: 0.01]
         --alt-max-detour <N>      Unitigs an alternative allele may traverse before it must
                                   rejoin the main route [default: 100]
     -t, --threads <N>             Threads per GraphAligner invocation, at least 1 [default: 1;
@@ -388,10 +389,10 @@ fn decision_lines(results: &[types::AccessionResult], guard: f64) -> Vec<String>
     let provisional = results.iter().filter(|r| r.provisional).count();
     if provisional > 0 {
         lines.push(format!(
-            "[logan-walker] {provisional} of {} results provisional: neighbourhood above {:.2}% \
-             of the graph",
+            "[logan-walker] {provisional} of {} results provisional: neighbourhood above {:.1} \
+             unitigs per reference base",
             results.len(),
-            guard * 100.0
+            guard
         ));
     }
     lines
@@ -583,7 +584,7 @@ fn real_main(mut args: Args) -> error::Result<()> {
         "[logan-walker] {}/{} accessions reconstructed",
         summary.success, summary.total
     );
-    for line in decision_lines(&summary.results, args.cfg.subgraph_fraction_guard) {
+    for line in decision_lines(&summary.results, args.cfg.subgraph_nodes_per_base_guard) {
         println!("{line}");
     }
 
@@ -626,9 +627,10 @@ mod tests {
         r[1].prune = prune(PruneResult::Applied);
         r[2].prune = prune(PruneResult::RefusedShorterSpan);
         r[1].provisional = true;
-        assert_eq!(decision_lines(&r, 0.01), vec![
+        assert_eq!(decision_lines(&r, 3.0), vec![
             "[logan-walker] prune: 2 applied, 1 refused (realignment spans less of the reference)",
-            "[logan-walker] 1 of 4 results provisional: neighbourhood above 1.00% of the graph",
+            "[logan-walker] 1 of 4 results provisional: neighbourhood above 3.0 unitigs per \
+reference base",
         ]);
         assert!(decision_lines(&run_of(&[Outcome::NoAnchors]), 0.01).is_empty());
     }

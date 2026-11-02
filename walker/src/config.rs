@@ -276,15 +276,27 @@ pub struct Config {
     /// longest consecutive run: the two agree in 22 of 24 measured cells, because a unitig is
     /// contiguous, and the plain count needs one counter instead of three.
     pub min_shared_kmers: u32,
-    /// If the 5-hop neighbourhood exceeds this fraction of the whole graph, the haplotype is
-    /// likely under-determined and the result should not be trusted without review.
+    /// If the 5-hop neighbourhood holds more than this many unitigs per reference base, the
+    /// haplotype is likely under-determined and the result should not be trusted without
+    /// review. Checked after `extract::expand`, not on anchor counts.
     ///
-    /// Checked after `extract::expand`, not on anchor counts. Measured across 10 accessions
-    /// at the default `min_shared_kmers`: every accession whose k-mer reconstruction matched
-    /// BLAST sat at or below **0.033%**, while the single discordant one (`SRR8209082`) sat
-    /// at **10.383%**. A 315x gap with nothing in between, so 1% has an order of magnitude
-    /// of margin on both sides.
-    pub subgraph_fraction_guard: f64,
+    /// Through 0.1.1-dev this was a share of the whole graph (`subgraph_fraction`) at 1%,
+    /// calibrated on 10 accessions where every concordant one sat at or below 0.033% and the
+    /// single discordant one at 10.383%. That calibration only holds when the target is a
+    /// sliver of the sample: on targeted or amplicon data the target *is* most of the graph,
+    /// so the share says more about the library than the haplotype. Measured on the
+    /// 20,000-accession SARS-CoV-2 run, it flagged 9,440 of the 9,448 successes, and the 8 it
+    /// cleared had a *lower* complete-ORF rate (50.0%) than the ones it flagged (67.0%): no
+    /// signal at all, in the wrong direction.
+    ///
+    /// Unitigs per reference base measures how tangled the graph is around the gene, which is
+    /// the thing that actually makes a walk ambiguous, and it does not move with the library's
+    /// breadth. On the same run, successes below 3 were 89.7% complete-ORF against 51.3% above,
+    /// and the cohorts where the walk is easy sit far below the cut (obelisk epsilon's median
+    /// is 0.3) rather than all being flagged.
+    ///
+    /// `subgraph_fraction` is still reported per result; it is a useful number, just not a gate.
+    pub subgraph_nodes_per_base_guard: f64,
 
     // ---- concurrency ----
     /// Threads streaming from S3. Bandwidth saturates around 8 streams at 17.4 MB/s aggregate,
@@ -454,7 +466,7 @@ impl Default for Config {
             max_alts: 32,
             alt_max_detour: 100,
             min_shared_kmers: 3,
-            subgraph_fraction_guard: 0.01,
+            subgraph_nodes_per_base_guard: 3.0,
             fetch_workers: 8,
             compute_workers: 8,
             channel_capacity: 4,

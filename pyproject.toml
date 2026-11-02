@@ -7,12 +7,22 @@ name = "disassembler"
 dynamic = ["version"]
 description = "Reconstruct coding haplotypes from planetary sequence indexes (Logan kmindex / LexicMap)."
 requires-python = ">=3.11"
+# Runtime imports only: biopython in cmd/msa.py, requests in cmd/harvest.py. Everything else
+# the pipeline needs is an external binary (logan-walker, the sieve, MAFFT, FastTree), which
+# the Bioconda recipe depends on and `resolve.py` finds on PATH. zstandard, numpy and pandas
+# were listed here through 0.1.0 and are not imported by the package: numpy and pandas belong
+# to the benchmark scripts (the `bench` extra below), and nothing imports zstandard at all.
 dependencies = [
     "biopython",
     "requests",
-    "zstandard",
+]
+
+[project.optional-dependencies]
+# bench/simulated_kmer_sensitivity/ only; not needed to run any subcommand.
+bench = [
     "numpy",
     "pandas",
+    "matplotlib",
 ]
 
 [project.scripts]

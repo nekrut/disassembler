@@ -748,5 +748,61 @@ class TestGalaxyApiKeyOrder(unittest.TestCase):
                     os.environ["GALAXY_API_KEY"] = old
 
 
+class TestCoverageTakesPrecedence(unittest.TestCase):
+    """A fragment is reported as a fragment, whatever its frame and stop codons say.
+
+    Through 0.1.1-dev the frame and stop rules were checked before coverage, so an accession
+    with almost none of the gene tiled still came out FLAGGED_FRAMESHIFT or
+    FLAGGED_PREMATURE_STOPS. On the SARS-CoV-2 strict pass that was 61,897 of 64,034
+    "frameshifts", at a median coverage of 0.18, which is far too little of a gene to tell a
+    real shift from a gap in the tiling.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.dir_path = Path(self.test_dir.name)
+        self.ref = self.dir_path / "cds60.fasta"
+        self.ref.write_text(f">cds60\n{CDS60}\n")
+
+    def tearDown(self):
+        self.test_dir.cleanup()
+
+    def _status(self, name, qstart, qend, qseq, sseq):
+        """One HSP covering reference bases qstart..qend (1-based, inclusive)."""
+        tsv = self.dir_path / f"{name}.tsv"
+        tsv.write_text(
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            f"SRR1\t98.0\t{100.0 * (qend - qstart + 1) / len(CDS60):.1f}\t{qstart}\t{qend}\t{qseq}\t{sseq}\n")
+        prefix = str(self.dir_path / name)
+        lms.stream_lexicmap_to_msa(ref_path=str(self.ref), file_path=str(tsv), out_prefix=prefix)
+        with open(f"{prefix}.cohort_ledger.tsv") as fh:
+            header = fh.readline().rstrip("\n").split("\t")
+            row = dict(zip(header, fh.readline().rstrip("\n").split("\t")))
+        return row["status"]
+
+    def test_a_fragment_with_a_frameshift_is_a_fragment(self):
+        # 20 of 60 bases tiled (0.33, under the 0.50 partial floor) with a 1-nt insertion.
+        frag = CDS60[:20]
+        qseq = frag[:10] + "-" + frag[10:]
+        sseq = frag[:10] + "G" + frag[10:]
+        self.assertEqual(self._status("frag_shift", 1, 20, qseq, sseq), "LOW_COVERAGE_FRAGMENT")
+
+    def test_a_fragment_with_a_premature_stop_is_a_fragment(self):
+        # Same 20 bases, with codon 3 (0-based 6..8) turned into TAA.
+        frag = CDS60[:20]
+        self.assertEqual(self._status("frag_stop", 1, 20, frag, frag[:6] + "TAA" + frag[9:]),
+                         "LOW_COVERAGE_FRAGMENT")
+
+    def test_a_well_covered_frameshift_still_flags(self):
+        # The control: the same insertion over the whole gene is a frameshift, not a fragment.
+        qseq, sseq = _ins(10, "G")
+        self.assertEqual(self._status("full_shift", 1, 60, qseq, sseq), "FLAGGED_FRAMESHIFT")
+
+    def test_a_well_covered_premature_stop_still_flags(self):
+        self.assertEqual(
+            self._status("full_stop", 1, 60, CDS60, CDS60[:6] + "TAA" + CDS60[9:]),
+            "FLAGGED_PREMATURE_STOPS")
+
+
 if __name__ == "__main__":
     unittest.main()

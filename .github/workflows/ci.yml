@@ -36,8 +36,15 @@ jobs:
         run: cargo test --release
 
   python-tests:
-    name: python tests
+    name: python tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The package is noarch and declares requires-python >=3.11, so every version it
+        # claims gets tested. Only an environment that must also hold GraphAligner 1.0.17b
+        # is capped at 3.12, and nothing in this job needs it.
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v5
         with:
@@ -45,25 +52,47 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       - name: Install disassembler (editable)
         run: pip install -e .
-      - name: Run lexicmap tests
-        run: python3 tests/test_lexicmap.py
-      - name: Run harvest tests
-        run: python3 tests/test_harvest.py
-      - name: Run stratify tests
-        run: python3 tests/test_stratify.py
-      - name: Run msa tests
-        run: python3 tests/test_msa.py
-      - name: Composite smoke tests
-        run: python3 tests/test_composites.py
-      # Both sieve tests build extern/kmer-diversity-sieve themselves (cc only) and skip
-      # cleanly if the submodule or a compiler is missing.
+      # Discovery, not a hand-kept list of files: test_cli.py and
+      # test_dedup_sieve_equivalence.py sat in the tree unrun because nobody added a step for
+      # them. test_sieve_integration.py is picked up here too; it builds
+      # extern/kmer-diversity-sieve itself (cc only) and skips cleanly without the submodule.
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t tests -v
+      # Bash, so not discoverable; also builds the sieve itself.
       - name: Sieve binary concordance
         run: bash tests/test_sieve.sh
-      - name: Sieve pipeline integration
-        run: python3 tests/test_sieve_integration.py
+
+  real-tools:
+    name: msa against real mafft and fasttree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install MAFFT and FastTree
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-name: tools
+          create-args: >-
+            -c conda-forge -c bioconda python=3.12 pip mafft=7.526 fasttree=2.2.0
+      - name: Install disassembler (editable)
+        shell: bash -el {0}
+        run: pip install -e .
+      # test_msa.py stubs both tools out, which is what makes its gate checks deterministic
+      # but also means no job ever runs the real MAFFT command line. This one does. It skips
+      # itself when the tools are missing, and a skip here would be a green job that checked
+      # nothing, so a skip fails the step.
+      - name: Real-tool MSA test
+        shell: bash -el {0}
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -t tests -p 'test_msa_real_tools.py' -v \
+            2>&1 | tee "$RUNNER_TEMP/real_tools.log"
+          if grep -q "skipped" "$RUNNER_TEMP/real_tools.log"; then
+            echo "the real-tool MSA test skipped itself; mafft/fasttree were not found" >&2
+            exit 1
+          fi
 
   golden:
     name: golden concordance and data-backed tests (manual)
