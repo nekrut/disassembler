@@ -1,0 +1,142 @@
+diff --git a/walker/src/stages/align.rs b/walker/src/stages/align.rs
+--- a/walker/src/stages/align.rs
++++ b/walker/src/stages/align.rs
+@@ -626,7 +626,7 @@
+         let cfg = Config { graphaligner_threads: 2, ..Config::default() };
+         let sub = Subgraph {
+             accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGT".to_vec()],
+-            gfa_path: "/tmp/nonexistent-logan-test/ACC.sub.gfa".into(), n_edges: 0,
++            gfa_path: "/tmp/nonexistent-logan-test/ACC.sub.gfa".into(), n_edges: 0, owns_gfa: false,
+         };
+         let cmd = command(Path::new("/usr/bin/GraphAligner"), &cfg, &sub,
+                           Path::new("/tmp/q.fasta"), Path::new("/tmp/out.gaf"));
+@@ -638,7 +638,6 @@
+             "-x", "dbg",
+             "-t", "2",
+         ]);
+-        std::mem::forget(sub); // avoid Drop trying to unlink a path that was never created
+     }
+ 
+     /// GraphAligner picks its parser from the file name, so the user's name for the query
+@@ -674,7 +673,7 @@
+         std::fs::write(&gfa, b"H\tVN:Z:1.0\nS\t1\tACGTACGTAAAA\n").unwrap();
+         let sub = Subgraph {
+             accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGTACGTAAAA".to_vec()],
+-            gfa_path: gfa, n_edges: 0,
++            gfa_path: gfa, n_edges: 0, owns_gfa: true,
+         };
+         let q = Query {
+             name: "dataset_1234".into(), record_id: "pol".into(), seq: b"ACGTACGTAAAA".to_vec(),
+@@ -792,7 +791,7 @@
+         std::fs::write(&gfa, b"H\tVN:Z:1.0\n").unwrap();
+         let sub = Subgraph {
+             accession: "EMPTY".into(), nodes: vec![], seqs: vec![],
+-            gfa_path: gfa.clone(), n_edges: 0,
++            gfa_path: gfa.clone(), n_edges: 0, owns_gfa: true,
+         };
+         let q = Query {
+             name: "q".into(), record_id: "q".into(), seq: b"ACGTACGT".to_vec(),
+diff --git a/walker/src/stages/extract.rs b/walker/src/stages/extract.rs
+--- a/walker/src/stages/extract.rs
++++ b/walker/src/stages/extract.rs
+@@ -305,6 +305,7 @@
+         seqs,
+         gfa_path,
+         n_edges,
++        owns_gfa: true,
+     })
+ }
+ 
+@@ -882,13 +883,16 @@
+         let nodes = expand(&cfg, &graph, &a).unwrap();
+         let seqs = collect_seqs(&graph, &nodes).unwrap();
+         let sub = write_gfa(&cfg, &graph, nodes, seqs).unwrap();
++        // Drop would unlink the GFA this helper exists to emit; keep it under a stable name.
++        let stable = PathBuf::from(&outdir).join("subgraph.gfa");
++        std::fs::copy(&sub.gfa_path, &stable).unwrap();
+ 
+         // The exact anchor ids, so another implementation can be driven with the same input.
+         let list: Vec<String> = a.ids.iter().map(|i| i.to_string()).collect();
+         std::fs::write(format!("{outdir}/anchors.txt"), list.join("\n")).unwrap();
+         eprintln!(
+             "  wrote {} ({} nodes, {} edges) and {} anchors",
+-            sub.gfa_path.display(),
++            stable.display(),
+             sub.nodes.len(),
+             sub.n_edges,
+             a.ids.len()
+diff --git a/walker/src/stages/phase.rs b/walker/src/stages/phase.rs
+--- a/walker/src/stages/phase.rs
++++ b/walker/src/stages/phase.rs
+@@ -441,7 +441,7 @@
+         let g = build(">T_0 ka:f:9.0\nACGT\n");
+         let sub = Subgraph {
+             accession: "T".into(), nodes: vec![], seqs: vec![],
+-            gfa_path: PathBuf::from("/dev/null"), n_edges: 0,
++            gfa_path: PathBuf::from("/dev/null"), n_edges: 0, owns_gfa: false,
+         };
+         assert!(phase(&c, &g, &sub).unwrap().is_empty());
+     }
+diff --git a/walker/src/stages/stitch.rs b/walker/src/stages/stitch.rs
+--- a/walker/src/stages/stitch.rs
++++ b/walker/src/stages/stitch.rs
+@@ -252,9 +252,19 @@
+             // Points at nothing; Drop's remove_file is allowed to fail.
+             gfa_path: PathBuf::from("/tmp/logan-stitch-test-nonexistent.gfa"),
+             n_edges: 0,
++            owns_gfa: false,
+         };
+         s
+     }
++    #[test]
++    fn dropping_a_hand_built_subgraph_leaves_its_path_alone() {
++        let p = std::env::temp_dir().join(format!("logan-owns-gfa-{}.gfa", std::process::id()));
++        std::fs::write(&p, b"keep").unwrap();
++        drop(Subgraph { accession: "A".into(), nodes: vec![], seqs: vec![], gfa_path: p.clone(), n_edges: 0, owns_gfa: false });
++        assert!(p.exists());
++        drop(Subgraph { accession: "A".into(), nodes: vec![], seqs: vec![], gfa_path: p.clone(), n_edges: 0, owns_gfa: true });
++        assert!(!p.exists());
++    }
+     fn q(seq: &str) -> Query {
+         Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa"), n_records: 1 }
+     }
+diff --git a/walker/src/stages/variants.rs b/walker/src/stages/variants.rs
+--- a/walker/src/stages/variants.rs
++++ b/walker/src/stages/variants.rs
+@@ -720,6 +720,7 @@
+             seqs,
+             gfa_path: PathBuf::from("/tmp/logan-variants-test-nonexistent.gfa"),
+             n_edges: 0,
++            owns_gfa: false,
+         }
+     }
+     fn walked() -> GafPath {
+diff --git a/walker/src/types.rs b/walker/src/types.rs
+--- a/walker/src/types.rs
++++ b/walker/src/types.rs
+@@ -193,6 +193,16 @@
+     /// Where the GFA was written. Should live on `/dev/shm`; it is ~38 KB.
+     pub gfa_path: PathBuf,
+     pub n_edges: usize,
++    /// True only when `extract::write_gfa` created `gfa_path`; Drop unlinks only then.
++    pub owns_gfa: bool,
++}
++
++impl Subgraph {
++    /// Give up ownership of the GFA so Drop leaves it on disk; returns its path.
++    pub fn keep(mut self) -> PathBuf {
++        self.owns_gfa = false;
++        self.gfa_path.clone()
++    }
+ }
+ 
+ /// Remove the scratch GFA when the subgraph goes out of scope.
+@@ -205,7 +215,7 @@
+ impl Drop for Subgraph {
+     fn drop(&mut self) {
+         // Set LOGAN_KEEP_SCRATCH=1 to retain the GFA for debugging a specific accession.
+-        if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
++        if self.owns_gfa && std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
+             let _ = std::fs::remove_file(&self.gfa_path);
+         }
+     }

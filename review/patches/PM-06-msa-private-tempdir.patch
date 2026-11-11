@@ -1,0 +1,52 @@
+diff --git a/src/disassembler/cmd/msa.py b/src/disassembler/cmd/msa.py
+index 6d19ea4f357a..000000000000 100644
+--- a/src/disassembler/cmd/msa.py
++++ b/src/disassembler/cmd/msa.py
+@@ -19,6 +19,7 @@
+ import statistics
+ import subprocess
+ import sys
++import tempfile
+ from pathlib import Path
+ 
+ from disassembler.textio import open_text
+@@ -226,12 +227,15 @@
+     # MAFFT reads both inputs from files beside the output. They are removed however this
+     # ends; they used to be removed only on the normal path, so an exception or a Ctrl-C
+     # during MAFFT left them behind.
+-    clean_input_p = out_aln.parent / f".tmp_{in_p.name}.{os.getpid()}"
+-    clean_ref_p = out_aln.parent / f".tmp_ref_{ref_p.name}.{os.getpid()}"
++    # One private directory with fixed names: names derived from the user's file names
++    # collided (same basename for --input and --out-aln, or an input named ref_<ref>).
++    tmp_dir = Path(tempfile.mkdtemp(prefix=".tmp_msa_", dir=out_aln.parent))
++    clean_input_p = tmp_dir / "input.fasta"
++    clean_ref_p = tmp_dir / "reference.fasta"
+     # Same temp-then-rename as the tree below: opening out_aln directly truncated it
+     # before MAFFT ran, so a MAFFT failure replaced a previously good alignment with
+     # an empty file.
+-    tmp_aln = out_aln.with_name(f".tmp_{out_aln.name}.{os.getpid()}")
++    tmp_aln = tmp_dir / "aligned.fasta"
+     try:
+         retained = flipped = unoriented = 0
+         with open(clean_input_p, "w") as fh:
+@@ -294,6 +298,10 @@
+ 
+         # Checked before the rename, so a failed check never replaces a good alignment.
+         aligned_recs = list(SeqIO.parse(tmp_aln, "fasta"))
++        if len(aligned_recs) != retained + 1 or aligned_recs[0].id != "Reference":
++            print(f"Error: MAFFT returned {len(aligned_recs)} records, expected the reference "
++                  f"plus {retained} sequences", file=sys.stderr)
++            return 1
+         print(f"[✓] MAFFT aligned {len(aligned_recs)} records. Validating codon lengths...")
+         for r in aligned_recs:
+             if len(r.seq) != ref_len:
+@@ -306,8 +314,7 @@
+             return 1
+         os.replace(tmp_aln, out_aln)
+     finally:
+-        for temp in (clean_input_p, clean_ref_p, tmp_aln):
+-            temp.unlink(missing_ok=True)
++        shutil.rmtree(tmp_dir, ignore_errors=True)
+ 
+     # Written to a temp and renamed on success: opening out_tree directly truncated it
+     # before FastTree ran, so a failure left a 0-byte .nwk that looks like a real output

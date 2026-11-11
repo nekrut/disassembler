@@ -1,0 +1,39 @@
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -427,6 +427,15 @@
+     Ok(())
+ }
+ 
++/// True when both paths name one existing file, through symlinks or hard links.
++fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
++    use std::os::unix::fs::MetadataExt;
++    match (std::fs::metadata(a), std::fs::metadata(b)) {
++        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
++        _ => false,
++    }
++}
++
+ fn real_main(mut args: Args) -> error::Result<()> {
+     // ---- validate offline / cache flag combinations -----------------------
+     if args.cfg.offline && args.cfg.unitigs_cache.is_none() {
+@@ -453,6 +462,19 @@
+         if args.query.is_empty() {
+             return Err(error::Error::Usage("--query is required".into()));
+         }
++        // The FASTA is written with File::create, which follows a symlink and truncates: an
++        // --out-fasta that is (or links to) a --query file destroyed the reference, even on
++        // a run that then failed. Checked before any download.
++        for q in &args.query {
++            if same_file(q, &args.out_fasta) {
++                return Err(error::Error::Usage(format!(
++                    "--out-fasta {} is the same file as --query {}; writing it would \
++                     overwrite the reference",
++                    args.out_fasta.display(),
++                    q.display()
++                )));
++            }
++        }
+         // Try the legacy single-file path first for its n_records semantics.
+         // If that file turns out to hold more than one record, re-load through
+         // read_query_set so the whole pool goes into anchor union / align fan-out.

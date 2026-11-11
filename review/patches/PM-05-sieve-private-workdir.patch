@@ -1,0 +1,63 @@
+diff --git a/src/disassembler/cmd/sieve.py b/src/disassembler/cmd/sieve.py
+index 54e68d33850f..000000000000 100644
+--- a/src/disassembler/cmd/sieve.py
++++ b/src/disassembler/cmd/sieve.py
+@@ -15,8 +15,10 @@
+ 
+ import argparse
+ import os
++import shutil
+ import subprocess
+ import sys
++import tempfile
+ from pathlib import Path
+ 
+ from disassembler.resolve import resolve_sieve
+@@ -176,18 +178,13 @@
+     output_fasta = Path(output_fasta)
+     output_fasta.parent.mkdir(parents=True, exist_ok=True)
+ 
+-    emit_prefix = output_fasta.with_suffix("")
+-
+-    def shards() -> list[Path]:
+-        return sorted(output_fasta.parent.glob(f"{emit_prefix.name}.rank*.fasta"))
+-
+-    # Clear any stale shards from a previous run so the concat glob can't pick them up.
+-    for stale in shards():
+-        stale.unlink()
+-
+-    # The binary runs on a deduplicated copy, written beside the output and removed after.
+-    deduped = output_fasta.with_name(f".tmp_{output_fasta.stem}.deduped.{os.getpid()}.fasta")
++    # The binary writes its result as <prefix>.rank<N>.fasta shards. It runs in a private
++    # directory beside the output, so no pattern built from the user's file name ever
++    # touches the output directory, and nothing but the output is left behind.
++    work = Path(tempfile.mkdtemp(prefix=".sieve_", dir=output_fasta.parent))
+     try:
++        deduped = work / "in.fasta"
++        emit_prefix = work / "promoted"
+         try:
+             n_in, n_unique = byte_exact_dedup(input_fasta, deduped)
+         except (OSError, ValueError) as e:
+@@ -221,15 +218,15 @@
+             print(f"sieve: kmer-diversity-sieve exited {rc}", file=sys.stderr)
+             return rc
+ 
+-        with output_fasta.open("w") as fh:
+-            for rf in shards():
++        shards = sorted(work.glob("promoted.rank*.fasta"),
++                        key=lambda p: int(p.name[len("promoted.rank"):-len(".fasta")]))
++        staged = work / "out.fasta"
++        with staged.open("w") as fh:
++            for rf in shards:
+                 fh.write(rf.read_text())
++        os.replace(staged, output_fasta)
+     finally:
+-        # The binary writes its result as <output>.rank*.fasta shards; the output is their
+-        # concatenation. The shards used to be left beside it, a second copy of every record.
+-        deduped.unlink(missing_ok=True)
+-        for rf in shards():
+-            rf.unlink(missing_ok=True)
++        shutil.rmtree(work, ignore_errors=True)
+ 
+     n_out = sum(1 for line in output_fasta.open() if line.startswith(">"))
+     print(f"[sieve] {n_in} -> {n_out} haplotypes "

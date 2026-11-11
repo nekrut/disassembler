@@ -1,0 +1,134 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -423,14 +423,6 @@
+     return Tiling(merged_seq, covered, mean_pid, single_ge_min_cov, single_full, indels)
+ 
+ 
+-def merge_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverage: float):
+-    """`tile_accession_hsps` without the indel record. Returns the row, the number of positions
+-    carrying a base (deletions not counted), the mean identity, and the two single-HSP flags."""
+-    t = tile_accession_hsps(hsps, ref_len, min_pident, min_coverage)
+-    based = sum(1 for c in t.seq if c != '-')
+-    return t.seq, based, t.mean_pident, t.single_ge_min_cov, t.single_full
+-
+-
+ def split_by_frame(indels: list) -> tuple:
+     """
+     Splits an accession's trusted indels by their effect on the reading frame.
+@@ -668,7 +660,6 @@
+     total_rows = 0
+     n_malformed = 0
+     n_other_query = 0
+-    n_qlen_mismatch = 0
+     total_accessions = 0
+     count_clean_full = 0
+     count_clean_partial = 0
+@@ -747,6 +738,11 @@
+         full_cov = 1.0 if full_length_only else min_coverage
+         stops_ok = n_stops <= max_internal_stops
+         frame_ok = not frameshifts or allow_frameshifts
++        def flag(label, extra=""):
++            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag={label}{extra}{indel_tag}\n{merged_seq}\n")
++            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\t{label}\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
++
++
+         if cov >= full_cov and stops_ok and frame_ok:
+             status = "CLEAN_FULL_LENGTH"
+             tier = 1
+@@ -786,25 +782,25 @@
+             status = "LOW_COVERAGE_FRAGMENT"
+             tier = 4
+             count_flagged_low_cov += 1
+-            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=LOW_COVERAGE{indel_tag}\n{merged_seq}\n")
+-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tLOW_COVERAGE\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
++            flag("LOW_COVERAGE")
+ 
+         elif not frame_ok:
+             status = "FLAGGED_FRAMESHIFT"
+             tier = 5
+             count_flagged_frameshift += 1
+-            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=FRAMESHIFT{indel_tag}\n{merged_seq}\n")
+-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tFRAMESHIFT\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
++            flag("FRAMESHIFT")
+ 
+         else:  # covered, in frame, so `stops_ok` is false by elimination
+             status = "FLAGGED_PREMATURE_STOPS"
+             tier = 3
+             count_flagged_stops += 1
+-            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=PREMATURE_STOPS stops={n_stops} codons={stop_str}{indel_tag}\n{merged_seq}\n")
+-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tPREMATURE_STOPS\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
++            flag("PREMATURE_STOPS", f" stops={n_stops} codons={stop_str}")
+ 
+         f_cohort_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\t{status}\t{tier}\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
+ 
++    max_needed = max(i for i in (idx_sgenome, idx_pident, idx_qcov, idx_qstart, idx_qend,
++                                 idx_qseq, idx_sseq, idx_query, idx_qlen) if i is not None)
++
+     try:
+         while True:
+             line = stream.readline()
+@@ -816,9 +812,7 @@
+ 
+             total_rows += 1
+             parts = line.split("\t")
+-            needed = [idx_sgenome, idx_pident, idx_qcov, idx_qstart, idx_qend, idx_qseq, idx_sseq]
+-            needed += [i for i in (idx_query, idx_qlen) if i is not None]
+-            if len(parts) <= max(needed):
++            if len(parts) <= max_needed:
+                 continue
+ 
+             # A LexicMap search against a multi-target panel emits rows for every target in
+@@ -838,15 +832,13 @@
+                 except ValueError:
+                     row_qlen = None
+                 if row_qlen is not None and row_qlen != ref_len:
+-                    n_qlen_mismatch += 1
+-                    if n_qlen_mismatch == 1:
+-                        raise ValueError(
+-                            f"reference length disagreement: the search reports qlen="
+-                            f"{row_qlen} for query '{parts[idx_query] if idx_query is not None else ref_name}', "
+-                            f"but {ref_path} is {ref_len} nt. Every HSP is projected onto a "
+-                            f"grid of the reference length, so this would mis-place all of "
+-                            f"them. Use the same reference FASTA the search used."
+-                        )
++                    raise ValueError(
++                        f"reference length disagreement: the search reports qlen="
++                        f"{row_qlen} for query '{parts[idx_query] if idx_query is not None else ref_name}', "
++                        f"but {ref_path} is {ref_len} nt. Every HSP is projected onto a "
++                        f"grid of the reference length, so this would mis-place all of "
++                        f"them. Use the same reference FASTA the search used."
++                    )
+ 
+             acc = parts[idx_sgenome]
+             # Bare float()/int() here aborted the whole stream on one bad field, AFTER the
+diff --git a/tests/test_lexicmap.py b/tests/test_lexicmap.py
+index 8a1ec9c321c1..000000000000 100644
+--- a/tests/test_lexicmap.py
++++ b/tests/test_lexicmap.py
+@@ -50,9 +50,9 @@
+         hsp1 = (100.0, 50.0, 1, 6, "ATGGCT", "ATGGCT")
+         hsp2 = (90.0, 66.7, 5, 12, "CTGAATAA", "TTGAATAA")
+ 
+-        merged, cov_bases, mean_pid, single_ge_cov, single_full = lms.merge_accession_hsps(
+-            [hsp1, hsp2], ref_len=12, min_pident=60.0, min_coverage=0.80
+-        )
++        t = lms.tile_accession_hsps([hsp1, hsp2], ref_len=12, min_pident=60.0, min_coverage=0.80)
++        merged, mean_pid, single_ge_cov, single_full = t.seq, t.mean_pident, t.single_ge_min_cov, t.single_full
++        cov_bases = sum(c != "-" for c in merged)
+ 
+         self.assertEqual(merged, "ATGGCTGAATAA")
+         self.assertEqual(cov_bases, 12)
+@@ -145,9 +145,10 @@
+                 self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 1)
+ 
+     def test_mean_pident_excludes_gap_positions(self):
+-        merged, cov_bases, mean_pid, _, _ = lms.merge_accession_hsps(
++        t = lms.tile_accession_hsps(
+             [(90.0, 100.0, 1, 6, "ATGGCT", "AT-GCT")], ref_len=6, min_pident=60.0, min_coverage=0.80
+         )
++        cov_bases, mean_pid = sum(c != "-" for c in t.seq), t.mean_pident
+         self.assertEqual(cov_bases, 5)
+         self.assertLessEqual(mean_pid, 100.0)
+         self.assertAlmostEqual(mean_pid, 90.0)

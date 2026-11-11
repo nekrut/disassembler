@@ -1,0 +1,228 @@
+diff --git a/src/disassembler/cmd/pipe_reconstruct.py b/src/disassembler/cmd/pipe_reconstruct.py
+index ec0cd7c15617..000000000000 100644
+--- a/src/disassembler/cmd/pipe_reconstruct.py
++++ b/src/disassembler/cmd/pipe_reconstruct.py
+@@ -13,7 +13,7 @@
+ from disassembler.cmd import msa as msa_cmd
+ from disassembler.cmd import sieve as sieve_cmd
+ from disassembler.cmd import walker as walker_cmd
+-from disassembler.resolve import resolve_sieve, resolve_walker
++from disassembler.resolve import resolve_sieve, resolve_walker, walker_version_problem
+ from disassembler.stage import stage_args
+ from disassembler.validators import (
+     fasta_has_record,
+@@ -317,11 +317,15 @@
+     if scrub_err:
+         return _die(scrub_err)
+ 
+-    if not resolve_walker(args.walker_bin):
++    walker_path = resolve_walker(args.walker_bin)
++    if not walker_path:
+         return _die(
+             f"logan-walker not found. Build it (`cd walker && cargo build --release`), "
+             f"put it on PATH, or pass --walker-bin."
+         )
++    walker_problem = walker_version_problem(walker_path)
++    if walker_problem:
++        return _die(walker_problem)
+ 
+     _warn_inert_knobs(args)
+ 
+diff --git a/src/disassembler/cmd/walker.py b/src/disassembler/cmd/walker.py
+index e7747339f568..000000000000 100644
+--- a/src/disassembler/cmd/walker.py
++++ b/src/disassembler/cmd/walker.py
+@@ -26,7 +26,7 @@
+ import subprocess
+ import sys
+ 
+-from disassembler.resolve import resolve_walker
++from disassembler.resolve import resolve_walker, walker_version_problem
+ 
+ 
+ def add_parser(subparsers: argparse._SubParsersAction) -> None:
+@@ -45,7 +45,8 @@
+     p.set_defaults(func=run)
+ 
+ 
+-def _resolved_or_report(walker_bin: str | None) -> str | None:
++def _resolved_or_report(walker_bin: str | None) -> tuple[str | None, int]:
++    """(path, 0), or (None, exit status) after printing why."""
+     resolved = resolve_walker(walker_bin)
+     if not resolved:
+         print(
+@@ -55,7 +56,12 @@
+             "$DISASSEMBLER_WALKER_BIN, PATH, walker/target/release/logan-walker.",
+             file=sys.stderr,
+         )
+-    return resolved
++        return None, 127
++    problem = walker_version_problem(resolved)
++    if problem:
++        print(f"walker: {problem}", file=sys.stderr)
++        return None, 2
++    return resolved, 0
+ 
+ 
+ def run_walker(argv: list[str], walker_bin: str | None = None) -> int:
+@@ -65,9 +71,9 @@
+     `walker` subcommand execv's instead (see `run`) so signals reach the caller
+     unmodified.
+     """
+-    resolved = _resolved_or_report(walker_bin)
++    resolved, rc = _resolved_or_report(walker_bin)
+     if not resolved:
+-        return 127
++        return rc
+     return subprocess.run([resolved, *argv]).returncode
+ 
+ 
+@@ -82,9 +88,9 @@
+         walker_bin = argv[i + 1]
+         del argv[i:i + 2]
+ 
+-    resolved = _resolved_or_report(walker_bin)
++    resolved, rc = _resolved_or_report(walker_bin)
+     if not resolved:
+-        return 127
++        return rc
+ 
+     # execvp when possible so signals and exit codes reach the caller unmodified.
+     if os.name == "posix":
+diff --git a/src/disassembler/resolve.py b/src/disassembler/resolve.py
+index a6917b60d3f0..000000000000 100644
+--- a/src/disassembler/resolve.py
++++ b/src/disassembler/resolve.py
+@@ -20,7 +20,9 @@
+ from __future__ import annotations
+ 
+ import os
++import re
+ import shutil
++import subprocess
+ from pathlib import Path
+ 
+ 
+@@ -52,6 +54,40 @@
+     )
+ 
+ 
++# The walker versions this disassembler release works with: the same range as the recipe's
++# `logan-walker >=0.1.1,<0.2`. Raise the floor with every walker release that ships with it.
++WALKER_MIN = (0, 1, 1)
++WALKER_BELOW = (0, 2, 0)
++
++
++def walker_version(path: str) -> tuple[int, int, int] | None:
++    """`logan-walker --version` as a tuple, or None if it does not answer like the walker."""
++    try:
++        out = subprocess.run([path, "--version"], capture_output=True, text=True,
++                             timeout=30).stdout
++    except (OSError, subprocess.SubprocessError):
++        return None
++    m = re.search(r"\blogan-walker (\d+)\.(\d+)\.(\d+)", out)
++    return tuple(int(x) for x in m.groups()) if m else None
++
++
++def walker_version_problem(path: str) -> str | None:
++    """A message if `path` is a logan-walker outside the supported range, else None.
++
++    A binary that does not report a version (a test stub, a wrapper script) is let through.
++    """
++    if os.environ.get("DISASSEMBLER_ANY_WALKER"):
++        return None
++    v = walker_version(path)
++    if v is None or WALKER_MIN <= v < WALKER_BELOW:
++        return None
++    from disassembler import __version__
++    fmt = lambda t: ".".join(map(str, t))  # noqa: E731
++    return (f"{path} is logan-walker {fmt(v)}; disassembler {__version__} needs "
++            f"logan-walker >={fmt(WALKER_MIN)},<{fmt(WALKER_BELOW[:2])}. Update it, pass "
++            f"--walker-bin, or set DISASSEMBLER_ANY_WALKER=1 to run it anyway.")
++
++
+ def resolve_sieve(explicit: str | None = None) -> str | None:
+     """Locate `l1_pipeline_serial`. See module docstring for resolution order."""
+     return (
+diff --git a/tests/test_walker_version.py b/tests/test_walker_version.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_walker_version.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""The walker passthrough and the composites refuse a logan-walker outside the supported range."""
++
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++
++def _fake(dirpath: Path, version_line: str) -> Path:
++    exe = dirpath / "logan-walker"
++    exe.write_text("#!/usr/bin/env bash\n"
++                   f'[ "$1" = --version ] && {{ echo "{version_line}"; exit 0; }}\n'
++                   'echo ran "$@"\n')
++    exe.chmod(0o755)
++    return exe
++
++
++def _cli(*argv, env=None):
++    return subprocess.run([sys.executable, "-m", "disassembler", *argv],
++                          capture_output=True, text=True, env=env)
++
++
++class TestWalkerVersionGuard(unittest.TestCase):
++    def setUp(self):
++        self.work = Path(tempfile.mkdtemp())
++        self.env = {k: v for k, v in os.environ.items() if k != "DISASSEMBLER_ANY_WALKER"}
++
++    def tearDown(self):
++        shutil.rmtree(self.work, ignore_errors=True)
++
++    def test_an_older_walker_is_refused(self):
++        w = _fake(self.work, "logan-walker 0.1.0")
++        r = _cli("walker", "--walker-bin", str(w), "--version", env=self.env)
++        self.assertEqual(r.returncode, 2)
++        self.assertIn("needs logan-walker >=0.1.1,<0.2", r.stderr)
++        self.assertEqual(r.stdout, "")
++
++    def test_a_next_minor_walker_is_refused(self):
++        w = _fake(self.work, "logan-walker 0.2.0")
++        self.assertEqual(_cli("walker", "--walker-bin", str(w), "-a", "X",
++                              env=self.env).returncode, 2)
++
++    def test_a_supported_walker_runs(self):
++        for v in ("0.1.1", "0.1.7"):
++            w = _fake(self.work, f"logan-walker {v}")
++            r = _cli("walker", "--walker-bin", str(w), "-a", "X", env=self.env)
++            self.assertEqual((r.returncode, r.stdout.strip()), (0, "ran -a X"))
++
++    def test_a_binary_without_a_version_is_let_through(self):
++        w = _fake(self.work, "something else")
++        self.assertEqual(_cli("walker", "--walker-bin", str(w), "-a", "X",
++                              env=self.env).returncode, 0)
++
++    def test_the_override_lets_an_old_walker_run(self):
++        w = _fake(self.work, "logan-walker 0.1.0")
++        env = dict(self.env, DISASSEMBLER_ANY_WALKER="1")
++        self.assertEqual(_cli("walker", "--walker-bin", str(w), "-a", "X",
++                              env=env).returncode, 0)
++
++    def test_reconstruct_refuses_an_old_walker_before_any_stage(self):
++        w = _fake(self.work, "logan-walker 0.1.0")
++        ref = self.work / "gene.fa"
++        ref.write_text(">gene\nATGAAATAA\n")
++        out = self.work / "out"
++        r = _cli("reconstruct", "-q", str(ref), "-a", "SRR1", "-o", str(out), "--skip-tree",
++                 "--walker-bin", str(w), env=self.env)
++        self.assertEqual(r.returncode, 1, r.stderr)
++        self.assertIn("is logan-walker 0.1.0", r.stderr)
++        self.assertNotIn("1/2 walker", r.stdout)
++
++
++if __name__ == "__main__":
++    unittest.main()

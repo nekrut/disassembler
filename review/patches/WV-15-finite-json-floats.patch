@@ -1,0 +1,97 @@
+diff --git a/walker/src/io/output.rs b/walker/src/io/output.rs
+--- a/walker/src/io/output.rs
++++ b/walker/src/io/output.rs
+@@ -38,6 +38,11 @@
+ 
+ /// Minimal JSON string escaping. Accessions and ids are alphanumeric in practice, but an
+ /// error message can contain anything.
++/// A float as a JSON number, or `null` when it is not finite (JSON has no inf/NaN).
++fn json_f64<T: std::fmt::Debug + Copy + Into<f64>>(v: T) -> String {
++    if v.into().is_finite() { format!("{v:?}") } else { "null".to_string() }
++}
++
+ fn esc(s: &str) -> String {
+     let mut out = String::with_capacity(s.len() + 8);
+     for c in s.chars() {
+@@ -218,15 +223,15 @@
+         ("graph_k", c.graph_k.to_string()),
+         ("min_shared_kmers", c.min_shared_kmers.to_string()),
+         ("hops", c.hops.to_string()),
+-        ("subgraph_nodes_per_base_guard", format!("{:?}", c.subgraph_nodes_per_base_guard)),
++        ("subgraph_nodes_per_base_guard", json_f64(c.subgraph_nodes_per_base_guard)),
+         ("max_size_mb", (c.max_compressed_bytes / (1024 * 1024)).to_string()),
+-        ("min_cov", format!("{:?}", c.min_cov)),
++        ("min_cov", json_f64(c.min_cov)),
+         ("primary_metric", format!("\"{}\"", c.primary_metric.as_str())),
+-        ("prune_frac", format!("{:?}", c.prune_frac)),
++        ("prune_frac", json_f64(c.prune_frac)),
+         ("prefer_majority", c.prefer_majority.to_string()),
+-        ("min_abund", format!("{:?}", c.min_abund)),
+-        ("min_abund_frac", format!("{:?}", c.min_abund_frac)),
+-        ("min_vaf", format!("{:?}", c.min_vaf)),
++        ("min_abund", json_f64(c.min_abund)),
++        ("min_abund_frac", json_f64(c.min_abund_frac)),
++        ("min_vaf", json_f64(c.min_vaf)),
+         ("alt_max_detour", c.alt_max_detour.to_string()),
+         ("max_alts", c.max_alts.to_string()),
+         ("indel_alts", c.allow_indel_alts.to_string()),
+@@ -268,7 +273,7 @@
+             writeln!(w, "          \"pident_inherited\": {},", h.pident_inherited)?;
+             writeln!(w, "          \"length\": {},", h.seq.len())?;
+             writeln!(w, "          \"nodes\": {},", h.nodes)?;
+-            writeln!(w, "          \"mean_ka\": {:.1},", h.mean_ka)?;
++            writeln!(w, "          \"mean_ka\": {},", if h.mean_ka.is_finite() { format!("{:.1}", h.mean_ka) } else { "null".into() })?;
+             // Emit `anchor_used` only when set. Absent field ≡ single-anchor legacy JSON.
+             if let Some(rid) = &h.anchor_used {
+                 writeln!(w, "          \"vaf\": {:.2},", h.vaf)?;
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -187,15 +187,9 @@
+             "--hops" => {
+                 args.cfg.hops = value()?.parse().map_err(|e| error::Error::Usage(format!("--hops: {e}")))?;
+             }
+-            "--min-abund" => {
+-                args.cfg.min_abund = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-abund: {e}")))?;
+-            }
+-            "--min-vaf" => {
+-                args.cfg.min_vaf = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-vaf: {e}")))?;
+-            }
+-            "--min-cov" => {
+-                args.cfg.min_cov = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-cov: {e}")))?;
+-            }
++            "--min-abund" => args.cfg.min_abund = finite_in("--min-abund", &value()?, 0.0, Some(f32::MAX as f64))? as f32,
++            "--min-vaf" => args.cfg.min_vaf = finite_in("--min-vaf", &value()?, 0.0, Some(1.0))?,
++            "--min-cov" => args.cfg.min_cov = finite_in("--min-cov", &value()?, 0.0, Some(1.0))?,
+             "--primary-metric" => {
+                 let raw = value()?;
+                 args.cfg.primary_metric = PrimaryMetric::parse(&raw).ok_or_else(|| {
+@@ -311,6 +305,17 @@
+     Ok(args)
+ }
+ 
++/// A float option that must be a finite number in `[lo, hi]` (`hi` = None: no upper bound).
++/// `inf` and `NaN` parse as f64 but cannot be written to JSON and switch gates off silently.
++fn finite_in(flag: &str, raw: &str, lo: f64, hi: Option<f64>) -> error::Result<f64> {
++    let v: f64 = raw.parse().map_err(|e| error::Error::Usage(format!("{flag}: {e}")))?;
++    if !v.is_finite() || v < lo || hi.is_some_and(|h| v > h) {
++        let range = match hi { Some(h) => format!("[{lo}, {h}]"), None => format!(">= {lo}") };
++        return Err(error::Error::Usage(format!("{flag} must be a finite number {range}, got {raw:?}")));
++    }
++    Ok(v)
++}
++
+ /// A count that must be at least 1. Zero compute workers left nothing to drain the fetch
+ /// queue, so `-w 0` hung on six accessions and silently dropped three.
+ fn at_least_one(flag: &str, raw: &str) -> error::Result<usize> {
+diff --git a/walker/src/stages/parse.rs b/walker/src/stages/parse.rs
+--- a/walker/src/stages/parse.rs
++++ b/walker/src/stages/parse.rs
+@@ -145,6 +145,7 @@
+                     ab = std::str::from_utf8(&f[5..])
+                         .ok()
+                         .and_then(|s| s.parse::<f32>().ok())
++                        .filter(|v| v.is_finite() && *v >= 0.0)
+                         .ok_or_else(|| {
+                             bad(format!(
+                                 "record {id}: bad abundance {:?}",

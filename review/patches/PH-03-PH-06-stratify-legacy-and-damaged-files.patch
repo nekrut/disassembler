@@ -1,0 +1,100 @@
+diff --git a/src/disassembler/cmd/stratify.py b/src/disassembler/cmd/stratify.py
+index 3e624b165abd..000000000000 100644
+--- a/src/disassembler/cmd/stratify.py
++++ b/src/disassembler/cmd/stratify.py
+@@ -27,8 +27,10 @@
+ from __future__ import annotations
+ 
+ import argparse
++import gzip
+ import json
+ import sys
++import zlib
+ from pathlib import Path
+ from typing import NamedTuple
+ 
+@@ -138,6 +140,17 @@
+     return picks, per_bin
+ 
+ 
++class NotJsonObject(ValueError):
++    """The file is not JSON at all (an accession list); a directory scan passes it over."""
++
++
++class DamagedScoreFile(ValueError):
++    """The file meant to be a score file but cannot be used; never passed over silently."""
++
++
++LEGACY_SUFFIX = ".scores.json"
++
++
+ class ScoreFile(NamedTuple):
+     path: Path
+     target: str | None  # None: the pre-0.1.1 shape, which has no target inside
+@@ -157,16 +170,29 @@
+     `{accession: score}` is the shape written before 0.1.1 (and by hand), with no target.
+     Raises if the file cannot be read or is not JSON.
+     """
+-    with open_text(path) as fh:
+-        start = fh.read(256)
+-        if not start.lstrip().startswith("{"):
+-            raise ValueError(f"{path}: not a JSON object")
+-        data = json.loads(start + fh.read())
++    try:
++        with open_text(path) as fh:
++            try:
++                start = fh.read(256)
++            except UnicodeDecodeError:
++                raise NotJsonObject(f"{path}: not text") from None
++            if not start.strip() and path.name.endswith(LEGACY_SUFFIX):
++                raise DamagedScoreFile(f"{path}: empty")
++            if not start.lstrip().startswith("{"):
++                raise NotJsonObject(f"{path}: not a JSON object")
++            data = json.loads(start + fh.read())
++    except (EOFError, zlib.error, gzip.BadGzipFile, UnicodeDecodeError,
++            json.JSONDecodeError) as e:
++        # Truncated or corrupt: a score file that was damaged, not some other kind of file.
++        raise DamagedScoreFile(f"{path}: cannot be read ({type(e).__name__}: {e})") from None
+     if (isinstance(data, dict) and isinstance(data.get("target"), str)
+             and _is_score_map(data.get("scores"))):
+         return ScoreFile(path, data["target"], data["scores"])
+     if data and _is_score_map(data):
+         return ScoreFile(path, None, data)
++    if isinstance(data, dict) and ("scores" in data or "target" in data) and "bins" not in data:
++        raise DamagedScoreFile(f"{path}: has a target/scores key but scores is not "
++                               f"{{accession: number}}")
+     return None
+ 
+ 
+@@ -193,12 +219,20 @@
+             for f in sorted(files):
+                 try:
+                     sf = read_score_file(f)
++                except DamagedScoreFile:
++                    raise
+                 except (OSError, ValueError):
+                     sf = None
+                 if sf is None:
+                     passed_over += 1
+-                else:
+-                    found.append(sf)
++                    continue
++                # harvest <= 0.1.0 wrote a bare map to <target>.scores.json; the file name is
++                # the only place its target was recorded.
++                if sf.target is None and f.name.endswith(LEGACY_SUFFIX):
++                    sf = sf._replace(target=f.name[:-len(LEGACY_SUFFIX)])
++                    print(f"[*] {f}: no target inside (written before 0.1.1); taking "
++                          f"{sf.target!r} from the file name", file=sys.stderr)
++                found.append(sf)
+         elif path.is_file():
+             sf = read_score_file(path)
+             if sf is None:
+@@ -227,6 +261,8 @@
+                       f"used: {', '.join(str(sf.path) for sf in unnamed)}", file=sys.stderr)
+             found = named
+         elif len(unnamed) == 1:
++            print(f"[*] {unnamed[0].path}: no target inside; taken to be {target!r}",
++                  file=sys.stderr)
+             found = [unnamed[0]._replace(target=target)]
+         elif unnamed:
+             raise ValueError(f"no score file names target {target!r}, and "

@@ -1,0 +1,81 @@
+diff --git a/walker/src/stages/variants.rs b/walker/src/stages/variants.rs
+--- a/walker/src/stages/variants.rs
++++ b/walker/src/stages/variants.rs
+@@ -180,7 +180,7 @@
+             if branches.len() < 2 || !branches.contains(&taken) {
+                 continue;
+             }
+-            let total: f64 = branches.iter().map(|&b| abund(b) as f64).sum();
++            let total = site_total(&v.out, &v.at, branches, taken, i, cfg.alt_max_detour, abund);
+             if total <= 0.0 {
+                 continue;
+             }
+@@ -189,7 +189,9 @@
+                 continue; // not a two-allele site; this is the error-branch case
+             }
+             // The best-supported credible alternative, and only if it beats what we took.
+-            let mut best: Option<(Oriented, f32)> = None;
++            // Only exits that rejoin the route are alleles of this site: a deeper exit that
++            // heads elsewhere must not pre-empt the swap to the real majority allele.
++            let mut best: Option<(f32, usize, Vec<Oriented>)> = None;
+             for &alt in branches {
+                 if alt == taken {
+                     continue;
+@@ -198,15 +200,14 @@
+                 if ab < floor || (ab as f64 / total) < cfg.min_vaf || ab <= taken_ab {
+                     continue;
+                 }
+-                if best.is_none_or(|(_, b)| ab > b) {
+-                    best = Some((alt, ab));
++                if best.as_ref().is_some_and(|(b, _, _)| ab <= *b) {
++                    continue;
++                }
++                if let Some((j, d)) = rejoin(&v.out, &v.at, alt, i, cfg.alt_max_detour) {
++                    best = Some((ab, j, d));
+                 }
+             }
+-            let Some((alt, _)) = best else { continue };
+-            let Some((rejoin_at, detour)) = rejoin(&v.out, &v.at, alt, i, cfg.alt_max_detour)
+-            else {
+-                continue;
+-            };
++            let Some((_, rejoin_at, detour)) = best else { continue };
+             let mut steps: Vec<PathStep> = Vec::with_capacity(current.steps.len() + detour.len());
+             steps.extend_from_slice(&current.steps[..=i]);
+             for &o in &detour {
+@@ -382,7 +383,7 @@
+             continue;
+         }
+         forks += 1;
+-        let total: f64 = branches.iter().map(|&b| abund(b) as f64).sum();
++        let total = site_total(&out, &at, branches, taken, i, cfg.alt_max_detour, abund);
+         if total <= 0.0 {
+             continue;
+         }
+@@ -649,6 +650,26 @@
+     total
+ }
+ 
++/// Coverage of the alleles at the fork after `walk[fork_index]`: the walked branch plus every
++/// other exit that rejoins the route within `max_detour`. An exit that heads elsewhere (a
++/// repeat, a paralog) is not an allele of this site and must not dilute its VAFs; `phase`
++/// applies the same rule through `in_bubble`.
++fn site_total(
++    out: &[Vec<Oriented>],
++    at: &HashMap<Oriented, usize>,
++    branches: &[Oriented],
++    taken: Oriented,
++    fork_index: usize,
++    max_detour: usize,
++    abund: impl Fn(Oriented) -> f32,
++) -> f64 {
++    branches
++        .iter()
++        .filter(|&&b| b == taken || rejoin(out, at, b, fork_index, max_detour).is_some())
++        .map(|&b| abund(b) as f64)
++        .sum()
++}
++
+ /// Shortest way from `alt` back onto the walked path, strictly after the fork.
+ ///
+ /// Returns the path index it rejoins at and the detour, excluding the rejoin node itself

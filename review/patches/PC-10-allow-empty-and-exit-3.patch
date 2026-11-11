@@ -1,0 +1,119 @@
+diff --git a/src/disassembler/cmd/pipe_from_kmindex.py b/src/disassembler/cmd/pipe_from_kmindex.py
+index 623dfc862f08..000000000000 100644
+--- a/src/disassembler/cmd/pipe_from_kmindex.py
++++ b/src/disassembler/cmd/pipe_from_kmindex.py
+@@ -189,6 +189,10 @@
+     g_walker.add_argument("--unitigs-cache", default=None, metavar="DIR",
+                           help="Read-through cache directory for downloaded unitigs. "
+                                "Populate once, then rerun offline with --offline.")
++    g_walker.add_argument("--allow-empty", action="store_true",
++                          help="Exit 0 when nothing was found in any accession (the walker's "
++                               "--allow-empty); the MSA and tree are then skipped. A run in "
++                               "which every accession errored still fails, with exit 3.")
+     g_walker.add_argument("--offline", action="store_true",
+                           help="Refuse the S3 fallback for the walker stage; every "
+                                "accession must already be in --unitigs-cache. Requires "
+@@ -376,6 +380,7 @@
+         sieve_bin=args.sieve_bin,
+         unitigs_cache=args.unitigs_cache,
+         offline=args.offline,
++        allow_empty=args.allow_empty,
+         walker_args=args.walker_args,
+     )
+     return pipe_reconstruct.run(reconstruct_ns)
+diff --git a/src/disassembler/cmd/pipe_reconstruct.py b/src/disassembler/cmd/pipe_reconstruct.py
+index ec0cd7c15617..000000000000 100644
+--- a/src/disassembler/cmd/pipe_reconstruct.py
++++ b/src/disassembler/cmd/pipe_reconstruct.py
+@@ -134,6 +134,10 @@
+     g_walker.add_argument("--offline", action="store_true",
+                           help="Refuse the S3 fallback for the walker stage; every accession "
+                                "must already be in --unitigs-cache. Requires --unitigs-cache.")
++    g_walker.add_argument("--allow-empty", action="store_true",
++                          help="Exit 0 when nothing was found in any accession (the walker's "
++                               "--allow-empty); the MSA and tree are then skipped. A run in "
++                               "which every accession errored still fails, with exit 3.")
+ 
+     # ---- Stage 2: sieve (optional diversity thinning) ---------------------
+     g_sieve = p.add_argument_group(
+@@ -382,22 +386,33 @@
+         walker_argv += ["--unitigs-cache", args.unitigs_cache]
+     if args.offline:
+         walker_argv += ["--offline"]
++    # `-- --allow-empty` (the only way before 0.2) means the same as the composite's flag.
++    allow_empty = args.allow_empty or "--allow-empty" in raw_extra
++    if allow_empty and "--allow-empty" not in raw_extra:
++        walker_argv += ["--allow-empty"]
+     walker_argv += list(raw_extra)
+ 
+     print(f"[reconstruct] 1/2 walker: {' '.join(walker_argv)}", flush=True)
+     rc = walker_cmd.run_walker(walker_argv, walker_bin=args.walker_bin)
+     if rc != 0:
+-        return _die(f"logan-walker (stage 1) failed (exit {rc}); see its output above.")
++        _die(f"logan-walker (stage 1) failed (exit {rc}); see its output above.")
++        # Keep the walker's status: 3 (every accession errored) is not 1 (nothing found).
++        return rc if rc > 0 else 128 - rc
+ 
+     n_recon = sum(1 for line in recon.open() if line.startswith(">")) if recon.is_file() else 0
+     print(f"[reconstruct] reconstructed {n_recon} haplotype(s) -> {recon}", flush=True)
+-    if n_recon == 0:
+-        return _die("no haplotypes reconstructed; nothing to align.")
+-
+     sieved = out / "reconstructed.sieved.fasta"
+     stem = msa_ref.stem
+     aln = out / f"{stem}_codon_msa.fasta"
+     tree = out / f"{stem}_fasttree.nwk"
++    if n_recon == 0:
++        if allow_empty:
++            for stale in (sieved, aln, tree):
++                stale.unlink(missing_ok=True)
++            print("[reconstruct] nothing reconstructed; nothing to align (--allow-empty).",
++                  flush=True)
++            return 0
++        return _die("no haplotypes reconstructed; nothing to align.")
+     # The walker has just rewritten the reconstruction, so a sieved copy an earlier run left in
+     # this --out-dir no longer matches it. With --sieve this run writes it again; kept, it sat
+     # beside fresh results as if this run had made it.
+diff --git a/tests/test_composites.py b/tests/test_composites.py
+index 765b994daef8..000000000000 100644
+--- a/tests/test_composites.py
++++ b/tests/test_composites.py
+@@ -237,6 +237,38 @@
+         self.assertTrue((out / "reconstructed.fasta").is_file())
+         self.assertEqual([p.name for p in stale if p.exists()], [])
+ 
++    def _walker_exiting(self, code):
++        w = self.work / f"walker_exit_{code}.sh"
++        w.write_text(f"#!/usr/bin/env bash\necho \"$@\" > \"$(dirname \"$0\")/walker_argv.txt\"\n"
++                     f"fasta=''; while [ $# -gt 0 ]; do [ \"$1\" = -f ] && fasta=\"$2\"; shift; done\n"
++                     f": > \"$fasta\"; exit {code}\n")
++        w.chmod(0o755)
++        return w
++
++    def test_an_all_errored_walker_keeps_exit_3(self):
++        rc, log = _run(["reconstruct", "-a", "SRR1", "-q", str(self.ref), "-o",
++                        str(self.work / "out"), "--walker-bin", str(self._walker_exiting(3))])
++        self.assertEqual(rc, 3, log)
++
++    def test_allow_empty_accepts_nothing_found(self):
++        out = self.work / "out"
++        out.mkdir()
++        stale = [out / "gene_codon_msa.fasta", out / "gene_fasttree.nwk",
++                 out / "reconstructed.sieved.fasta"]
++        for p in stale:
++            p.write_text(">old\n")
++        argv = ["reconstruct", "-a", "SRR1", "-q", str(self.ref), "-o", str(out),
++                "--walker-bin", str(self._walker_exiting(0))]
++        rc, log = _run(argv)
++        self.assertEqual(rc, 1, log)
++        rc, log = _run(argv + ["--allow-empty"])
++        self.assertEqual(rc, 0, log)
++        self.assertIn("--allow-empty", self.walker_argv())
++        self.assertEqual([p.name for p in stale if p.exists()], [])
++        rc, log = _run(argv + ["--", "--allow-empty"])
++        self.assertEqual(rc, 0, log)
++        self.assertEqual(self.walker_argv().count("--allow-empty"), 1)
++
+     def test_gzipped_query_and_accession_list(self):
+         import gzip
+         q = self.work / "gene.fa"  # gzipped, but not named .gz

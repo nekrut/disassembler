@@ -1,0 +1,209 @@
+diff --git a/walker/src/io/output.rs b/walker/src/io/output.rs
+--- a/walker/src/io/output.rs
++++ b/walker/src/io/output.rs
+@@ -319,6 +319,10 @@
+                 Some(v) => write!(w, ", \"aln_len\": {v}")?,
+                 None => write!(w, ", \"aln_len\": null")?,
+             }
++            match c.ref_span {
++                Some(v) => write!(w, ", \"ref_span\": {v}")?,
++                None => write!(w, ", \"ref_span\": null")?,
++            }
+             write!(w, ", \"selected\": {}", c.selected)?;
+             writeln!(w, "}}{}", if last { "" } else { "," })?;
+         }
+@@ -1288,7 +1292,7 @@
+                 nodes: Some(120),
+                 path_len: Some(4500),
+                 num_matches: Some(2288),
+-                aln_len: Some(2350),
++                ref_span: None, aln_len: Some(2350),
+                 selected: false,
+             },
+             CandidateReport {
+@@ -1300,7 +1304,7 @@
+                 nodes: Some(160),
+                 path_len: Some(4600),
+                 num_matches: Some(3785),
+-                aln_len: Some(3800),
++                ref_span: None, aln_len: Some(3800),
+                 selected: true,
+             },
+         ];
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -208,7 +208,7 @@
+                 args.cfg.min_shared_kmers = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-shared-kmers: {e}")))?;
+             }
+             "--max-size-mb" => {
+-                let mb: u64 = value()?.parse().map_err(|e| error::Error::Usage(format!("--max-size-mb: {e}")))?;
++                let mb = at_least_one("--max-size-mb", &value()?)? as u64;
+                 // saturate rather than wrap: an absurd value should mean "no cap", not a tiny one.
+                 args.cfg.max_compressed_bytes = mb.saturating_mul(1024 * 1024);
+             }
+@@ -549,6 +549,27 @@
+             args.query.len(),
+             args.cfg.primary_metric.as_str()
+         );
++        let groups = stages::anchor::reference_groups(args.cfg.k, &queries, 0.01);
++        if groups.len() > 1 {
++            let shown: Vec<String> = groups
++                .iter()
++                .take(5)
++                .map(|g| {
++                    let ids: Vec<&str> = g.iter().take(3).map(|&i| queries[i].record_id.as_str()).collect();
++                    format!("[{}{}]", ids.join(", "), if g.len() > 3 { ", ..." } else { "" })
++                })
++                .collect();
++            eprintln!(
++                "[warn] multi-anchor: the {} references fall into {} groups that share under 1% of their {}-mers \
++                 ({}{}). Multi-anchor mode keeps ONE primary per accession across all of them, so \
++                 if these are different genes every gene but the winner is dropped; run once per gene.",
++                queries.len(),
++                groups.len(),
++                args.cfg.k,
++                shown.join(" "),
++                if groups.len() > 5 { " ..." } else { "" }
++            );
++        }
+     }
+ 
+     let summary = pipeline::run(&args.cfg, accessions, &queries)?;
+@@ -693,7 +714,7 @@
+ 
+     #[test]
+     fn worker_and_thread_counts_must_be_at_least_one() {
+-        for flag in ["-w", "--workers", "--fetch-workers", "-t", "--threads"] {
++        for flag in ["-w", "--workers", "--fetch-workers", "-t", "--threads", "--max-size-mb"] {
+             let err = parse_args(&argv(&format!("{flag} 0"))).err().expect(flag);
+             assert!(err.to_string().contains("must be at least 1"), "{flag}: {err}");
+         }
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -403,7 +403,16 @@
+             );
+         }
+         Outcome::NoAnchors => println!("[{done}/{total}] {}: no_anchors", r.accession),
+-        Outcome::NoPath => println!("[{done}/{total}] {}: no_path", r.accession),
++        Outcome::NoPath => {
++            let best = r.candidates.iter().filter_map(|c| c.ref_span).fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))));
++            match best {
++                Some(span) => println!(
++                    "[{done}/{total}] {}: no_path (best alignment spans {:.2} of the reference, under --min-cov)",
++                    r.accession, span
++                ),
++                None => println!("[{done}/{total}] {}: no_path (no alignment)", r.accession),
++            }
++        }
+         Outcome::NoLoganData => println!(
+             "[{done}/{total}] {}: no_logan_data (no Logan unitigs for this accession)",
+             r.accession
+@@ -637,7 +646,7 @@
+     // the non-winning references' cov/pident are dropped on the floor. Only populated in
+     // multi-anchor mode so single-anchor `summary.json` stays byte-identical.
+     let multi_anchor = queries.len() > 1;
+-    let candidate_reports: Vec<crate::types::CandidateReport> = if multi_anchor {
++    let candidate_reports: Vec<crate::types::CandidateReport> = {
+         candidates
+             .iter()
+             .map(|c| crate::types::CandidateReport {
+@@ -658,11 +667,10 @@
+                 path_len: c.path.as_ref().map(|p| p.path_len),
+                 num_matches: c.path.as_ref().map(|p| p.num_matches),
+                 aln_len: c.path.as_ref().map(|p| p.aln_len),
++                ref_span: c.path.as_ref().map(|p| p.query_span() as f64 / c.ref_len.max(1) as f64),
+                 selected: false, // set below once pick_primary names a winner
+             })
+             .collect()
+-    } else {
+-        Vec::new()
+     };
+     let winner = stages::stitch::pick_primary(candidates, cfg.primary_metric);
+     // Alternative-haplotype recovery is `stages::variants`: it corrects the consensus to the
+diff --git a/walker/src/stages/anchor.rs b/walker/src/stages/anchor.rs
+--- a/walker/src/stages/anchor.rs
++++ b/walker/src/stages/anchor.rs
+@@ -236,6 +236,68 @@
+     Ok(idx)
+ }
+ 
++/// Group the references of a multi-anchor pool by shared canonical k-mers.
++///
++/// Two references are linked when the k-mers they share are at least `min_frac` of the
++/// smaller one's distinct k-mers; groups are the connected components. Multi-anchor mode
++/// keeps one primary per accession across the whole pool, so more than one group means
++/// the pool probably holds different genes and all but one will be dropped.
++pub fn reference_groups(k: usize, queries: &[Query], min_frac: f64) -> Vec<Vec<usize>> {
++    let mask = if k >= 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
++    let shift = 2 * (k as u64 - 1);
++    let sets: Vec<std::collections::HashSet<u64>> = queries
++        .iter()
++        .map(|q| {
++            let mut s = std::collections::HashSet::new();
++            let (mut fwd, mut rev, mut run) = (0u64, 0u64, 0usize);
++            for &b in &q.seq {
++                match base_code(b) {
++                    Some(c) => {
++                        fwd = ((fwd << 2) | c) & mask;
++                        rev = (rev >> 2) | ((3 - c) << shift);
++                        run += 1;
++                    }
++                    None => (fwd, rev, run) = (0, 0, 0),
++                }
++                if run >= k {
++                    s.insert(fwd.min(rev));
++                }
++            }
++            s
++        })
++        .collect();
++    let mut parent: Vec<usize> = (0..queries.len()).collect();
++    fn root(p: &mut [usize], mut x: usize) -> usize {
++        while p[x] != x {
++            p[x] = p[p[x]];
++            x = p[x];
++        }
++        x
++    }
++    for i in 0..sets.len() {
++        for j in i + 1..sets.len() {
++            let small = sets[i].len().min(sets[j].len());
++            if small == 0 {
++                continue;
++            }
++            let (a, b) = if sets[i].len() <= sets[j].len() { (i, j) } else { (j, i) };
++            let shared = sets[a].iter().filter(|x| sets[b].contains(x)).count();
++            if shared as f64 >= min_frac * small as f64 {
++                let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
++                parent[ri] = rj;
++            }
++        }
++    }
++    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
++    for i in 0..queries.len() {
++        let r = root(&mut parent, i);
++        groups.entry(r).or_default().push(i);
++    }
++    let mut out: Vec<Vec<usize>> = groups.into_values().collect();
++    out.sort_by_key(|g| g[0]);
++    out
++}
++
+ /// Scan every unitig, counting shared canonical k-mers.
+ ///
+ /// A unitig is an anchor when it shares at least `cfg.min_shared_kmers` canonical k-mers
+diff --git a/walker/src/types.rs b/walker/src/types.rs
+--- a/walker/src/types.rs
++++ b/walker/src/types.rs
+@@ -399,6 +399,9 @@
+     pub num_matches: Option<usize>,
+     /// GAF column 11.
+     pub aln_len: Option<usize>,
++    /// GAF reference span (query_end - query_start) over the reference length; set even when
++    /// the stitched haplotype falls under --min-cov.
++    pub ref_span: Option<f64>,
+     /// True iff this candidate was the winner `pick_primary` returned.
+     pub selected: bool,
+ }

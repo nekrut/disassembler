@@ -1,0 +1,163 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -125,6 +125,16 @@
+     'GGT': 'G', 'GGC': 'G', 'GGA': 'G', 'GGG': 'G'
+ }
+ 
++def codon_table_for(code_id: int) -> dict:
++    """Forward table of NCBI genetic code `code_id`, stops as '*'."""
++    if code_id == 11:
++        return CODON_TABLE_11
++    from Bio.Data.CodonTable import unambiguous_dna_by_id
++    t = unambiguous_dna_by_id[code_id]
++    table = dict(t.forward_table)
++    table.update({c: '*' for c in t.stop_codons})
++    return table
++
+ def get_galaxy_api_key(api_key: str = None, key_file: str = None) -> str:
+     """The Galaxy API key: --api-key, then --api-key-file, then $GALAXY_API_KEY, then
+     /tmp/gxy.txt, the order the help gives and `harvest` uses. The environment variable used
+@@ -521,7 +531,9 @@
+     max_records: int = None,
+     sample_cap: int = 10,
+     out_prefix: str = None,
+-    write_a2m: bool = True
++    write_a2m: bool = True,
++    genetic_code: int = 11,
++    non_coding: bool = False,
+ ) -> dict:
+     """
+     Main streaming pipeline:
+@@ -534,8 +546,21 @@
+     """
+     ref_name, ref_header, ref_seq = load_reference(ref_path)
+     ref_len = len(ref_seq)
+-    ref_is_cds = (ref_len % 3 == 0)
+-    ref_aa = translate_nt(ref_seq) if ref_is_cds else ""
++    codon_table = codon_table_for(genetic_code)
++    ref_is_cds = (not non_coding) and ref_len % 3 == 0
++    if not non_coding and not ref_is_cds:
++        print(f"[warn] reference length {ref_len} is not a multiple of 3: treating it as "
++              f"non-coding (no stop or frameshift checks). Pass --non-coding to silence this.",
++              file=sys.stderr)
++    if ref_is_cds:
++        ref_stops = find_internal_stops(ref_seq.upper(), ref_len, codon_table)
++        if ref_stops:
++            raise ValueError(
++                f"the reference {ref_name} has {len(ref_stops)} in-frame stop codon(s) under "
++                f"genetic code {genetic_code} (first at codon {ref_stops[0]}), so every match "
++                f"would be flagged for premature stops. Give an in-frame CDS, the right "
++                f"--genetic-code, or --non-coding for an RNA gene or other non-coding target.")
++    ref_aa = translate_nt(ref_seq, codon_table) if ref_is_cds else ""
+ 
+     if dataset_id:
+         check_dataset_ready(dataset_id,
+@@ -643,11 +668,14 @@
+         print(f"[*] no qlen column; skipping the reference length agreement check.")
+ 
+     # Cohort file handles
+-    f_clean_fa = open(f"{out_prefix}.clean.accessions.fasta", "w", encoding="utf-8")
+-    f_clean_exp_fa = open(f"{out_prefix}.clean_expanded.accessions.fasta", "w", encoding="utf-8")
+-    f_flagged_fa = open(f"{out_prefix}.flagged.accessions.fasta", "w", encoding="utf-8")
+-    f_flagged_tsv = open(f"{out_prefix}.flagged.tsv", "w", encoding="utf-8")
+-    f_cohort_tsv = open(f"{out_prefix}.cohort_ledger.tsv", "w", encoding="utf-8")
++    # Written under .partial names and renamed only once the stream has been consumed, so a
++    # run that stops part-way leaves nothing that looks like a result.
++    cohort_paths = [f"{out_prefix}.{x}" for x in ("clean.accessions.fasta",
++                    "clean_expanded.accessions.fasta", "flagged.accessions.fasta",
++                    "flagged.tsv", "cohort_ledger.tsv")]
++    (f_clean_fa, f_clean_exp_fa, f_flagged_fa, f_flagged_tsv, f_cohort_tsv) = [
++        open(p + ".partial", "w", encoding="utf-8") for p in cohort_paths]
++    stream_ok = False
+ 
+     f_flagged_tsv.write("accession\tcoverage\tmean_pident\tflag\tn_stops\tstop_codons\thsps_merged\tindels\n")
+     f_cohort_tsv.write("accession\tcoverage\tmean_pident\tstatus\ttier\tn_stops\tstop_codons\thsps_merged\tindels\n")
+@@ -706,8 +734,9 @@
+             raise ValueError(
+                 f"Accession '{acc}' reappears after its block was already processed, so the "
+                 f"input is not grouped by accession. All HSPs of an accession must be "
+-                f"contiguous. Sort the LexicMap output by the accession column first, e.g. "
+-                f"`sort -k<sgenome_col> -s input.tsv`, then re-run."
++                f"contiguous. Sort the data rows by column {idx_sgenome + 1} and keep the "
++                f"header first, e.g. `(head -n1 in.tsv; tail -n +2 in.tsv | sort -t$'\\t' "
++                f"-k{idx_sgenome + 1},{idx_sgenome + 1} -s) > sorted.tsv`, then re-run."
+             )
+         seen_accessions.add(acc)
+ 
+@@ -728,7 +757,7 @@
+         indel_tag = f" indels={indel_str}" if tiling.indels else ""
+ 
+         # Check premature stop codons in coding body
+-        stop_codons = (find_internal_stops_with_indels(merged_seq, ref_len, tiling.indels)
++        stop_codons = (find_internal_stops_with_indels(merged_seq, ref_len, tiling.indels, codon_table)
+                        if ref_is_cds else [])
+         n_stops = len(stop_codons)
+         stop_str = ",".join(str(p) for p in stop_codons) if stop_codons else "None"
+@@ -746,7 +775,7 @@
+         # premature stops still flag.
+         full_cov = 1.0 if full_length_only else min_coverage
+         stops_ok = n_stops <= max_internal_stops
+-        frame_ok = not frameshifts or allow_frameshifts
++        frame_ok = not ref_is_cds or not frameshifts or allow_frameshifts
+         if cov >= full_cov and stops_ok and frame_ok:
+             status = "CLEAN_FULL_LENGTH"
+             tier = 1
+@@ -919,6 +948,7 @@
+                     f"all {total_rows:,} data rows had unparseable numeric fields; "
+                     f"check the column layout of the input against the resolved schema above"
+                 )
++        stream_ok = True
+ 
+     finally:
+         if raw is not sys.stdin.buffer:
+@@ -928,6 +958,11 @@
+         f_flagged_fa.close()
+         f_flagged_tsv.close()
+         f_cohort_tsv.close()
++        for p in cohort_paths:
++            if stream_ok:
++                os.replace(p + ".partial", p)
++            else:
++                Path(p + ".partial").unlink(missing_ok=True)
+ 
+     total_time = time.time() - start_time
+ 
+@@ -1065,7 +1100,7 @@
+             if seq == ref_seq and not indels:
+                 mut_class = "WT"
+             elif ref_is_cds:
+-                h_aa = translate_nt(seq)
++                h_aa = translate_nt(seq, codon_table)
+                 for r_idx, (r_a, h_a) in enumerate(zip(ref_aa, h_aa)):
+                     if h_a != '-' and h_a != r_a:
+                         aa_muts.append(f"{r_a}{r_idx+1}{h_a}")
+@@ -1139,6 +1174,7 @@
+         "reference_name": ref_name,
+         "reference_length_bp": ref_len,
+         "is_cds": ref_is_cds,
++        "genetic_code": genetic_code if ref_is_cds else None,
+         "regime": regime,
+         "regime_warning": warning_msg,
+         "total_streamed_rows": total_rows,
+@@ -1234,6 +1270,10 @@
+     parser.add_argument("--max-internal-stops", type=non_negative_int, default=0,
+                         help="Maximum premature stop codons tolerated in the CDS body before "
+                              "an accession is flagged out of the clean cohort (default: 0).")
++    parser.add_argument("--genetic-code", type=positive_int, default=11,
++                        help="NCBI genetic code for translation and the stop scan (default 11).")
++    parser.add_argument("--non-coding", action="store_true",
++                        help="The reference is not a CDS: skip the stop and frameshift tiers.")
+     parser.add_argument("--allow-frameshift-alts", action="store_true",
+                         help="Let accessions whose tiled sequence carries a frameshifting "
+                              "indel into the clean tiers instead of FLAGGED_FRAMESHIFT (a "
+@@ -1314,6 +1354,8 @@
+             out_prefix=(os.path.join(args.out_dir, "") if args.out_dir
+                         else args.out_prefix),
+             write_a2m=not args.no_a2m,
++            genetic_code=args.genetic_code,
++            non_coding=args.non_coding,
+         )
+     except DatasetNotReady as e:
+         print(f"lexicmap: {e}", file=sys.stderr)

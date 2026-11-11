@@ -1,0 +1,16 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -633,7 +633,10 @@
+     if idx_sseq is None: missing.append("sseq")
+ 
+     if missing:
+-        raise KeyError(f"Missing required columns {missing} in LexicMap header: {header_cols}")
++        hint = (" Re-run `lexicmap search` with -a/--all (Galaxy: Output all columns) so "
++                "qseq and sseq are written." if {"qseq", "sseq"} & set(missing) else "")
++        raise ValueError(f"missing required column(s) {missing} in the LexicMap header "
++                         f"{header_cols}.{hint}")
+ 
+     if idx_query is None:
+         print(f"[warn] no query-name column in the header ({header_cols}); rows cannot be "

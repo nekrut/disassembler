@@ -1,0 +1,24 @@
+diff --git a/bench/check_golden.sh b/bench/check_golden.sh
+index e812a59a5952..000000000000 100755
+--- a/bench/check_golden.sh
++++ b/bench/check_golden.sh
+@@ -26,12 +26,16 @@
+ set -uo pipefail
+ ROOT="$(cd "$(dirname "$0")/.."; pwd)"
+ WALKER="${LOGAN_WALKER_BIN:-$ROOT/walker/target/release/logan-walker}"
+-WORK="$(mktemp -d)"
++WORK="$(mktemp -d)" && [ -d "$WORK" ] || { echo "FAIL: cannot create a temp directory (TMPDIR=${TMPDIR:-unset})"; exit 1; }
+ trap 'rm -rf "$WORK"' EXIT
+ 
+-if [ ! -x "$WALKER" ]; then
+-  echo "building walker..."; ( cd "$ROOT/walker" && cargo build --release ) || exit 1
++# Always (re)build unless a binary is named explicitly: cargo is a no-op when it is fresh, and a
++# binary left over from older source must not be what the gate green-lights.
++if [ -z "${LOGAN_WALKER_BIN:-}" ]; then
++  echo "building walker..."; ( cd "$ROOT/walker" && cargo build --release --locked ) || exit 1
+ fi
++[ -x "$WALKER" ] || { echo "FAIL: no walker binary at $WALKER"; exit 1; }
++echo "walker: $("$WALKER" --version 2>&1 | head -n 1) at $WALKER"
+ command -v GraphAligner >/dev/null || { echo "FAIL: GraphAligner not on PATH"; exit 1; }
+ 
+ # Record the aligner version with the result. The fixtures are version-dependent: 1.0.19+

@@ -1,0 +1,186 @@
+diff --git a/walker/src/io/input.rs b/walker/src/io/input.rs
+--- a/walker/src/io/input.rs
++++ b/walker/src/io/input.rs
+@@ -197,6 +197,7 @@
+         seq,
+         path: path.to_path_buf(),
+         n_records,
++        raw: Some(std::sync::Arc::from(bytes)),
+     })
+ }
+ 
+@@ -220,9 +221,18 @@
+     if paths.is_empty() {
+         return Err(Error::Usage("no query FASTAs provided".into()));
+     }
+-    let mut out: Vec<Query> = Vec::new();
++    let mut inputs = Vec::with_capacity(paths.len());
+     for path in paths {
+-        let bytes = read_input(path, "query")?;
++        inputs.push((path.clone(), read_input(path, "query")?));
++    }
++    read_query_set_from(inputs)
++}
++
++/// [`read_query_set`] on bytes already read, so a pipe is never read twice.
++pub fn read_query_set_from(inputs: Vec<(PathBuf, Vec<u8>)>) -> Result<Vec<Query>> {
++    let mut out: Vec<Query> = Vec::new();
++    for (path, bytes) in &inputs {
++        let path: &Path = path;
+ 
+         let mut records: Vec<(String, Vec<u8>)> = Vec::new();
+         let mut header: Option<String> = None;
+@@ -263,6 +273,7 @@
+             .map(|s| s.to_string_lossy().to_string())
+             .ok_or_else(|| Error::Usage(format!("{}: cannot derive a name", path.display())))?;
+         let n_in_file = records.len();
++        let raw: Option<std::sync::Arc<[u8]>> = (n_in_file == 1).then(|| std::sync::Arc::from(&bytes[..]));
+         for (record_id, seq) in records {
+             if seq.is_empty() {
+                 return Err(Error::Usage(format!(
+@@ -300,6 +311,7 @@
+                 seq,
+                 path: path.to_path_buf(),
+                 n_records: n_in_file,
++                raw: raw.clone(),
+             });
+         }
+     }
+diff --git a/walker/src/io/output.rs b/walker/src/io/output.rs
+--- a/walker/src/io/output.rs
++++ b/walker/src/io/output.rs
+@@ -1023,7 +1023,7 @@
+     }
+ 
+     fn query(seq: &[u8]) -> Query {
+-        Query { name: "g".into(), record_id: "g".into(), seq: seq.to_vec(), path: PathBuf::from("g.fa"), n_records: 1 }
++        Query { name: "g".into(), record_id: "g".into(), seq: seq.to_vec(), path: PathBuf::from("g.fa"), n_records: 1, raw: None }
+     }
+ 
+     /// Multi-anchor: the VCF and the long table are written in the winning reference's
+@@ -1032,9 +1032,9 @@
+     #[test]
+     fn variant_writers_use_the_winning_reference() {
+         let first = Query { name: "a".into(), record_id: "first".into(), seq: b"AAAA".to_vec(),
+-                            path: PathBuf::from("a.fa"), n_records: 1 };
++                            path: PathBuf::from("a.fa"), n_records: 1, raw: None };
+         let winner = Query { name: "b".into(), record_id: "winner".into(), seq: b"CCCCCC".to_vec(),
+-                             path: PathBuf::from("b.fa"), n_records: 1 };
++                             path: PathBuf::from("b.fa"), n_records: 1, raw: None };
+         let pool = [first, winner];
+         let mut r = result(b"CCCCCC", Vec::new());
+         assert_eq!(reference_of(&r, &pool).record_id, "first", "single-anchor falls back");
+@@ -1181,7 +1181,7 @@
+         let cfg = crate::config::Config::default();
+         let queries = [crate::types::Query {
+             name: "gene".into(), record_id: "gene".into(), seq: b"ACGT".to_vec(),
+-            path: std::path::PathBuf::from("gene.fa"), n_records: 1,
++            path: std::path::PathBuf::from("gene.fa"), n_records: 1, raw: None,
+         }];
+         let run = super::RunInfo { graphaligner: "GraphAligner bioconda 1.0.17b-0", cfg: &cfg,
+                                    queries: &queries };
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -459,7 +459,8 @@
+         Some(if args.query.len() == 1 {
+             let first = io::input::read_query(&args.query[0])?;
+             if first.n_records > 1 {
+-                io::input::read_query_set(&args.query)?
++                let raw = first.raw.as_deref().map(<[u8]>::to_vec).unwrap_or_default();
++                io::input::read_query_set_from(vec![(args.query[0].clone(), raw)])?
+             } else {
+                 vec![first]
+             }
+diff --git a/walker/src/stages/align.rs b/walker/src/stages/align.rs
+--- a/walker/src/stages/align.rs
++++ b/walker/src/stages/align.rs
+@@ -166,8 +166,11 @@
+         // Read through `read_input`, which returns a plain file's bytes unchanged and
+         // decompresses a gzipped one: a plain copy handed GraphAligner gzip bytes under a
+         // `.fa` name, and it found no alignment, so every accession came back no_path.
+-        let bytes = crate::io::input::read_input(&queries[0].path, "query")?;
+-        std::fs::write(&query_fa, bytes).map_err(file_err("write", &query_fa))?;
++        let bytes: std::borrow::Cow<[u8]> = match &queries[0].raw {
++            Some(raw) => std::borrow::Cow::Borrowed(&raw[..]),
++            None => std::borrow::Cow::Owned(crate::io::input::read_input(&queries[0].path, "query")?),
++        };
++        std::fs::write(&query_fa, &bytes).map_err(file_err("write", &query_fa))?;
+     } else {
+         // Merged pool: one `>record_id\n<seq>\n` block per query, in input order.
+         // This is written even for a single Query whose source file has extra records,
+@@ -678,7 +681,7 @@
+         };
+         let q = Query {
+             name: "dataset_1234".into(), record_id: "pol".into(), seq: b"ACGTACGTAAAA".to_vec(),
+-            path: src, n_records: 1,
++            path: src, n_records: 1, raw: None,
+         };
+         let gaf = dir.join("ACC.sub.gaf");
+ 
+@@ -797,7 +800,7 @@
+         let q = Query {
+             name: "q".into(), record_id: "q".into(), seq: b"ACGTACGT".to_vec(),
+             path: "../queries/pfcrt_only.fasta".into(),
+-            n_records: 1,
++            n_records: 1, raw: None,
+         };
+         let got = run(&cfg, &sub, std::slice::from_ref(&q), &cfg.scratch_dir.join("EMPTY.sub.gaf")).unwrap();
+         assert!(got.is_empty(), "must report no path rather than invoking the tool");
+diff --git a/walker/src/stages/anchor.rs b/walker/src/stages/anchor.rs
+--- a/walker/src/stages/anchor.rs
++++ b/walker/src/stages/anchor.rs
+@@ -322,7 +322,7 @@
+         parse::build(&"T".to_string(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
+     }
+     fn query(seq: &str) -> Query {
+-        Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa"), n_records: 1 }
++        Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa"), n_records: 1, raw: None }
+     }
+     fn cfg(k: usize, m: u32) -> Config {
+         Config { k, min_shared_kmers: m, ..Config::default() }
+@@ -452,7 +452,7 @@
+             record_id: "test".into(),
+             seq: seq.as_bytes().to_vec(),
+             path: PathBuf::from("test.fasta"),
+-            n_records: 1,
++            n_records: 1, raw: None,
+         }
+     }
+     fn cfg_k(k: usize) -> Config {
+diff --git a/walker/src/stages/stitch.rs b/walker/src/stages/stitch.rs
+--- a/walker/src/stages/stitch.rs
++++ b/walker/src/stages/stitch.rs
+@@ -256,7 +256,7 @@
+         s
+     }
+     fn q(seq: &str) -> Query {
+-        Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa"), n_records: 1 }
++        Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa"), n_records: 1, raw: None }
+     }
+     fn path(steps: &[(Orient, u32)], len: usize, start: usize, end: usize) -> GafPath {
+         GafPath {
+diff --git a/walker/src/stages/variants.rs b/walker/src/stages/variants.rs
+--- a/walker/src/stages/variants.rs
++++ b/walker/src/stages/variants.rs
+@@ -744,7 +744,7 @@
+             record_id: "q".into(),
+             seq: seq.as_bytes().to_vec(),
+             path: PathBuf::from("q.fa"),
+-            n_records: 1,
++            n_records: 1, raw: None,
+         }
+     }
+     fn cfg(emit: bool) -> Config {
+diff --git a/walker/src/types.rs b/walker/src/types.rs
+--- a/walker/src/types.rs
++++ b/walker/src/types.rs
+@@ -45,6 +45,8 @@
+     /// Records present in `path`. With more than one, `align` writes out only this Query's
+     /// record instead of copying the file, so GraphAligner aligns just that one.
+     pub n_records: usize,
++    /// The decompressed bytes read once at startup; `align::run` copies these, never re-reads `path`.
++    pub raw: Option<std::sync::Arc<[u8]>>,
+ }
+ 
+ // ---------------------------------------------------------------------------

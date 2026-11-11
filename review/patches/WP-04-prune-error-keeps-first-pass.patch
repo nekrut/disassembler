@@ -1,0 +1,146 @@
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -777,72 +777,62 @@
+                 );
+                 }
+                 PruneOutcome::Prune => {
+-                // Both subgraphs live at the same scratch path, so the first must be dropped
+-                // (which deletes its GFA) before the second is written.
+-                let nodes = std::mem::take(&mut subgraph.nodes);
+-                let seqs = std::mem::take(&mut subgraph.seqs);
+-                let (kept_nodes, kept_seqs) =
+-                    stages::extract::prune_nodes(&graph, nodes, seqs, floor);
++                // The pass-1 GFA is not read again (later stages use only nodes and seqs), so
++                // free its tmpfs space now but keep the Subgraph: it is the fallback.
++                if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
++                    let _ = std::fs::remove_file(&subgraph.gfa_path);
++                }
++                let (kept_nodes, kept_seqs) = stages::extract::prune_nodes(
++                    &graph, subgraph.nodes.clone(), subgraph.seqs.clone(), floor);
+                 let dropped = before - kept_nodes.len();
+-                drop(subgraph);
+-                let pruned =
+-                    stages::extract::write_gfa(cfg, &graph, kept_nodes, kept_seqs)?;
+-                let gaf2 = pruned.gfa_path.with_extension("pass2.gaf");
+                 let t = Instant::now();
+-                let mut gaf2_map = stages::align::run(cfg, &pruned, std::slice::from_ref(query), &gaf2)?;
+-                let second = match gaf2_map.remove(query.record_id.as_str()) {
+-                    Some(p) => stages::stitch::stitch(cfg, &graph, &p, &pruned, query)?.map(|h| (p, h)),
+-                    None => None,
+-                };
++                // Any error in the second pass is a refusal, never a failed accession.
++                let second: Result<(crate::types::Subgraph, Option<(GafPath, crate::types::Haplotype)>)> = (|| {
++                    let pruned = stages::extract::write_gfa(cfg, &graph, kept_nodes, kept_seqs)?;
++                    let gaf2 = pruned.gfa_path.with_extension("pass2.gaf");
++                    let mut gaf2_map =
++                        stages::align::run(cfg, &pruned, std::slice::from_ref(query), &gaf2)?;
++                    let s = match gaf2_map.remove(query.record_id.as_str()) {
++                        Some(p) => stages::stitch::stitch(cfg, &graph, &p, &pruned, query)?
++                            .map(|h| (p, h)),
++                        None => None,
++                    };
++                    Ok((pruned, s))
++                })();
+                 timing.align += t.elapsed().as_secs_f64();
+-                let pruned_span = second.as_ref().map(|(p, _)| (p.query_start, p.query_end));
+                 match second {
+-                    Some((p, h)) if pruned_covers_as_much(path, &p) => {
+-                        prune = Some(report(PruneResult::Applied, pruned_span));
++                    Err(e) => {
++                        prune = Some(report(PruneResult::RefusedError, None));
++                        eprintln!(
++                            "[{}] prune: depth {:.0}x, floor {:.1}x; realignment failed ({e}); \
++                             keeping the unpruned result",
++                            graph.accession, depth, floor
++                        );
++                    }
++                    Ok((pruned, Some((p, h)))) if pruned_covers_as_much(path, &p) => {
++                        prune = Some(report(PruneResult::Applied, Some((p.query_start, p.query_end))));
+                         eprintln!(
+                             "[{}] prune: depth {:.0}x, floor {:.1}x, {} of {} unitigs kept; \
+-                             realigned, min coverage on the route now {:.1}x",
+-                            graph.accession, depth, floor, before - dropped, before,
+-                            stages::extract::path_depth(&graph, &p.steps).min(
+-                                p.steps.iter()
+-                                    .map(|s| graph.abundance[s.node as usize])
+-                                    .fold(f32::INFINITY, f32::min)
+-                            )
++                             realigned",
++                            graph.accession, depth, floor, before - dropped, before
+                         );
+                         haplotype = Some(h);
+                         final_path = Some(p);
+                         subgraph = pruned;
+                     }
+-                    rejected => {
++                    Ok((_pruned, rejected)) => {
++                        let pruned_span = rejected.as_ref().map(|(p, _)| (p.query_start, p.query_end));
+                         let result = if rejected.is_some() {
+                             PruneResult::RefusedShorterSpan
+                         } else {
+                             PruneResult::RefusedNoHaplotype
+                         };
+                         prune = Some(report(result, pruned_span));
+-                        match rejected {
+-                            Some((p, _)) => eprintln!(
+-                                "[{}] prune: depth {:.0}x, floor {:.1}x; the realigned route \
+-                                 spans reference bases {}-{} of {}, {} short of the unpruned \
+-                                 {}-{} and past the {}-base tolerance; keeping the unpruned \
+-                                 result",
+-                                graph.accession, depth, floor, p.query_start, p.query_end,
+-                                query.seq.len(),
+-                                path.query_span().saturating_sub(p.query_span()),
+-                                path.query_start, path.query_end, PRUNE_SPAN_TOLERANCE
+-                            ),
+-                            None => eprintln!(
+-                                "[{}] prune: depth {:.0}x, floor {:.1}x cost the alignment; \
+-                                 keeping the unpruned result",
+-                                graph.accession, depth, floor
+-                            ),
+-                        }
+-                        // Redo pass 1's subgraph so later stages have it. Cheap: the
+-                        // sequences are already decoded, only the GFA is rewritten.
+-                        drop(pruned);
+-                        let nodes = stages::extract::expand(cfg, &graph, &anchors)?;
+-                        let seqs = stages::extract::collect_seqs(&graph, &nodes)?;
+-                        subgraph = stages::extract::write_gfa(cfg, &graph, nodes, seqs)?;
++                        eprintln!(
++                            "[{}] prune: depth {:.0}x, floor {:.1}x; {}; keeping the unpruned result",
++                            graph.accession, depth, floor, result.as_str()
++                        );
++                        // `subgraph` (pass 1) is still alive: nothing to rebuild.
+                     }
+                 }
+                 }
+diff --git a/walker/src/types.rs b/walker/src/types.rs
+--- a/walker/src/types.rs
++++ b/walker/src/types.rs
+@@ -503,6 +503,8 @@
+     RefusedShorterSpan,
+     /// The realignment produced no haplotype; the first stands.
+     RefusedNoHaplotype,
++    /// The second pass failed (GraphAligner, I/O); the first stands.
++    RefusedError,
+ }
+ 
+ impl PruneResult {
+@@ -513,6 +515,7 @@
+             Self::WouldEmpty => "would_empty",
+             Self::RefusedShorterSpan => "refused_shorter_span",
+             Self::RefusedNoHaplotype => "refused_no_haplotype",
++            Self::RefusedError => "refused_error",
+         }
+     }
+ }
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -374,6 +374,7 @@
+         (P::Applied, "applied"),
+         (P::RefusedShorterSpan, "refused (realignment spans less of the reference)"),
+         (P::RefusedNoHaplotype, "refused (realignment gave no haplotype)"),
++        (P::RefusedError, "refused (realignment failed)"),
+         (P::NothingToRemove, "nothing to remove"),
+         (P::WouldEmpty, "skipped (would have removed every unitig)"),
+     ]

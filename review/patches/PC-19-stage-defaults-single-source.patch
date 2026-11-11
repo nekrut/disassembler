@@ -1,0 +1,321 @@
+diff --git a/src/disassembler/cmd/msa.py b/src/disassembler/cmd/msa.py
+index 6d19ea4f357a..000000000000 100644
+--- a/src/disassembler/cmd/msa.py
++++ b/src/disassembler/cmd/msa.py
+@@ -135,6 +135,10 @@
+     return True
+ 
+ 
++DEFAULT_MAFFT_THREADS = 8
++DEFAULT_MIN_COV = 0.70
++
++
+ def add_parser(subparsers: argparse._SubParsersAction) -> None:
+     p = subparsers.add_parser(
+         "msa",
+@@ -158,8 +162,8 @@
+     )
+     p.add_argument("--out-aln", "-a", required=True, help="Output codon MSA FASTA")
+     p.add_argument("--out-tree", "-t", required=True, help="Output Newick tree")
+-    p.add_argument("--mafft-threads", type=positive_int, default=8, help="MAFFT threads")
+-    p.add_argument("--msa-min-cov", type=fraction, default=0.70,
++    p.add_argument("--mafft-threads", type=positive_int, default=DEFAULT_MAFFT_THREADS, help="MAFFT threads")
++    p.add_argument("--msa-min-cov", type=fraction, default=DEFAULT_MIN_COV,
+                    help="Minimum coverage to enter the MSA: a sequence's A/C/G/T bases, as a "
+                         "fraction of the reference length (default 0.70). Gaps ('-') and N "
+                         "do not count, so a gapped lexicmap row is measured by what it covers.")
+diff --git a/src/disassembler/cmd/pipe_from_kmindex.py b/src/disassembler/cmd/pipe_from_kmindex.py
+index 623dfc862f08..000000000000 100644
+--- a/src/disassembler/cmd/pipe_from_kmindex.py
++++ b/src/disassembler/cmd/pipe_from_kmindex.py
+@@ -21,7 +21,9 @@
+ from pathlib import Path
+ 
+ from disassembler.cmd import harvest as harvest_cmd
++from disassembler.cmd import msa as msa_cmd
+ from disassembler.cmd import pipe_reconstruct
++from disassembler.cmd import sieve as sieve_cmd
+ from disassembler.cmd import stratify as stratify_cmd
+ from disassembler.stage import stage_args
+ from disassembler.validators import (
+@@ -206,11 +208,11 @@
+     )
+     g_sieve.add_argument("--sieve", action="store_true",
+                          help="Enable the diversity-thinning pass. Off by default.")
+-    g_sieve.add_argument("--sieve-threshold", type=fraction, default=0.005,
+-                         help="LSH promotion threshold tau (default 0.005, gene-scale). "
++    g_sieve.add_argument("--sieve-threshold", type=fraction, default=None,
++                         help=f"LSH promotion threshold tau (default {sieve_cmd.DEFAULT_THRESHOLD}, gene-scale). "
+                               "Higher tau collapses more.")
+-    g_sieve.add_argument("--sieve-sketch", type=positive_int, default=256,
+-                         help="MinHash sketch size m (default 256, gene-scale). Caps the "
++    g_sieve.add_argument("--sieve-sketch", type=positive_int, default=None,
++                         help=f"MinHash sketch size m (default {sieve_cmd.DEFAULT_SKETCH}, gene-scale). Caps the "
+                               "resolution of the novelty estimator at 1/m.")
+     g_sieve.add_argument("--sieve-min-len", type=positive_int, default=None,
+                          help="Minimum sequence length gate for the sieve "
+@@ -225,11 +227,11 @@
+         description="Options for the codon-MSA + FastTree GTR stage. Skipped entirely "
+                     "under --skip-tree.",
+     )
+-    g_msa.add_argument("--mafft-threads", type=positive_int, default=8,
+-                       help="Thread count for MAFFT in the MSA stage (default: 8).")
+-    g_msa.add_argument("--msa-min-cov", type=fraction, default=0.70,
++    g_msa.add_argument("--mafft-threads", type=positive_int, default=None,
++                       help=f"Thread count for MAFFT in the MSA stage (default: {msa_cmd.DEFAULT_MAFFT_THREADS}).")
++    g_msa.add_argument("--msa-min-cov", type=fraction, default=None,
+                        help="Minimum coverage fraction for a reconstructed sequence to "
+-                            "enter the MSA (default: 0.70). Distinct from the walker's "
++                            f"enter the MSA (default: {msa_cmd.DEFAULT_MIN_COV}). Distinct from the walker's "
+                             "own --min-cov (default 0.85), which gates which "
+                             "reconstructions are produced at all.")
+     g_msa.add_argument("--skip-tree", action="store_true",
+diff --git a/src/disassembler/cmd/pipe_from_lexicmap.py b/src/disassembler/cmd/pipe_from_lexicmap.py
+index 73afa2c25a57..000000000000 100644
+--- a/src/disassembler/cmd/pipe_from_lexicmap.py
++++ b/src/disassembler/cmd/pipe_from_lexicmap.py
+@@ -27,7 +27,7 @@
+ from disassembler.cmd import msa as msa_cmd
+ from disassembler.cmd import sieve as sieve_cmd
+ from disassembler.resolve import resolve_sieve
+-from disassembler.stage import stage_args
++from disassembler.stage import given, stage_args
+ 
+ 
+ from disassembler.validators import (
+@@ -163,11 +163,11 @@
+     g_sieve.add_argument("--sieve", action="store_true",
+                          help="Enable the diversity-thinning pass before the MSA/tree. "
+                               "Off by default.")
+-    g_sieve.add_argument("--sieve-threshold", type=fraction, default=0.005,
+-                         help="LSH promotion threshold tau (default 0.005, gene-scale). "
++    g_sieve.add_argument("--sieve-threshold", type=fraction, default=None,
++                         help=f"LSH promotion threshold tau (default {sieve_cmd.DEFAULT_THRESHOLD}, gene-scale). "
+                               "Higher tau collapses more.")
+-    g_sieve.add_argument("--sieve-sketch", type=positive_int, default=256,
+-                         help="MinHash sketch size m (default 256, gene-scale). Caps the "
++    g_sieve.add_argument("--sieve-sketch", type=positive_int, default=None,
++                         help=f"MinHash sketch size m (default {sieve_cmd.DEFAULT_SKETCH}, gene-scale). Caps the "
+                               "resolution of the novelty estimator at 1/m.")
+     g_sieve.add_argument("--sieve-min-len", type=positive_int, default=None,
+                          help="Minimum sequence length gate for the sieve (default: auto "
+@@ -190,8 +190,8 @@
+         description="Options for the codon-MSA + FastTree GTR stage. See "
+                     "`disassembler msa -h`.",
+     )
+-    g_msa.add_argument("--mafft-threads", type=positive_int, default=8,
+-                       help="Thread count for MAFFT in the MSA stage (default: 8).")
++    g_msa.add_argument("--mafft-threads", type=positive_int, default=None,
++                       help=f"Thread count for MAFFT in the MSA stage (default: {msa_cmd.DEFAULT_MAFFT_THREADS}).")
+     g_msa.add_argument("--msa-min-cov", type=fraction, default=None,
+                        help="Minimum fraction of the reference a row must cover in A/C/G/T "
+                             "bases to enter the MSA. Default: 0.70, or the cohort's coverage "
+@@ -250,9 +250,9 @@
+     # add_parser above.
+     if not args.sieve:
+         sieve_inert = []
+-        if args.sieve_threshold != 0.005:
++        if args.sieve_threshold is not None:
+             sieve_inert.append("--sieve-threshold")
+-        if args.sieve_sketch != 256:
++        if args.sieve_sketch is not None:
+             sieve_inert.append("--sieve-sketch")
+         if args.sieve_min_len is not None:
+             sieve_inert.append("--sieve-min-len")
+@@ -344,8 +344,7 @@
+             ref=Path(args.ref),
+             min_len=args.sieve_min_len,
+             max_gap_frac=max_gap_frac,
+-            threshold=args.sieve_threshold,
+-            sketch=args.sieve_sketch,
++            **given(threshold=args.sieve_threshold, sketch=args.sieve_sketch),
+             sieve_bin=args.sieve_bin,
+         )
+         if rc != 0:
+@@ -359,14 +358,14 @@
+           f"--out-tree {tree}", flush=True)
+     msa_min_cov = args.msa_min_cov
+     if msa_min_cov is None:
+-        msa_min_cov = round(min(0.70, gate - GATE_MARGIN), 6)
++        msa_min_cov = round(min(msa_cmd.DEFAULT_MIN_COV, gate - GATE_MARGIN), 6)
+     msa_ns = stage_args(
+         msa_cmd,
+         ref=args.ref,
+         input=str(msa_input),
+         out_aln=str(aln),
+         out_tree=str(tree),
+-        mafft_threads=args.mafft_threads,
++        **given(mafft_threads=args.mafft_threads),
+         msa_min_cov=msa_min_cov,
+     )
+     rc = msa_cmd.run(msa_ns)
+diff --git a/src/disassembler/cmd/pipe_reconstruct.py b/src/disassembler/cmd/pipe_reconstruct.py
+index ec0cd7c15617..000000000000 100644
+--- a/src/disassembler/cmd/pipe_reconstruct.py
++++ b/src/disassembler/cmd/pipe_reconstruct.py
+@@ -14,7 +14,7 @@
+ from disassembler.cmd import sieve as sieve_cmd
+ from disassembler.cmd import walker as walker_cmd
+ from disassembler.resolve import resolve_sieve, resolve_walker
+-from disassembler.stage import stage_args
++from disassembler.stage import given, stage_args
+ from disassembler.validators import (
+     fasta_has_record,
+     fasta_record_lengths,
+@@ -148,12 +148,12 @@
+     )
+     g_sieve.add_argument("--sieve", action="store_true",
+                          help="Enable the diversity-thinning pass. Off by default.")
+-    g_sieve.add_argument("--sieve-threshold", type=fraction, default=0.005,
+-                         help="LSH promotion threshold tau (default 0.005, gene-scale). "
++    g_sieve.add_argument("--sieve-threshold", type=fraction, default=None,
++                         help=f"LSH promotion threshold tau (default {sieve_cmd.DEFAULT_THRESHOLD}, gene-scale). "
+                               "A sequence is promoted only if 1 - maxJaccard >= tau against "
+                               "the already-promoted set, so higher tau collapses more.")
+-    g_sieve.add_argument("--sieve-sketch", type=positive_int, default=256,
+-                         help="MinHash sketch size m (default 256, gene-scale). Caps the "
++    g_sieve.add_argument("--sieve-sketch", type=positive_int, default=None,
++                         help=f"MinHash sketch size m (default {sieve_cmd.DEFAULT_SKETCH}, gene-scale). Caps the "
+                               "resolution of the novelty estimator at 1/m.")
+     g_sieve.add_argument("--sieve-min-len", type=positive_int, default=None,
+                          help="Minimum sequence length gate for the sieve "
+@@ -168,14 +168,14 @@
+         description="Options for the codon-MSA + FastTree GTR stage, delegated to the "
+                     "`disassembler msa` atomic. Skipped entirely under --skip-tree.",
+     )
+-    g_msa.add_argument("--mafft-threads", type=positive_int, default=8,
+-                       help="Thread count for MAFFT in the MSA stage (default: 8). "
++    g_msa.add_argument("--mafft-threads", type=positive_int, default=None,
++                       help=f"Thread count for MAFFT in the MSA stage (default: {msa_cmd.DEFAULT_MAFFT_THREADS}). "
+                             "Distinct from the walker's -t/--threads, which sets "
+                             "GraphAligner's thread count and is kept at 1 for "
+                             "reproducibility.")
+-    g_msa.add_argument("--msa-min-cov", type=fraction, default=0.70,
++    g_msa.add_argument("--msa-min-cov", type=fraction, default=None,
+                        help="Minimum coverage fraction for a reconstructed sequence to "
+-                            "enter the MSA (default: 0.70). Distinct from the walker's own "
++                            f"enter the MSA (default: {msa_cmd.DEFAULT_MIN_COV}). Distinct from the walker's own "
+                             "--min-cov (default 0.85), which gates which reconstructions "
+                             "are produced at all.")
+     g_msa.add_argument("--skip-tree", action="store_true",
+@@ -248,9 +248,9 @@
+     """
+     if not args.sieve:
+         sieve_inert = []
+-        if args.sieve_threshold != 0.005:
++        if args.sieve_threshold is not None:
+             sieve_inert.append("--sieve-threshold")
+-        if args.sieve_sketch != 256:
++        if args.sieve_sketch is not None:
+             sieve_inert.append("--sieve-sketch")
+         if args.sieve_min_len is not None:
+             sieve_inert.append("--sieve-min-len")
+@@ -263,9 +263,9 @@
+ 
+     if args.skip_tree:
+         msa_inert = []
+-        if args.mafft_threads != 8:
++        if args.mafft_threads is not None:
+             msa_inert.append("--mafft-threads")
+-        if args.msa_min_cov != 0.70:
++        if args.msa_min_cov is not None:
+             msa_inert.append("--msa-min-cov")
+         if args.msa_reference is not None:
+             msa_inert.append("--msa-reference")
+@@ -411,15 +411,14 @@
+         min_len = args.sieve_min_len
+         if min_len is None:
+             rid, length = min(references, key=lambda r: r[1])
+-            min_len = int(length * 0.95)
++            min_len = sieve_cmd.min_len_for(references)
+             if len(references) > 1:
+-                print(f"[reconstruct] sieve --min-len {min_len}: 95% of the shortest "
++                print(f"[reconstruct] sieve --min-len {min_len}: {sieve_cmd.AUTO_MIN_LEN_FRACTION:.0%} of the shortest "
+                       f"reference ({rid}, {length} nt).", flush=True)
+         rc = sieve_cmd.sieve_run(
+             recon, sieved,
+             min_len=min_len,
+-            threshold=args.sieve_threshold,
+-            sketch=args.sieve_sketch,
++            **given(threshold=args.sieve_threshold, sketch=args.sieve_sketch),
+             sieve_bin=args.sieve_bin,
+         )
+         if rc != 0:
+@@ -443,8 +442,7 @@
+         input=str(msa_input),
+         out_aln=str(aln),
+         out_tree=str(tree),
+-        mafft_threads=args.mafft_threads,
+-        msa_min_cov=args.msa_min_cov,
++        **given(mafft_threads=args.mafft_threads, msa_min_cov=args.msa_min_cov),
+     )
+     rc = msa_cmd.run(msa_args)
+     if rc != 0:
+diff --git a/src/disassembler/cmd/sieve.py b/src/disassembler/cmd/sieve.py
+index 54e68d33850f..000000000000 100644
+--- a/src/disassembler/cmd/sieve.py
++++ b/src/disassembler/cmd/sieve.py
+@@ -28,6 +28,14 @@
+ # row is on the reference grid with '-' wherever no HSP reached, so the same limit becomes a
+ # coverage gate; from-lexicmap derives its value from the cohort's own coverage gate instead.
+ DEFAULT_MAX_GAP_FRAC = 0.05
++DEFAULT_THRESHOLD = 0.005   # gene-scale tau
++DEFAULT_SKETCH = 256
++AUTO_MIN_LEN_FRACTION = 0.95
++
++
++def min_len_for(records) -> int:
++    """The auto --min-len for (id, length) records: AUTO_MIN_LEN_FRACTION of the shortest."""
++    return int(min(r[1] for r in records) * AUTO_MIN_LEN_FRACTION)
+ 
+ 
+ def auto_min_len(ref: Path) -> int | None:
+@@ -49,7 +57,7 @@
+     # Reconstructions are typically a few bases shorter than the reference (the walk may
+     # not reach the exact termini). Defaulting to the exact query length would then drop
+     # every haplotype, so the auto-default takes a 5% haircut.
+-    return int(length * 0.95)
++    return min_len_for(records)
+ 
+ 
+ def byte_exact_dedup(src: Path, dst: Path) -> tuple[int, int]:
+@@ -137,8 +145,8 @@
+     ref: Path | None = None,
+     min_len: int | None = None,
+     max_gap_frac: float = DEFAULT_MAX_GAP_FRAC,
+-    threshold: float = 0.005,
+-    sketch: int = 256,
++    threshold: float = DEFAULT_THRESHOLD,
++    sketch: int = DEFAULT_SKETCH,
+     sieve_bin: str | None = None,
+ ) -> int:
+     """Run the sieve on `input_fasta`, concatenate rank shards to `output_fasta`.
+@@ -268,11 +276,11 @@
+                         "have no gaps. For a LexicMap cohort, whose rows carry '-' where no "
+                         "HSP reached, use 1 - the cohort's coverage gate + 0.05, as "
+                         "from-lexicmap does.")
+-    p.add_argument("--threshold", type=fraction, default=0.005,
+-                   help="LSH promotion threshold tau (default 0.005, gene-scale). "
++    p.add_argument("--threshold", type=fraction, default=DEFAULT_THRESHOLD,
++                   help=f"LSH promotion threshold tau (default {DEFAULT_THRESHOLD}, gene-scale). "
+                         "The sieve binary's own default of 0.15 targets archive-scale.")
+-    p.add_argument("--sketch", type=positive_int, default=256,
+-                   help="MinHash sketch size m (default 256, gene-scale). The "
++    p.add_argument("--sketch", type=positive_int, default=DEFAULT_SKETCH,
++                   help=f"MinHash sketch size m (default {DEFAULT_SKETCH}, gene-scale). The "
+                         "estimator cannot resolve novelty finer than 1/m.")
+     p.add_argument("--sieve-bin", default=None,
+                    help="Path to l1_pipeline_serial (auto-discovered otherwise).")
+diff --git a/src/disassembler/stage.py b/src/disassembler/stage.py
+index 547fb9b2e6da..000000000000 100644
+--- a/src/disassembler/stage.py
++++ b/src/disassembler/stage.py
+@@ -39,3 +39,8 @@
+ 
+     ns.update(parser._defaults)
+     return argparse.Namespace(**ns)
++
++
++def given(**values):
++    """The subset of `values` the user set (not None); the stage applies its own default."""
++    return {k: v for k, v in values.items() if v is not None}

@@ -1,0 +1,74 @@
+diff --git a/walker/src/scratch.rs b/walker/src/scratch.rs
+--- a/walker/src/scratch.rs
++++ b/walker/src/scratch.rs
+@@ -16,6 +16,8 @@
+ use std::path::{Path, PathBuf};
+ 
+ const PREFIX: &str = "logan-walker.";
++/// Written into a run directory kept with `LOGAN_KEEP_SCRATCH`; the sweep never removes it.
++const KEEP_MARKER: &str = ".keep";
+ 
+ pub struct Scratch {
+     path: PathBuf,
+@@ -45,7 +47,13 @@
+         for attempt in 0..16u32 {
+             let path = base.join(format!("{PREFIX}{pid}.{nanos:08x}{attempt:x}"));
+             match make_private_dir(&path) {
+-                Ok(()) => return Ok(Scratch { path, keep }),
++                Ok(()) => {
++                    if keep {
++                        std::fs::write(path.join(KEEP_MARKER), b"")
++                            .map_err(file_err("mark the kept scratch directory", &path))?;
++                    }
++                    return Ok(Scratch { path, keep });
++                }
+                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                 Err(e) => {
+                     return Err(Error::Usage(format!(
+@@ -88,7 +96,10 @@
+ impl Drop for Scratch {
+     fn drop(&mut self) {
+         if self.keep {
+-            eprintln!("[logan-walker] LOGAN_KEEP_SCRATCH: kept {}", self.path.display());
++            eprintln!(
++                "[logan-walker] LOGAN_KEEP_SCRATCH: kept {} (never swept; remove it yourself)",
++                self.path.display()
++            );
+         } else {
+             remove(&self.path);
+         }
+@@ -148,6 +159,9 @@
+         if !meta.is_dir() || meta.uid() != uid || pid as u32 == std::process::id() {
+             continue;
+         }
++        if entry.path().join(KEEP_MARKER).exists() {
++            continue; // kept on purpose with LOGAN_KEEP_SCRATCH
++        }
+         if !process_exists(pid) {
+             remove(&entry.path());
+             removed += 1;
+@@ -225,6 +239,24 @@
+         drop(s);
+         let _ = std::fs::remove_dir_all(&b);
+     }
++
++    #[test]
++    fn a_kept_directory_survives_the_next_runs_sweep() {
++        let b = base("keep");
++        std::fs::create_dir_all(&b).unwrap();
++        let mut child = std::process::Command::new("true").spawn().unwrap();
++        let dead = child.id();
++        child.wait().unwrap();
++        // What a finished LOGAN_KEEP_SCRATCH run leaves behind.
++        let kept = b.join(format!("{PREFIX}{dead}.0"));
++        std::fs::create_dir(&kept).unwrap();
++        std::fs::write(kept.join(KEEP_MARKER), b"").unwrap();
++        std::fs::write(kept.join("x.sub.gfa"), b"H\n").unwrap();
++        let s = Scratch::create(Some(&b)).unwrap();
++        assert!(kept.join("x.sub.gfa").exists(), "a kept directory is the user's to delete");
++        drop(s);
++        let _ = std::fs::remove_dir_all(&b);
++    }
+ 
+     #[test]
+     fn an_unwritable_base_names_itself() {

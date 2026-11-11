@@ -1,0 +1,113 @@
+diff --git a/src/disassembler/cmd/stratify.py b/src/disassembler/cmd/stratify.py
+index 3e624b165abd..000000000000 100644
+--- a/src/disassembler/cmd/stratify.py
++++ b/src/disassembler/cmd/stratify.py
+@@ -28,6 +28,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import json
++import re
+ import sys
+ from pathlib import Path
+ from typing import NamedTuple
+@@ -141,7 +142,20 @@ def sample_bins_from_scores(scores, bins):
+ class ScoreFile(NamedTuple):
+     path: Path
+     target: str | None  # None: the pre-0.1.1 shape, which has no target inside
+-    scores: dict
++    scores: dict | None = None  # None: not loaded yet (see load)
++
++    def load(self) -> dict:
++        """The scores, read from `path` if discovery did not keep them."""
++        if self.scores is not None:
++            return self.scores
++        sf = read_score_file(self.path)
++        if sf is None:
++            raise ValueError(f"{self.path}: no longer a harvest score file")
++        return sf.scores
++
++
++# harvest writes `{"target": T, ...` first, so the target can be read without the scores.
++_HEAD_TARGET = re.compile(r'\s*\{\s*"target"\s*:\s*("(?:[^"\\]|\\.)*")\s*,\s*"scores"\s*:\s*\{')
+ 
+ 
+ def _is_score_map(d) -> bool:
+@@ -150,7 +164,7 @@ def _is_score_map(d) -> bool:
+         for k, v in d.items())
+ 
+ 
+-def read_score_file(path: Path) -> ScoreFile | None:
++def read_score_file(path: Path, only_target: str | None = None) -> ScoreFile | None:
+     """The harvest scores in `path`, or None if it holds something else. Plain or gzipped.
+ 
+     `{"target": T, "scores": {accession: score}}` is what `harvest` writes; a bare, non-empty
+@@ -161,6 +175,11 @@ def read_score_file(path: Path) -> ScoreFile | None:
+         start = fh.read(256)
+         if not start.lstrip().startswith("{"):
+             raise ValueError(f"{path}: not a JSON object")
++        if only_target is not None:
++            m = _HEAD_TARGET.match(start)
++            if m and json.loads(m.group(1)) != only_target:
++                # Another target's file: name it, but do not parse its scores.
++                return ScoreFile(path, json.loads(m.group(1)), None)
+         data = json.loads(start + fh.read())
+     if (isinstance(data, dict) and isinstance(data.get("target"), str)
+             and _is_score_map(data.get("scores"))):
+@@ -192,15 +211,15 @@ def find_score_files(sources, target: str | None = None) -> list[ScoreFile]:
+             files = (x for x in path.iterdir() if x.is_file() and not x.name.startswith("."))
+             for f in sorted(files):
+                 try:
+-                    sf = read_score_file(f)
++                    sf = read_score_file(f, target)
+                 except (OSError, ValueError):
+                     sf = None
+                 if sf is None:
+                     passed_over += 1
+                 else:
+-                    found.append(sf)
++                    found.append(sf._replace(scores=None))  # loaded one at a time later
+         elif path.is_file():
+-            sf = read_score_file(path)
++            sf = read_score_file(path, None if name else target)
+             if sf is None:
+                 raise ValueError(f"{path}: not a harvest score file ({{\"target\": ..., "
+                                  f"\"scores\": {{accession: score}}}}, or a bare "
+@@ -209,7 +228,7 @@ def find_score_files(sources, target: str | None = None) -> list[ScoreFile]:
+                 if sf.target not in (None, name):
+                     raise ValueError(f"{src}: the file's own target is {sf.target!r}")
+                 sf = sf._replace(target=name)
+-            found.append(sf)
++            found.append(sf._replace(scores=None))
+         else:
+             raise ValueError(f"{path}: no such file or directory")
+ 
+@@ -264,7 +283,8 @@ def stratify_bins(out_dir: Path, bins, score_files: list[ScoreFile]) -> None:
+     out_dir.mkdir(parents=True, exist_ok=True)
+     all_summaries = {}
+     for sf in sorted(score_files, key=lambda f: f.target):
+-        target, scores = sf.target, sf.scores
++        target, scores = sf.target, sf.load()
++        n_nonzero = sum(1 for s in scores.values() if s > 0.0)
+ 
+         picks, per_bin = sample_bins_from_scores(scores, bins)
+ 
+@@ -273,7 +293,7 @@ def stratify_bins(out_dir: Path, bins, score_files: list[ScoreFile]) -> None:
+         out_txt.write_text(("\n".join(x[0] for x in picks) + "\n") if picks else "")
+         out_json.write_text(json.dumps({
+             "target": target,
+-            "n_available_nonzero": sum(1 for s in scores.values() if s > 0.0),
++            "n_available_nonzero": n_nonzero,
+             "n_total_input": len(scores),
+             "total_selected": len(picks),
+             "bins": per_bin,
+@@ -286,8 +306,9 @@ def stratify_bins(out_dir: Path, bins, score_files: list[ScoreFile]) -> None:
+         all_summaries[target] = {
+             "total_selected": len(picks),
+             "bins": per_bin,
+-            "n_available_nonzero": sum(1 for s in scores.values() if s > 0.0),
++            "n_available_nonzero": n_nonzero,
+         }
++        del scores, picks, per_bin  # one target's map alive at a time
+ 
+     summary_file = out_dir / "bins_summary.json"
+     summary_file.write_text(json.dumps(all_summaries, indent=2))

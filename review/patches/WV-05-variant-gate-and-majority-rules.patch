@@ -1,0 +1,117 @@
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -862,8 +862,20 @@
+     let mut alts: Vec<crate::types::AltHaplotype> = Vec::new();
+     // Correct the consensus first, so the alternatives that follow are the minority alleles
+     // relative to a corrected route rather than to a reference-biased one.
++    // A refused prune hands back the unpruned subgraph. The variant gate must not reopen
++    // to plain min_abund there: hold it at the floor the prune measured.
++    let vcfg_raised;
++    let vcfg: &Config = match prune.as_ref() {
++        Some(r) if !matches!(r.result, PruneResult::Applied | PruneResult::NothingToRemove)
++            && r.floor > cfg.min_abund =>
++        {
++            vcfg_raised = Config { min_abund: r.floor, ..cfg.clone() };
++            &vcfg_raised
++        }
++        _ => cfg,
++    };
+     if let (Some(path), Some(_)) = (&final_path, &haplotype) {
+-        if let Some(fixed) = stages::variants::prefer_majority(cfg, &graph, &subgraph, path, query)?
++        if let Some(fixed) = stages::variants::prefer_majority(vcfg, &graph, &subgraph, path, query)?
+         {
+             if let Some(mut h) = stages::stitch::stitch(cfg, &graph, &fixed, &subgraph, query)? {
+                 // The route was spliced onto the majority allele, so the GAF's identity
+@@ -875,7 +887,7 @@
+         }
+     }
+     if let (Some(path), Some(_)) = (&final_path, &haplotype) {
+-        alts = stages::variants::find_alts(cfg, &graph, &subgraph, path, query)?;
++        alts = stages::variants::find_alts(vcfg, &graph, &subgraph, path, query)?;
+     }
+     // Tag the primary with the winning reference when the anchor pool held more than one.
+     // Single-anchor mode leaves anchor_used = None on Haplotype, alts, and AccessionResult
+diff --git a/walker/src/stages/variants.rs b/walker/src/stages/variants.rs
+--- a/walker/src/stages/variants.rs
++++ b/walker/src/stages/variants.rs
+@@ -188,21 +188,17 @@
+             if taken_ab < floor || (taken_ab as f64 / total) < cfg.min_vaf {
+                 continue; // not a two-allele site; this is the error-branch case
+             }
+-            // The best-supported credible alternative, and only if it beats what we took.
+-            let mut best: Option<(Oriented, f32)> = None;
+-            for &alt in branches {
+-                if alt == taken {
+-                    continue;
+-                }
+-                let ab = abund(alt);
+-                if ab < floor || (ab as f64 / total) < cfg.min_vaf || ab <= taken_ab {
+-                    continue;
+-                }
+-                if best.is_none_or(|(_, b)| ab > b) {
+-                    best = Some((alt, ab));
+-                }
+-            }
+-            let Some((alt, _)) = best else { continue };
++            // Every credible alternative that beats what we took, most abundant first (stable,
++            // so ties keep branch order as before); the first that passes every rule wins.
++            let mut better: Vec<(Oriented, f32)> = branches
++                .iter()
++                .copied()
++                .filter(|&alt| alt != taken)
++                .map(|alt| (alt, abund(alt)))
++                .filter(|&(_, ab)| ab >= floor && (ab as f64 / total) >= cfg.min_vaf && ab > taken_ab)
++                .collect();
++            better.sort_by(|a, b| b.1.total_cmp(&a.1));
++            for (alt, _) in better {
+             let Some((rejoin_at, detour)) = rejoin(&v.out, &v.at, alt, i, cfg.alt_max_detour)
+             else {
+                 continue;
+@@ -227,7 +223,7 @@
+             if delta != 0
+                 && (!cfg.allow_indel_alts
+                     || delta.unsigned_abs() as usize > cfg.max_alt_indel
+-                    || (delta % 3 != 0 && !cfg.allow_frameshift_alts))
++                    || delta % 3 != 0)
+                 {
+                     continue;
+                 }
+@@ -266,6 +262,10 @@
+             swaps += 1;
+             applied = true;
+             break;
++            }
++            if applied {
++                break;
++            }
+         }
+         if !applied {
+             break;
+@@ -833,6 +833,26 @@
+         let c = Config { allow_indel_alts: false, ..maj(true) };
+         assert!(prefer_majority(&c, &g, &s, &walked(), &q("ACGTAG")).unwrap().is_none(),
+                 "and not with indel support switched off either");
++        let c = Config { allow_frameshift_alts: true, ..maj(true) };
++        assert!(prefer_majority(&c, &g, &s, &walked(), &q("ACGTAG")).unwrap().is_none(),
++                "--allow-frameshift-alts admits side-file alleles, never a reframed primary");
++    }
++
++    /// Three branches: the top one (45%) is a frameshift and cannot be swapped in, but the
++    /// substitution at 30% still outnumbers the 25% the route took, so it must win.
++    #[test]
++    fn a_refused_top_alternative_falls_through_to_the_next() {
++        let fa = ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+  L:+:4:+\nACGT\n\
++                  >T_1 ka:f:25.0   L:-:0:-  L:+:3:+\nCGTA\n\
++                  >T_2 ka:f:45.0   L:-:0:-  L:+:3:+\nCGTCA\n\
++                  >T_3 ka:f:100.0  L:-:1:-  L:-:2:-  L:-:4:-\nGTAG\n\
++                  >T_4 ka:f:30.0   L:-:0:-  L:+:3:+\nCGTC\n";
++        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap();
++        let s = subgraph_of(&g);
++        let fixed = prefer_majority(&maj(true), &g, &s, &walked(), &q("ACGTAG"))
++            .unwrap()
++            .expect("the 30% substitution beats the 25% the route took");
++        assert!(fixed.steps.iter().any(|p| p.node == 4));
+     }
+ 
+     #[test]

@@ -1,0 +1,115 @@
+diff --git a/src/disassembler/cmd/sieve.py b/src/disassembler/cmd/sieve.py
+index 54e68d33850f..000000000000 100644
+--- a/src/disassembler/cmd/sieve.py
++++ b/src/disassembler/cmd/sieve.py
+@@ -78,11 +78,13 @@
+         nonlocal n_out
+         if header is None:
+             return
+-        seq = "".join(seq_lines).replace("\n", "").replace("\r", "").upper()
+-        if seq and seq not in seen:
+-            seen.add(seq)
+-            fout.write(header)
+-            fout.writelines(seq_lines)
++        # Whitespace is not sequence: the binary keeps every byte but CR/LF and would count
++        # a space as a non-ACGT base, so write the record unwrapped with whitespace removed.
++        seq = "".join("".join(seq_lines).split())
++        key = seq.upper()
++        if seq and key not in seen:
++            seen.add(key)
++            fout.write(header.rstrip("\r\n") + "\n" + seq + "\n")
+             n_out += 1
+ 
+     with open_text(src) as fin, dst.open("w") as fout:
+@@ -92,6 +94,9 @@
+                 header = line
+                 seq_lines = []
+                 n_in += 1
++            elif header is None:
++                if line.strip():
++                    raise ValueError(f"{src}: text before the first '>' header")
+             else:
+                 seq_lines.append(line)
+         _emit(fout)
+@@ -187,11 +192,18 @@
+ 
+     # The binary runs on a deduplicated copy, written beside the output and removed after.
+     deduped = output_fasta.with_name(f".tmp_{output_fasta.stem}.deduped.{os.getpid()}.fasta")
++    tmp_out = output_fasta.with_name(f".tmp_{output_fasta.name}.{os.getpid()}")
+     try:
+         try:
+             n_in, n_unique = byte_exact_dedup(input_fasta, deduped)
+         except (OSError, ValueError) as e:
+-            print(f"sieve: cannot read the input FASTA: {e}", file=sys.stderr)
++            # byte_exact_dedup both reads the input and writes beside the output; name the
++            # side that failed (an OSError carries the path it was raised for).
++            if isinstance(e, OSError) and e.filename == str(deduped):
++                print(f"sieve: cannot write beside the output {output_fasta}: {e}",
++                      file=sys.stderr)
++            else:
++                print(f"sieve: cannot read the input FASTA: {e}", file=sys.stderr)
+             return 1
+         if n_unique == 0:
+             print(f"sieve: {input_fasta} has no sequences.", file=sys.stderr)
+@@ -221,25 +233,39 @@
+             print(f"sieve: kmer-diversity-sieve exited {rc}", file=sys.stderr)
+             return rc
+ 
+-        with output_fasta.open("w") as fh:
++        # Concatenate into a temp file and rename only on success, as msa does: a run
++        # that promotes nothing must not replace a previous result with an empty file.
++        n_out = 0
++        with tmp_out.open("w") as fh:
+             for rf in shards():
+-                fh.write(rf.read_text())
++                text = rf.read_text()
++                n_out += sum(1 for line in text.splitlines() if line.startswith(">"))
++                fh.write(text)
++        if n_out == 0:
++            # The first admitted record is always promoted, so tau is never the cause.
++            why = []
++            if short:
++                why.append(f"{short} shorter than --min-len {min_len}")
++            if gappy:
++                why.append(f"{gappy} over --max-gap-frac {max_gap_frac}")
++            print(f"sieve: promoted 0 of {n_unique} haplotypes; {output_fasta} left "
++                  f"unchanged. Completeness gate: {', '.join(why) or 'no record dropped'}. "
++                  "Lower --min-len (reconstructions may be shorter than the reference) "
++                  "or raise --max-gap-frac (gapped rows, such as LexicMap partials); a "
++                  "record with no 15-mer of A/C/G/T cannot be sketched at all.",
++                  file=sys.stderr)
++            return 1
++        os.replace(tmp_out, output_fasta)
+     finally:
+         # The binary writes its result as <output>.rank*.fasta shards; the output is their
+         # concatenation. The shards used to be left beside it, a second copy of every record.
+         deduped.unlink(missing_ok=True)
++        tmp_out.unlink(missing_ok=True)
+         for rf in shards():
+             rf.unlink(missing_ok=True)
+ 
+-    n_out = sum(1 for line in output_fasta.open() if line.startswith(">"))
+     print(f"[sieve] {n_in} -> {n_out} haplotypes "
+           f"(tau={threshold}, sketch={sketch}) -> {output_fasta}", flush=True)
+-    if n_out == 0:
+-        print("sieve: promoted 0 haplotypes; try a lower --threshold, a lower --min-len "
+-              "(reconstructions may be shorter than the reference), or a higher "
+-              "--max-gap-frac (gapped rows, such as LexicMap partials).",
+-              file=sys.stderr)
+-        return 1
+     return 0
+ 
+ 
+diff --git a/src/disassembler/textio.py b/src/disassembler/textio.py
+index 04e5c5abf337..000000000000 100644
+--- a/src/disassembler/textio.py
++++ b/src/disassembler/textio.py
+@@ -29,7 +29,7 @@
+         raise ValueError(f"the input is {ZSTD_REFUSED}")
+     if head.startswith(GZIP_MAGIC):
+         buf = gzip.GzipFile(fileobj=buf)
+-    return io.TextIOWrapper(buf, encoding="utf-8")
++    return io.TextIOWrapper(buf, encoding="utf-8-sig")
+ 
+ 
+ def open_text(path) -> io.TextIOWrapper:

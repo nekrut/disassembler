@@ -1,0 +1,219 @@
+diff --git a/walker/src/error.rs b/walker/src/error.rs
+--- a/walker/src/error.rs
++++ b/walker/src/error.rs
+@@ -38,6 +38,9 @@
+     AllErrored { total: usize },
+     /// `--fetch-only` left accessions out of the cache.
+     FetchIncomplete { total: usize, errors: usize, negatives: usize },
++    /// `--fetch-only` downloaded an accession but could not write its cache entry. The cache
++    /// is what that mode produces, so this fails the accession rather than warning.
++    CacheWrite { accession: String, path: PathBuf, source: std::io::Error },
+ }
+ 
+ impl Error {
+@@ -65,6 +68,11 @@
+             Error::Io(e) => write!(f, "io error: {e}"),
+             Error::File { op, path, source } => write!(f, "cannot {op} {}: {source}", path.display()),
+             Error::Fetch { accession, detail } => write!(f, "[{accession}] fetch failed: {detail}"),
++            Error::CacheWrite { accession, path, source } => write!(
++                f,
++                "[{accession}] downloaded, but could not write the cache entry {}: {source}",
++                path.display()
++            ),
+             Error::Decompress { accession, detail } => {
+                 write!(f, "[{accession}] decompress failed: {detail}")
+             }
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -513,6 +513,10 @@
+     // --fetch-only takes the short path: fill the cache and exit. No compute pool, no
+     // output files, no query. Success = every accession is in the cache after this.
+     if args.cfg.fetch_only {
++        // Checked above: --fetch-only requires --unitigs-cache.
++        if let Some(dir) = &args.cfg.unitigs_cache {
++            stages::stream::probe_cache_dir(dir)?;
++        }
+         let (ok, negatives, errors) = pipeline::run_fetch_only(&args.cfg, accessions)?;
+         eprintln!(
+             "[logan-walker --fetch-only] {ok} fetched, {negatives} not available \
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -199,12 +199,19 @@
+     let fetcher = stages::stream::Fetcher::new(cfg);
+     let fetcher = &fetcher;
+     let done = Arc::new(Mutex::new((0usize, 0usize, 0usize))); // (ok, negatives, errors)
++    // Set when a cache write fails because the filesystem is full, over quota or read-only:
++    // every later download would be thrown away too, so stop taking new accessions.
++    let cache_full = std::sync::atomic::AtomicBool::new(false);
++    let cache_full = &cache_full;
+ 
+     std::thread::scope(|scope| {
+         for _ in 0..cfg.fetch_workers {
+             let work = Arc::clone(&work);
+             let done = Arc::clone(&done);
+             scope.spawn(move || loop {
++                if cache_full.load(std::sync::atomic::Ordering::Relaxed) {
++                    break;
++                }
+                 let (index, accession) = match work.lock().unwrap().recv() {
+                     Ok(a) => a,
+                     Err(_) => break,
+@@ -222,6 +229,12 @@
+                         );
+                     }
+                     Err(e) => {
++                        if let crate::error::Error::CacheWrite { source, .. } = &e {
++                            use std::io::ErrorKind as K;
++                            if matches!(source.kind(), K::StorageFull | K::QuotaExceeded | K::ReadOnlyFilesystem) {
++                                cache_full.store(true, std::sync::atomic::Ordering::Relaxed);
++                            }
++                        }
+                         let negative = unfetched(index, accession.clone(), e.to_string(), &e)
+                             .outcome
+                             .is_negative();
+@@ -243,7 +256,15 @@
+         }
+     });
+ 
+-    let counts = *done.lock().unwrap();
++    let mut counts = *done.lock().unwrap();
++    let skipped = work.lock().unwrap().try_iter().count();
++    if skipped > 0 {
++        eprintln!(
++            "[logan-walker --fetch-only] {skipped} accessions not attempted: the cache \
++             filesystem is full, over quota or read-only"
++        );
++        counts.2 += skipped;
++    }
+     Ok(counts)
+ }
+ 
+diff --git a/walker/src/stages/stream.rs b/walker/src/stages/stream.rs
+--- a/walker/src/stages/stream.rs
++++ b/walker/src/stages/stream.rs
+@@ -41,6 +41,8 @@
+     attempts: u32,
+     cache_dir: Option<PathBuf>,
+     offline: bool,
++    /// `--fetch-only`: the cache entry is the product, so a failed write fails the accession.
++    cache_is_product: bool,
+ }
+ 
+ impl Fetcher {
+@@ -58,6 +60,7 @@
+             attempts: cfg.fetch_attempts.max(1),
+             cache_dir: cfg.unitigs_cache.clone(),
+             offline: cfg.offline,
++            cache_is_product: cfg.fetch_only,
+         }
+     }
+ 
+@@ -123,19 +126,7 @@
+ 
+         for attempt in 1..=self.attempts {
+             match self.try_once(index, accession, &url) {
+-                Ok(f) => {
+-                    if let Some(dir) = &self.cache_dir {
+-                        if let Err(e) = write_cache_atomic(dir, accession, &f.compressed) {
+-                            // Cache-write failure must not lose a successful fetch. Warn and
+-                            // hand the bytes back so the compute stage still runs; the next
+-                            // run will just have to fetch again.
+-                            eprintln!(
+-                                "[{accession}] warning: could not write cache entry: {e}"
+-                            );
+-                        }
+-                    }
+-                    return Ok(f);
+-                }
++                Ok(f) => return self.store(accession, f),
+                 Err(FetchAttempt::Permanent(detail)) => {
+                     return Err(Error::Fetch {
+                         accession: accession.clone(),
+@@ -169,6 +160,26 @@
+         })
+     }
+ 
++    /// Write a download back to the cache. In an analysis run the cache is a convenience: a
++    /// failed write must not lose a successful fetch, so warn and hand the bytes on (the next
++    /// run fetches again). Under `--fetch-only` the cache entry is the product, so a failed
++    /// write fails the accession and the run's exit status says so.
++    fn store(&self, accession: &Accession, f: FetchedUnitigs) -> Result<FetchedUnitigs> {
++        let Some(dir) = &self.cache_dir else { return Ok(f) };
++        match write_cache_atomic(dir, accession, &f.compressed) {
++            Ok(()) => Ok(f),
++            Err(source) if self.cache_is_product => Err(Error::CacheWrite {
++                accession: accession.clone(),
++                path: cache_path(dir, accession),
++                source,
++            }),
++            Err(e) => {
++                eprintln!("[{accession}] warning: could not write cache entry: {e}");
++                Ok(f)
++            }
++        }
++    }
++
+     fn try_once(&self, index: usize, accession: &Accession, url: &str) -> std::result::Result<FetchedUnitigs, FetchAttempt> {
+         let mut resp = self
+             .agent
+@@ -271,6 +282,16 @@
+     }
+ }
+ 
++/// Check before any download that `dir` can take cache entries, so a read-only, foreign or
++/// mistyped cache directory fails the run at once instead of after every transfer.
++pub fn probe_cache_dir(dir: &Path) -> Result<()> {
++    std::fs::create_dir_all(dir).map_err(crate::error::file_err("create cache directory", dir))?;
++    let probe = dir.join(format!(".probe.{}.tmp", std::process::id()));
++    std::fs::write(&probe, b"").map_err(crate::error::file_err("write into cache directory", dir))?;
++    let _ = std::fs::remove_file(&probe);
++    Ok(())
++}
++
+ /// A streaming zstd decoder over the compressed buffer.
+ ///
+ /// Deliberately a `Read`, not a `Vec<u8>`. `ERR2028820` decompresses to 145 MB and the
+@@ -716,3 +737,41 @@
+         assert!(out == expected, "content mismatch vs zstd CLI");
+     }
+ }
++
++#[cfg(test)]
++mod store_tests {
++    use super::*;
++    use crate::config::Config;
++
++    /// A cache path that cannot be created even by root: its parent is a regular file.
++    fn unwritable_cache(tag: &str) -> PathBuf {
++        let blocker = std::env::temp_dir().join(format!("logan-walker-store-{tag}-{}", std::process::id()));
++        std::fs::write(&blocker, b"x").unwrap();
++        blocker.join("cache")
++    }
++
++    fn fetched() -> FetchedUnitigs {
++        FetchedUnitigs { index: 0, accession: "X".into(), compressed: vec![1, 2, 3], compressed_len: 3, fetch_secs: 0.0 }
++    }
++
++    #[test]
++    fn fetch_only_fails_an_accession_whose_cache_write_failed() {
++        let dir = unwritable_cache("product");
++        let f = Fetcher::new(&Config { unitigs_cache: Some(dir.clone()), fetch_only: true, ..Config::default() });
++        match f.store(&"X".to_string(), fetched()) {
++            Err(Error::CacheWrite { path, .. }) => assert_eq!(path, cache_path(&dir, "X")),
++            Err(e) => panic!("wrong error: {e}"),
++            Ok(_) => panic!("a failed cache write was reported as cached"),
++        }
++        assert!(probe_cache_dir(&dir).is_err(), "the up-front probe must refuse it too");
++        let _ = std::fs::remove_file(dir.parent().unwrap());
++    }
++
++    #[test]
++    fn an_analysis_run_keeps_the_bytes_when_the_cache_write_fails() {
++        let dir = unwritable_cache("analysis");
++        let f = Fetcher::new(&Config { unitigs_cache: Some(dir.clone()), ..Config::default() });
++        assert_eq!(f.store(&"X".to_string(), fetched()).expect("bytes kept").compressed_len, 3);
++        let _ = std::fs::remove_file(dir.parent().unwrap());
++    }
++}

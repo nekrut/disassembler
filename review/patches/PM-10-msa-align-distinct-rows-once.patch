@@ -1,0 +1,66 @@
+diff --git a/src/disassembler/cmd/msa.py b/src/disassembler/cmd/msa.py
+index 6d19ea4f357a..000000000000 100644
+--- a/src/disassembler/cmd/msa.py
++++ b/src/disassembler/cmd/msa.py
+@@ -234,6 +234,10 @@
+     tmp_aln = out_aln.with_name(f".tmp_{out_aln.name}.{os.getpid()}")
+     try:
+         retained = flipped = unoriented = 0
++        # MAFFT --addfragments aligns each fragment to the reference alone, so a copy of a
++        # sequence always gets the same row: align each distinct sequence once.
++        rep_of: dict = {}   # oriented sequence -> clean id of its first copy
++        rows: list = []     # (clean id, representative id) in input order
+         with open(clean_input_p, "w") as fh:
+             for r in input_records:
+                 seq = str(r.seq).upper()
+@@ -248,7 +252,10 @@
+                 elif strand == 0:
+                     unoriented += 1
+                 clean_id = sanitize_id(r.id, used_ids)
+-                fh.write(f">{clean_id}\n{seq}\n")
++                rep = rep_of.setdefault(seq, clean_id)
++                rows.append((clean_id, rep))
++                if rep == clean_id:
++                    fh.write(f">{clean_id}\n{seq}\n")
+                 retained += 1
+ 
+         if retained == 0:
+@@ -275,7 +282,8 @@
+         with open(clean_ref_p, "w") as fh:
+             fh.write(f">Reference\n{str(ref_rec.seq).upper()}\n")
+ 
+-        print("[*] Running MAFFT --keeplength --addfragments...")
++        print(f"[*] Running MAFFT --keeplength --addfragments on {len(rep_of)} distinct "
++              f"of {retained} sequences...")
+         mafft_cmd = [
+             mafft_bin,
+             "--auto",
+@@ -293,8 +301,17 @@
+             return 1
+ 
+         # Checked before the rename, so a failed check never replaces a good alignment.
+-        aligned_recs = list(SeqIO.parse(tmp_aln, "fasta"))
+-        print(f"[✓] MAFFT aligned {len(aligned_recs)} records. Validating codon lengths...")
++        distinct = list(SeqIO.parse(tmp_aln, "fasta"))
++        by_id = {r.id: r for r in distinct}
++        if len(distinct) != len(rep_of) + 1 or any(rep not in by_id for _, rep in rows):
++            print("Error: MAFFT output does not match its input records", file=sys.stderr)
++            return 1
++        aligned_recs = [distinct[0]]
++        for clean_id, rep in rows:
++            rec = by_id[rep][:]
++            rec.id, rec.description = clean_id, ""
++            aligned_recs.append(rec)
++        print(f"[✓] MAFFT aligned {len(distinct)} records. Validating codon lengths...")
+         for r in aligned_recs:
+             if len(r.seq) != ref_len:
+                 print(
+@@ -304,6 +321,8 @@
+                 return 1
+         if not identity_ok(aligned_recs, args.min_identity):
+             return 1
++        if len(distinct) != len(aligned_recs):
++            SeqIO.write(aligned_recs, tmp_aln, "fasta")
+         os.replace(tmp_aln, out_aln)
+     finally:
+         for temp in (clean_input_p, clean_ref_p, tmp_aln):

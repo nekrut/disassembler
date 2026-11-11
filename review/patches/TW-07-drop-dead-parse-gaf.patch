@@ -1,0 +1,208 @@
+diff --git a/walker/src/stages/align.rs b/walker/src/stages/align.rs
+--- a/walker/src/stages/align.rs
++++ b/walker/src/stages/align.rs
+@@ -123,7 +123,7 @@
+ ///
+ /// `read_query` selects the first record of a query FASTA and warns about the rest, but
+ /// handing the whole file to GraphAligner undoes that: it aligns every record, and
+-/// `parse_gaf` used to take the best-scoring row across all of them. `stitch` then sliced
++/// the parser then took the best-scoring row across all of them. `stitch` then sliced
+ /// with that row's coordinates while dividing by the *selected* record's length, so a
+ /// 160-record panel such as `queries/master_planetary_targets.fasta` produced another gene's
+ /// path published under the first gene's name, at a coverage above 1.0.
+@@ -249,9 +249,10 @@
+ /// Parse a GAF and keep the best alignment for every expected reference name.
+ ///
+ /// Multi-anchor's stitch stage needs one `GafPath` per reference so it can score each
+-/// reference against its own length and pick a primary. This is the same logic as
+-/// [`parse_gaf`] applied per record id: rows are grouped by column 1, the one with the most
+-/// residue matches (column 10) wins per group, ties keep file order.
++/// reference against its own length and pick a primary; the single-reference path is the
++/// same call with one expected name. Rows are grouped by the first word of column 1, the one
++/// with the most residue matches (column 10) wins per group, ties keep file order. Columns 3-4
++/// are the query span, 7-9 the path length and span, 11 the alignment block length.
+ ///
+ /// A row is matched on the first word of its query name, which is the record id: GraphAligner
+ /// names a read by its whole header line, description included. Matching the whole name
+@@ -319,76 +320,6 @@
+     Ok(out)
+ }
+ 
+-/// Parse the GAF GraphAligner emits and return the best alignment.
+-///
+-/// Column 6 is the path, e.g. `>860013>579233<27101`. The best row is the one with the most
+-/// residue matches (column 10), chosen with a stable sort so ties keep file order.
+-pub fn parse_gaf(gaf_bytes: &[u8], expect: &str) -> Result<Option<GafPath>> {
+-    let text = std::str::from_utf8(gaf_bytes)
+-        .map_err(|e| Error::Usage(format!("GAF is not valid UTF-8: {e}")))?;
+-
+-    let mut rows: Vec<Vec<&str>> = Vec::new();
+-    for line in text.lines() {
+-        let line = line.trim_end();
+-        if line.is_empty() {
+-            continue;
+-        }
+-        let f: Vec<&str> = line.split('\t').collect();
+-        // 12 columns is the GAF minimum; anything shorter cannot carry the fields we need.
+-        if f.len() >= 11 {
+-            rows.push(f);
+-        }
+-    }
+-    if rows.is_empty() {
+-        return Ok(None);
+-    }
+-
+-    // GAF column 1 is the query name, which GraphAligner copies from the FASTA record
+-    // (`pfcrt`, `hiv1_pol`). Taking the best row without checking it is what let one gene's
+-    // path be published under another gene's name.
+-    let mine: Vec<Vec<&str>> = rows.iter().filter(|r| r[0] == expect).cloned().collect();
+-    let mut rows = if !mine.is_empty() {
+-        mine
+-    } else {
+-        // Only one record was ever handed to GraphAligner, so these rows are this query
+-        // under a name the tool spelled differently. Say so rather than silently dropping
+-        // the alignment, and carry on with what is there.
+-        let mut names: Vec<&str> = rows.iter().map(|r| r[0]).collect();
+-        names.sort_unstable();
+-        names.dedup();
+-        eprintln!(
+-            "[warn] GAF carries no row for query {expect:?} (names present: {names:?}); \
+-             using the best row anyway"
+-        );
+-        rows
+-    };
+-
+-    let matches_of = |r: &Vec<&str>| r[9].parse::<usize>().unwrap_or(0);
+-    rows.sort_by_key(|r| std::cmp::Reverse(matches_of(r)));
+-    let best = &rows[0];
+-
+-    let num = |i: usize| -> Result<usize> {
+-        best[i].parse::<usize>().map_err(|e| {
+-            Error::Usage(format!("GAF column {} is not a number: {e}", i + 1))
+-        })
+-    };
+-    let steps = parse_path(best[5]);
+-    if steps.is_empty() {
+-        return Ok(None);
+-    }
+-
+-    Ok(Some(GafPath {
+-        steps,
+-        query_start: num(2)?,
+-        query_end: num(3)?,
+-        path_len: num(6)?,
+-        path_start: num(7)?,
+-        path_end: num(8)?,
+-        num_matches: num(9)?,
+-        aln_len: num(10)?,
+-    }))
+-}
+-
+ /// Split a GAF path string into oriented steps. `>` is forward, `<` reverse-complement.
+ /// No regex: the grammar is a sign followed by digits, repeated.
+ fn parse_path(s: &str) -> Vec<PathStep> {
+@@ -425,9 +356,15 @@
+     /// A real GAF line captured from GraphAligner on ERR2028820.
+     const REAL: &str = "pfcrt\t1275\t0\t1274\t+\t>860013>579233>390349<27101\t1288\t7\t1281\t1268\t1274\t60";
+ 
++    fn one(gaf: &str, name: &str) -> Option<GafPath> {
++        parse_gaf_multi(gaf.as_bytes(), &[name]).unwrap().remove(name)
++    }
++
+     #[test]
+     fn parses_a_real_gaf_line() {
+-        let g = parse_gaf(REAL.as_bytes(), "pfcrt").unwrap().expect("a path");
++        let g = one(REAL, "pfcrt").expect("a path");
++        assert_eq!(g.query_start, 0);
++        assert_eq!(g.query_end, 1274);
+         assert_eq!(g.path_len, 1288);
+         assert_eq!(g.path_start, 7);
+         assert_eq!(g.path_end, 1281);
+@@ -440,6 +377,16 @@
+         assert_eq!(g.steps[3].orient, Orient::Reverse);
+     }
+ 
++    /// Every numeric column distinct, so a swapped or shifted index cannot pass.
++    #[test]
++    fn each_gaf_column_lands_in_its_own_field() {
++        let g = one("q\t100\t3\t97\t+\t>1\t200\t11\t105\t90\t96\t60\n", "q").unwrap();
++        assert_eq!(
++            (g.query_start, g.query_end, g.path_len, g.path_start, g.path_end, g.num_matches, g.aln_len),
++            (3, 97, 200, 11, 105, 90, 96)
++        );
++    }
++
+     #[test]
+     fn path_parsing_handles_long_mixed_orientation() {
+         let steps = parse_path(">1<22>333<4444>5");
+@@ -450,65 +397,23 @@
+         ]);
+     }
+ 
+-    /// Best row is the one with the most residue matches (column 10), not the first.
+-    #[test]
+-    fn picks_the_row_with_most_matches() {
+-        let gaf = "q\t10\t0\t10\t+\t>1\t10\t0\t10\t50\t60\t60\n\
+-             q\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60\n\
+-             q\t10\t0\t10\t+\t>3\t10\t0\t10\t100\t120\t60\n".to_string();
+-        let g = parse_gaf(gaf.as_bytes(), "q").unwrap().unwrap();
+-        assert_eq!(g.num_matches, 900);
+-        assert_eq!(g.steps[0].node, 2);
+-    }
+-
+-    /// Ties keep file order: the sort is stable.
++    /// Ties keep file order: first-seen wins.
+     #[test]
+     fn ties_keep_file_order() {
+         let gaf = "q\t10\t0\t10\t+\t>7\t10\t0\t10\t500\t600\t60\n\
+                    q\t10\t0\t10\t+\t>9\t10\t0\t10\t500\t600\t60\n";
+-        let g = parse_gaf(gaf.as_bytes(), "q").unwrap().unwrap();
+-        assert_eq!(g.steps[0].node, 7);
+-    }
+-
+-    #[test]
+-    fn empty_or_unusable_gaf_is_none_not_an_error() {
+-        assert!(parse_gaf(b"", "q").unwrap().is_none(), "empty file");
+-        assert!(parse_gaf(b"\n\n", "q").unwrap().is_none(), "blank lines");
+-        assert!(parse_gaf(b"too\tfew\tcolumns\n", "q").unwrap().is_none(), "short row");
+-        // Well-formed row whose path names no nodes.
+-        let g = "q\t10\t0\t10\t+\t*\t10\t0\t10\t5\t6\t60\n";
+-        assert!(parse_gaf(g.as_bytes(), "q").unwrap().is_none(), "empty path");
+-    }
+-
+-    /// The bug this guards: a multi-record query used to let another gene's row win, and
+-    /// `stitch` then divided that row's span by the selected record's length.
+-    #[test]
+-    fn rows_for_another_query_are_ignored() {
+-        let gaf = "pfcrt\t10\t0\t10\t+\t>1\t10\t0\t10\t50\t60\t60\n\
+-                   hiv1_pol\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60\n";
+-        let g = parse_gaf(gaf.as_bytes(), "pfcrt").unwrap().unwrap();
+-        assert_eq!(g.num_matches, 50, "the higher-scoring hiv1_pol row must not win");
+-        assert_eq!(g.steps[0].node, 1);
+-
+-        // Asking for the other gene selects the other row, from the same bytes.
+-        let g = parse_gaf(gaf.as_bytes(), "hiv1_pol").unwrap().unwrap();
+-        assert_eq!(g.num_matches, 900);
+-        assert_eq!(g.steps[0].node, 2);
++        assert_eq!(one(gaf, "q").unwrap().steps[0].node, 7);
+     }
+ 
+-    /// Only one record is ever handed to GraphAligner, so an unrecognised name means the
+-    /// tool spelled it differently, not that a foreign gene crept in. Warn, do not drop.
+     #[test]
+-    fn unknown_query_name_still_parses() {
+-        let gaf = "some_other_spelling\t10\t0\t10\t+\t>5\t10\t0\t10\t7\t8\t60\n";
+-        let g = parse_gaf(gaf.as_bytes(), "pfcrt").unwrap().expect("a path");
+-        assert_eq!(g.steps[0].node, 5);
++    fn short_rows_are_skipped_not_an_error() {
++        assert!(parse_gaf_multi(b"too\tfew\tcolumns\n", &["too"]).unwrap().is_empty());
+     }
+ 
+     #[test]
+     fn non_numeric_column_is_an_error() {
+         let g = "q\t10\t0\t10\t+\t>1\tNOTANUMBER\t0\t10\t5\t6\t60\n";
+-        assert!(parse_gaf(g.as_bytes(), "q").is_err());
++        assert!(parse_gaf_multi(g.as_bytes(), &["q"]).is_err());
+     }
+ 
+     #[test]

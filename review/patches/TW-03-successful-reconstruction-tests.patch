@@ -1,0 +1,52 @@
+diff --git a/walker/tests/cli.rs b/walker/tests/cli.rs
+--- a/walker/tests/cli.rs
++++ b/walker/tests/cli.rs
+@@ -34,7 +34,14 @@
+         std::fs::write(dir.join("q.fasta"), format!(">gene\n{QUERY}\n")).unwrap();
+         // Stand-in GraphAligners: both answer --version; `ga_fast` then finds no alignment,
+         // `ga_slow` sleeps, so a test can catch the walker mid-alignment.
+-        for (name, body) in [("ga_fast", "exit 0"), ("ga_slow", "sleep 5")] {
++        // `ga_ok` writes one GAF row walking node 0 (the unitig holding the whole query) end
++        // to end, so a `matching` accession reconstructs.
++        let ga_ok = "while [ $# -gt 0 ]; do case \"$1\" in\n\
++  -f) name=$(head -1 \"$2\" | cut -c2- | cut -d' ' -f1); shift 2;;\n\
++  -a) gaf=\"$2\"; shift 2;;\n\
++  *) shift;;\nesac; done\n\
++printf '%s\\t63\\t0\\t63\\t+\\t>0\\t63\\t0\\t63\\t63\\t63\\t60\\n' \"$name\" > \"$gaf\"";
++        for (name, body) in [("ga_fast", "exit 0"), ("ga_slow", "sleep 5"), ("ga_ok", ga_ok)] {
+             let script = dir.join(name);
+             std::fs::write(&script, format!(
+                 "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n{body}\n"
+@@ -276,3 +283,32 @@
+     assert!(err.contains("--workers must be at least 1"), "{err}");
+ }
+ 
++
++/// The success path end to end under default flags: stitch, prune, prefer-majority, alts and
++/// every output writer, in input order with several workers.
++#[test]
++fn a_matching_accession_is_reconstructed() {
++    let fx = Fixture::matching("success", 3);
++    let out = fx.cmd_ga("ga_ok", "cache", &["-w", "3"]).output().unwrap();
++    let err = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
++    assert_eq!(out.status.code(), Some(0), "{err}");
++    assert!(err.contains("3/3 accessions reconstructed"), "{err}");
++    let fasta = std::fs::read_to_string(fx.dir.join("out").join("r.fasta")).unwrap();
++    let recs: Vec<(&str, &str)> = fasta.split('>').skip(1)
++        .map(|r| { let (h, s) = r.split_once('\n').unwrap(); (h.split(' ').next().unwrap(), s.trim()) })
++        .collect();
++    let want: Vec<(String, &str)> = (0..3).map(|i| (format!("SRRFAKE{i}_primary"), QUERY)).collect();
++    assert_eq!(recs.iter().map(|(h, s)| (h.to_string(), *s)).collect::<Vec<_>>(), want, "{fasta}");
++    let summary = std::fs::read_to_string(fx.dir.join("out").join("q_walker_summary.json")).unwrap();
++    assert_eq!(summary.matches("\"status\": \"success\"").count(), 3, "{summary}");
++}
++
++#[test]
++fn fetch_only_counts_hits_and_misses() {
++    let fx = Fixture::new("fetchonly", 2);
++    let (code, err) = fx.code("cache", &["--fetch-only"]);
++    assert_eq!(code, 0, "{err}");
++    assert!(err.contains("2 fetched, 0 not available"), "{err}");
++    let (code, err) = fx.code("empty_cache", &["--fetch-only"]);
++    assert_ne!(code, 0, "a cache miss under --offline must not succeed: {err}");
++}

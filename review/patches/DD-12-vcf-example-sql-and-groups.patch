@@ -1,0 +1,50 @@
+diff --git a/docs/vcf_example.md b/docs/vcf_example.md
+index c1e1c8ce1a48..000000000000 100644
+--- a/docs/vcf_example.md
++++ b/docs/vcf_example.md
+@@ -61,18 +61,20 @@
+ count):
+ 
+ ```sql
++CREATE TABLE snv AS SELECT * FROM read_csv_auto('snvs.tsv', sep='\t');
++
+ SELECT pos, ref, alt, count(*) AS n_samples,
+        round(avg(af),3) AS mean_af, round(min(af),3) AS min_af, round(max(af),3) AS max_af
+-FROM read_csv_auto('snvs.tsv', sep='\t')
+-GROUP BY pos, ref, alt HAVING count(*) >= 2 ORDER BY n_samples DESC;
++FROM snv
++GROUP BY pos, ref, alt HAVING count(*) >= 2 ORDER BY n_samples DESC, pos;
+ ```
+ 
+ ```
+- pos  change  n_samples  mean_af
+- 2225 T>G     6          0.128
+- 2525 G>A     6          0.173
+- 2064 A>G     4          0.288
+- 517  G>A     3          0.140
++ pos   ref  alt  n_samples  mean_af  min_af  max_af
++ 2225  T    G    6          0.128    0.102   0.187
++ 2525  G    A    6          0.173    0.144   0.252
++ 2064  A    G    4          0.288    0.231   0.351
++ 517   G    A    3          0.140    0.132   0.156
+  ...
+ ```
+ 
+@@ -109,13 +111,14 @@
+ ![Zika NS5 intra-host SNP frequencies across the cohort](examples/zika_ns5/zika_ns5.af_matrix.png)
+ 
+ Each cell is a minor-allele frequency; grey means the site was not called in that sample. The
+-picture is the point of the VCF: it has visible cross-sample structure. Two groups fall out.
++picture is the point of the VCF: it has visible cross-sample structure. Two overlapping groups fall out.
+ 
+ - **Sites 2225 and 2525** carry a minor allele in the *same six* samples (SRR6251963, 967, 969,
+   973, 979, 984) at 10-25%. Two rows that light up together across the same samples is the
+   correlated-column signal that frequency-covariation phasing would run on.
+-- **Sites 517, 871, 1762, 2064, 2153** cluster in SRR6251992 and 6251993 (and partly 6251973/
+-  979), a second, largely disjoint set.
++- **Sites 517, 871, 1762 and 2153** are seen together in SRR6251967, 6251992 and 6251993, and
++  site 2064 in 6251973, 979, 992 and 993. The groups overlap: SRR6251967 also carries 2225 and
++  2525, and 6251973/979 carry 2064 as well.
+ 
+ A single sample's marginal frequencies cannot say whether two of its sites sit on the same
+ molecule (see [`issue_intra_accession_variance_lost.md`](issue_intra_accession_variance_lost.md)

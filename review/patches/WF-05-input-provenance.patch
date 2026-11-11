@@ -1,0 +1,506 @@
+diff --git a/walker/src/io/output.rs b/walker/src/io/output.rs
+--- a/walker/src/io/output.rs
++++ b/walker/src/io/output.rs
+@@ -349,6 +349,27 @@
+     if let Some(e) = &r.error {
+         writeln!(w, "      \"error\": \"{}\",", esc(e))?;
+     }
++    match &r.input {
++        None => writeln!(w, "      \"input\": null,")?,
++        Some(i) => {
++            let opt = |v: &Option<String>| match v {
++                Some(s) => format!("\"{}\"", esc(s)),
++                None => "null".to_string(),
++            };
++            writeln!(
++                w,
++                "      \"input\": {{\"source\": \"{}\", \"location\": \"{}\", \"bytes\": {}, \
++                 \"sha256\": \"{}\", \"etag\": {}, \"last_modified\": {}, \"fetched_at\": {}}},",
++                i.source,
++                esc(&i.location),
++                i.bytes,
++                i.sha256,
++                opt(&i.etag),
++                opt(&i.last_modified),
++                i.fetched_at.map_or("null".to_string(), |t| t.to_string()),
++            )?;
++        }
++    }
+     writeln!(w, "      \"timing\": {{")?;
+     let t = &r.timing;
+     writeln!(w, "        \"stream\": {:.3},", t.stream)?;
+@@ -1019,6 +1040,7 @@
+             subgraph_fraction: None,
+             provisional: false,
+             prune: None,
++            input: None,
+         }
+     }
+ 
+@@ -1172,6 +1194,7 @@
+                 subgraph_fraction: None,
+                 provisional: false,
+                 prune: None,
++                input: None,
+             }],
+         }
+     }
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -468,6 +468,9 @@
+         };
+         let accession = fetched.accession.clone();
+         let index = fetched.index;
++        // Cloned before `run_one` consumes `fetched`, and attached below to every outcome,
++        // failures and panics included: what was analysed matters most when it went wrong.
++        let provenance = fetched.input.clone();
+ 
+         // A stage returning `Err` is already handled below. A stage that *panics* (e.g. an
+         // index out of bounds on a malformed graph) must not take the worker down with it: the
+@@ -488,6 +491,8 @@
+                 "internal error: a stage panicked".to_string(),
+             )
+         });
++        let mut result = result;
++        result.input = Some(provenance);
+         if out.send(result).is_err() {
+             break;
+         }
+@@ -564,6 +569,7 @@
+             subgraph_fraction: None,
+             provisional: false,
+             prune: None,
++            input: None,
+         });
+     }
+ 
+@@ -929,6 +935,7 @@
+         subgraph_fraction: Some(subgraph_fraction),
+         provisional,
+         prune,
++        input: None,
+     })
+ }
+ 
+diff --git a/walker/src/stages/align.rs b/walker/src/stages/align.rs
+--- a/walker/src/stages/align.rs
++++ b/walker/src/stages/align.rs
+@@ -739,7 +739,7 @@
+             accession: "ERR2028820".into(),
+             compressed_len: compressed.len(),
+             compressed,
+-            fetch_secs: 0.0,
++            fetch_secs: 0.0, input: Default::default(),
+         };
+         let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
+         let query = read_query(Path::new("../queries/pfcrt_only.fasta")).unwrap();
+@@ -847,7 +847,7 @@
+                 accession: acc.into(),
+                 compressed_len: compressed.len(),
+                 compressed,
+-                fetch_secs: 0.0,
++                fetch_secs: 0.0, input: Default::default(),
+             };
+             let graph = {
+                 let rd = stream::decoder(&f).unwrap();
+diff --git a/walker/src/stages/anchor.rs b/walker/src/stages/anchor.rs
+--- a/walker/src/stages/anchor.rs
++++ b/walker/src/stages/anchor.rs
+@@ -706,7 +706,7 @@
+             accession: "ERR2028820".to_string(),
+             compressed_len: compressed.len(),
+             compressed,
+-            fetch_secs: 0.0,
++            fetch_secs: 0.0, input: Default::default(),
+         };
+         let graph = parse::build(&fetched.accession, stream::decoder(&fetched).unwrap()).unwrap();
+         let query = read_query(qpath).unwrap();
+diff --git a/walker/src/stages/extract.rs b/walker/src/stages/extract.rs
+--- a/walker/src/stages/extract.rs
++++ b/walker/src/stages/extract.rs
+@@ -564,7 +564,7 @@
+     fn load(dir: &str, acc: &str) -> Option<UnitigGraph> {
+         let p = format!("{dir}/{acc}.unitigs.fa.zst");
+         let compressed = std::fs::read(&p).ok()?;
+-        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
++        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0, input: Default::default() };
+         let g = {
+             let rd = stream::decoder(&f).ok()?;
+             parse::build(&f.accession, rd).ok()
+@@ -668,7 +668,7 @@
+             accession: "ERR2028820".into(),
+             compressed_len: compressed.len(),
+             compressed,
+-            fetch_secs: 0.0,
++            fetch_secs: 0.0, input: Default::default(),
+         };
+         let graph = {
+             let rd = stream::decoder(&f).unwrap();
+@@ -866,7 +866,7 @@
+             accession: "ERR2028820".into(),
+             compressed_len: compressed.len(),
+             compressed,
+-            fetch_secs: 0.0,
++            fetch_secs: 0.0, input: Default::default(),
+         };
+         let graph = {
+             let rd = stream::decoder(&f).unwrap();
+diff --git a/walker/src/stages/parse.rs b/walker/src/stages/parse.rs
+--- a/walker/src/stages/parse.rs
++++ b/walker/src/stages/parse.rs
+@@ -376,7 +376,7 @@
+             accession: "ERR2028820".to_string(),
+             compressed_len: compressed.len(),
+             compressed,
+-            fetch_secs: 0.0,
++            fetch_secs: 0.0, input: Default::default(),
+         };
+ 
+         let t0 = std::time::Instant::now();
+diff --git a/walker/src/stages/phase.rs b/walker/src/stages/phase.rs
+--- a/walker/src/stages/phase.rs
++++ b/walker/src/stages/phase.rs
+@@ -498,7 +498,7 @@
+                 eprintln!("SKIP: no data for {acc}");
+                 continue;
+             };
+-            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
++            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0, input: Default::default() };
+             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
+             let query = read_query(Path::new(qpath)).unwrap();
+             let mut cfg = Config::default();
+@@ -558,7 +558,7 @@
+             ("SRR8209082", "../queries/query_hiv1_pol.fasta"),
+         ] {
+             let Ok(compressed) = std::fs::read(format!("{dir}/{acc}.unitigs.fa.zst")) else { continue };
+-            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
++            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0, input: Default::default() };
+             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
+             let query = read_query(Path::new(qpath)).unwrap();
+             let mut cfg = Config::default();
+diff --git a/walker/src/stages/stitch.rs b/walker/src/stages/stitch.rs
+--- a/walker/src/stages/stitch.rs
++++ b/walker/src/stages/stitch.rs
+@@ -669,7 +669,7 @@
+             accession: "ERR2028820".into(),
+             compressed_len: compressed.len(),
+             compressed,
+-            fetch_secs: 0.0,
++            fetch_secs: 0.0, input: Default::default(),
+         };
+         let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
+         let query = read_query(Path::new("../queries/pfcrt_only.fasta")).unwrap();
+diff --git a/walker/src/stages/stream.rs b/walker/src/stages/stream.rs
+--- a/walker/src/stages/stream.rs
++++ b/walker/src/stages/stream.rs
+@@ -12,7 +12,7 @@
+ 
+ use crate::config::Config;
+ use crate::error::{Error, Result};
+-use crate::types::{Accession, FetchedUnitigs};
++use crate::types::{Accession, FetchedUnitigs, InputProvenance};
+ use std::io::Read;
+ use std::path::{Path, PathBuf};
+ use std::time::Duration;
+@@ -99,12 +99,54 @@
+                         detail: format!("cache file is empty: {}", path.display()),
+                     });
+                 }
++                // A cache file is named for an accession but nothing ties its contents to
++                // that name. Logan writes the accession into every header (`>SRR8209082_0`),
++                // so a file holding another run's unitigs is refused here instead of being
++                // reported, and published, under the wrong name.
++                match first_record_accession(&compressed) {
++                    Some(found) if found == *accession => {}
++                    found => {
++                        return Err(Error::Fetch {
++                            accession: accession.clone(),
++                            detail: format!(
++                                "cache file {} does not hold {accession}'s unitigs (first record \
++                                 is from {})",
++                                path.display(),
++                                found.as_deref().unwrap_or("an unreadable header")
++                            ),
++                        })
++                    }
++                }
++                let sha256 = sha256_hex(&compressed);
++                let meta = read_cache_meta(&path);
++                if let Some(recorded) = meta.get("sha256") {
++                    if *recorded != sha256 {
++                        return Err(Error::Fetch {
++                            accession: accession.clone(),
++                            detail: format!(
++                                "cache file {} changed since it was fetched (sha256 {sha256}, \
++                                 recorded {recorded})",
++                                path.display()
++                            ),
++                        });
++                    }
++                }
++                let input = InputProvenance {
++                    source: "cache",
++                    location: path.display().to_string(),
++                    bytes: compressed.len() as u64,
++                    sha256,
++                    etag: meta.get("etag").cloned(),
++                    last_modified: meta.get("last_modified").cloned(),
++                    fetched_at: meta.get("fetched_at").and_then(|v| v.parse().ok()),
++                };
+                 return Ok(FetchedUnitigs {
+                     index,
+                     accession: accession.clone(),
+                     compressed_len: compressed.len(),
+                     compressed,
+                     fetch_secs: 0.0,
++                    input,
+                 });
+             }
+             if self.offline {
+@@ -125,7 +167,9 @@
+             match self.try_once(index, accession, &url) {
+                 Ok(f) => {
+                     if let Some(dir) = &self.cache_dir {
+-                        if let Err(e) = write_cache_atomic(dir, accession, &f.compressed) {
++                        if let Err(e) = write_cache_atomic(dir, accession, &f.compressed)
++                            .and_then(|()| write_cache_meta(dir, accession, &f.input))
++                        {
+                             // Cache-write failure must not lose a successful fetch. Warn and
+                             // hand the bytes back so the compute stage still runs; the next
+                             // run will just have to fetch again.
+@@ -202,6 +246,13 @@
+         //
+         // Running into the limit is the size cap, not a transient failure. It used to be
+         // retried, downloading up to the cap three times before reporting a fetch error.
++        let header = |name: &str| {
++            resp.headers().get(name).and_then(|v| v.to_str().ok()).map(|v| v.to_string())
++        };
++        let etag = header("etag");
++        let last_modified = header("last-modified");
++        let fetched_at = now_unix();
++
+         let compressed = resp
+             .body_mut()
+             .with_config()
+@@ -220,16 +271,92 @@
+             return Err(FetchAttempt::Transient("empty body".to_string()));
+         }
+ 
++        let input = InputProvenance {
++            source: "s3",
++            location: url.to_string(),
++            bytes: compressed.len() as u64,
++            sha256: sha256_hex(&compressed),
++            etag,
++            last_modified,
++            fetched_at: Some(fetched_at),
++        };
+         Ok(FetchedUnitigs {
+             index,
+             accession: accession.clone(),
+             compressed_len: compressed.len(),
+             compressed,
+             fetch_secs: 0.0,
++            input,
+         })
+     }
+ }
+ 
++fn sha256_hex(bytes: &[u8]) -> String {
++    use sha2::{Digest, Sha256};
++    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
++}
++
++fn now_unix() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or(0)
++}
++
++/// The accession named in the first record's header, `>SRR8209082_0 ka:f:…` -> `SRR8209082`.
++/// Decodes only the first few KB.
++fn first_record_accession(compressed: &[u8]) -> Option<String> {
++    let mut dec = zstd::stream::read::Decoder::with_buffer(std::io::Cursor::new(compressed)).ok()?;
++    let mut buf = vec![0u8; 4096];
++    let mut n = 0;
++    while n < buf.len() {
++        match dec.read(&mut buf[n..]) {
++            Ok(0) => break,
++            Ok(k) => n += k,
++            Err(_) => return None,
++        }
++        if buf[..n].contains(&b'\n') {
++            break;
++        }
++    }
++    let line = buf[..n].split(|&b| b == b'\n').next()?;
++    let name = line.strip_prefix(b">")?.split(|b| b.is_ascii_whitespace()).next()?;
++    let p = name.iter().rposition(|&b| b == b'_')?;
++    Some(String::from_utf8_lossy(&name[..p]).into_owned())
++}
++
++/// Sidecar next to a cache entry: what the walker downloaded, as `key\tvalue` lines.
++fn meta_path(dir: &Path, accession: &str) -> PathBuf {
++    dir.join(format!("{accession}.unitigs.fa.zst.meta"))
++}
++
++fn read_cache_meta(cache_file: &Path) -> std::collections::HashMap<String, String> {
++    let mut p = cache_file.as_os_str().to_owned();
++    p.push(".meta");
++    std::fs::read_to_string(PathBuf::from(p))
++        .unwrap_or_default()
++        .lines()
++        .filter_map(|l| l.split_once('\t'))
++        .map(|(k, v)| (k.to_string(), v.to_string()))
++        .collect()
++}
++
++fn write_cache_meta(dir: &Path, accession: &str, i: &InputProvenance) -> std::io::Result<()> {
++    let mut text = format!("url\t{}\nbytes\t{}\nsha256\t{}\n", i.location, i.bytes, i.sha256);
++    if let Some(v) = &i.etag {
++        text.push_str(&format!("etag\t{v}\n"));
++    }
++    if let Some(v) = &i.last_modified {
++        text.push_str(&format!("last_modified\t{v}\n"));
++    }
++    if let Some(v) = i.fetched_at {
++        text.push_str(&format!("fetched_at\t{v}\n"));
++    }
++    let tmp = dir.join(format!(".{accession}.meta.{}.tmp", std::process::id()));
++    std::fs::write(&tmp, text)?;
++    std::fs::rename(&tmp, meta_path(dir, accession))
++}
++
+ /// Whether a failed attempt is worth repeating.
+ enum FetchAttempt {
+     /// Transport error or 5xx. Retry.
+@@ -496,6 +623,43 @@
+         std::fs::remove_dir_all(&dir).ok();
+     }
+ 
++    /// A cache file whose unitigs belong to another run is refused, not analysed and
++    /// reported under the name it was filed under.
++    #[test]
++    fn a_cache_file_holding_another_accession_is_refused() {
++        let dir = tempdir("swap");
++        let bytes = zstd::encode_all(&b">OTHER0001_0 ka:f:5.0\nACGT\n"[..], 3).unwrap();
++        std::fs::write(cache_path(&dir, "CACHED0003"), &bytes).unwrap();
++        let f = Fetcher::new(&Config { unitigs_cache: Some(dir.clone()), offline: true, ..Config::default() });
++        let msg = f.fetch(0, &"CACHED0003".to_string()).err().expect("must fail").to_string();
++        assert!(msg.contains("does not hold CACHED0003") && msg.contains("OTHER0001"), "{msg}");
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
++    /// A cache hit reports what it read, and refuses a file whose bytes no longer match the
++    /// sidecar written when it was downloaded.
++    #[test]
++    fn a_cache_hit_reports_its_provenance_and_checks_the_sidecar() {
++        let dir = tempdir("meta");
++        let bytes = zstd::encode_all(&b">CACHED0004_0 ka:f:5.0\nACGT\n"[..], 3).unwrap();
++        std::fs::write(cache_path(&dir, "CACHED0004"), &bytes).unwrap();
++        let input = InputProvenance {
++            source: "s3", location: "u".into(), bytes: bytes.len() as u64,
++            sha256: sha256_hex(&bytes), etag: Some("e".into()), last_modified: Some("lm".into()),
++            fetched_at: Some(7),
++        };
++        write_cache_meta(&dir, "CACHED0004", &input).unwrap();
++        let f = Fetcher::new(&Config { unitigs_cache: Some(dir.clone()), offline: true, ..Config::default() });
++        let got = f.fetch(0, &"CACHED0004".to_string()).unwrap().input;
++        assert_eq!((got.source, got.sha256.as_str(), got.etag.as_deref(), got.fetched_at),
++                   ("cache", input.sha256.as_str(), Some("e"), Some(7)));
++        let other = zstd::encode_all(&b">CACHED0004_0 ka:f:5.0\nACGA\n"[..], 3).unwrap();
++        std::fs::write(cache_path(&dir, "CACHED0004"), &other).unwrap();
++        let msg = f.fetch(0, &"CACHED0004".to_string()).err().expect("must fail").to_string();
++        assert!(msg.contains("changed since it was fetched"), "{msg}");
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
+     /// A cache miss under --offline fails fast, without touching the network. The error
+     /// message names the accession and the expected cache path so a user can act on it.
+     #[test]
+@@ -568,7 +732,7 @@
+             accession: "TEST0001".to_string(),
+             compressed_len: compressed.len(),
+             compressed,
+-            fetch_secs: 0.0,
++            fetch_secs: 0.0, input: Default::default(),
+         }
+     }
+ 
+@@ -697,7 +861,7 @@
+             accession: "REAL".to_string(),
+             compressed_len: compressed.len(),
+             compressed,
+-            fetch_secs: 0.0,
++            fetch_secs: 0.0, input: Default::default(),
+         };
+         let mut out = Vec::new();
+         decoder(&f)
+diff --git a/walker/src/types.rs b/walker/src/types.rs
+--- a/walker/src/types.rs
++++ b/walker/src/types.rs
+@@ -69,6 +69,30 @@
+     /// Seconds spent downloading, recorded by the fetch worker so the compute worker can
+     /// report it. Network time belongs to the accession, not to whichever thread fetched it.
+     pub fetch_secs: f64,
++    /// Which bytes these are: written to `summary.json` as the accession's `input` object.
++    pub input: InputProvenance,
++}
++
++/// The identity of the unitig bytes an accession was analysed from.
++///
++/// `u/` objects on logan-pub are unversioned and can be replaced in place, and a cache file
++/// is whatever sits at `<dir>/<ACC>.unitigs.fa.zst`, so without this a summary cannot say
++/// what it was computed from.
++#[derive(Debug, Clone, Default)]
++pub struct InputProvenance {
++    /// `"s3"` or `"cache"`.
++    pub source: &'static str,
++    /// The URL downloaded, or the cache file read.
++    pub location: String,
++    pub bytes: u64,
++    /// SHA-256 of the compressed bytes that were parsed, hex.
++    pub sha256: String,
++    /// S3 `ETag` and `Last-Modified`: from the response on a download, from the cache
++    /// sidecar on a cache hit (absent for a cache file the walker did not write).
++    pub etag: Option<String>,
++    pub last_modified: Option<String>,
++    /// Unix seconds when the bytes were downloaded (cache hit: from the sidecar).
++    pub fetched_at: Option<u64>,
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -488,6 +512,8 @@
+     /// What the depth-based prune did. `None` when it did not run: `--prune-frac 0`, or no
+     /// first-pass haplotype to measure the depth on. Until 0.1.1 this too was stderr only.
+     pub prune: Option<PruneReport>,
++    /// What was analysed; `None` when nothing was fetched.
++    pub input: Option<InputProvenance>,
+ }
+ 
+ /// How the second, pruned alignment pass ended for one accession.
+@@ -562,6 +588,7 @@
+             subgraph_fraction: None,
+             provisional: false,
+             prune: None,
++            input: None,
+         }
+     }
+ }
+diff --git a/walker/Cargo.toml b/walker/Cargo.toml
+--- a/walker/Cargo.toml
++++ b/walker/Cargo.toml
+@@ -22,10 +22,9 @@
+ signal-hook = "0.4.5"
+ ureq = "3.4.1"
+ zstd = "0.14.0"
++sha2 = "0.11.0"
+ 
+ [dev-dependencies]
+-# Test-only: verifies reconstructed haplotypes against the golden fixtures by hash.
+-sha2 = "0.11.0"
+ 
+ [profile.release]
+ opt-level = 3

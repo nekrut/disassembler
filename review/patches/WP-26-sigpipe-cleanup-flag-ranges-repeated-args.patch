@@ -1,0 +1,314 @@
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -31,6 +31,22 @@
+     clippy::type_complexity
+ )]
+ 
++/// `println!` for progress lines. On a closed stdout the write raises SIGPIPE, which the
++/// signal thread in scratch.rs turns into "stop aligners, remove scratch, die by SIGPIPE";
++/// this thread only has to wait for it rather than panic with a backtrace.
++macro_rules! println {
++    ($($t:tt)*) => {{
++        use std::io::Write as _;
++        if let Err(e) = writeln!(std::io::stdout(), $($t)*) {
++            if e.kind() == std::io::ErrorKind::BrokenPipe {
++                std::thread::sleep(std::time::Duration::from_secs(10));
++                std::process::exit(128 + 13);
++            }
++            panic!("failed printing to stdout: {e}");
++        }
++    }};
++}
++
+ mod config;
+ mod error;
+ mod io;
+@@ -170,14 +186,42 @@
+     let mut i = 0;
+     while i < argv.len() {
+         let flag = argv[i].as_str();
++        // A value that looks like a flag is a forgotten value (`-o --emit-vcf`), not a path.
++        // Negative numbers stay accepted so the range checks below can name them.
+         let value = || -> error::Result<String> {
+-            argv.get(i + 1)
+-                .cloned()
+-                .ok_or_else(|| error::Error::Usage(format!("{flag} needs a value")))
++            match argv.get(i + 1) {
++                None => Err(error::Error::Usage(format!("{flag} needs a value"))),
++                Some(v) if v.starts_with('-') && v.parse::<f64>().is_err() => Err(
++                    error::Error::Usage(format!("{flag} needs a value, got the option {v}")),
++                ),
++                Some(v) => Ok(v.clone()),
++            }
++        };
++        // Single-value options may be given once: the last one used to win silently, so
++        // `-a A -a B` did B alone.
++        let once = |set: bool| -> error::Result<()> {
++            if set {
++                Err(error::Error::Usage(format!(
++                    "{flag} given twice{}",
++                    if matches!(flag, "-a" | "--accession" | "-l" | "--accession-list") {
++                        "; put several accessions in one --accession-list file"
++                    } else {
++                        ""
++                    }
++                )))
++            } else {
++                Ok(())
++            }
+         };
+         match flag {
+-            "-a" | "--accession" => args.accession = Some(value()?),
+-            "-l" | "--accession-list" => args.accession_list = Some(PathBuf::from(value()?)),
++            "-a" | "--accession" => {
++                once(args.accession.is_some())?;
++                args.accession = Some(value()?)
++            }
++            "-l" | "--accession-list" => {
++                once(args.accession_list.is_some())?;
++                args.accession_list = Some(PathBuf::from(value()?))
++            }
+             "-q" | "--query" => args.query.push(PathBuf::from(value()?)),
+             "-o" | "--out-dir" => args.out_dir = PathBuf::from(value()?),
+             "-f" | "--out-fasta" => args.out_fasta = PathBuf::from(value()?),
+@@ -187,15 +231,9 @@
+             "--hops" => {
+                 args.cfg.hops = value()?.parse().map_err(|e| error::Error::Usage(format!("--hops: {e}")))?;
+             }
+-            "--min-abund" => {
+-                args.cfg.min_abund = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-abund: {e}")))?;
+-            }
+-            "--min-vaf" => {
+-                args.cfg.min_vaf = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-vaf: {e}")))?;
+-            }
+-            "--min-cov" => {
+-                args.cfg.min_cov = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-cov: {e}")))?;
+-            }
++            "--min-abund" => args.cfg.min_abund = number_in(flag, &value()?, 0.0, f32::MAX as f64)? as f32,
++            "--min-vaf" => args.cfg.min_vaf = number_in(flag, &value()?, 0.0, 1.0)?,
++            "--min-cov" => args.cfg.min_cov = number_in(flag, &value()?, 0.0, 1.0)?,
+             "--primary-metric" => {
+                 let raw = value()?;
+                 args.cfg.primary_metric = PrimaryMetric::parse(&raw).ok_or_else(|| {
+@@ -205,7 +243,9 @@
+                 })?;
+             }
+             "--min-shared-kmers" => {
+-                args.cfg.min_shared_kmers = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-shared-kmers: {e}")))?;
++                let n = at_least_one(flag, &value()?)?;
++                args.cfg.min_shared_kmers = u32::try_from(n)
++                    .map_err(|e| error::Error::Usage(format!("{flag}: {e}")))?;
+             }
+             "--max-size-mb" => {
+                 let mb: u64 = value()?.parse().map_err(|e| error::Error::Usage(format!("--max-size-mb: {e}")))?;
+@@ -321,6 +361,19 @@
+     }
+ }
+ 
++/// A finite number in `[lo, hi]`. `f64::from_str` takes "nan" and "inf", which disabled
++/// a gate (`cov < NaN` is false) and wrote NaN/inf into the run summary's JSON.
++fn number_in(flag: &str, raw: &str, lo: f64, hi: f64) -> error::Result<f64> {
++    let v: f64 = raw
++        .parse()
++        .map_err(|_| error::Error::Usage(format!("{flag} needs a number, got {raw:?}")))?;
++    if !v.is_finite() || v < lo || v > hi {
++        let range = if hi >= f32::MAX as f64 { format!(">= {lo}") } else { format!("in [{lo}, {hi}]") };
++        return Err(error::Error::Usage(format!("{flag} must be {range}, got {raw}")));
++    }
++    Ok(v)
++}
++
+ /// End quietly when stdout is closed, as other Unix tools do. Rust ignores SIGPIPE, so a
+ /// write to a closed pipe (`logan-walker ... | head -1`) returns EPIPE, and `println!`
+ /// panics on it.
+@@ -335,7 +388,14 @@
+ fn main() -> ExitCode {
+     #[cfg(unix)]
+     default_sigpipe();
+-    let argv: Vec<String> = std::env::args().skip(1).collect();
++    // `env::args` panics on a non-UTF-8 argument; report it as a usage error instead.
++    let argv: Vec<String> = match std::env::args_os().skip(1).map(|a| a.into_string()).collect() {
++        Ok(v) => v,
++        Err(bad) => {
++            eprintln!("error: argument {bad:?} is not valid UTF-8");
++            return ExitCode::FAILURE;
++        }
++    };
+ 
+     if argv.is_empty() || argv.iter().any(|a| a == "-h" || a == "--help") {
+         print!("{USAGE}");
+@@ -704,4 +764,38 @@
+         );
+         assert!(at_least_one("-w", "two").is_err());
+     }
++
++    #[test]
++    fn repeated_single_value_options_are_rejected() {
++        for a in ["-a SRR1 -a SRR2", "-l a.txt -l b.txt", "--accession SRR1 -a SRR2"] {
++            let err = parse_args(&argv(a)).err().expect(a).to_string();
++            assert!(err.contains("given twice"), "{a}: {err}");
++        }
++        assert_eq!(parse_args(&argv("-q a.fa -q b.fa")).unwrap().query.len(), 2);
++    }
++
++    #[test]
++    fn an_option_is_not_taken_as_a_value() {
++        for a in ["-o --emit-vcf", "-a --offline", "-q --min-cov"] {
++            let err = parse_args(&argv(a)).err().expect(a).to_string();
++            assert!(err.contains("needs a value"), "{a}: {err}");
++        }
++    }
++
++    #[test]
++    fn thresholds_are_range_checked() {
++        for a in [
++            "--min-cov 85", "--min-cov nan", "--min-cov -0.1", "--min-vaf inf",
++            "--min-vaf 1.5", "--min-abund -inf", "--min-abund -1", "--min-abund NaN",
++            "--min-shared-kmers 0",
++        ] {
++            assert!(parse_args(&argv(a)).is_err(), "{a} was accepted");
++        }
++        let ok = parse_args(&argv("--min-cov 0.9 --min-vaf 0.05 --min-abund 2 --min-shared-kmers 4"))
++            .unwrap();
++        assert_eq!(
++            (ok.cfg.min_cov, ok.cfg.min_vaf, ok.cfg.min_abund, ok.cfg.min_shared_kmers),
++            (0.9, 0.05, 2.0, 4)
++        );
++    }
+ }
+diff --git a/walker/src/scratch.rs b/walker/src/scratch.rs
+--- a/walker/src/scratch.rs
++++ b/walker/src/scratch.rs
+@@ -69,11 +69,17 @@
+     /// On SIGINT, SIGTERM or SIGHUP, remove the directory, then end the process as the
+     /// signal would have, so the caller still sees "terminated by SIGTERM".
+     pub fn remove_on_signal(&self) -> Result<()> {
+-        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+-        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
++        use signal_hook::consts::{SIGHUP, SIGINT, SIGPIPE, SIGTERM};
++        // SIGPIPE too: main restores its default action so `| head -1` ends the run, and
++        // that default used to skip this cleanup and leave the directory behind.
++        let mut signals =
++            signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP, SIGPIPE])?;
+         let (path, keep) = (self.path.clone(), self.keep);
+         std::thread::spawn(move || {
+             if let Some(sig) = signals.forever().next() {
++                // Stop the aligners first: they write into the directory, and a signal sent
++                // to the walker alone (kill PID, a closed stdout) does not reach them.
++                terminate_children();
+                 if !keep {
+                     remove(&path);
+                 }
+@@ -85,6 +91,35 @@
+     }
+ }
+ 
++/// PIDs of running GraphAligner children, so a signal can stop them before the directory
++/// they write into is removed.
++static CHILDREN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
++
++pub fn track_child(pid: u32) {
++    if let Ok(mut c) = CHILDREN.lock() {
++        c.push(pid);
++    }
++}
++
++pub fn untrack_child(pid: u32) {
++    if let Ok(mut c) = CHILDREN.lock() {
++        c.retain(|&p| p != pid);
++    }
++}
++
++fn terminate_children() {
++    // try_lock: never block the signal thread behind a worker.
++    if let Ok(c) = CHILDREN.try_lock() {
++        for &pid in c.iter() {
++            // SAFETY: kill has no memory-safety preconditions.
++            #[cfg(unix)]
++            unsafe {
++                libc::kill(pid as libc::pid_t, libc::SIGTERM);
++            }
++        }
++    }
++}
++
+ impl Drop for Scratch {
+     fn drop(&mut self) {
+         if self.keep {
+@@ -98,8 +133,13 @@
+ /// `remove_dir_all`, tried twice: a worker can create a file in the directory while it is
+ /// being emptied, which makes the first attempt fail with "directory not empty".
+ fn remove(path: &Path) {
+-    if std::fs::remove_dir_all(path).is_err() {
+-        let _ = std::fs::remove_dir_all(path);
++    // A worker may still be writing a file into it; nothing recreates the directory, so a
++    // few tries converge.
++    for _ in 0..20 {
++        if std::fs::remove_dir_all(path).is_ok() || !path.exists() {
++            return;
++        }
++        std::thread::sleep(std::time::Duration::from_millis(5));
+     }
+ }
+ 
+diff --git a/walker/src/stages/align.rs b/walker/src/stages/align.rs
+--- a/walker/src/stages/align.rs
++++ b/walker/src/stages/align.rs
+@@ -198,13 +198,40 @@
+     // GraphAligner is chatty on stdout; only stderr is kept, for error reporting.
+     cmd.stdout(std::process::Stdio::null());
+ 
+-    let output = cmd.output().map_err(|e| {
++    cmd.stdin(std::process::Stdio::null());
++    cmd.stderr(std::process::Stdio::piped());
++    let could_not_run = |e: std::io::Error| {
+         let _ = std::fs::remove_file(&query_fa);
+         Error::GraphAligner {
+             accession: subgraph.accession.clone(),
+             detail: format!("could not run {}: {e}", bin.display()),
+         }
+-    })?;
++    };
++    // If the walker dies (SIGPIPE, SIGKILL, the OOM killer), the kernel stops the aligner too,
++    // instead of leaving it to run on and write into a scratch directory nobody removes.
++    #[cfg(target_os = "linux")]
++    {
++        use std::os::unix::process::CommandExt;
++        // SAFETY: only async-signal-safe calls between fork and exec.
++        let parent = unsafe { libc::getpid() };
++        unsafe {
++            cmd.pre_exec(move || {
++                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
++                    return Err(std::io::Error::last_os_error());
++                }
++                if libc::getppid() != parent {
++                    libc::raise(libc::SIGTERM);
++                }
++                Ok(())
++            });
++        }
++    }
++    let child = cmd.spawn().map_err(could_not_run)?;
++    let pid = child.id();
++    crate::scratch::track_child(pid);
++    let output = child.wait_with_output();
++    crate::scratch::untrack_child(pid);
++    let output = output.map_err(could_not_run)?;
+ 
+     if !output.status.success() {
+         // Remove any partial GAF so a later run cannot read a truncated file.
+diff --git a/walker/src/stages/extract.rs b/walker/src/stages/extract.rs
+--- a/walker/src/stages/extract.rs
++++ b/walker/src/stages/extract.rs
+@@ -290,6 +290,10 @@
+         });
+     }
+ 
++    // The run's directory is made once, private, by scratch.rs. Recreating it here undid the
++    // signal handler's removal when a worker was mid-accession, and with mode 0755.
++    // Unit tests build Configs with a fresh scratch_dir and rely on it being made here.
++    #[cfg(test)]
+     std::fs::create_dir_all(&cfg.scratch_dir)
+         .map_err(crate::error::file_err("create", &cfg.scratch_dir))?;
+     let gfa_path = cfg.scratch_dir.join(format!("{}.sub.gfa", scratch_stem(&graph.accession)));

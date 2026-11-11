@@ -1,0 +1,152 @@
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -729,6 +729,7 @@
+             let depth = stages::extract::path_depth(&graph, &path.steps);
+             let floor = stages::extract::depth_floor(cfg, depth);
+             let before = subgraph.nodes.len();
++            let protected = stages::extract::protected_route_nodes(&graph, &path.steps, floor);
+ 
+             // Count survivors before consuming anything. `prune_nodes` takes ownership of the
+             // node and sequence vectors, so a prune that turns out to be unusable cannot be
+@@ -744,7 +745,7 @@
+             let surviving = subgraph
+                 .nodes
+                 .iter()
+-                .filter(|&&id| graph.abundance[id as usize] >= floor)
++                .filter(|&&id| graph.abundance[id as usize] >= floor || protected.contains(&id))
+                 .count();
+ 
+             let unpruned_span = (path.query_start, path.query_end);
+@@ -782,7 +783,7 @@
+                 let nodes = std::mem::take(&mut subgraph.nodes);
+                 let seqs = std::mem::take(&mut subgraph.seqs);
+                 let (kept_nodes, kept_seqs) =
+-                    stages::extract::prune_nodes(&graph, nodes, seqs, floor);
++                    stages::extract::prune_nodes(&graph, nodes, seqs, floor, &protected);
+                 let dropped = before - kept_nodes.len();
+                 drop(subgraph);
+                 let pruned =
+@@ -1081,7 +1082,7 @@
+ 
+         // And the predicate above matches what prune_nodes would actually do.
+         let seqs = vec![b"ACGT".to_vec(); 3];
+-        let (kept, _) = prune_nodes(&g, nodes, seqs, floor);
++        let (kept, _) = prune_nodes(&g, nodes, seqs, floor, &Default::default());
+         assert!(kept.is_empty(), "prune_nodes agrees the subgraph would be emptied");
+     }
+ }
+diff --git a/walker/src/stages/extract.rs b/walker/src/stages/extract.rs
+--- a/walker/src/stages/extract.rs
++++ b/walker/src/stages/extract.rs
+@@ -125,12 +125,66 @@
+ ///
+ /// Median rather than mean, so one repeat-collapsed unitig cannot drag it.
+ pub fn path_depth(graph: &UnitigGraph, steps: &[PathStep]) -> f32 {
+-    let mut ab: Vec<f32> = steps.iter().map(|s| graph.abundance[s.node as usize]).collect();
++    // k-mer-weighted median: a unitig counts once per k-mer it holds, so short error
++    // unitigs on the route cannot outvote the long ones that carry the gene.
++    let mut ab: Vec<(f32, u64)> = steps
++        .iter()
++        .map(|s| {
++            let w = graph.seq_len(s.node).saturating_sub(30).max(1) as u64;
++            (graph.abundance[s.node as usize], w)
++        })
++        .collect();
+     if ab.is_empty() {
+         return 0.0;
+     }
+-    ab.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+-    ab[ab.len() / 2]
++    ab.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
++    let total: u64 = ab.iter().map(|x| x.1).sum();
++    let mut acc = 0u64;
++    for &(a, w) in &ab {
++        acc += w;
++        if acc * 2 > total {
++            return a;
++        }
++    }
++    ab[ab.len() - 1].0
++}
++
++/// Route unitigs below `floor` that are NOT error branches: no sibling at the fork into or
++/// out of them clears the floor, so removing them would cut the gene rather than an error.
++pub fn protected_route_nodes(
++    graph: &UnitigGraph,
++    steps: &[PathStep],
++    floor: f32,
++) -> std::collections::HashSet<UnitigId> {
++    use crate::types::Orient;
++    let fwd = |s: &PathStep| matches!(s.orient, Orient::Forward);
++    // deeper sibling leaving `from` (oriented) other than `skip`
++    let deeper = |from: UnitigId, from_fwd: bool, skip: UnitigId| {
++        graph.edges(from).iter().any(|&e| {
++            let (t, sf, _) = parse::unpack_edge(e);
++            sf == from_fwd && t != skip && graph.abundance[t as usize] >= floor
++        })
++    };
++    let mut keep = std::collections::HashSet::new();
++    for (i, s) in steps.iter().enumerate() {
++        if graph.abundance[s.node as usize] >= floor {
++            continue;
++        }
++        let mut error_branch = false;
++        if i > 0 {
++            let p = &steps[i - 1];
++            error_branch |= deeper(p.node, fwd(p), s.node);
++        }
++        if i + 1 < steps.len() {
++            let n = &steps[i + 1];
++            // into n = out of n reversed
++            error_branch |= deeper(n.node, !fwd(n), s.node);
++        }
++        if !error_branch {
++            keep.insert(s.node);
++        }
++    }
++    keep
+ }
+ 
+ /// Mean `ka:f` over the unitigs the path traverses, for reporting.
+@@ -171,11 +225,12 @@
+     nodes: Vec<UnitigId>,
+     seqs: Vec<Vec<u8>>,
+     floor: f32,
++    protected: &std::collections::HashSet<UnitigId>,
+ ) -> (Vec<UnitigId>, Vec<Vec<u8>>) {
+     let mut kn = Vec::with_capacity(nodes.len());
+     let mut ks = Vec::with_capacity(seqs.len());
+     for (id, seq) in nodes.into_iter().zip(seqs) {
+-        if graph.abundance[id as usize] >= floor {
++        if graph.abundance[id as usize] >= floor || protected.contains(&id) {
+             kn.push(id);
+             ks.push(seq);
+         }
+@@ -974,7 +1029,7 @@
+         ));
+         let c = Config { prune_frac: 0.01, ..Config::default() };
+         let floor = depth_floor(&c, path_depth(&g, &steps(&[0, 1, 2])));
+-        let (kept, seqs) = prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A']; 3], floor);
++        let (kept, seqs) = prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A']; 3], floor, &Default::default());
+         assert_eq!(kept, vec![0, 1, 2]);
+         assert_eq!(seqs.len(), 3);
+     }
+@@ -991,7 +1046,7 @@
+         // median of an even-length list takes the upper middle, so depth is 15000 here
+         let floor = depth_floor(&c, path_depth(&g, &steps(&[0, 1])));
+         assert_eq!(floor, 150.0);
+-        let (kept, _) = prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A']; 3], floor);
++        let (kept, _) = prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A']; 3], floor, &Default::default());
+         assert_eq!(kept, vec![0, 1], "the 2x branch is 0.014% of depth and goes");
+     }
+ 
+@@ -1005,7 +1060,7 @@
+         ));
+         let (kept, seqs) = prune_nodes(
+             &g, vec![0, 1, 2],
+-            vec![b"AAAA".to_vec(), b"CCCC".to_vec(), b"GGGG".to_vec()], 10.0,
++            vec![b"AAAA".to_vec(), b"CCCC".to_vec(), b"GGGG".to_vec()], 10.0, &Default::default(),
+         );
+         assert_eq!(kept, vec![0, 2]);
+         assert_eq!(seqs, vec![b"AAAA".to_vec(), b"GGGG".to_vec()]);

@@ -1,0 +1,137 @@
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -549,6 +549,8 @@
+             args.query.len(),
+             args.cfg.primary_metric.as_str()
+         );
++        let names: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
++        eprintln!("[logan-walker] multi-anchor references: {}", names.join(", "));
+     }
+ 
+     let summary = pipeline::run(&args.cfg, accessions, &queries)?;
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -852,7 +852,7 @@
+ 
+     // Upstream's explicit scratch cleanup, applied to whichever subgraph ended up active:
+     // the fallback replaces `subgraph` above when pruning cost us the haplotype.
+-    if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
++    if !crate::scratch::keep() {
+         let _ = std::fs::remove_file(&subgraph.gfa_path);
+     }
+     // Intra-host variant recovery. `prune_frac` is not part of this: it cleans the graph
+diff --git a/walker/src/scratch.rs b/walker/src/scratch.rs
+--- a/walker/src/scratch.rs
++++ b/walker/src/scratch.rs
+@@ -17,6 +17,11 @@
+ 
+ const PREFIX: &str = "logan-walker.";
+ 
++/// Whether `LOGAN_KEEP_SCRATCH` asks to keep scratch files: set, non-empty and not `0`.
++pub fn keep() -> bool {
++    matches!(std::env::var_os("LOGAN_KEEP_SCRATCH"), Some(v) if !v.is_empty() && v != "0")
++}
++
+ pub struct Scratch {
+     path: PathBuf,
+     keep: bool,
+@@ -36,7 +41,7 @@
+                 base.display()
+             );
+         }
+-        let keep = std::env::var_os("LOGAN_KEEP_SCRATCH").is_some();
++        let keep = keep();
+         let pid = std::process::id();
+         let nanos = std::time::SystemTime::now()
+             .duration_since(std::time::UNIX_EPOCH)
+diff --git a/walker/src/stages/align.rs b/walker/src/stages/align.rs
+--- a/walker/src/stages/align.rs
++++ b/walker/src/stages/align.rs
+@@ -185,13 +185,6 @@
+         std::fs::write(&query_fa, &body).map_err(file_err("write", &query_fa))?;
+         // One record out of a panel is the multi-anchor prune pass realigning the winner, on
+         // every accession; it is expected, so it is not logged.
+-        if queries.len() > 1 {
+-            let names: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
+-            eprintln!(
+-                "[{}] multi-anchor: aligning against {} references {:?}",
+-                subgraph.accession, queries.len(), names
+-            );
+-        }
+     }
+ 
+     let mut cmd = command(&bin, cfg, subgraph, &query_fa, gaf_out);
+@@ -207,11 +200,15 @@
+     })?;
+ 
+     if !output.status.success() {
+-        // Remove any partial GAF so a later run cannot read a truncated file.
+-        let _ = std::fs::remove_file(gaf_out);
+-        let _ = std::fs::remove_file(&query_fa);
++        // Keep the failing inputs (and any partial GAF) when asked to, for a rerun by hand.
++        if !crate::scratch::keep() {
++            let _ = std::fs::remove_file(gaf_out);
++            let _ = std::fs::remove_file(&query_fa);
++        }
+         let tail = String::from_utf8_lossy(&output.stderr);
+-        let tail = tail.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
++        let mut tail: Vec<&str> = tail.lines().rev().take(3).collect();
++        tail.reverse();
++        let tail = tail.join(" | ");
+         return Err(Error::GraphAligner {
+             accession: subgraph.accession.clone(),
+             detail: format!(
+@@ -228,9 +225,16 @@
+         // because `extract::scratch_stem` keys the GAF on PID and a per-task counter, so no
+         // other worker or process can have deleted it out from under us; keyed on the
+         // accession alone, a file another run unlinked arrived here as a biological negative.
++        // GraphAligner opens its GAF before aligning and aborts if it cannot, so a clean exit
++        // always leaves one (empty when nothing aligned). No file means it was not GraphAligner.
+         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+-            let _ = std::fs::remove_file(&query_fa);
+-            return Ok(HashMap::new());
++            if !crate::scratch::keep() {
++                let _ = std::fs::remove_file(&query_fa);
++            }
++            return Err(Error::GraphAligner {
++                accession: subgraph.accession.clone(),
++                detail: format!("{} exited 0 but wrote no GAF at {}", bin.display(), gaf_out.display()),
++            });
+         }
+         Err(e) => {
+             let _ = std::fs::remove_file(gaf_out);
+@@ -238,7 +242,7 @@
+             return Err(file_err("read", gaf_out)(e));
+         }
+     };
+-    if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
++    if !crate::scratch::keep() {
+         let _ = std::fs::remove_file(gaf_out);
+         let _ = std::fs::remove_file(&query_fa);
+     }
+diff --git a/walker/src/types.rs b/walker/src/types.rs
+--- a/walker/src/types.rs
++++ b/walker/src/types.rs
+@@ -205,7 +205,7 @@
+ impl Drop for Subgraph {
+     fn drop(&mut self) {
+         // Set LOGAN_KEEP_SCRATCH=1 to retain the GFA for debugging a specific accession.
+-        if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
++        if !crate::scratch::keep() {
+             let _ = std::fs::remove_file(&self.gfa_path);
+         }
+     }
+diff --git a/walker/tests/cli.rs b/walker/tests/cli.rs
+--- a/walker/tests/cli.rs
++++ b/walker/tests/cli.rs
+@@ -34,7 +34,7 @@
+         std::fs::write(dir.join("q.fasta"), format!(">gene\n{QUERY}\n")).unwrap();
+         // Stand-in GraphAligners: both answer --version; `ga_fast` then finds no alignment,
+         // `ga_slow` sleeps, so a test can catch the walker mid-alignment.
+-        for (name, body) in [("ga_fast", "exit 0"), ("ga_slow", "sleep 5")] {
++        for (name, body) in [("ga_fast", ": > \"$6\""), ("ga_slow", "sleep 5")] {
+             let script = dir.join(name);
+             std::fs::write(&script, format!(
+                 "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n{body}\n"

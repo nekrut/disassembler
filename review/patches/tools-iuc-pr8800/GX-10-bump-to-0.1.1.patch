@@ -1,0 +1,141 @@
+--- a/tools/disassembler/disassembler_stratify.xml
++++ b/tools/disassembler/disassembler_stratify.xml
+@@ -6,45 +6,18 @@
+     <expand macro="requirements"/>
+     <expand macro="version_command"/>
+     <command detect_errors="exit_code"><![CDATA[
+-        #import re
+-        ## stratify reads <target>.scores.json from one directory and names its outputs
+-        ## after <target>, so each dataset is staged under its name. We strip a trailing
+-        ## .scores.json (or just .json) so a dataset uploaded with the original filename
+-        ## does not end up as <name>.scores.json.scores.json.
+-        ##
+-        ## The name is then made safe and unique. Safe: anything outside [A-Za-z0-9_.-]
+-        ## becomes '_', and leading or trailing dots go, so no staged name can escape the
+-        ## directory or land on a dotfile. Unique: the sanitising step is many-to-one
+-        ## ('gene a' and 'gene_a' both give 'gene_a') and Galaxy allows two datasets to
+-        ## share a name outright, so a bare sanitised name can repeat. A repeat used to
+-        ## collide on the symlink. Later copies take the first free '_<n>' suffix; the
+-        ## loop rather than a plain index is what keeps 'a', 'a_2', 'a' from colliding on
+-        ## 'a_2'. A name that survives as empty becomes 'target'. The first use of any name
+-        ## is unchanged, so the common case still names outputs exactly after the inputs.
+-        #set $used = set()
+         mkdir candidates &&
+-        #for $scores_file in $scores:
+-            #set $raw = str($scores_file.element_identifier)
+-            #set $raw = re.sub(r'\.scores\.json$', '', $raw)
+-            #set $raw = re.sub(r'\.json$', '', $raw)
+-            #set $base = re.sub(r'[^\w.\-]', '_', $raw).strip('.') or 'target'
+-            #set $target = $base
+-            #set $n = 0
+-            #while $target in $used
+-                #set $n = $n + 1
+-                #set $target = '%s_%d' % ($base, $n)
+-            #end while
+-            #silent $used.add($target)
+-            ln -s '$scores_file' 'candidates/${target}.scores.json' &&
+-        #end for
+         disassembler stratify
+             --out-dir candidates
++            #for $scores_file in $scores:
++                --scores '$scores_file'
++            #end for
+             #for $b in $score_bins:
+                 --score-bin '${b.lo}:${b.hi}:${b.n}'
+             #end for
+     ]]></command>
+     <inputs>
+-        <param name="scores" type="data" multiple="true" format="json" label="Harvest scores" help="The scores JSON datasets produced by disassembler harvest, one per target. Each dataset's name is used as the target name."/>
++        <param name="scores" type="data" multiple="true" format="json" label="Harvest scores" help="The scores JSON datasets produced by disassembler harvest, one per target. Each file names its own target (harvest 0.1.1 output); outputs are named after it."/>
+         <repeat name="score_bins" title="Score bin" min="1" help="Maps to --score-bin LO:HI:N. Bins must not overlap.">
+             <param name="lo" type="float" value="0.0" min="0" label="Lower score bound (inclusive)"/>
+             <param name="hi" type="float" value="1.01" min="0" label="Upper score bound (exclusive)" help="Bins are half-open, so a bin that should include a perfect containment score of 1.0 needs an upper bound above 1."/>
+--- a/tools/disassembler/disassembler_walker.xml
++++ b/tools/disassembler/disassembler_walker.xml
+@@ -23,15 +23,16 @@
+         max_size_mb=\${DISASSEMBLER_WALKER_MAX_SIZE_MB} &&
+         if [ -n "\${GALAXY_MEMORY_MB:-}" ]; then
+             budget=\$(( GALAXY_MEMORY_MB * 4 / 5 ));
+-            fit=\$(( (budget - 43 * workers) / max_size_mb - 4 - workers ));
++            ## logan-walker 0.1.1 bound (Config::max_resident_bytes): cap x (4 + F + W) + W x cap x 1.7
++            fit=\$(( (10 * budget - 10 * max_size_mb * (4 + workers) - 17 * workers * max_size_mb) / (10 * max_size_mb) ));
+             if [ "\$fit" -lt "\$fetch_workers" ]; then fetch_workers=\$fit; fi;
+             if [ "\$fetch_workers" -lt 1 ]; then
+                 fetch_workers=1;
+-                fit=\$(( (budget - 5 * max_size_mb) / (max_size_mb + 43) ));
++                fit=\$(( 10 * (budget - 5 * max_size_mb) / (27 * max_size_mb) ));
+                 if [ "\$fit" -lt "\$workers" ]; then workers=\$fit; fi;
+                 if [ "\$workers" -lt 1 ]; then
+                     workers=1;
+-                    max_size_mb=\$(( (budget - 43) / 6 ));
++                    max_size_mb=\$(( 10 * budget / 77 ));
+                 fi;
+             fi;
+             if [ "\$max_size_mb" -lt 64 ]; then
+@@ -125,7 +126,8 @@
+             <param argument="--hops" type="integer" value="5" min="0" label="Hop radius for subgraph expansion" help="How far from the anchored unitigs the local graph is grown."/>
+             <param argument="--min-shared-kmers" type="integer" value="3" min="1" max="5" label="Minimum shared k-mers for an anchor" help="k-mers a unitig must share with the reference to anchor the subgraph."/>
+             <param argument="--primary-metric" type="select" label="Primary haplotype selection (multi-anchor mode)" help="How the winning reference is chosen when the reference FASTA has more than one record. Ignored for a single reference.">
+-                <option value="cov" selected="true">Reference coverage (cov)</option>
++                <option value="matched" selected="true">Fraction of reference bases matched (matched)</option>
++                <option value="cov">Reference coverage (cov; the pre-0.1.1 default, biased toward shorter references)</option>
+                 <option value="pident">Percent identity (pident)</option>
+                 <option value="cov_x_pident">Coverage times identity (cov_x_pident)</option>
+             </param>
+@@ -162,7 +164,7 @@
+     </outputs>
+     <tests>
+         <!-- These tests stream Logan unitigs from the public S3 bucket. SRR8209082 is 1.8 MB
+-             compressed. SRR0000001 has no Logan unitigs and fails at the fetch (HTTP 404). -->
++             compressed. SRR0000001 has no Logan unitigs (HTTP 404): status no_logan_data, a negative, not an error. -->
+         <test expect_num_outputs="4">
+             <conditional name="input">
+                 <param name="mode" value="accession"/>
+@@ -252,7 +254,7 @@
+             <output name="summary">
+                 <assert_contents>
+                     <has_json_property_with_value property="success" value="0"/>
+-                    <has_text text="HTTP 404"/>
++                    <has_text text="no_logan_data"/>
+                 </assert_contents>
+             </output>
+         </test>
+--- a/tools/disassembler/macros.xml
++++ b/tools/disassembler/macros.xml
+@@ -1,6 +1,6 @@
+ <macros>
+-    <token name="@TOOL_VERSION@">0.1.0</token>
+-    <token name="@WALKER_VERSION@">0.1.0</token>
++    <token name="@TOOL_VERSION@">0.1.1</token>
++    <token name="@WALKER_VERSION@">0.1.1</token>
+     <token name="@VERSION_SUFFIX@">0</token>
+     <token name="@PROFILE@">25.0</token>
+     <xml name="requirements">
+--- a/tools/disassembler/test-data/hiv1_pol.scores.json
++++ b/tools/disassembler/test-data/hiv1_pol.scores.json
+@@ -1,5 +1,8 @@
+ {
+-  "SRR8209082": 0.97,
+-  "DRR000252": 0.41,
+-  "SRR0000001": 0.62
++  "target": "hiv1_pol",
++  "scores": {
++    "SRR8209082": 0.97,
++    "DRR000252": 0.41,
++    "SRR0000001": 0.62
++  }
+ }
+\ No newline at end of file
+--- a/tools/disassembler/test-data/pfcrt.scores.json
++++ b/tools/disassembler/test-data/pfcrt.scores.json
+@@ -1,4 +1,7 @@
+ {
+-  "ERR2028820": 0.88,
+-  "ERR0000002": 0.12
++  "target": "pfcrt",
++  "scores": {
++    "ERR2028820": 0.88,
++    "ERR0000002": 0.12
++  }
+ }
+\ No newline at end of file

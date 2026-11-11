@@ -1,0 +1,120 @@
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -378,6 +378,15 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
+ }
+ 
+ /// One line per finished accession.
++/// A closed stdout must not panic the collector: the SIGPIPE handler in `scratch` removes
++/// the scratch directory and ends the run with the default action.
++macro_rules! out {
++    ($($t:tt)*) => {{
++        use std::io::Write as _;
++        let _ = writeln!(std::io::stdout(), $($t)*);
++    }};
++}
++
+ fn report(done: usize, total: usize, r: &AccessionResult) {
+     match r.outcome {
+         Outcome::Success => {
+@@ -391,7 +400,7 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
+             } else {
+                 String::new()
+             };
+-            println!(
++            out!(
+                 "[{done}/{total}] {}: DONE in {:.1}s (nodes={}, cov={:.2}, pid={:.1}%, bubbles={}{})",
+                 r.accession,
+                 r.timing.total,
+@@ -402,18 +411,18 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
+                 haps_info
+             );
+         }
+-        Outcome::NoAnchors => println!("[{done}/{total}] {}: no_anchors", r.accession),
+-        Outcome::NoPath => println!("[{done}/{total}] {}: no_path", r.accession),
+-        Outcome::NoLoganData => println!(
++        Outcome::NoAnchors => out!("[{done}/{total}] {}: no_anchors", r.accession),
++        Outcome::NoPath => out!("[{done}/{total}] {}: no_path", r.accession),
++        Outcome::NoLoganData => out!(
+             "[{done}/{total}] {}: no_logan_data (no Logan unitigs for this accession)",
+             r.accession
+         ),
+-        Outcome::TooLarge => println!(
++        Outcome::TooLarge => out!(
+             "[{done}/{total}] {}: too_large, skipped by --max-size-mb ({})",
+             r.accession,
+             r.error.as_deref().unwrap_or("over the cap")
+         ),
+-        Outcome::Failed => println!(
++        Outcome::Failed => out!(
+             "[{done}/{total}] {}: ERROR: {}",
+             r.accession,
+             r.error.as_deref().unwrap_or("unknown")
+diff --git a/walker/src/scratch.rs b/walker/src/scratch.rs
+--- a/walker/src/scratch.rs
++++ b/walker/src/scratch.rs
+@@ -69,8 +69,17 @@ impl Scratch {
+     /// On SIGINT, SIGTERM or SIGHUP, remove the directory, then end the process as the
+     /// signal would have, so the caller still sees "terminated by SIGTERM".
+     pub fn remove_on_signal(&self) -> Result<()> {
+-        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+-        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
++        use signal_hook::consts::*;
++        // Every signal whose default action ends the process and that can be caught, so a
++        // run killed by `| head` (SIGPIPE), a batch scheduler's soft limit (SIGUSR1/2,
++        // SIGXCPU) or Ctrl-\ (SIGQUIT) still removes its directory. A signal the caller set
++        // to SIG_IGN (nohup, `trap '' USR1`) stays ignored.
++        let wanted = [
++            SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGQUIT, SIGUSR1, SIGUSR2, SIGXCPU, SIGXFSZ,
++            SIGALRM, SIGVTALRM, SIGPROF,
++        ];
++        let sigs: Vec<i32> = wanted.into_iter().filter(|&s| !ignored_at_start(s)).collect();
++        let mut signals = signal_hook::iterator::Signals::new(&sigs)?;
+         let (path, keep) = (self.path.clone(), self.keep);
+         std::thread::spawn(move || {
+             if let Some(sig) = signals.forever().next() {
+@@ -95,11 +104,28 @@ impl Drop for Scratch {
+     }
+ }
+ 
++/// Whether `sig` was inherited as SIG_IGN.
++#[cfg(unix)]
++fn ignored_at_start(sig: i32) -> bool {
++    // SAFETY: a null `act` only reads the current disposition.
++    unsafe {
++        let mut old: libc::sigaction = std::mem::zeroed();
++        libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
++    }
++}
++
+ /// `remove_dir_all`, tried twice: a worker can create a file in the directory while it is
+ /// being emptied, which makes the first attempt fail with "directory not empty".
+ fn remove(path: &Path) {
+-    if std::fs::remove_dir_all(path).is_err() {
+-        let _ = std::fs::remove_dir_all(path);
++    // Rename first: a worker still running keeps writing to the old name and gets ENOENT
++    // instead of refilling the directory while it is being emptied. The new name keeps the
++    // `logan-walker.<pid>.` prefix, so the next run's sweep still finds it.
++    let mut dying = path.as_os_str().to_owned();
++    dying.push(".dying");
++    let dying = PathBuf::from(dying);
++    let target = if std::fs::rename(path, &dying).is_ok() { dying.as_path() } else { path };
++    if std::fs::remove_dir_all(target).is_err() {
++        let _ = std::fs::remove_dir_all(target);
+     }
+ }
+ 
+diff --git a/walker/src/stages/extract.rs b/walker/src/stages/extract.rs
+--- a/walker/src/stages/extract.rs
++++ b/walker/src/stages/extract.rs
+@@ -290,6 +290,10 @@ pub fn write_gfa(
+         });
+     }
+ 
++    // The run's directory is made once by `Scratch::create`. Recreating it here brought it
++    // back (mode 0755) after the signal handler removed it, and a worker still in flight
++    // refilled it; unit tests that call this directly make their own.
++    #[cfg(test)]
+     std::fs::create_dir_all(&cfg.scratch_dir)
+         .map_err(crate::error::file_err("create", &cfg.scratch_dir))?;
+     let gfa_path = cfg.scratch_dir.join(format!("{}.sub.gfa", scratch_stem(&graph.accession)));

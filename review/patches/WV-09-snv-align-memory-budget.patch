@@ -1,0 +1,181 @@
+diff --git a/walker/src/io/output.rs b/walker/src/io/output.rs
+--- a/walker/src/io/output.rs
++++ b/walker/src/io/output.rs
+@@ -577,20 +577,20 @@
+     if r.alts.is_empty() {
+         return Vec::new();
+     }
+-    // Guard: full DP is O(n*m); genes are short. Skip pathological inputs loudly.
+-    if primary.seq.len() > 20_000 || query.seq.len() > 20_000 {
++    // Map each primary base to a query position (None where the primary base aligns to a gap in
++    // the query, i.e. an insertion relative to the gene). The cost is bounded by the traceback
++    // budget, not by length: a long gene at high identity bands cheaply; only a pair too
++    // divergent to fit the budget is skipped.
++    let Some(map) = align_primary_to_query(&primary.seq, &query.seq) else {
+         eprintln!(
+-            "[{}] SNP sites skipped: sequence longer than 20 kb (primary {}, query {})",
++            "[{}] SNP sites skipped: primary ({} nt) too divergent from the reference ({} nt) to map within {} MB",
+             r.accession,
+             primary.seq.len(),
+-            query.seq.len()
++            query.seq.len(),
++            SNV_ALIGN_BUDGET >> 20
+         );
+         return Vec::new();
+-    }
+-
+-    // Map each primary base to a query position (None where the primary base aligns to a gap in
+-    // the query, i.e. an insertion relative to the gene).
+-    let map = align_primary_to_query(&primary.seq, &query.seq);
++    };
+ 
+     let mut rows: Vec<VcfRow> = Vec::new();
+     for a in &r.alts {
+@@ -697,6 +697,9 @@
+     Ok(())
+ }
+ 
++/// Byte budget for one traceback matrix in `align_primary_to_query`.
++const SNV_ALIGN_BUDGET: usize = 256 << 20;
++
+ /// Global (Needleman-Wunsch) alignment of the primary against the query, returning for each
+ /// primary base the query position it aligns to, or `None` if it aligns to a gap (an
+ /// insertion relative to the gene).
+@@ -706,7 +709,7 @@
+ /// The two sequences are the same gene at high identity, so the optimal path hugs the main
+ /// diagonal and a band a few dozen cells wide contains it. That matters because the exact
+ /// implementation below allocates a full `(n+1)*(m+1)` byte traceback matrix: measured at
+-/// 1.6 MB and 11.1 ms for pfcrt, but **381 MB and 978 ms** at the 20 kb the guard permits,
++/// 1.6 MB and 11.1 ms for pfcrt, but **381 MB and 978 ms** at 20 kb,
+ /// which is a large single allocation on top of the pipeline's compressed-buffer ceiling.
+ ///
+ /// Banding makes that `(n+1)*w` for a band width `w`, so pfcrt drops from 1.6 MB to ~170 KB.
+@@ -716,19 +719,33 @@
+ /// A band is only a speedup if the optimum stays inside it. The traceback reports whether it
+ /// touched a band edge; if it did, the band may have clipped the true optimum, so the band is
+ /// doubled and the alignment redone. When the band reaches full width this calls `align_full`,
+-/// so the worst case is exactly the old behaviour and never a wrong answer.
+-fn align_primary_to_query(primary: &[u8], query: &[u8]) -> Vec<Option<usize>> {
++/// so the worst case is exactly the old behaviour and never a wrong answer. Every pass is
++/// checked against `SNV_ALIGN_BUDGET` first; `None` means the pair would not fit.
++fn align_primary_to_query(primary: &[u8], query: &[u8]) -> Option<Vec<Option<usize>>> {
++    align_within(primary, query, SNV_ALIGN_BUDGET)
++}
++
++/// `None` when the next pass would allocate more than `budget` bytes of traceback.
++fn align_within(primary: &[u8], query: &[u8], budget: usize) -> Option<Vec<Option<usize>>> {
+     let (n, m) = (primary.len(), query.len());
+     let full = n.max(m);
+     // The band has to span the length difference before it can absorb any drift on top.
+     let mut band = (n.abs_diff(m) + 16).max(32);
+     while band < full {
++        // align_banded allocates (n+1) * (|n-m| + 2*band + 1) bytes.
++        let w = n.abs_diff(m).saturating_add(band.saturating_mul(2)).saturating_add(1);
++        if (n + 1).saturating_mul(w) > budget {
++            return None;
++        }
+         if let Some(map) = align_banded(primary, query, band) {
+-            return map;
++            return Some(map);
+         }
+         band = band.saturating_mul(2);
+     }
+-    align_full(primary, query)
++    if (n + 1).saturating_mul(m + 1) > budget {
++        return None;
++    }
++    Some(align_full(primary, query))
+ }
+ 
+ /// One banded pass. `None` means the traceback reached a band edge, so the result may not be
+@@ -926,7 +943,7 @@
+                 continue;
+             }
+             assert_eq!(
+-                align_primary_to_query(&a, &b),
++                align_primary_to_query(&a, &b).unwrap(),
+                 align_full(&a, &b),
+                 "case {case}: banded disagreed with the exact DP (n={}, m={})",
+                 a.len(),
+@@ -942,7 +959,7 @@
+         let a = vec![b'A'; 120];
+         let mut b = vec![b'T'; 40];
+         b.extend(std::iter::repeat_n(b'A', 30));
+-        assert_eq!(align_primary_to_query(&a, &b), align_full(&a, &b));
++        assert_eq!(align_primary_to_query(&a, &b).unwrap(), align_full(&a, &b));
+     }
+ 
+     /// Degenerate shapes the band arithmetic has to survive.
+@@ -955,7 +972,7 @@
+             b"ACGTACGTACGTACGTACGTACGTACGTAC".to_vec(),
+             vec![b'G'; 1],
+         ] {
+-            assert_eq!(align_primary_to_query(&a, &b), align_full(&a, &b), "b len {}", b.len());
++            assert_eq!(align_primary_to_query(&a, &b).unwrap(), align_full(&a, &b), "b len {}", b.len());
+         }
+     }
+ }
+@@ -1098,20 +1115,20 @@
+     #[test]
+     fn identical_sequences_map_one_to_one() {
+         let s = b"ACGTACGTAC";
+-        let map = align_primary_to_query(s, s);
++        let map = align_primary_to_query(s, s).unwrap();
+         assert_eq!(map, (0..s.len()).map(Some).collect::<Vec<_>>());
+     }
+ 
+     #[test]
+     fn a_substitution_keeps_coordinates_aligned() {
+-        let map = align_primary_to_query(b"ACGTACGT", b"ACGTTCGT");
++        let map = align_primary_to_query(b"ACGTACGT", b"ACGTTCGT").unwrap();
+         assert_eq!(map, (0..8).map(Some).collect::<Vec<_>>());
+     }
+ 
+     #[test]
+     fn an_insertion_in_the_primary_has_no_query_coordinate() {
+         // primary "ACGTGACGT" has one extra G at index 4 relative to query "ACGTACGT"
+-        let map = align_primary_to_query(b"ACGTGACGT", b"ACGTACGT");
++        let map = align_primary_to_query(b"ACGTGACGT", b"ACGTACGT").unwrap();
+         assert_eq!(map.len(), 9);
+         assert_eq!(map[0], Some(0));
+         assert_eq!(map[4], None, "the inserted base maps to no query position");
+@@ -1121,13 +1138,38 @@
+     #[test]
+     fn a_deletion_in_the_primary_skips_a_query_position() {
+         // primary "ACGACGT" is query "ACGTACGT" missing the T at query index 3
+-        let map = align_primary_to_query(b"ACGACGT", b"ACGTACGT");
++        let map = align_primary_to_query(b"ACGACGT", b"ACGTACGT").unwrap();
+         assert_eq!(map.len(), 7);
+         assert_eq!(map[0], Some(0));
+         assert_eq!(map[2], Some(2));
+         assert_eq!(map[3], Some(4), "query position 3 (the deleted T) is skipped");
+         assert_eq!(map[6], Some(7));
+     }
++
++    #[test]
++    fn long_gene_at_high_identity_is_not_skipped() {
++        // 21,291 nt (ORF1ab length) with one on-path SNV: the old 20 kb guard returned nothing.
++        let mut seed = 11u64;
++        let q: Vec<u8> = (0..21_291).map(|_| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); b"ACGT"[((seed >> 33) % 4) as usize] }).collect();
++        let p = q.len() / 2;
++        let mut a = q.clone();
++        a[p] = if q[p] == b'A' { b'C' } else { b'A' };
++        let rows = snv_sites(&result(&q, vec![alt(&a, 0.40, 40.0)]), &query(&q));
++        assert_eq!(rows.len(), 1);
++        assert_eq!(rows[0].pos, p + 1);
++    }
++
++    #[test]
++    fn a_pass_over_the_budget_is_refused_not_allocated() {
++        // A 2 kb primary against an unrelated 6 kb reference: the first band must already span
++        // the 4 kb length difference, (2001 * 12033) = 24 MB, over a 1 MB budget.
++        let mut seed = 5u64;
++        let mut rnd = |n: usize| -> Vec<u8> { (0..n).map(|_| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); b"ACGT"[((seed >> 33) % 4) as usize] }).collect() };
++        let a = rnd(2000);
++        let b = rnd(6000);
++        assert!(super::align_within(&a, &b, 1 << 20).is_none());
++        assert_eq!(super::align_within(&a, &b, usize::MAX).unwrap(), super::align_full(&a, &b));
++    }
+ }
+ 
+ #[cfg(test)]

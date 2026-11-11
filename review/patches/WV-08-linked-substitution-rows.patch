@@ -1,0 +1,116 @@
+diff --git a/walker/src/io/output.rs b/walker/src/io/output.rs
+--- a/walker/src/io/output.rs
++++ b/walker/src/io/output.rs
+@@ -572,6 +572,10 @@
+ /// Shared by the per-accession VCF and the long table so the two cannot disagree. Substitutions
+ /// only; an alt whose length differs from the primary, or that differs at more than one base, is
+ /// an indel or a multi-substitution block and stays in `alt_haplotypes.fasta`.
++/// Most linked substitutions one equal-length alt may contribute; above this it is treated as a
++/// reroute through other sequence, not a block of SNVs, and stays in `alt_haplotypes.fasta`.
++const MAX_LINKED_SNVS: usize = 8;
++
+ fn snv_sites(r: &AccessionResult, query: &Query) -> Vec<VcfRow> {
+     let Some(primary) = &r.haplotype else { return Vec::new() };
+     if r.alts.is_empty() {
+@@ -598,47 +602,45 @@
+         if alt_seq.len() != primary.seq.len() {
+             continue;
+         }
+-        let mut diff: Option<usize> = None;
+-        let mut multiple = false;
+-        for (i, (x, y)) in primary.seq.iter().zip(alt_seq.iter()).enumerate() {
+-            if x != y {
+-                if diff.is_some() {
+-                    multiple = true;
+-                    break;
+-                }
+-                diff = Some(i);
+-            }
++        // Every differing column of an equal-length alt is a substitution. Two or more of them
++        // are linked on one route (they share a bubble), so each gets its own row with the
++        // same frequency and FORK; FORK is what ties the rows of one allele together.
++        let diffs: Vec<usize> = primary.seq.iter().zip(alt_seq.iter()).enumerate()
++            .filter(|(_, (x, y))| x != y).map(|(i, _)| i).collect();
++        if diffs.is_empty() || diffs.len() > MAX_LINKED_SNVS {
++            continue; // identical, or a reroute rather than a block of substitutions
+         }
+-        let (Some(i), false) = (diff, multiple) else { continue };
++        for i in diffs {
+         let Some(qpos) = map[i] else { continue }; // primary base has no query coordinate
+ 
+-        let ref_base = query.seq[qpos];
+-        let major = primary.seq[i]; // the primary carries the majority allele
+-        let minor = alt_seq[i];
+-        let major_ka = a.taken_abundance;
+-        let minor_ka = a.alt_abundance;
+-
+-        // Report every sample allele that differs from the query base as an ALT. At most one of
+-        // {major, minor} can equal REF (they differ from each other), so this is one ALT in the
+-        // common case and two only when the gene base is a third allele.
+-        let mut alts: Vec<(u8, f64, f32)> = Vec::new();
+-        if minor != ref_base {
+-            alts.push((minor, a.alt_vaf, minor_ka));
+-        }
+-        if major != ref_base {
+-            alts.push((major, a.taken_vaf, major_ka));
+-        }
+-        if alts.is_empty() {
+-            continue; // neither allele differs from the gene base: nothing to call
+-        }
+-        let ref_ka = if ref_base == major {
+-            major_ka
+-        } else if ref_base == minor {
+-            minor_ka
+-        } else {
+-            0.0
+-        };
+-        rows.push(VcfRow { pos: qpos + 1, ref_base, alts, ref_ka, fork: a.fork });
++            let ref_base = query.seq[qpos];
++            let major = primary.seq[i]; // the primary carries the majority allele
++            let minor = alt_seq[i];
++            let major_ka = a.taken_abundance;
++            let minor_ka = a.alt_abundance;
++
++            // Report every sample allele that differs from the query base as an ALT. At most one of
++            // {major, minor} can equal REF (they differ from each other), so this is one ALT in the
++            // common case and two only when the gene base is a third allele.
++            let mut alts: Vec<(u8, f64, f32)> = Vec::new();
++            if minor != ref_base {
++                alts.push((minor, a.alt_vaf, minor_ka));
++            }
++            if major != ref_base {
++                alts.push((major, a.taken_vaf, major_ka));
++            }
++            if alts.is_empty() {
++                continue; // neither allele differs from the gene base: nothing to call
++            }
++            let ref_ka = if ref_base == major {
++                major_ka
++            } else if ref_base == minor {
++                minor_ka
++            } else {
++                0.0
++            };
++            rows.push(VcfRow { pos: qpos + 1, ref_base, alts, ref_ka, fork: a.fork });
++        }
+     }
+     rows.sort_by_key(|r| (r.pos, r.fork));
+ 
+@@ -1043,6 +1045,17 @@
+         assert_eq!(chrom_of(reference_of(&r, &pool)), "winner");
+     }
+ 
++    /// An alt with two substitutions in one bubble yields two linked rows, not none.
++    #[test]
++    fn two_linked_substitutions_yield_two_rows() {
++        let primary = b"TTTATTTGTTT";
++        let q = query(primary);
++        let rows = snv_sites(&result(primary, vec![alt(b"TTTCTTTATTT", 0.25, 25.0)]), &q);
++        let got: Vec<(usize, u8)> = rows.iter().map(|r| (r.pos, r.alts[0].0)).collect();
++        assert_eq!(got, vec![(4, b'C'), (8, b'A')]);
++        assert!(rows.iter().all(|r| r.fork == 7 && r.alts[0].1 == 0.25));
++    }
++
+     /// A triallelic on-path fork yields two alt haplotypes that differ from the primary at the
+     /// same position. They must coalesce into ONE multiallelic site, not two records at the same
+     /// POS (which would be a malformed VCF and break `bcftools merge`).

@@ -1,0 +1,54 @@
+--- a/tools/disassembler/disassembler_walker.xml
++++ b/tools/disassembler/disassembler_walker.xml
+@@ -124,8 +124,9 @@
+             <param argument="--k" type="integer" value="21" min="1" max="32" label="Anchor k-mer size"/>
+             <param argument="--hops" type="integer" value="5" min="0" label="Hop radius for subgraph expansion" help="How far from the anchored unitigs the local graph is grown."/>
+             <param argument="--min-shared-kmers" type="integer" value="3" min="1" max="5" label="Minimum shared k-mers for an anchor" help="k-mers a unitig must share with the reference to anchor the subgraph."/>
+-            <param argument="--primary-metric" type="select" label="Primary haplotype selection (multi-anchor mode)" help="How the winning reference is chosen when the reference FASTA has more than one record. Ignored for a single reference.">
+-                <option value="cov" selected="true">Reference coverage (cov)</option>
++            <param argument="--primary-metric" type="select" label="Primary haplotype selection (multi-anchor mode)" help="How the winning reference is chosen when the reference FASTA has more than one record. Ignored for a single reference. 'cov' was the default before logan-walker 0.1.1 and favours references shorter than the sample's gene; choose it only to reproduce older runs.">
++                <option value="matched" selected="true">Fraction of the reference's bases matched (matched)</option>
++                <option value="cov">Reference coverage (cov)</option>
+                 <option value="pident">Percent identity (pident)</option>
+                 <option value="cov_x_pident">Coverage times identity (cov_x_pident)</option>
+             </param>
+@@ -256,6 +257,29 @@
+                 </assert_contents>
+             </output>
+         </test>
++        <test expect_num_outputs="3">
++            <!-- Multi-anchor: the panel holds hiv1_pol and hiv1_pol_del9 (the same CDS with an
++                 in-frame 9-nt deletion). 'cov' would pick the shorter record (ratio above 1.0);
++                 the 0.1.1 default 'matched' must keep the exact one. -->
++            <conditional name="input">
++                <param name="mode" value="accession"/>
++                <param name="accession" value="SRR8209082"/>
++            </conditional>
++            <param name="query" value="hiv1_pol_panel.fasta" ftype="fasta"/>
++            <section name="output_options">
++                <param name="emit_alts" value="false"/>
++            </section>
++            <output name="reconstructed">
++                <assert_contents>
++                    <has_line_matching expression="^>SRR8209082_primary .* anchor=hiv1_pol$"/>
++                </assert_contents>
++            </output>
++            <output name="summary">
++                <assert_contents>
++                    <has_text text="&quot;primary_metric&quot;: &quot;matched&quot;"/>
++                </assert_contents>
++            </output>
++        </test>
+         <test expect_failure="true">
+             <!-- Same run without the escape hatch fails the job. -->
+             <conditional name="input">
+--- a/tools/disassembler/macros.xml
++++ b/tools/disassembler/macros.xml
+@@ -1,6 +1,6 @@
+ <macros>
+     <token name="@TOOL_VERSION@">0.1.0</token>
+-    <token name="@WALKER_VERSION@">0.1.0</token>
++    <token name="@WALKER_VERSION@">0.1.1</token>
+     <token name="@VERSION_SUFFIX@">0</token>
+     <token name="@PROFILE@">25.0</token>
+     <xml name="requirements">

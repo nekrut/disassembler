@@ -1,0 +1,157 @@
+diff --git a/src/disassembler/cmd/msa.py b/src/disassembler/cmd/msa.py
+index 6d19ea4f357a..000000000000 100644
+--- a/src/disassembler/cmd/msa.py
++++ b/src/disassembler/cmd/msa.py
+@@ -16,9 +16,11 @@
+ import os
+ import re
+ import shutil
++import stat
+ import statistics
+ import subprocess
+ import sys
++import tempfile
+ from pathlib import Path
+ 
+ from disassembler.textio import open_text
+@@ -47,6 +49,27 @@
+     )
+ 
+ 
++def is_special(path: Path) -> bool:
++    """True if `path` is a symlink, or exists and is not a regular file: a device
++    (/dev/null), a pipe (a FIFO, a bash >(...)), /dev/stdout (a symlink). Those are written
++    into, never renamed over, and no temp file is put beside them."""
++    try:
++        return path.is_symlink() or not stat.S_ISREG(os.stat(path).st_mode)
++    except FileNotFoundError:
++        return False
++
++
++def publish(tmp: Path, dest: Path) -> None:
++    """Put a finished temp file in place: an atomic rename onto a regular file or a new
++    path; a copy into an existing special file, which a rename would replace (as root,
++    `--out-tree /dev/null` turned /dev/null into a regular file holding the tree)."""
++    if is_special(dest):
++        with open(tmp, "rb") as src, open(dest, "wb") as dst:
++            shutil.copyfileobj(src, dst)
++    else:
++        os.replace(tmp, dest)
++
++
+ def sanitize_id(s: str, used: set) -> str:
+     clean = re.sub(r"[^A-Za-z0-9_]", "_", s).strip("_")
+     if not clean:
+@@ -226,12 +249,17 @@
+     # MAFFT reads both inputs from files beside the output. They are removed however this
+     # ends; they used to be removed only on the normal path, so an exception or a Ctrl-C
+     # during MAFFT left them behind.
+-    clean_input_p = out_aln.parent / f".tmp_{in_p.name}.{os.getpid()}"
+-    clean_ref_p = out_aln.parent / f".tmp_ref_{ref_p.name}.{os.getpid()}"
++    # A special output (/dev/null, /dev/stdout, a FIFO) sits in a directory that may not
++    # be writable (/dev) or not hold files at all (/dev/fd), so its temps go to $TMPDIR.
++    aln_dir = Path(tempfile.gettempdir()) if is_special(out_aln) else out_aln.parent
++    tree_dir = Path(tempfile.gettempdir()) if is_special(out_tree) else out_tree.parent
++    clean_input_p = aln_dir / f".tmp_{in_p.name}.{os.getpid()}"
++    clean_ref_p = aln_dir / f".tmp_ref_{ref_p.name}.{os.getpid()}"
+     # Same temp-then-rename as the tree below: opening out_aln directly truncated it
+     # before MAFFT ran, so a MAFFT failure replaced a previously good alignment with
+     # an empty file.
+-    tmp_aln = out_aln.with_name(f".tmp_{out_aln.name}.{os.getpid()}")
++    tmp_aln = aln_dir / f".tmp_{out_aln.name}.{os.getpid()}"
++    tmp_tree = tree_dir / f".tmp_{out_tree.name}.{os.getpid()}"
+     try:
+         retained = flipped = unoriented = 0
+         with open(clean_input_p, "w") as fh:
+@@ -304,18 +332,18 @@
+                 return 1
+         if not identity_ok(aligned_recs, args.min_identity):
+             return 1
+-        os.replace(tmp_aln, out_aln)
+-    finally:
+-        for temp in (clean_input_p, clean_ref_p, tmp_aln):
+-            temp.unlink(missing_ok=True)
+-
+-    # Written to a temp and renamed on success: opening out_tree directly truncated it
+-    # before FastTree ran, so a failure left a 0-byte .nwk that looks like a real output
+-    # to anything downstream (and destroyed a previously good tree).
+-    print(f"[*] Generating FastTree GTR phylogeny -> {out_tree}...")
+-    tmp_tree = out_tree.with_name(f".tmp_{out_tree.name}.{os.getpid()}")
+-    try:
+-        with open(out_aln, "r") as infh, open(tmp_tree, "w") as outfh:
++        publish(tmp_aln, out_aln)
++        clean_input_p.unlink()
++        clean_ref_p.unlink()
++
++        # Written to a temp and renamed on success: opening out_tree directly truncated it
++        # before FastTree ran, so a failure left a 0-byte .nwk that looks like a real output
++        # to anything downstream (and destroyed a previously good tree).
++        print(f"[*] Generating FastTree GTR phylogeny -> {out_tree}...")
++        # FastTree reads the alignment back; a special out_aln cannot be read back, and
++        # publish() leaves tmp_aln in place in exactly that case.
++        aln_src = tmp_aln if tmp_aln.exists() else out_aln
++        with open(aln_src, "r") as infh, open(tmp_tree, "w") as outfh:
+             ft_res = subprocess.run(
+                 [fasttree_bin, "-nt", "-gtr", "-quiet"],
+                 stdin=infh, stdout=outfh, stderr=subprocess.PIPE, text=True,
+@@ -323,9 +351,10 @@
+         if ft_res.returncode != 0:
+             print(f"FastTree failed: {ft_res.stderr}", file=sys.stderr)
+             return 1
+-        os.replace(tmp_tree, out_tree)
++        publish(tmp_tree, out_tree)
+     finally:
+-        Path(tmp_tree).unlink(missing_ok=True)
++        for temp in (clean_input_p, clean_ref_p, tmp_aln, tmp_tree):
++            temp.unlink(missing_ok=True)
+ 
+     print(
+         f"\n[✓] Codon alignment complete: {len(aligned_recs)} taxa x {ref_len} nt "
+diff --git a/tests/test_msa.py b/tests/test_msa.py
+index e4a700b1c73f..000000000000 100644
+--- a/tests/test_msa.py
++++ b/tests/test_msa.py
+@@ -129,6 +129,43 @@
+                 self._msa([("full", REF)])
+         self.assertEqual(sorted(p.name for p in self.work.glob(".tmp_*")), [])
+ 
++    def _run_to(self, out_aln, out_tree):
++        ref, inp = self.work / "ref.fasta", self.work / "in.fasta"
++        _write(ref, [("gene", GENE)])
++        _write(inp, [("a", GENE), ("b", GENE)])
++        from disassembler.stage import stage_args
++        ns = stage_args(self.msa, ref=str(ref), input=str(inp), out_aln=str(out_aln),
++                        out_tree=str(out_tree), mafft_threads=1)
++        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
++            return self.msa.run(ns)
++
++    def test_a_fifo_output_is_written_into_not_replaced(self):
++        # os.replace() swapped a regular file in for the FIFO: the reader blocked forever
++        # and, as root, --out-tree /dev/null turned /dev/null into a regular file.
++        import stat
++        import threading
++        fifo = self.work / "tree.fifo"
++        os.mkfifo(fifo)
++        got = []
++        reader = threading.Thread(target=lambda: got.append(fifo.read_text()), daemon=True)
++        reader.start()
++        self.assertEqual(self._run_to(self.work / "aln.fasta", fifo), 0)
++        reader.join(10)
++        self.assertFalse(reader.is_alive(), "the FIFO's reader never got the tree")
++        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode))
++        self.assertEqual(got, ["(Reference);\n"])
++        self.assertEqual(sorted(p.name for p in self.work.glob(".tmp_*")), [])
++
++    def test_a_symlinked_output_keeps_its_link(self):
++        # /dev/stdout is a symlink; a rename replaced it with a regular file.
++        target = self.work / "real.fasta"
++        link = self.work / "link.fasta"
++        link.symlink_to(target)
++        self.assertEqual(self._run_to(link, self.work / "tree.nwk"), 0)
++        self.assertTrue(link.is_symlink())
++        self.assertEqual(target.read_text().count(">"), 3)
++        self.assertEqual((self.work / "tree.nwk").read_text(), "(Reference);\n")
++
+     def test_a_multi_record_reference_uses_the_first_and_says_so(self):
+         rc, log, rows = self._msa([("a", GENE)],
+                                   ref_records=[("gene", GENE), ("other", REF)])

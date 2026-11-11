@@ -1,0 +1,118 @@
+diff --git a/walker/src/config.rs b/walker/src/config.rs
+--- a/walker/src/config.rs
++++ b/walker/src/config.rs
+@@ -342,6 +342,9 @@
+     /// Smaller graphs never showed the effect: `ERR2028820` scored 1268 on all five runs at
+     /// every thread count. It appears where the alignment is ambiguous enough to search.
+     pub graphaligner_threads: usize,
++    /// Wall-clock limit for one GraphAligner call; 0 = none. On expiry the child is killed and
++    /// only that accession fails.
++    pub graphaligner_timeout_secs: u64,
+ 
+     // ---- fetch ----
+     /// Whole-request timeout, including body transfer. A 343 MB accession at the measured
+@@ -471,6 +474,7 @@
+             compute_workers: 8,
+             channel_capacity: 4,
+             graphaligner_threads: 1,
++            graphaligner_timeout_secs: 3600,
+             fetch_timeout_secs: 900,
+             fetch_connect_timeout_secs: 15,
+             fetch_attempts: 3,
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -217,6 +217,9 @@
+             "--fetch-workers" => args.cfg.fetch_workers = at_least_one("--fetch-workers", &value()?)?,
+             "--scratch-dir" => args.scratch_base = Some(PathBuf::from(value()?)),
+             "--graphaligner" => args.cfg.graphaligner_bin = value()?,
++            "--graphaligner-timeout" => {
++                args.cfg.graphaligner_timeout_secs = value()?.parse().map_err(|e| error::Error::Usage(format!("--graphaligner-timeout: {e}")))?;
++            }
+             // The prune sweep is the reason this flag exists, so it validates its range
+             // rather than just parsing.
+             // A boolean, so it consumes no value and must not fall through to `value()`.
+diff --git a/walker/src/scratch.rs b/walker/src/scratch.rs
+--- a/walker/src/scratch.rs
++++ b/walker/src/scratch.rs
+@@ -17,6 +17,18 @@
+ 
+ const PREFIX: &str = "logan-walker.";
+ 
++/// PIDs of the GraphAligner children now running; the signal thread stops them before it
++/// removes the directory they work in.
++pub static CHILDREN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
++
++fn stop_children() {
++    let pids = CHILDREN.lock().map(|g| g.clone()).unwrap_or_default();
++    for pid in pids {
++        // SAFETY: kill has no memory-safety preconditions.
++        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
++    }
++}
++
+ pub struct Scratch {
+     path: PathBuf,
+     keep: bool,
+@@ -74,6 +86,7 @@
+         let (path, keep) = (self.path.clone(), self.keep);
+         std::thread::spawn(move || {
+             if let Some(sig) = signals.forever().next() {
++                stop_children();
+                 if !keep {
+                     remove(&path);
+                 }
+diff --git a/walker/src/stages/align.rs b/walker/src/stages/align.rs
+--- a/walker/src/stages/align.rs
++++ b/walker/src/stages/align.rs
+@@ -198,13 +198,48 @@
+     // GraphAligner is chatty on stdout; only stderr is kept, for error reporting.
+     cmd.stdout(std::process::Stdio::null());
+ 
+-    let output = cmd.output().map_err(|e| {
++    cmd.stderr(std::process::Stdio::piped());
++    let spawn_err = |e: std::io::Error| {
+         let _ = std::fs::remove_file(&query_fa);
+         Error::GraphAligner {
+             accession: subgraph.accession.clone(),
+             detail: format!("could not run {}: {e}", bin.display()),
+         }
+-    })?;
++    };
++    let mut child = cmd.spawn().map_err(spawn_err)?;
++    let pid = child.id();
++    if let Ok(mut g) = crate::scratch::CHILDREN.lock() { g.push(pid); }
++    let mut err_pipe = child.stderr.take().expect("stderr is piped");
++    let reader = std::thread::spawn(move || {
++        let mut buf = Vec::new();
++        let _ = std::io::Read::read_to_end(&mut err_pipe, &mut buf);
++        buf
++    });
++    let limit = cfg.graphaligner_timeout_secs;
++    let start = std::time::Instant::now();
++    let waited = loop {
++        match child.try_wait() {
++            Ok(Some(st)) => break Ok(st),
++            Ok(None) if limit > 0 && start.elapsed().as_secs() >= limit => {
++                let _ = child.kill();
++                let _ = child.wait();
++                break Err(format!("timed out after {limit} s (--graphaligner-timeout)"));
++            }
++            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
++            Err(e) => break Err(format!("wait failed: {e}")),
++        }
++    };
++    if let Ok(mut g) = crate::scratch::CHILDREN.lock() { g.retain(|&p| p != pid); }
++    let stderr = reader.join().unwrap_or_default();
++    let status = match waited {
++        Ok(st) => st,
++        Err(detail) => {
++            let _ = std::fs::remove_file(gaf_out);
++            let _ = std::fs::remove_file(&query_fa);
++            return Err(Error::GraphAligner { accession: subgraph.accession.clone(), detail });
++        }
++    };
++    let output = std::process::Output { status, stdout: Vec::new(), stderr };
+ 
+     if !output.status.success() {
+         // Remove any partial GAF so a later run cannot read a truncated file.

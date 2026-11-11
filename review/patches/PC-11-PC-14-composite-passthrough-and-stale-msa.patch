@@ -1,0 +1,179 @@
+diff --git a/src/disassembler/cli.py b/src/disassembler/cli.py
+index 5c6bf2553a39..000000000000 100644
+--- a/src/disassembler/cli.py
++++ b/src/disassembler/cli.py
+@@ -55,6 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
+     return p
+ 
+ 
++_WALKER_PASSTHROUGH = ("reconstruct", "from-kmindex")
++
++
+ def main(argv: Sequence[str] | None = None) -> int:
+     if argv is None:
+         argv = sys.argv[1:]
+@@ -70,8 +73,18 @@ def main(argv: Sequence[str] | None = None) -> int:
+         rc = walker_mod.run(ns)
+         return int(rc) if rc is not None else 0
+ 
++    # Composites forward everything after the first literal `--` to the walker. Split it
++    # off here, as for `walker` above; an argparse.REMAINDER positional would also take a
++    # stray token (and every option after it) without any `--`.
++    tail = None
++    if argv and argv[0] in _WALKER_PASSTHROUGH and "--" in argv:
++        i = argv.index("--")
++        argv, tail = argv[:i], argv[i + 1:]
++
+     parser = build_parser()
+     args = parser.parse_args(argv)
++    if tail is not None:
++        args.walker_args = tail
+     rc = args.func(args)
+     return int(rc) if rc is not None else 0
+ 
+diff --git a/src/disassembler/cmd/pipe_from_kmindex.py b/src/disassembler/cmd/pipe_from_kmindex.py
+index 623dfc862f08..000000000000 100644
+--- a/src/disassembler/cmd/pipe_from_kmindex.py
++++ b/src/disassembler/cmd/pipe_from_kmindex.py
+@@ -249,9 +249,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
+             "  See `disassembler walker -h` for the full CLI.\n"
+         ),
+     )
+-    g_pass.add_argument("walker_args", nargs=argparse.REMAINDER,
+-                        help="Extra args forwarded to logan-walker (put them after `--`).")
+-    p.set_defaults(func=run)
++    p.set_defaults(func=run, walker_args=[])
+ 
+ 
+ def run(args) -> int:
+@@ -262,9 +260,7 @@ def run(args) -> int:
+     if cache_err:
+         print(f"from-kmindex: {cache_err}", file=sys.stderr)
+         return 1
+-    raw_extra = (
+-        args.walker_args[1:] if args.walker_args[:1] == ["--"] else args.walker_args
+-    )
++    raw_extra = args.walker_args
+     scrub_err = pipe_reconstruct._scrub_walker_passthrough(list(raw_extra))
+     if scrub_err:
+         print(f"from-kmindex: {scrub_err}", file=sys.stderr)
+diff --git a/src/disassembler/cmd/pipe_reconstruct.py b/src/disassembler/cmd/pipe_reconstruct.py
+index ec0cd7c15617..000000000000 100644
+--- a/src/disassembler/cmd/pipe_reconstruct.py
++++ b/src/disassembler/cmd/pipe_reconstruct.py
+@@ -195,9 +195,31 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
+             "  See `disassembler walker -h` for the full CLI.\n"
+         ),
+     )
+-    g_pass.add_argument("walker_args", nargs=argparse.REMAINDER,
+-                        help="Extra args forwarded to logan-walker (put them after `--`).")
+-    p.set_defaults(func=run)
++    # The tail after `--` is split off in cli.main before argparse runs, so a stray
++    # positional (`-q a.fa b.fa`) is "unrecognized" at parse time instead of being
++    # swallowed, with every later option, into the walker passthrough.
++    p.set_defaults(func=run, walker_args=[])
++
++
++DERIVED_MANIFEST = ".disassembler_derived"
++
++
++def clear_derived(out: Path) -> None:
++    """Remove the MSA/tree an earlier composite run recorded in `out`, then the record."""
++    m = out / DERIVED_MANIFEST
++    try:
++        names = m.read_text().split("\n")
++    except FileNotFoundError:
++        return
++    for name in names:
++        # Bare file names only: the manifest must not reach outside --out-dir.
++        if name and Path(name).name == name and name not in (".", ".."):
++            (out / name).unlink(missing_ok=True)
++    m.unlink(missing_ok=True)
++
++
++def record_derived(out: Path, *paths: Path) -> None:
++    (out / DERIVED_MANIFEST).write_text("".join(f"{p.name}\n" for p in paths))
+ 
+ 
+ def _die(msg: str) -> int:
+@@ -312,7 +334,7 @@ def run(args) -> int:
+         return _die(cache_err)
+ 
+     # Scrub composite-owned flags out of the walker passthrough.
+-    raw_extra = args.walker_args[1:] if args.walker_args[:1] == ["--"] else args.walker_args
++    raw_extra = args.walker_args
+     scrub_err = _scrub_walker_passthrough(list(raw_extra))
+     if scrub_err:
+         return _die(scrub_err)
+@@ -402,6 +424,9 @@ def run(args) -> int:
+     # this --out-dir no longer matches it. With --sieve this run writes it again; kept, it sat
+     # beside fresh results as if this run had made it.
+     sieved.unlink(missing_ok=True)
++    # An MSA or tree an earlier run made, under whatever reference stem, no longer matches the
++    # reconstruction either; the manifest names what that run wrote.
++    clear_derived(out)
+ 
+     # ---- optional sieve ----------------------------------------------------
+     msa_input = recon
+@@ -450,6 +475,7 @@ def run(args) -> int:
+     if rc != 0:
+         return _die(f"codon MSA / tree (stage 2) failed (exit {rc}); see its output above.")
+ 
++    record_derived(out, aln, tree)
+     print(f"[reconstruct] done:\n"
+           f"  haplotypes : {recon}\n"
+           f"  codon MSA  : {aln}\n"
+diff --git a/src/disassembler/stage.py b/src/disassembler/stage.py
+index 547fb9b2e6da..000000000000 100644
+--- a/src/disassembler/stage.py
++++ b/src/disassembler/stage.py
+@@ -25,6 +25,9 @@ def stage_args(module, **values) -> argparse.Namespace:
+ 
+     actions = [a for a in parser._actions if a.default is not argparse.SUPPRESS]
+     ns = {a.dest: a.default for a in actions}
++    # set_defaults() entries (func, and walker_args, which has no action because cli.main
++    # splits it off at `--`) override action defaults, as in argparse; `values` wins over both.
++    ns.update(parser._defaults)
+     unknown = sorted(set(values) - set(ns))
+     if unknown:
+         raise TypeError(f"{parser.prog}: no option(s) {', '.join(unknown)}")
+@@ -37,5 +40,4 @@ def stage_args(module, **values) -> argparse.Namespace:
+     if missing:
+         raise TypeError(f"{parser.prog}: missing required {', '.join(missing)}")
+ 
+-    ns.update(parser._defaults)
+     return argparse.Namespace(**ns)
+diff --git a/tests/test_composites.py b/tests/test_composites.py
+index 765b994daef8..000000000000 100644
+--- a/tests/test_composites.py
++++ b/tests/test_composites.py
+@@ -237,6 +237,29 @@ class TestReconstruct(_Stubs):
+         self.assertTrue((out / "reconstructed.fasta").is_file())
+         self.assertEqual([p.name for p in stale if p.exists()], [])
+ 
++    def test_skip_tree_removes_an_msa_made_against_another_reference(self):
++        out = self.work / "out"
++        rc, log = _run(["reconstruct", "-a", "SRR1", "-q", str(self.ref), "-o", str(out),
++                        "--walker-bin", str(self.walker)])
++        self.assertEqual(rc, 0, log)
++        other = self.work / "geneB.fasta"
++        other.write_text(f">geneB\n{REF}\n")
++        rc, log = _run(["reconstruct", "-a", "SRR2", "-q", str(other), "-o", str(out),
++                        "--walker-bin", str(self.walker), "--skip-tree"])
++        self.assertEqual(rc, 0, log)
++        self.assertEqual(sorted(p.name for p in out.glob("*_codon_msa.fasta")), [])
++        self.assertEqual(sorted(p.name for p in out.glob("*_fasttree.nwk")), [])
++
++    def test_a_stray_positional_is_a_usage_error_not_walker_passthrough(self):
++        # `-q` takes one FASTA; a second file used to capture every later option into the
++        # walker passthrough and fail only inside the walker (after from-kmindex's harvest).
++        out = self.work / "out"
++        rc, log = _run(["reconstruct", "-a", "SRR1", "-q", str(self.ref), str(self.ref),
++                        "-o", str(out), "--walker-bin", str(self.walker)])
++        self.assertEqual(rc, 2, log)
++        self.assertIn("unrecognized arguments", log)
++        self.assertFalse(out.exists())
++
+     def test_gzipped_query_and_accession_list(self):
+         import gzip
+         q = self.work / "gene.fa"  # gzipped, but not named .gz

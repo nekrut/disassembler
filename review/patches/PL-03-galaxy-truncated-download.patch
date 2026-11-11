@@ -1,0 +1,82 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -91,6 +91,7 @@
+ import time
+ import argparse
+ import bisect
++import http.client
+ import urllib.request
+ from pathlib import Path
+ from collections import Counter, defaultdict
+@@ -891,6 +892,16 @@
+                 print(f"\n[*] Reached row limit (--max-records {max_records:,}).")
+                 break
+ 
++        # A body cut short of its Content-Length reads as a plain end of file through
++        # HTTPResponse.read1 (no IncompleteRead), over HTTP and over TLS alike. `length` is
++        # what the server still owed; it is 0 after a complete download.
++        owed = getattr(raw, "length", None) if dataset_id else None
++        if owed and not (max_records and total_rows >= max_records):
++            raise RuntimeError(
++                f"the download of Galaxy dataset {dataset_id} ended {owed:,} bytes short of "
++                f"its Content-Length (connection closed early); the table is truncated and "
++                f"the outputs are incomplete. Rerun.")
++
+         if curr_acc is not None:
+             process_accession_block(curr_acc, curr_hsps)
+ 
+@@ -1320,8 +1331,9 @@
+         return EX_TEMPFAIL
+     # Input problems (a missing or empty file, a bad table, an unreadable Galaxy dataset, a
+     # missing API key) end in one line naming the cause, not a traceback.
+-    except (ValueError, OSError, RuntimeError) as e:
+-        print(f"lexicmap: {e}", file=sys.stderr)
++    except (ValueError, OSError, RuntimeError, EOFError, http.client.HTTPException) as e:
++        print(f"lexicmap: {e!r}" if isinstance(e, http.client.HTTPException) else f"lexicmap: {e}",
++              file=sys.stderr)
+         return 1
+ 
+     # Empty-cohort hard-fail: a wrapping workflow should treat "no clean accessions
+diff --git a/tests/test_lexicmap.py b/tests/test_lexicmap.py
+index 8a1ec9c321c1..000000000000 100644
+--- a/tests/test_lexicmap.py
++++ b/tests/test_lexicmap.py
+@@ -724,6 +724,36 @@
+         self.assertFalse(self.downloaded)
+ 
+ 
++    def http_body(self, body, sent):
++        """A real http.client.HTTPResponse whose server declared len(body) and sent `sent`."""
++        import http.client
++        import io
++
++        class Sock:
++            def makefile(self, *a, **k):
++                return io.BufferedReader(io.BytesIO(
++                    b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body[:sent]))
++
++        resp = http.client.HTTPResponse(Sock())
++        resp.begin()
++        return resp
++
++    def test_a_download_cut_short_of_content_length_is_an_error(self):
++        # HTTPResponse.read1 returns b"" when the connection closes early, so the text
++        # wrapper saw a normal end of file: a partial cohort, status ok, exit 0.
++        body = TABLE.encode()
++        lms.get_galaxy_stream = lambda *a, **k: self.http_body(body, len(body) - 20)
++        rc, err = self.run_with_state("ok")
++        self.assertEqual(rc, 1, err)
++        self.assertIn("short of its Content-Length", err)
++        self.assertFalse((self.dir / "out" / "gene.summary.json").exists())
++
++    def test_a_complete_download_and_a_max_records_preview_pass(self):
++        body = TABLE.encode()
++        lms.get_galaxy_stream = lambda *a, **k: self.http_body(body, len(body))
++        rc, err = self.run_with_state("ok")
++        self.assertEqual(rc, 0, err)
++
+ class TestGalaxyApiKeyOrder(unittest.TestCase):
+     """--api-key, then --api-key-file, then $GALAXY_API_KEY: the help's order, and harvest's."""
+ 

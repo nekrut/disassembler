@@ -1,0 +1,150 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -155,13 +155,14 @@
+             aa_list.append(codon_table.get(codon, 'X'))
+     return "".join(aa_list)
+ 
+-def find_internal_stops(seq: str, ref_len: int, codon_table: dict = CODON_TABLE_11) -> list:
++def find_internal_stops(seq: str, ref_len: int, codon_table: dict = CODON_TABLE_11,
++                        skip_last: bool = True) -> list:
+     """
+     Finds 1-based codon positions of premature stop codons in coding sequence body.
+-    Excludes the terminal natural stop codon (last 3 nt) of the CDS.
++    Excludes the last codon only when `skip_last` (the reference ends in its natural stop).
+     """
+     stop_positions = []
+-    for i in range(0, ref_len - 3, 3):
++    for i in range(0, ref_len - 3 if skip_last else ref_len - 2, 3):
+         codon = seq[i:i + 3]
+         if '-' not in codon and len(codon) == 3:
+             if codon_table.get(codon, 'X') == '*':
+@@ -341,6 +342,7 @@
+     deletion. Otherwise another HSP's bases are what the row shows there.
+     """
+     grid = [None] * ref_len   # (base, pident, index of the HSP that supplied it)
++    best_base = {}            # position -> best non-gap (base, pident, k), where a '-' won grid
+     spans = {}                # HSP index -> (first query position, one past the last)
+     raw = []                  # (HSP index, kind, pos, length, bases)
+     single_ge_min_cov = False
+@@ -362,6 +364,10 @@
+                     ex = grid[q_pos]
+                     if ex is None or pident > ex[1]:
+                         grid[q_pos] = (sc.upper(), pident, k)
++                    elif ex[0] == '-':
++                        bb = best_base.get(q_pos)
++                        if bb is None or pident > bb[1]:
++                            best_base[q_pos] = (sc.upper(), pident, k)
+                 q_pos += 1
+             spans[k] = (qstart - 1, q_pos)
+             continue
+@@ -386,7 +392,15 @@
+             if 0 <= q_pos < ref_len:
+                 ex = grid[q_pos]
+                 if ex is None or pident > ex[1]:
++                    if ex is not None and ex[0] != '-' and sc == '-':
++                        bb = best_base.get(q_pos)
++                        if bb is None or ex[1] > bb[1]:
++                            best_base[q_pos] = ex
+                     grid[q_pos] = (sc.upper(), pident, k)
++                elif sc != '-' and ex[0] == '-':
++                    bb = best_base.get(q_pos)
++                    if bb is None or pident > bb[1]:
++                        best_base[q_pos] = (sc.upper(), pident, k)
+             q_pos += 1
+         if dele:
+             raw.append((k, "del", del_start, len(dele), "".join(dele).upper()))
+@@ -408,6 +422,20 @@
+             margin = min(pos - first, end - (pos + length))
+         if owned:
+             indels.append(Indel(kind, pos, length, bases, margin < INDEL_EDGE_WINDOW))
++    # An untrusted (edge) deletion must not hide a base another HSP supplied there: put the
++    # best such base back and drop the deletion, as for any indel whose positions the row
++    # takes from another HSP.
++    if best_base:
++        kept = []
++        for e in indels:
++            if e.kind == "del" and e.edge and any(p in best_base for p in range(e.pos, e.pos + e.length)):
++                for p in range(e.pos, e.pos + e.length):
++                    if p in best_base:
++                        grid[p] = best_base[p]
++                if all(p in best_base for p in range(e.pos, e.pos + e.length)):
++                    continue
++            kept.append(e)
++        indels = kept
+     indels.sort(key=lambda e: e.pos)
+ 
+     # Mean identity over the positions that actually carry a subject base. Summing pident over
+@@ -443,24 +471,31 @@
+     """
+     in_frame, shifted, cluster = [], [], []
+     offset = start = 0
++    skipped = 0   # reference bases deleted inside the open cluster: never read out of frame
+     for e in sorted((e for e in indels if not e.edge), key=lambda e: e.pos):
+         new = (offset + (e.length if e.kind == "ins" else -e.length)) % 3
+         if offset == 0 and new == 0:
+             in_frame.append(e)
+             continue
+-        if offset == 0:
+-            start, cluster = e.pos, []
++        opening = offset == 0
++        if opening:
++            # The frame is off from the first reference base read after the opening indel.
++            start, cluster, skipped = e.pos + (e.length if e.kind == "del" else 0), [], 0
+         cluster.append(e)
+         offset = new
+         if offset == 0:
+-            (in_frame if e.pos - start < FRAMESHIFT_MIN_SPAN else shifted).extend(cluster)
++            span = e.pos - start - skipped
++            (in_frame if span < FRAMESHIFT_MIN_SPAN else shifted).extend(cluster)
+             cluster = []
++        elif not opening and e.kind == "del":
++            skipped += e.length
+     shifted.extend(cluster)
+     return in_frame, shifted
+ 
+ 
+ def find_internal_stops_with_indels(seq: str, ref_len: int, indels: list,
+-                                    codon_table: dict = CODON_TABLE_11) -> list:
++                                    codon_table: dict = CODON_TABLE_11,
++                                    skip_last: bool = True) -> list:
+     """
+     `find_internal_stops` on the sample's own coding sequence: trusted in-frame deletions are
+     removed and trusted in-frame insertions spliced back in, so a stop codon formed across an
+@@ -470,7 +505,7 @@
+     """
+     applied, _shifted = split_by_frame(indels)
+     if not applied:
+-        return find_internal_stops(seq, ref_len, codon_table)
++        return find_internal_stops(seq, ref_len, codon_table, skip_last)
+     # Build the sample sequence from slices of the row. `pieces` records where each piece
+     # starts in the sample and in the reference, so a codon can be mapped back.
+     parts, starts, pieces = [], [], []
+@@ -497,7 +532,7 @@
+ 
+     stops = {c for c, aa in codon_table.items() if aa == '*'}
+     stop_positions = []
+-    for i in range(0, len(sample) - 3, 3):
++    for i in range(0, len(sample) - 3 if skip_last else len(sample) - 2, 3):
+         if sample[i:i + 3] in stops:
+             j = bisect.bisect_right(starts, i) - 1
+             ref_start, is_insertion = pieces[j]
+@@ -536,6 +571,7 @@
+     ref_len = len(ref_seq)
+     ref_is_cds = (ref_len % 3 == 0)
+     ref_aa = translate_nt(ref_seq) if ref_is_cds else ""
++    ref_has_term_stop = ref_aa.endswith("*")
+ 
+     if dataset_id:
+         check_dataset_ready(dataset_id,
+@@ -728,7 +764,8 @@
+         indel_tag = f" indels={indel_str}" if tiling.indels else ""
+ 
+         # Check premature stop codons in coding body
+-        stop_codons = (find_internal_stops_with_indels(merged_seq, ref_len, tiling.indels)
++        stop_codons = (find_internal_stops_with_indels(merged_seq, ref_len, tiling.indels,
++                                                       skip_last=ref_has_term_stop)
+                        if ref_is_cds else [])
+         n_stops = len(stop_codons)
+         stop_str = ",".join(str(p) for p in stop_codons) if stop_codons else "None"

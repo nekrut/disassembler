@@ -1,0 +1,182 @@
+diff --git a/walker/src/stages/variants.rs b/walker/src/stages/variants.rs
+--- a/walker/src/stages/variants.rs
++++ b/walker/src/stages/variants.rs
+@@ -164,6 +164,13 @@
+     let mut baseline_len = stitched_len(cfg, &path.steps, subgraph);
+     let mut current = GafPath { steps: path.steps.clone(), ..copy_coords(path) };
+     let mut swaps = 0usize;
++    // What the route publishes: the alignment window `path_start..path_end` of the stitched
++    // path, which is shorter than the path whenever the alignment starts or ends inside a
++    // unitig, i.e. on every real GAF row. The post-stitch check below is against this.
++    let Some(first) = stitch::stitch(cfg, graph, path, subgraph, query)? else {
++        return Ok(None);
++    };
++    let mut window = first.seq;
+ 
+     // Each swap fixes one site and makes that site's taken branch the majority, so it cannot
+     // be chosen again. The cap is a backstop against a shape that defeats that reasoning.
+@@ -251,14 +258,25 @@
+             let Some(restitched) = stitch::stitch(cfg, graph, &candidate, subgraph, query)? else {
+                 continue; // would fail the coverage gate; leave the site alone
+             };
+-            // Defence in depth on the consensus, mirroring the `expected` check in `find_alts`.
+-            // `shifted_window` is proven correct and `stitched_len` predicts the stitch length
+-            // exactly, so this cannot fire today; it is a backstop so a future change to overlap
+-            // handling (or a `graph_k` larger than the graph's real k) cannot silently reframe
+-            // `_primary`, which is the record the codon alignment and selection analysis read.
+-            if restitched.seq.len() != spliced_len {
++            // Defence in depth on the consensus, the same `expected` check as `find_alts`: the
++            // window must come out exactly `delta` longer than it was. It is a backstop so a
++            // future change to overlap handling (or a `graph_k` larger than the graph's real k)
++            // cannot silently reframe `_primary`, which is the record the codon alignment and
++            // selection analysis read.
++            //
++            // This compares windows. It used to compare the new window with the length of the
++            // whole spliced path, which only agree when the alignment covers the path end to
++            // end; on a real row (path_len 1288, path_start 7, path_end 1281) it discarded
++            // every swap, so the correction never ran.
++            if restitched.seq.len() as i64 != window.len() as i64 + delta {
++                continue;
++            }
++            // A different route through the same published sequence is not a correction, as
++            // in `find_alts`: leave the route, and its `pident=`, alone.
++            if restitched.seq == window {
+                 continue;
+             }
++            window = restitched.seq;
+             // A length-changing swap moves the baseline every later swap is measured
+             // against, so it has to be updated rather than left at the original route's.
+             baseline_len = spliced_len;
+@@ -781,6 +799,55 @@
+         assert!(!fixed.steps.iter().any(|p| p.node == 1), "and not the 40% one");
+     }
+ 
++    /// A real GAF row never spans its path end to end: the first and last unitig carry graph
++    /// context outside the gene (`align.rs` REAL: path_len 1288, path_start 7, path_end 1281).
++    /// The swap has to work on that shape. It used to be discarded, because the post-stitch
++    /// guard compared the window's length with the whole path's.
++    #[test]
++    fn the_majority_swap_works_when_the_window_is_inside_the_path() {
++        let g = diamond(40.0, 60.0);
++        let s = subgraph_of(&g);
++        let p = GafPath { path_start: 1, path_end: 5, ..walked() };
++        let query = q("CGTA");
++        let before = stitch::stitch(&maj(true), &g, &p, &s, &query).unwrap().unwrap();
++        assert_eq!(before.seq, b"CGTA", "stitched[1..5] of ACGTAG");
++        let fixed = prefer_majority(&maj(true), &g, &s, &p, &query)
++            .unwrap()
++            .expect("the 60% allele must replace the 40% one wherever the window sits");
++        let after = stitch::stitch(&maj(true), &g, &fixed, &s, &query).unwrap().unwrap();
++        assert_eq!(after.seq, b"CGTC");
++        assert_eq!((fixed.path_start, fixed.path_end), (1, 5), "a substitution moves nothing");
++    }
++
++    /// The same, for a majority allele that inserts a codon: the window's end moves by the
++    /// delta and its start does not.
++    #[test]
++    fn an_in_frame_indel_majority_shifts_a_window_inside_the_path() {
++        let fa = ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n\
++                  >T_1 ka:f:40.0   L:-:0:-  L:+:3:+\nCGTA\n\
++                  >T_2 ka:f:60.0   L:-:0:-  L:+:3:+\nCGTCAAA\n\
++                  >T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nGTAG\n";
++        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap();
++        let s = subgraph_of(&g);
++        let p = GafPath { path_start: 1, path_end: 5, ..walked() };
++        let query = q("CGTA");
++        let fixed = prefer_majority(&maj(true), &g, &s, &p, &query).unwrap().expect("corrected");
++        assert_eq!((fixed.path_start, fixed.path_end), (1, 8));
++        let after = stitch::stitch(&maj(true), &g, &fixed, &s, &query).unwrap().unwrap();
++        assert_eq!(after.seq, b"CGTCAAA");
++    }
++
++    /// A fork whose two branches read the same inside the window is not a correction: the
++    /// published sequence would not change, so the route, `pident=` and the count stay put.
++    #[test]
++    fn a_swap_that_leaves_the_window_unchanged_is_not_a_correction() {
++        let g = diamond(40.0, 60.0);
++        let s = subgraph_of(&g);
++        // The alleles differ at stitched offset 4; this window stops just before it.
++        let p = GafPath { path_start: 0, path_end: 4, ..walked() };
++        assert!(prefer_majority(&maj(true), &g, &s, &p, &q("ACGT")).unwrap().is_none());
++    }
++
+     #[test]
+     fn a_route_already_carrying_the_majority_is_left_alone() {
+         let g = diamond(60.0, 40.0);
+diff --git a/walker/tests/cli.rs b/walker/tests/cli.rs
+--- a/walker/tests/cli.rs
++++ b/walker/tests/cli.rs
+@@ -276,3 +276,73 @@
+     assert!(err.contains("--workers must be at least 1"), "{err}");
+ }
+ 
++
++/// The default-on majority correction, through the binary, on the shape every real GAF row
++/// has: the alignment starts and ends inside a unitig (`path_start` 10, `path_end` 130 of a
++/// 140 nt path). One site, 60% against 40%, and the aligner hands back the 40% route because
++/// it is the one that matches the reference.
++#[test]
++fn the_majority_allele_reaches_the_primary_when_the_gene_has_flanks() {
++    use std::os::unix::fs::PermissionsExt;
++    let dir = std::env::temp_dir().join(format!("logan-walker-cli-{}-majority", std::process::id()));
++    let _ = std::fs::remove_dir_all(&dir);
++    std::fs::create_dir_all(dir.join("cache")).unwrap();
++
++    let (left, right) = ("TTGACCATGA", "CGGATTACTG");
++    let gene = "ATGGCTGCTAAAGAAGGCGTTCTGGAAATCGGTCAGTGGATCAAAGAGCTGCTGAAAGGCACCGTTGATCTGCGTAACCC\
++                GGAAGTGCTGTTTACCGATCACAGCTGGATTCAGGGCTAA";
++    assert_eq!(gene.len(), 120);
++    let full = format!("{left}{gene}{right}");
++    let site = left.len() + 60; // 0-based offset of the two-allele site in `full`
++    let other = if full.as_bytes()[site] == b'A' { "C" } else { "A" };
++    let minor = &full[site - 30..site + 31]; // k = 31: 30 + the site + 30
++    let major = format!("{}{other}{}", &full[site - 30..site], &full[site + 1..site + 31]);
++    let unitigs = format!(
++        ">SRRMAJ_0 ka:f:100.0   L:+:1:+  L:+:2:+\n{}\n\
++         >SRRMAJ_1 ka:f:40.0   L:-:0:-  L:+:3:+\n{minor}\n\
++         >SRRMAJ_2 ka:f:60.0   L:-:0:-  L:+:3:+\n{major}\n\
++         >SRRMAJ_3 ka:f:100.0   L:-:1:-  L:-:2:-\n{}\n",
++        &full[..site], &full[site + 1..]
++    );
++    std::fs::write(dir.join("cache").join("SRRMAJ.unitigs.fa.zst"),
++                   zstd::encode_all(unitigs.as_bytes(), 3).unwrap()).unwrap();
++    std::fs::write(dir.join("accs.txt"), "SRRMAJ\n").unwrap();
++    std::fs::write(dir.join("q.fasta"), format!(">gene\n{gene}\n")).unwrap();
++    // The row GraphAligner would write: the reference-matching route >0>1>3, 140 nt, with the
++    // gene at 10..130 of it.
++    let ga = dir.join("ga");
++    std::fs::write(&ga,
++        "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }\n\
++         while [ $# -gt 0 ]; do case \"$1\" in -a) gaf=\"$2\"; shift 2;; *) shift;; esac; done\n\
++         printf 'gene\\t120\\t0\\t120\\t+\\t>0>1>3\\t140\\t10\\t130\\t120\\t120\\t60\\n' > \"$gaf\"\n").unwrap();
++    std::fs::set_permissions(&ga, std::fs::Permissions::from_mode(0o755)).unwrap();
++
++    let run = |out: &str, extra: &[&str]| -> (String, String) {
++        let o = Command::new(BIN)
++            .arg("--graphaligner").arg(&ga)
++            .arg("-l").arg(dir.join("accs.txt"))
++            .arg("-q").arg(dir.join("q.fasta"))
++            .arg("--unitigs-cache").arg(dir.join("cache")).arg("--offline")
++            .arg("-o").arg(dir.join(out))
++            .arg("-f").arg(dir.join(out).join("r.fasta"))
++            .args(extra)
++            .output().unwrap();
++        let err = String::from_utf8_lossy(&o.stderr).into_owned();
++        assert_eq!(o.status.code(), Some(0), "{err}");
++        let fa = std::fs::read_to_string(dir.join(out).join("r.fasta")).unwrap();
++        let seq: String = fa.lines().filter(|l| !l.starts_with('>')).collect();
++        (seq, err)
++    };
++
++    let (kept, _) = run("off", &["--no-prefer-majority"]);
++    assert_eq!(kept, gene, "switched off, the primary stays on the reference-matching 40% allele");
++
++    let (seq, err) = run("on", &[]);
++    let want = format!("{}{other}{}", &gene[..60], &gene[61..]);
++    assert_eq!(seq, want, "by default the primary must carry the 60% allele\n{err}");
++    assert!(err.contains("consensus: 1 site(s)"), "{err}");
++    let alts = std::fs::read_to_string(dir.join("on").join("alt_haplotypes.fasta")).unwrap();
++    assert!(alts.contains(" vaf=0.400 ") && !alts.contains(" vaf=0.600 "),
++            "the alternative left over must be the minority allele: {alts}");
++    let _ = std::fs::remove_dir_all(&dir);
++}

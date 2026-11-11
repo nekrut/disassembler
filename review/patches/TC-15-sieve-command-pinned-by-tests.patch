@@ -1,0 +1,89 @@
+diff --git a/src/disassembler/cmd/sieve.py b/src/disassembler/cmd/sieve.py
+index 54e68d33850f..000000000000 100644
+--- a/src/disassembler/cmd/sieve.py
++++ b/src/disassembler/cmd/sieve.py
+@@ -28,6 +28,17 @@
+ # row is on the reference grid with '-' wherever no HSP reached, so the same limit becomes a
+ # coverage gate; from-lexicmap derives its value from the cohort's own coverage gate instead.
+ DEFAULT_MAX_GAP_FRAC = 0.05
++# Admission warmup of the binary (records); see byte_exact_dedup and docs/sieve.md.
++WARMUP = 2000
++
++
++def sieve_command(binary, input_fasta, emit_prefix, *, min_len, max_gap_frac=DEFAULT_MAX_GAP_FRAC,
++                  threshold=0.005, sketch=256) -> list[str]:
++    """The binary's command line, as sieve_run runs it."""
++    return [str(binary), "--input", str(input_fasta), "--min-len", str(min_len),
++            "--max-n-frac", str(max_gap_frac), "--threshold", str(threshold),
++            "--warmup", str(WARMUP), "--sketch", str(sketch),
++            "--emit-promoted", str(emit_prefix)]
+ 
+ 
+ def auto_min_len(ref: Path) -> int | None:
+@@ -205,16 +216,8 @@
+                   f"{max_gap_frac:.0%} gaps or other non-ACGT characters (--max-gap-frac)",
+                   flush=True)
+ 
+-        cmd = [
+-            resolved,
+-            "--input", str(deduped),
+-            "--min-len", str(min_len),
+-            "--max-n-frac", str(max_gap_frac),
+-            "--threshold", str(threshold),
+-            "--warmup", "2000",
+-            "--sketch", str(sketch),
+-            "--emit-promoted", str(emit_prefix),
+-        ]
++        cmd = sieve_command(resolved, deduped, emit_prefix, min_len=min_len,
++                            max_gap_frac=max_gap_frac, threshold=threshold, sketch=sketch)
+         print(f"[sieve] {' '.join(cmd)}", flush=True)
+         rc = subprocess.run(cmd).returncode
+         if rc != 0:
+diff --git a/tests/test_dedup_sieve_equivalence.py b/tests/test_dedup_sieve_equivalence.py
+index 308e8d7a4b71..000000000000 100644
+--- a/tests/test_dedup_sieve_equivalence.py
++++ b/tests/test_dedup_sieve_equivalence.py
+@@ -64,16 +64,8 @@
+     emit_prefix = output_fa.with_suffix("")
+     for stale in output_fa.parent.glob(f"{emit_prefix.name}.rank*.fasta"):
+         stale.unlink()
+-    cmd = [
+-        str(SIEVE_BIN),
+-        "--input", str(input_fa),
+-        "--min-len", str(min_len),
+-        "--max-n-frac", "0.05",
+-        "--threshold", "0.005",
+-        "--warmup", "2000",
+-        "--sketch", "256",
+-        "--emit-promoted", str(emit_prefix),
+-    ]
++    from disassembler.cmd import sieve
++    cmd = sieve.sieve_command(SIEVE_BIN, input_fa, emit_prefix, min_len=min_len)
+     rc = subprocess.run(cmd, capture_output=True).returncode
+     if rc != 0:
+         raise RuntimeError(f"sieve exited {rc}")
+@@ -131,7 +123,10 @@
+         deduped = self.work / f"c{copies}.deduped.fa"
+         sieved_full = self.work / f"c{copies}.sieved_full.fa"
+         sieved_from_ded = self.work / f"c{copies}.sieved_from_ded.fa"
+-        _write_fasta(cohort, self._make_cohort(copies))
++        from disassembler.cmd.sieve import WARMUP
++        records = self._make_cohort(copies)
++        self.assertLess(len(records), WARMUP, "premise: the cohort is below the binary's warmup")
++        _write_fasta(cohort, records)
+         n_in, n_out = self.dedup(cohort, deduped)
+         _run_sieve(cohort, sieved_full, self.min_len)
+         _run_sieve(deduped, sieved_from_ded, self.min_len)
+diff --git a/tests/test_sieve_integration.py b/tests/test_sieve_integration.py
+index d64d0f7f3087..000000000000 100644
+--- a/tests/test_sieve_integration.py
++++ b/tests/test_sieve_integration.py
+@@ -250,6 +250,8 @@
+         rc, n, log = self._run(records, min_len=850)
+         self.assertEqual(rc, 0, log)
+         self.assertIn("dedup: 2120 -> 24 records", log)
++        self.assertIn("--threshold 0.005 --warmup 2000 --sketch 256", log,
++                      "sieve_run runs the binary with the documented 2000-record warmup")
+         self.assertEqual(n, 24, "all four common and all 20 new sequences are promoted")
+ 
+     def test_a_gzipped_input_gives_the_same_output(self):
