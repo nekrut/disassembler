@@ -19,7 +19,7 @@ overrides, output paths) are not exposed; they stay on the command line.
 | `disassembler_walker` | `logan-walker` | an accession list dataset or a single accession, plus the reference CDS | see below |
 | `disassembler_lexicmap` | `lexicmap -f` | a LexicMap search table with all columns, plus the reference CDS | |
 | `disassembler_sieve` | `sieve` | a FASTA, plus a reference or an explicit length gate | gene-scale defaults come from the subcommand |
-| `disassembler_msa` | `msa` | haplotypes FASTA, plus the reference CDS | pins MAFFT 7.526 (7.525 segfaults on the `--add` path `msa` uses) |
+| `disassembler_msa` | `msa` | haplotypes FASTA, plus the reference CDS | pins MAFFT 7.526 (7.525 has a bug in `--addfragments`, the path `msa` uses) |
 
 Two subcommands are not tools:
 

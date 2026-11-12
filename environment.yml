@@ -1,6 +1,10 @@
 # Toolchain for the walker's external binaries and the downstream codon MSA / tree step.
 # Rust itself is not here: install it via rustup (https://rustup.rs) and build walker/ with cargo.
-# For a packaged install instead, see docs/packaging.md (conda install -c bioconda disassembler).
+# For a packaged install instead, see docs/packaging.md
+# (conda install -c conda-forge -c bioconda disassembler). Keep conda-forge first: -c prepends,
+# and a bioconda-first solve takes MAFFT 7.525, which has the --addfragments bug.
+#
+# linux-64 only (see docs/packaging.md, "Platforms").
 #
 #   conda env create -f environment.yml    # or: mamba env create -f environment.yml
 #   conda activate disassembler
@@ -25,10 +29,11 @@ dependencies:
   - blast=2.16.0
   - zstd=1.5.6
   - python=3.12
-  # Python deps for the disassembler package and the benchmark scripts.
+  # The package's runtime imports (pyproject.toml `[project] dependencies`).
   - biopython
   - requests
-  - zstandard
+  # ...and the benchmark scripts only (pyproject.toml's `bench` extra). The `zstd` pin above is
+  # the CLI tool and stays; the `zstandard` Python binding was never imported and is gone.
   - numpy
   - pandas
   - matplotlib
