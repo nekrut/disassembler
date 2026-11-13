@@ -193,19 +193,32 @@ pub struct Subgraph {
     /// Where the GFA was written. Should live on `/dev/shm`; it is ~38 KB.
     pub gfa_path: PathBuf,
     pub n_edges: usize,
+    /// True only when this value created `gfa_path`, which in production means
+    /// `extract::write_gfa`. `Drop` unlinks the file only then.
+    ///
+    /// There is no default on purpose. `Subgraph` is built as a struct literal, so a new
+    /// production constructor cannot omit this and silently leak tmpfs files; it will not
+    /// compile until it says which it is.
+    pub owns_gfa: bool,
 }
 
-/// Remove the scratch GFA when the subgraph goes out of scope.
+/// Remove the scratch GFA when the subgraph goes out of scope, if this value created it.
 ///
 /// It runs on every exit path, including early returns and errors.
 ///
 /// It matters because `scratch_dir` is tmpfs, so a leaked file occupies RAM that never
 /// appears in any process's RSS. At ~1 MB for a large subgraph, a 10,000-accession run
 /// would quietly consume gigabytes.
+///
+/// The `owns_gfa` guard exists because this used to unlink `gfa_path` whoever built the value,
+/// and unit tests build `Subgraph` by hand with paths they do not own: `/dev/null` and two
+/// fixed `/tmp` names. As an ordinary user those unlinks fail silently, so CI never showed it.
+/// As root they succeed, which turned `/dev/null` into a regular file and then failed every
+/// `tests/cli.rs` case with `NotFound`, because they open it for child stdio. See TW-01.
 impl Drop for Subgraph {
     fn drop(&mut self) {
         // Set LOGAN_KEEP_SCRATCH=1 to retain the GFA for debugging a specific accession.
-        if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
+        if self.owns_gfa && std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
             let _ = std::fs::remove_file(&self.gfa_path);
         }
     }
@@ -563,5 +576,45 @@ impl AccessionResult {
             provisional: false,
             prune: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TW-01. `Drop` unlinked `gfa_path` whoever built the value, and unit tests build
+    /// `Subgraph` by hand with paths they never created, so as root the suite deleted
+    /// `/dev/null` and then failed every `tests/cli.rs` case with `NotFound`.
+    #[test]
+    fn drop_unlinks_the_gfa_only_when_the_subgraph_owns_it() {
+        let dir = std::env::temp_dir().join(format!("logan-types-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let borrowed = dir.join("not-ours.gfa");
+        let owned = dir.join("ours.gfa");
+        let make = |path: &std::path::Path, owns_gfa: bool| Subgraph {
+            accession: "ACC".into(),
+            nodes: vec![],
+            seqs: vec![],
+            gfa_path: path.to_path_buf(),
+            n_edges: 0,
+            owns_gfa,
+        };
+
+        std::fs::write(&borrowed, b"H\tVN:Z:1.0\n").unwrap();
+        drop(make(&borrowed, false));
+        assert!(borrowed.exists(), "Drop removed a file the Subgraph did not create");
+
+        std::fs::write(&owned, b"H\tVN:Z:1.0\n").unwrap();
+        drop(make(&owned, true));
+        // The env override still wins, so assert whichever contract is in force rather than
+        // mutating the environment, which is not sound in a threaded test binary (TW-08).
+        if std::env::var_os("LOGAN_KEEP_SCRATCH").is_some() {
+            assert!(owned.exists(), "LOGAN_KEEP_SCRATCH is set, so even an owned GFA must stay");
+        } else {
+            assert!(!owned.exists(), "Drop left a file the Subgraph did create");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

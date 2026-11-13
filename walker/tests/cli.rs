@@ -594,3 +594,42 @@ fn wv_01_a_flanked_alignment_window_loses_the_majority_correction() {
     assert!(alts.contains("vaf=0.600"), "{alts}");
     assert!(alts.contains("primary_vaf=0.400"), "{alts}");
 }
+
+/// `--fetch-only` had no test at all: nothing called `pipeline::run_fetch_only`, and no case
+/// passed the flag (review TW-03). It is the path a Galaxy wrapper and the CI data step both
+/// use to warm a cache before the real run, so its counts and its exit code are a contract.
+#[test]
+fn fetch_only_reports_its_counts_and_exit_code() {
+    let f = Fixture::new("fetch-only", 2);
+
+    // Every accession already in the cache: nothing to download, even under --offline.
+    let (code, stderr) = f.code("cache", &["--fetch-only"]);
+    assert_eq!(code, 0, "a full cache should satisfy --fetch-only; stderr:\n{stderr}");
+    assert!(
+        stderr.contains(
+            "[logan-walker --fetch-only] 2 fetched, 0 not available \
+             (no Logan data or over --max-size-mb), 0 failed"
+        ),
+        "counts line wrong:\n{stderr}"
+    );
+
+    // An offline miss is an ERROR, not a negative. The distinction matters: "not available"
+    // means Logan has no data for the accession (or it is over --max-size-mb) and is a fact
+    // about the accession, while this is a fact about the cache. Only the former is what
+    // --allow-empty is for, which is why the next assertion holds.
+    let (code, stderr) = f.code("empty_cache", &["--fetch-only"]);
+    assert_eq!(code, 3, "an offline miss should exit 3; stderr:\n{stderr}");
+    assert!(
+        stderr.contains(
+            "[logan-walker --fetch-only] 0 fetched, 0 not available \
+             (no Logan data or over --max-size-mb), 2 failed"
+        ),
+        "counts line wrong:\n{stderr}"
+    );
+
+    // --allow-empty must not rescue an all-errored fetch. It covers an empty RESULT, not a
+    // run that could not read its inputs.
+    let (code, stderr) = f.code("empty_cache", &["--fetch-only", "--allow-empty"]);
+    assert_eq!(code, 3, "--allow-empty must not mask an all-errored fetch; stderr:\n{stderr}");
+    assert!(stderr.contains("--allow-empty does not apply to errors"), "{stderr}");
+}

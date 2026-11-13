@@ -34,6 +34,14 @@ jobs:
         run: cargo clippy --all-targets --release -- -D warnings
       - name: Test
         run: cargo test --release
+      # The suite used to delete paths its fixtures never created, including /dev/null, which
+      # as root turns it into a regular file that silently swallows every later redirect. The
+      # unlink fails for an unprivileged user, so nothing here ever showed it; assert the
+      # device directly, because a broken /dev/null is invisible until something depends on
+      # it. See TW-01 and types::tests::drop_unlinks_the_gfa_only_when_the_subgraph_owns_it.
+      - name: /dev/null survived the suite
+        if: ${{ !cancelled() }}
+        run: test -c /dev/null
 
   python-tests:
     name: python tests (${{ matrix.python-version }})

@@ -441,7 +441,12 @@ mod tests {
         let g = build(">T_0 ka:f:9.0\nACGT\n");
         let sub = Subgraph {
             accession: "T".into(), nodes: vec![], seqs: vec![],
-            gfa_path: PathBuf::from("/dev/null"), n_edges: 0,
+            // Not `/dev/null`, which this used to be. `owns_gfa: false` already stops Drop
+            // touching it, but a path with nothing special about it means that if that guard
+            // is ever lost again the blast radius is a name under /tmp rather than the
+            // system's null device. `phase` never opens the GFA for an empty node list.
+            gfa_path: PathBuf::from("/tmp/logan-phase-test-nonexistent.gfa"), n_edges: 0,
+            owns_gfa: false,
         };
         assert!(phase(&c, &g, &sub).unwrap().is_empty());
     }

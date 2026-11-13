@@ -305,6 +305,8 @@ pub fn write_gfa(
         seqs,
         gfa_path,
         n_edges,
+        // This function just wrote the file, so it is the one place that may unlink it.
+        owns_gfa: true,
     })
 }
 

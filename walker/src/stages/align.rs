@@ -627,6 +627,7 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
         let sub = Subgraph {
             accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGT".to_vec()],
             gfa_path: "/tmp/nonexistent-logan-test/ACC.sub.gfa".into(), n_edges: 0,
+            owns_gfa: false,
         };
         let cmd = command(Path::new("/usr/bin/GraphAligner"), &cfg, &sub,
                           Path::new("/tmp/q.fasta"), Path::new("/tmp/out.gaf"));
@@ -638,7 +639,6 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
             "-x", "dbg",
             "-t", "2",
         ]);
-        std::mem::forget(sub); // avoid Drop trying to unlink a path that was never created
     }
 
     /// GraphAligner picks its parser from the file name, so the user's name for the query
@@ -675,6 +675,8 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
         let sub = Subgraph {
             accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGTACGTAAAA".to_vec()],
             gfa_path: gfa, n_edges: 0,
+            // This test wrote that file, so Drop may remove it.
+            owns_gfa: true,
         };
         let q = Query {
             name: "dataset_1234".into(), record_id: "pol".into(), seq: b"ACGTACGTAAAA".to_vec(),
@@ -793,6 +795,7 @@ mod align_real {
         let sub = Subgraph {
             accession: "EMPTY".into(), nodes: vec![], seqs: vec![],
             gfa_path: gfa.clone(), n_edges: 0,
+            owns_gfa: true,
         };
         let q = Query {
             name: "q".into(), record_id: "q".into(), seq: b"ACGTACGT".to_vec(),

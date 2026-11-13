@@ -720,6 +720,7 @@ mod tests {
             seqs,
             gfa_path: PathBuf::from("/tmp/logan-variants-test-nonexistent.gfa"),
             n_edges: 0,
+            owns_gfa: false,
         }
     }
     fn walked() -> GafPath {

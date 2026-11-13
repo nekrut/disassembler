@@ -249,9 +249,11 @@ mod tests {
             accession: "ACC".into(),
             nodes,
             seqs: seqs.iter().map(|x| x.as_bytes().to_vec()).collect(),
-            // Points at nothing; Drop's remove_file is allowed to fail.
+            // Points at nothing, and `owns_gfa: false` means Drop leaves it alone. Before
+            // TW-01 this relied on the unlink failing, which it does not do as root.
             gfa_path: PathBuf::from("/tmp/logan-stitch-test-nonexistent.gfa"),
             n_edges: 0,
+            owns_gfa: false,
         };
         s
     }
