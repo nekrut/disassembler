@@ -1,0 +1,98 @@
+name: golden
+
+# The only gate that exercises real reconstructions: the golden concordance script plus the
+# 17 `#[ignore]` data-backed walker tests. It needs GraphAligner 1.0.17b and network access to
+# the Logan S3 bucket, so it is not in `ci.yml`, whose jobs are offline and run on every push.
+#
+# It lives in its own workflow file because `paths` filters apply to a whole workflow, not to
+# one job: keeping it in `ci.yml` would mean either running it on every push to any file, or
+# filtering the offline jobs too.
+#
+# Until 2026-11-13 this was a job in `ci.yml` guarded by `if: github.event_name ==
+# 'workflow_dispatch'`, so it only ever ran when someone remembered to press the button. It had
+# been dispatched twice, both on 2026-09-12, 63 commits before v0.1.1; `walker/src` then changed
+# by +2004/-513 lines across 17 files, so the gate as written had never executed. Neither
+# release was gated by it. See review finding TC-01.
+
+on:
+  workflow_dispatch:
+  # Weekly, so an upstream change (a Logan regeneration, a conda rebuild) is caught even in a
+  # quiet month. GitHub disables a schedule after 60 days without repository activity.
+  schedule:
+    - cron: '23 4 * * 1'
+  push:
+    branches: [main]
+    # No `paths` filter on this trigger: it would drop tag pushes, which carry no file list.
+    tags:
+      - 'v*'
+      - 'logan-walker-v*'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'walker/**'
+      - 'bench/golden/**'
+      - 'bench/check_golden.sh'
+      - 'queries/**'
+      - 'environment.yml'
+      - '.github/workflows/golden.yml'
+
+env:
+  # The accessions this workflow downloads, and the cache key. Logan's `u/` objects are
+  # immutable, so a cached object never needs refreshing; only a change to this set does.
+  LOGAN_ACCESSIONS: ERR2028820-SRR12363134-SRR8209082
+
+jobs:
+  golden:
+    name: golden concordance and data-backed tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install GraphAligner
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-name: gaa
+          create-args: >-
+            -c conda-forge -c bioconda graphaligner=1.0.17b zstd
+      # Shared by both steps below, so the gate survives an S3 hiccup and a re-run costs one
+      # download instead of four. Restored on a miss from any earlier key, since an object that
+      # is present is always the right one.
+      - name: Cache Logan unitig objects
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/logan
+          key: logan-objects-${{ env.LOGAN_ACCESSIONS }}
+          restore-keys: logan-objects-
+      - name: Build walker
+        run: cargo build --release
+        working-directory: walker
+      - name: Golden concordance
+        shell: bash -el {0}
+        env:
+          LOGAN_UNITIGS_CACHE: ${{ runner.temp }}/logan
+        run: bench/check_golden.sh
+      # The walker's #[ignore] tests check it against real Logan files and recorded
+      # measurements. Without their data they skip themselves and still pass, which is how
+      # three of them stayed broken from the -k default change until 0.1.1, so a SKIP fails
+      # this step. `cross_check` only writes a GFA for inspection and asserts nothing.
+      - name: Data-backed walker tests
+        # Independent of the golden check above, so it runs even when that fails.
+        if: ${{ !cancelled() }}
+        shell: bash -el {0}
+        working-directory: walker
+        run: |
+          set -o pipefail
+          data="$RUNNER_TEMP/logan"
+          printf 'ERR2028820\nSRR8209082\n' > "$RUNNER_TEMP/accessions.txt"
+          target/release/logan-walker --fetch-only -l "$RUNNER_TEMP/accessions.txt" \
+            --unitigs-cache "$data" -o "$RUNNER_TEMP/fetch"
+          zstd -dc "$data/ERR2028820.unitigs.fa.zst" > "$RUNNER_TEMP/ERR2028820.unitigs.fa"
+          LOGAN_TEST_ZST="$data/ERR2028820.unitigs.fa.zst" LOGAN_TEST_DIR="$data" \
+            LOGAN_TEST_PLAIN="$RUNNER_TEMP/ERR2028820.unitigs.fa" \
+            cargo test --release -- --ignored --nocapture --test-threads 1 --skip cross_check \
+            2>&1 | tee "$RUNNER_TEMP/ignored.log"
+          if grep -n "SKIP:" "$RUNNER_TEMP/ignored.log"; then
+            echo "a data-backed test skipped itself (lines above); it was not checked" >&2
+            exit 1
+          fi

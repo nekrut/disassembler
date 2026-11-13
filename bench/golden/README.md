@@ -1,7 +1,11 @@
 # Golden-truth fixtures
 
-Concordance baselines for `logan-walker`: the primary haplotype each accession must reproduce
-byte for byte under old-behaviour flags. `bench/check_golden.sh` checks them.
+Concordance baselines for `logan-walker`, in two sets, both checked by `bench/check_golden.sh`:
+
+- **old-behaviour** (this directory): the primary haplotype each accession must reproduce byte
+  for byte under `--prune-frac 0.0 --no-prefer-majority --no-emit-alts`.
+- **default-flag** (`default/`): every output the walk produces with no flags at all, which is
+  what users actually run.
 
 ## Current fixtures (recaptured 2026-10-18)
 
@@ -20,6 +24,54 @@ The two gated primaries are the previous fixtures plus their final base, which r
 codon that GraphAligner 1.0.19 and 1.0.20 clip (`docs/issue_graphaligner_end_clipping.md`). Under
 1.0.20 the gate now fails on exactly that base. `SRR8209082` takes a different unpruned route under
 1.0.17b than in the earlier capture; it is reported, not gated (see `check_golden.sh`).
+
+## Default-flag fixtures (`default/`, captured 2026-11-13)
+
+Captured from `logan-walker` 0.1.1 at commit `bf7560c` under GraphAligner 1.0.17b with
+`graphaligner_threads` at its default of 1, with no flags but `--emit-vcf --emit-snv-table`
+(a writer that is off by default produces nothing to gate).
+
+| Accession | Primary | Alts | Bubbles | SNVs | VCF |
+|---|---|---|---|---|---|
+| `ERR2028820` | 1,275 nt | none | 1 | none | none |
+| `SRR12363134` | 1,575 nt | none | 0 | none | none |
+| `SRR8209082` | 2,738 nt | 1 (`vaf=0.310`) | 3,632 | 1 | 1 row |
+
+Why this set exists: the old-behaviour gate switches off three of the four steps that shape a
+default primary, and compares only the bare sequence. So the prune/realign acceptance,
+`variants::prefer_majority`, and the alt, VCF and SNV-table writers had no end-to-end check
+anywhere in the tree (review finding TC-02).
+
+Three things worth knowing before trusting a green run:
+
+1. **`SRR8209082` is gated here, unlike above.** Its route is stabilised by the default pruning
+   that the old gate turns off, and three independent default runs on 2026-11-13 agreed byte for
+   byte across all five outputs. That evidence covers one machine at one thread only;
+   GraphAligner is not deterministic on a graph this size with more than one thread. If it flaps
+   in CI, demote it to the informational section of the script rather than removing the gate.
+2. **Its default primary is 2,738 nt against the old-behaviour fixture's 2,740 nt.** It is the
+   one accession here whose answer the defaults actually change, which is why leaving it ungated
+   left the largest hole. For the other two the default walk reproduces the same primary
+   sequence despite pruning being active (479 of 747 and 135 of 296 unitigs kept), so there
+   these fixtures gate the header statistics, bubbles, alts and SNV table rather than the
+   sequence.
+3. **None of the three exercises the majority correction.** No run printed a `consensus:` line:
+   `SRR8209082`'s walk already took the majority branch (`primary_vaf=0.690` against the alt's
+   `vaf=0.310`), `ERR2028820`'s four biallelic candidates were all rejected for unrelated
+   reasons, and `SRR12363134` has no on-path fork. So a green run here says nothing about
+   `prefer_majority`; the only coverage of that path is `walker/tests/cli.rs`.
+
+`alts.fasta` is empty for the two clonal isolates, and a **missing** VCF fixture is itself an
+assertion: those two recover no SNPs, so a VCF appearing is a real change. `SRR8209082`'s
+`bubbles.json` is gated by sha256 rather than committed, because 3,632 bubbles make a 1 MB file
+that no one could read as a diff and that is regenerable in a minute.
+
+No normalisation is applied. The VCF carries no `##fileDate` and no command line, and the FASTA
+headers hold only walk statistics, so every file is byte-comparable as written.
+
+To regenerate: run the walker as above, then copy `primary.fasta`, `alt_haplotypes.fasta`,
+`snvs.tsv`, `<acc>.vcf` and `bubbles.json` to `default/<tag>.{primary.fasta,alts.fasta,snvs.tsv,
+vcf,bubbles.json}`, or record its sha256 where the file is large.
 
 ## Original capture (2026-09-10)
 
@@ -49,8 +101,10 @@ Python-based `capture_golden.py`/`verify_golden.py` are under `../archive/`.
 
 ## What is asserted, and what is not
 
-**What the live gate actually checks.** `check_golden.sh` byte-compares the primary sequence
-against the `*.primary.fasta` fixtures and nothing else. The richer field list below describes
+**What the live gate actually checks.** In the old-behaviour set, `check_golden.sh`
+byte-compares the primary sequence against the `*.primary.fasta` fixtures and nothing else. The
+`default/` set above additionally compares the full primary record, the alt haplotypes, the SNV
+table, the VCF and the bubbles. The richer field list below describes
 `verify_golden.py`, which moved to `../archive/` with the Python walker and is not runnable. The
 `*.golden.json` files are therefore not read by anything in the current tree; they are kept as a
 record of the original capture.

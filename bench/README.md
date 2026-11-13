@@ -17,8 +17,11 @@ Byte-exact on two clonal, deterministic accessions, `ERR2028820` (PfCRT) and `SR
 (*C. auris* ERG11). `SRR8209082` (HIV-1 *pol*) is reported but not gated: its subgraph is a
 large share of the whole graph, and its unpruned route is not reproducible across GraphAligner
 versions. The gate needs GraphAligner 1.0.17b on `PATH` and network access to the Logan S3
-bucket, so it is the manual `golden` CI job, not the every-push gate. The header of the script
-documents why each accession is or isn't gated.
+bucket, so it runs in its own workflow (`.github/workflows/golden.yml`) rather than in the
+every-push `ci.yml`: on pushes to `main`, on `v*` and `logan-walker-v*` tags, on pull requests
+touching `walker/`, weekly, and on manual dispatch. Set `LOGAN_UNITIGS_CACHE` to keep the
+downloaded objects between runs. The header of the script documents why each accession is or
+isn't gated.
 
 ## The reference-bias finding
 

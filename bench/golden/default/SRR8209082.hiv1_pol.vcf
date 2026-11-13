@@ -1,0 +1,13 @@
+##fileformat=VCFv4.2
+##source=logan-walker intra-host SNPs. Frequencies are k-mer coverage (ka:f) ratios at a graph fork, a proxy for allele frequency, not read counts. Sites are per-locus and NOT phased: two rows do not assert co-occurrence on one molecule.
+##contig=<ID=hiv1_pol,length=2739>
+##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency, ka:f ratio at the fork">
+##INFO=<ID=AO,Number=A,Type=Float,Description="Alternate allele k-mer coverage (ka:f)">
+##INFO=<ID=RO,Number=1,Type=Float,Description="Reference allele k-mer coverage (ka:f); 0 if the gene base is not observed">
+##INFO=<ID=FORK,Number=1,Type=Integer,Description="Unitig id of the fork on the walked path">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype (missing: this is a frequency call, not a diploid genotype)">
+##FORMAT=<ID=AF,Number=A,Type=Float,Description="Allele frequency">
+##FORMAT=<ID=AO,Number=A,Type=Float,Description="Alternate allele k-mer coverage">
+##FORMAT=<ID=RO,Number=1,Type=Float,Description="Reference allele k-mer coverage">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SRR8209082
+hiv1_pol	2451	.	G	A	.	PASS	AF=0.3103;AO=3600.0;RO=8000.0;FORK=49624	GT:AF:AO:RO	.:0.3103:3600.0:8000.0

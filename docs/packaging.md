@@ -87,7 +87,10 @@ Before enabling a platform, check that it actually solves:
    `walker/Cargo.lock`) if the walker changed.
 2. Run the checks: `cargo clippy --all-targets --release -- -D warnings` and
    `cargo test --release` in `walker/`, the Python tests in `tests/`, and the golden gate
-   (`bench/check_golden.sh`, which needs GraphAligner 1.0.17b and network access).
+   (`bench/check_golden.sh`, which needs GraphAligner 1.0.17b and network access). The golden
+   gate also runs in CI on every push to `main` and on the release tag
+   (`.github/workflows/golden.yml`); record the URL of a green run for the release commit,
+   because a local run leaves no record.
 3. Tag the release commit `v<version>`, and `logan-walker-v<version>` if the walker changed.
 4. **Open the recipe PR immediately**, in the same sitting as the tag. Bioconda's autobump bot
    opens its own version-only PR within minutes of a tag appearing, and that PR cannot be
