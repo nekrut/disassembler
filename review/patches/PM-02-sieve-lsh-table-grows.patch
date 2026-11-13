@@ -1,0 +1,78 @@
+--- a/scripts/l1_pipeline.c
++++ b/scripts/l1_pipeline.c
+@@ -133,11 +133,12 @@
+ 
+ /* ---- novelty promoted-set + LSH band index (from l1_novelty.c) ---- */
+ typedef struct { uint64_t key; int *ids; int n,cap; } bucket_t;
+-typedef struct { uint64_t*sk; int n,cap,m; bucket_t*buk; uint64_t nbuk,mask;
++typedef struct { uint64_t*sk; int n,cap,m; bucket_t*buk; uint64_t nbuk,mask,nused;
+                  char**hdrs; } pset_t;    /* hdrs: promoted headers (for --emit) */
+ static void pset_init(pset_t*p,int m,uint64_t log2buk){ p->m=m;p->n=0;p->cap=1024;
+     p->sk=malloc((size_t)p->cap*m*sizeof(uint64_t)); p->hdrs=malloc(p->cap*sizeof(char*));
+-    p->nbuk=(uint64_t)1<<log2buk; p->mask=p->nbuk-1; p->buk=calloc(p->nbuk,sizeof(bucket_t)); }
++    p->nbuk=(uint64_t)1<<log2buk; p->mask=p->nbuk-1; p->nused=0; p->buk=calloc(p->nbuk,sizeof(bucket_t));
++    if(!p->sk||!p->hdrs||!p->buk){fprintf(stderr,"pset alloc fail\n");L1_ABORT();} }
+ /* Date-partitioned novelty: fold the sample's month bucket into the LSH
+  * band key so novelty is judged WITHIN a date window. A genome only ever compares against
+  * promoted genomes from the SAME month, so undersampled months keep their own tau-diverse
+@@ -147,9 +148,19 @@
+     uint64_t h=0x9E3779B97F4A7C15ULL^((uint64_t)band*0xC2B2AE3D27D4EB4FULL);
+     h^=(uint64_t)(mbucket+1)*0x94D049BB133111EBULL; h*=0x100000001B3ULL; h^=h>>33;  /* date in signature */
+     for(int r=0;r<R;r++){h^=sk[band*R+r];h*=0x100000001B3ULL;h^=h>>33;} return h; }
++/* open addressing with linear probing: keep the load factor <= 1/2 by doubling, so a probe
++ * always reaches an empty slot (a full table made bucket_find/bucket_add spin forever). */
++static void pset_grow(pset_t*p){ uint64_t nn=p->nbuk<<1,nm=nn-1; bucket_t*nb=calloc(nn,sizeof(bucket_t));
++    if(!nb){fprintf(stderr,"LSH bucket alloc fail\n");L1_ABORT();}
++    for(uint64_t i=0;i<p->nbuk;i++){ if(!p->buk[i].ids)continue; uint64_t key=p->buk[i].key,idx=(key^(key>>29))&nm;
++        while(nb[idx].ids)idx=(idx+1)&nm; nb[idx]=p->buk[i]; }
++    free(p->buk); p->buk=nb; p->nbuk=nn; p->mask=nm; }
+ static void bucket_add(pset_t*p,uint64_t key,int id){ uint64_t idx=(key^(key>>29))&p->mask;
+-    while(p->buk[idx].ids&&p->buk[idx].key!=key)idx=(idx+1)&p->mask; bucket_t*b=&p->buk[idx];
+-    if(!b->ids){b->key=key;b->cap=4;b->ids=malloc(b->cap*sizeof(int));b->n=0;}
++    while(p->buk[idx].ids&&p->buk[idx].key!=key)idx=(idx+1)&p->mask;
++    if(!p->buk[idx].ids && 2*(p->nused+1)>p->nbuk){ pset_grow(p); idx=(key^(key>>29))&p->mask;
++        while(p->buk[idx].ids)idx=(idx+1)&p->mask; }
++    bucket_t*b=&p->buk[idx];
++    if(!b->ids){b->key=key;b->cap=4;b->ids=malloc(b->cap*sizeof(int));b->n=0;p->nused++;}
+     if(b->n==b->cap){b->cap*=2;b->ids=realloc(b->ids,b->cap*sizeof(int));} b->ids[b->n++]=id; }
+ static bucket_t* bucket_find(pset_t*p,uint64_t key){ uint64_t idx=(key^(key>>29))&p->mask;
+     while(p->buk[idx].ids){if(p->buk[idx].key==key)return &p->buk[idx];idx=(idx+1)&p->mask;} return NULL; }
+@@ -176,7 +187,7 @@
+     free(p->sk); p->sk=NULL;
+     for(uint64_t b=0;b<p->nbuk;b++) free(p->buk[b].ids);
+     free(p->buk); p->buk=NULL;
+-    p->n=p->cap=0;
++    p->n=p->cap=0; p->nused=0;
+ }
+ /* parse month bucket (year*12+month0) from a GISAID header: field 2 of '|' split = YYYY-MM-DD.
+  * returns -1 if undated/unparseable (all such genomes share one bucket). */
+--- a/tests/unit_test.c
++++ b/tests/unit_test.c
+@@ -63,6 +63,19 @@
+     CHECK(n_fraction((const uint8_t *)"", 0) == 1.0, "empty -> 1.0 (treated as all-missing)");
+ }
+ 
++/* ================= LSH bucket table never fills (regression: 2^20 fixed table hung) ================= */
++static void test_pset_grows(void) {
++    pset_t p; pset_init(&p, 4, 2);                 /* 4 slots: the old code spun on the 5th key */
++    for (int i = 0; i < 1000; i++) bucket_add(&p, 0x9E3779B97F4A7C15ULL * (uint64_t)(i + 1), i);
++    CHECK(p.nbuk >= 2000, "table must grow to keep load <= 1/2 (nbuk=%llu)", (unsigned long long)p.nbuk);
++    int ok = 1;
++    for (int i = 0; i < 1000; i++) { bucket_t *b = bucket_find(&p, 0x9E3779B97F4A7C15ULL * (uint64_t)(i + 1));
++        if (!b || b->n != 1 || b->ids[0] != i) ok = 0; }
++    CHECK(ok, "every key survives the rehash with its id list");
++    CHECK(bucket_find(&p, 12345) == NULL, "absent key -> NULL (probe terminates)");
++    pset_free(&p);
++}
++
+ /* ================= month_bucket (date-partition key parsing) ================= */
+ static void test_month_bucket(void) {
+     /* GISAID-style header: name|date|... ; date = YYYY-MM-DD ; bucket = year*12 + (month-1) */
+@@ -116,6 +129,7 @@
+     test_genome_kmers();
+     test_n_fraction();
+     test_month_bucket();
++    test_pset_grows();
+     test_cms();
+     test_minhash_jaccard();
+ 

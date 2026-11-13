@@ -1,0 +1,273 @@
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -555,30 +555,62 @@
+ 
+     // ---- OUT of the pipeline ----------------------------------------------
+     std::fs::create_dir_all(&args.out_dir).map_err(error::file_err("create", &args.out_dir))?;
+-    io::output::write_fasta(&summary, &args.out_fasta).map_err(|e| e.at("write", &args.out_fasta))?;
++    // Every writer is attempted and the summary is always written, so one failing optional
++    // output cannot cost the per-accession status of the whole shard. The first error wins.
++    let mut first_err: Option<error::Error> = None;
++    let mut keep = |r: std::result::Result<(), error::Error>| {
++        if let Err(e) = r {
++            // The first is returned and printed by the caller; later ones are reported here.
++            match first_err {
++                None => first_err = Some(e),
++                Some(_) => eprintln!("error: {e}"),
++            }
++        }
++    };
++    keep(io::output::write_fasta(&summary, &args.out_fasta).map_err(|e| e.at("write", &args.out_fasta)));
+     let bubbles = args.out_dir.join("bubbles.json");
+-    io::output::write_bubbles(&summary, &bubbles).map_err(|e| e.at("write", &bubbles))?;
++    keep(io::output::write_bubbles(&summary, &bubbles).map_err(|e| e.at("write", &bubbles)));
++    let snvs = args.out_dir.join("snvs.tsv");
++    let alts = args.out_dir.join("alt_haplotypes.fasta");
+     // One alignment pass per accession, shared by both writers.
+     if args.cfg.emit_vcf || args.cfg.emit_snv_table {
+         let sites = io::output::snv_sites_all(&summary, &queries);
+         if args.cfg.emit_vcf {
+-            io::output::write_vcfs(&summary, &queries, &args.out_dir, &sites)
+-                .map_err(|e| e.at("write VCFs in", &args.out_dir))?;
++            keep(io::output::write_vcfs(&summary, &queries, &args.out_dir, &sites)
++                .map_err(|e| e.at("write VCFs in", &args.out_dir)));
+         }
+         if args.cfg.emit_snv_table {
+-            let snvs = args.out_dir.join("snvs.tsv");
+-            io::output::write_snv_table(&summary, &queries, &snvs, &sites)
+-                .map_err(|e| e.at("write", &snvs))?;
++            keep(io::output::write_snv_table(&summary, &queries, &snvs, &sites)
++                .map_err(|e| e.at("write", &snvs)));
++        }
++    }
++    // A disabled output that an earlier run left here would sit beside this run's primary and
++    // summary as if it belonged to them. Only files this walker wrote are removed.
++    let mut stale = |p: &std::path::Path, sig: &[u8]| {
++        match io::output::remove_if_ours(p, sig) {
++            Ok(true) => eprintln!("[logan-walker] removed {} left by an earlier run", p.display()),
++            Ok(false) => {}
++            Err(e) => keep(Err(e.at("remove", p))),
+         }
++    };
++    if !args.cfg.emit_vcf {
++        for r in &summary.results {
++            stale(&args.out_dir.join(format!("{}.vcf", r.accession)), io::output::VCF_SIGNATURE);
++        }
++    }
++    if !args.cfg.emit_snv_table {
++        stale(&snvs, io::output::SNV_TABLE_HEADER.as_bytes());
+     }
+     if args.cfg.emit_alts {
+-        let alts = args.out_dir.join("alt_haplotypes.fasta");
+-        io::output::write_alts(&summary, &alts).map_err(|e| e.at("write", &alts))?;
++        keep(io::output::write_alts(&summary, &alts).map_err(|e| e.at("write", &alts)));
+     }
+     let summary_path = args.out_dir.join(format!("{}_walker_summary.json", queries[0].name));
+     let run = io::output::RunInfo { graphaligner: &version, cfg: &args.cfg, queries: &queries };
+-    io::output::write_summary(&summary, &run, &summary_path)
+-        .map_err(|e| e.at("write", &summary_path))?;
++    keep(io::output::write_summary(&summary, &run, &summary_path)
++        .map_err(|e| e.at("write", &summary_path)));
++    if let Some(e) = first_err {
++        return Err(e);
++    }
+ 
+     println!(
+         "[logan-walker] {}/{} accessions reconstructed",
+diff --git a/walker/src/io/output.rs b/walker/src/io/output.rs
+--- a/walker/src/io/output.rs
++++ b/walker/src/io/output.rs
+@@ -16,7 +16,72 @@
+ use crate::pipeline::Summary;
+ use crate::types::{AccessionResult, Outcome, Query, Strand};
+ use std::io::{BufWriter, Write};
+-use std::path::Path;
++use std::path::{Path, PathBuf};
++
++/// Writes `<dst>.tmp.<pid>` and renames it over `dst` on `commit`, so a reader (or a rerun
++/// after a failure) never sees a truncated file under the final name.
++pub struct AtomicFile {
++    tmp: PathBuf,
++    dst: PathBuf,
++    w: Option<BufWriter<std::fs::File>>,
++}
++
++impl AtomicFile {
++    pub fn create(dst: &Path) -> Result<Self> {
++        let mut name = dst.file_name().unwrap_or_default().to_os_string();
++        name.push(format!(".tmp.{}", std::process::id()));
++        let tmp = dst.with_file_name(name);
++        let w = BufWriter::new(std::fs::File::create(&tmp)?);
++        Ok(AtomicFile { tmp, dst: dst.to_path_buf(), w: Some(w) })
++    }
++    pub fn commit(mut self) -> Result<()> {
++        let w = self.w.take().expect("not committed");
++        let f = w.into_inner().map_err(|e| e.into_error())?;
++        let done = f.sync_all().and_then(|_| std::fs::rename(&self.tmp, &self.dst));
++        if done.is_err() {
++            let _ = std::fs::remove_file(&self.tmp);
++        }
++        Ok(done?)
++    }
++}
++
++impl Write for AtomicFile {
++    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
++        self.w.as_mut().expect("open").write(b)
++    }
++    fn flush(&mut self) -> std::io::Result<()> {
++        self.w.as_mut().expect("open").flush()
++    }
++}
++
++impl Drop for AtomicFile {
++    fn drop(&mut self) {
++        if self.w.take().is_some() {
++            let _ = std::fs::remove_file(&self.tmp);
++        }
++    }
++}
++
++/// First bytes of every VCF this walker writes; only such files are ever deleted.
++pub const VCF_SIGNATURE: &[u8] = b"##fileformat=VCFv4.2\n##source=logan-walker";
++pub const SNV_TABLE_HEADER: &str = "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork";
++
++/// Remove `path` only if it starts with `sig` (a file this walker wrote). Returns whether it did.
++pub fn remove_if_ours(path: &Path, sig: &[u8]) -> Result<bool> {
++    use std::io::Read;
++    let mut head = vec![0u8; sig.len()];
++    match std::fs::File::open(path) {
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
++        Err(e) => return Err(e.into()),
++        Ok(mut f) => {
++            if f.read_exact(&mut head).is_err() || head != sig {
++                return Ok(false);
++            }
++        }
++    }
++    std::fs::remove_file(path)?;
++    Ok(true)
++}
+ 
+ fn outcome_str(o: Outcome) -> &'static str {
+     match o {
+@@ -69,7 +134,7 @@
+             std::fs::create_dir_all(parent)?;
+         }
+     }
+-    let mut w = BufWriter::new(std::fs::File::create(path)?);
++    let mut w = AtomicFile::create(path)?;
+     for r in &summary.results {
+         for h in &r.haplotypes {
+             // anchor_used is emitted only when set (multi-anchor mode). Single-anchor
+@@ -95,7 +160,7 @@
+             w.write_all(b"\n")?;
+         }
+     }
+-    w.flush()?;
++    w.commit()?;
+     Ok(())
+ }
+ 
+@@ -123,7 +188,7 @@
+             std::fs::create_dir_all(parent)?;
+         }
+     }
+-    let mut w = BufWriter::new(std::fs::File::create(path)?);
++    let mut w = AtomicFile::create(path)?;
+     for r in &summary.results {
+         for a in &r.alts {
+             let h = &a.haplotype;
+@@ -148,7 +213,7 @@
+             w.write_all(b"\n")?;
+         }
+     }
+-    w.flush()?;
++    w.commit()?;
+     Ok(())
+ }
+ 
+@@ -162,7 +227,7 @@
+             std::fs::create_dir_all(parent)?;
+         }
+     }
+-    let mut w = BufWriter::new(std::fs::File::create(path)?);
++    let mut w = AtomicFile::create(path)?;
+     writeln!(w, "[")?;
+     for (i, r) in summary.results.iter().enumerate() {
+         writeln!(w, "  {{")?;
+@@ -192,7 +257,7 @@
+         writeln!(w, "  }}{}", if i + 1 == summary.results.len() { "" } else { "," })?;
+     }
+     writeln!(w, "]")?;
+-    w.flush()?;
++    w.commit()?;
+     Ok(())
+ }
+ 
+@@ -387,7 +452,7 @@
+             std::fs::create_dir_all(parent)?;
+         }
+     }
+-    let mut w = BufWriter::new(std::fs::File::create(path)?);
++    let mut w = AtomicFile::create(path)?;
+     writeln!(w, "{{")?;
+     write_run_info(&mut w, run)?;
+     writeln!(w, "  \"total\": {},", summary.total)?;
+@@ -411,7 +476,7 @@
+     }
+     writeln!(w, "  ]")?;
+     writeln!(w, "}}")?;
+-    w.flush()?;
++    w.commit()?;
+     Ok(())
+ }
+ 
+@@ -472,16 +537,15 @@
+         if rows.is_empty() {
+             // A VCF an earlier run left in this --out-dir would claim sites this run did not
+             // find, beside a primary that no longer has them.
+-            match std::fs::remove_file(&path) {
+-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+-                _ => {}
++            if !remove_if_ours(&path, VCF_SIGNATURE)? && path.exists() {
++                eprintln!("[warn] left {} in place: not a logan-walker VCF", path.display());
+             }
+             continue;
+         }
+ 
+         let query = reference_of(r, queries);
+         let chrom = chrom_of(query);
+-        let mut w = BufWriter::new(std::fs::File::create(&path)?);
++        let mut w = AtomicFile::create(&path)?;
+         write_vcf_header(&mut w, chrom, query.seq.len(), &r.accession)?;
+         for row in rows {
+             let alt_bases: Vec<String> =
+@@ -504,7 +568,7 @@
+                 row.ref_ka,
+             )?;
+         }
+-        w.flush()?;
++        w.commit()?;
+     }
+     Ok(())
+ }
+@@ -533,7 +597,7 @@
+             std::fs::create_dir_all(parent)?;
+         }
+     }
+-    let mut w = BufWriter::new(std::fs::File::create(path)?);
++    let mut w = AtomicFile::create(path)?;
+     writeln!(w, "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork")?;
+     for (r, rows) in summary.results.iter().zip(sites) {
+         let chrom = chrom_of(reference_of(r, queries));
+@@ -555,7 +619,7 @@
+             }
+         }
+     }
+-    w.flush()?;
++    w.commit()?;
+     Ok(())
+ }
+ 

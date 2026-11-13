@@ -1,0 +1,66 @@
+diff --git a/walker/src/stages/variants.rs b/walker/src/stages/variants.rs
+--- a/walker/src/stages/variants.rs
++++ b/walker/src/stages/variants.rs
+@@ -77,7 +77,6 @@
+     out: Vec<Vec<Oriented>>,
+     walk: Vec<Oriented>,
+     at: HashMap<Oriented, usize>,
+-    local: HashMap<UnitigId, usize>,
+ }
+ 
+ fn view(graph: &UnitigGraph, subgraph: &Subgraph, path: &GafPath) -> Option<View> {
+@@ -113,7 +112,7 @@
+         // and the rejoin search only ever moves forward.
+         at.entry(o).or_insert(i);
+     }
+-    Some(View { out, walk, at, local })
++    Some(View { out, walk, at })
+ }
+ 
+ /// Rewrite the route so that at every two-allele site it carries the **more abundant**
+@@ -317,42 +316,9 @@
+         return Ok(Vec::new());
+     }
+ 
+-    let n = subgraph.nodes.len();
+-    let mut local: HashMap<UnitigId, usize> = HashMap::with_capacity(n * 2);
+-    for (i, &id) in subgraph.nodes.iter().enumerate() {
+-        local.insert(id, i);
+-    }
+-
+-    // Same oriented adjacency as `phase`: an edge in u's header is the traversal
+-    // (u, s1) -> (t, s2), and the reverse arrives independently from t's own header.
+-    let mut out: Vec<Vec<Oriented>> = vec![Vec::new(); n * 2];
+-    for (i, &id) in subgraph.nodes.iter().enumerate() {
+-        for &packed in graph.edges(id) {
+-            let (target, src_fwd, dst_fwd) = parse::unpack_edge(packed);
+-            let Some(&j) = local.get(&target) else { continue };
+-            out[i * 2 + usize::from(src_fwd)].push((j * 2 + usize::from(dst_fwd)) as Oriented);
+-        }
+-    }
+-    for v in out.iter_mut() {
+-        v.sort_unstable();
+-        v.dedup();
+-    }
+-
+-    // The walked path as oriented ids, and where each one sits.
+-    let mut walk: Vec<Oriented> = Vec::with_capacity(path.steps.len());
+-    for step in &path.steps {
+-        let Some(&i) = local.get(&step.node) else {
+-            return Ok(Vec::new()); // path leaves the subgraph; stitch would bail too
+-        };
+-        let fwd = matches!(step.orient, Orient::Forward);
+-        walk.push((i * 2 + usize::from(fwd)) as Oriented);
+-    }
+-    let mut at: HashMap<Oriented, usize> = HashMap::with_capacity(walk.len());
+-    for (i, &o) in walk.iter().enumerate() {
+-        // First occurrence wins; a repeated node makes "where does it rejoin" ambiguous and
+-        // the rejoin search below only ever moves forward.
+-        at.entry(o).or_insert(i);
+-    }
++    let Some(View { out, walk, at }) = view(graph, subgraph, path) else {
++        return Ok(Vec::new()); // path leaves the subgraph; stitch would bail too
++    };
+ 
+     let Some(primary) = stitch::stitch(cfg, graph, path, subgraph, query)? else {
+         return Ok(Vec::new());

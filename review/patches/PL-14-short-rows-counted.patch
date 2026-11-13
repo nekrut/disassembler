@@ -1,0 +1,80 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -667,6 +667,7 @@
+ 
+     total_rows = 0
+     n_malformed = 0
++    n_short = 0
+     n_other_query = 0
+     n_qlen_mismatch = 0
+     total_accessions = 0
+@@ -746,7 +747,7 @@
+         # premature stops still flag.
+         full_cov = 1.0 if full_length_only else min_coverage
+         stops_ok = n_stops <= max_internal_stops
+-        frame_ok = not frameshifts or allow_frameshifts
++        frame_ok = (not ref_is_cds) or not frameshifts or allow_frameshifts
+         if cov >= full_cov and stops_ok and frame_ok:
+             status = "CLEAN_FULL_LENGTH"
+             tier = 1
+@@ -810,8 +811,9 @@
+             line = stream.readline()
+             if not line:
+                 break
+-            line = line.strip()
+-            if not line:
++            unterminated = not line.endswith("\n")
++            line = line.rstrip("\r\n")
++            if not line.strip():
+                 continue
+ 
+             total_rows += 1
+@@ -819,6 +821,14 @@
+             needed = [idx_sgenome, idx_pident, idx_qcov, idx_qstart, idx_qend, idx_qseq, idx_sseq]
+             needed += [i for i in (idx_query, idx_qlen) if i is not None]
+             if len(parts) <= max(needed):
++                if unterminated:
++                    raise ValueError(
++                        f"row {total_rows} is the last line, has no newline and only "
++                        f"{len(parts)} of {max(needed) + 1} columns: the input looks truncated")
++                n_short += 1
++                if n_short <= MALFORMED_REPORT_LIMIT:
++                    print(f"[warn] row {total_rows}: {len(parts)} columns, "
++                          f"{max(needed) + 1} needed, skipping: {line[:120]}", file=sys.stderr)
+                 continue
+ 
+             # A LexicMap search against a multi-target panel emits rows for every target in
+@@ -906,6 +916,13 @@
+                     f"the query column of the search."
+                 )
+ 
++        if n_short:
++            print(f"[!] {n_short:,} of {total_rows:,} rows had too few columns and were skipped.",
++                  file=sys.stderr)
++            if n_short == total_rows:
++                raise ValueError(
++                    f"all {total_rows:,} data rows have fewer columns than the header needs; "
++                    f"check the column layout of the input against the resolved schema above")
+         if n_malformed:
+             print(f"[!] {n_malformed:,} of {total_rows:,} rows had an unparseable numeric "
+                   f"field and were skipped"
+@@ -914,7 +931,7 @@
+             # Every row unusable is a schema mismatch, not dirty data, and the cohort below
+             # would be empty rather than incomplete. Fail rather than write a plausible-looking
+             # empty output directory.
+-            if n_malformed == total_rows:
++            if n_malformed + n_short == total_rows:
+                 raise ValueError(
+                     f"all {total_rows:,} data rows had unparseable numeric fields; "
+                     f"check the column layout of the input against the resolved schema above"
+@@ -1142,6 +1159,8 @@
+         "regime": regime,
+         "regime_warning": warning_msg,
+         "total_streamed_rows": total_rows,
++        "skipped_rows": {"too_few_columns": n_short, "unparseable": n_malformed,
++                         "other_query": n_other_query},
+         "total_accessions_evaluated": total_accessions,
+         "cohort_breakdown": {
+             "clean_full_length": count_clean_full,

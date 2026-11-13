@@ -1,0 +1,196 @@
+diff --git a/walker/src/types.rs b/walker/src/types.rs
+--- a/walker/src/types.rs
++++ b/walker/src/types.rs
+@@ -175,8 +175,9 @@
+     ///
+     /// This is deliberately NOT the guard signal. Anchor fraction separates a healthy
+     /// accession from a pathological one by only about 1.2x at the default threshold, which
+-    /// is far too little to act on. `extract::subgraph_fraction` separates the same cases by
+-    /// roughly 315x and is what `pipeline::run_one` actually checks.
++    /// is far too little to act on. The guard `pipeline::run_one` checks is
++    /// `extract::exceeds_guard`: unitigs in the neighbourhood per reference base, against
++    /// `Config::subgraph_nodes_per_base_guard`.
+     pub fraction_of_graph: f64,
+ }
+ 
+@@ -297,7 +298,8 @@
+     pub anchor_used: Option<String>,
+ }
+ 
+-/// A recovered second allele: the primary haplotype with exactly one substitution.
++/// A recovered second allele: the primary haplotype with exactly one alternative allele, a
++/// substitution or an in-frame indel of up to `max_alt_indel` bases (`length_delta`).
+ ///
+ /// The frequencies are what make it interpretable. `alt_vaf` is this allele's share of
+ /// coverage at its fork, `taken_vaf` the primary's, and both cleared the same gates, so the
+@@ -463,8 +465,8 @@
+     /// Everything written to the main FASTA; holds the single primary haplotype.
+     pub haplotypes: Vec<Haplotype>,
+     /// Second alleles recovered at biallelic sites by `stages::variants`, written to their own
+-    /// file (`alt_haplotypes.fasta`). Never combined with each other: one substitution per
+-    /// record.
++    /// file (`alt_haplotypes.fasta`). Never combined with each other: one allele (a
++    /// substitution or an in-frame indel) per record.
+     pub alts: Vec<AltHaplotype>,
+     pub bubbles: Vec<Bubble>,
+     pub timing: Timing,
+diff --git a/walker/src/stages/extract.rs b/walker/src/stages/extract.rs
+--- a/walker/src/stages/extract.rs
++++ b/walker/src/stages/extract.rs
+@@ -185,8 +185,12 @@
+ 
+ /// Share of the whole graph pulled into the local neighbourhood.
+ ///
+-/// This is the guard signal, and it replaces the anchor-fraction check that used to live in
+-/// `anchor::find`. That one was calibrated on BLAST anchor counts and then applied to k-mer
++/// Reported per result and in the provisional warning, but NOT a gate: the guard is
++/// [`exceeds_guard`] (unitigs per reference base); see `Config::subgraph_nodes_per_base_guard`
++/// for why this share of the graph was retired as the gate after 0.1.1-dev.
++///
++/// History: this was the guard for a while, replacing the anchor-fraction check that used to
++/// live in `anchor::find`. That one was calibrated on BLAST anchor counts and then applied to k-mer
+ /// anchors, so at the default `min_shared_kmers = 3` it sat 9x below its threshold and
+ /// stayed silent on the very accession it existed to catch.
+ ///
+@@ -250,9 +254,8 @@
+ /// other's files: measured as GraphAligner SIGABRTs, a "non supported overlap" on a
+ /// half-written GFA, and a run that produced zero records at exit 0.
+ ///
+-/// `--scratch-dir` defaults to `/dev/shm/logan-walker` for *every* process, so two runs over
+-/// different genes collide by default. The PID separates processes and the counter separates
+-/// duplicate accessions inside one process.
++/// Each run now has its own scratch directory (`scratch.rs`), so the PID is belt and braces
++/// across processes; the counter is what separates duplicate accessions inside one process.
+ fn scratch_stem(accession: &str) -> String {
+     use std::sync::atomic::{AtomicU64, Ordering};
+     static SEQ: AtomicU64 = AtomicU64::new(0);
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -268,10 +268,10 @@
+ 
+ /// Fan accessions through the two pools and collect results.
+ ///
+-/// `queries` is the reference pool. In today's single-anchor path it holds one [`Query`];
+-/// multi-anchor mode passes several and the walker unions their canonical k-mers into one
+-/// anchor index. The downstream stages are handed the first [`Query`] for now — later phases
+-/// of the multi-anchor feature (align/stitch/pick_primary) fan out over the whole pool.
++/// `queries` is the reference pool: one [`Query`] per reference record. The anchor index is
++/// the union of every reference's canonical k-mers; align and stitch run over the whole pool
++/// and `pick_primary` chooses the winner, which is the [`Query`] the later stages
++/// (prune pass, prefer_majority, find_alts) use.
+ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Result<Summary> {
+     if queries.is_empty() {
+         return Err(crate::error::Error::Usage("no queries supplied".into()));
+@@ -294,7 +294,7 @@
+     // Built once per run, not per accession: it depends only on cfg and the anchor pool.
+     // Multi-anchor mode's whole point lives here — the anchor index is the union of every
+     // reference's canonical k-mers, so a graph carrying an Omicron-like spike is anchor-hit
+-    // even under a Wuhan-only invocation of downstream stages (until Phase 4 fans them out).
++    // and then aligned against every reference in the pool.
+     let query_index = stages::anchor::index_query_set(cfg, queries)?;
+     let query_index = &query_index;
+ 
+diff --git a/walker/src/io/input.rs b/walker/src/io/input.rs
+--- a/walker/src/io/input.rs
++++ b/walker/src/io/input.rs
+@@ -1,7 +1,7 @@
+ //! Everything that enters the pipeline.
+ //!
+ //! IN   accession list (one per line, `#` comments skipped) or a single accession
+-//!      reference CDS FASTA, in frame, single record
++//!      reference CDS FASTA(s), in frame; one record, or several for multi-anchor mode
+ //! OUT  Vec<Accession>, Query
+ 
+ use crate::error::{Error, Result};
+@@ -556,7 +556,7 @@
+ 
+     #[test]
+     fn set_preserves_input_ordering_for_tie_break() {
+-        // The primary picker will tie-break on this order in Phase 4, so it must be stable.
++        // pick_primary tie-breaks on this order, so it must be stable.
+         let a = tmp("first.fasta", b">a\nACGT\n");
+         let b = tmp("second.fasta", b">b\nCCCC\n");
+         let c = tmp("third.fasta", b">c\nGGGG\n");
+diff --git a/walker/src/stages/align.rs b/walker/src/stages/align.rs
+--- a/walker/src/stages/align.rs
++++ b/walker/src/stages/align.rs
+@@ -121,7 +121,8 @@
+ ///
+ /// # One record in, one record out
+ ///
+-/// `read_query` selects the first record of a query FASTA and warns about the rest, but
++/// `read_query` selects the first record of a query FASTA (main sends multi-record files to
++/// `read_query_set` instead), but
+ /// handing the whole file to GraphAligner undoes that: it aligns every record, and
+ /// `parse_gaf` used to take the best-scoring row across all of them. `stitch` then sliced
+ /// with that row's coordinates while dividing by the *selected* record's length, so a
+diff --git a/walker/src/stages/variants.rs b/walker/src/stages/variants.rs
+--- a/walker/src/stages/variants.rs
++++ b/walker/src/stages/variants.rs
+@@ -5,7 +5,7 @@
+ //! puts it back, as one extra record per site.
+ //!
+ //! IN   UnitigGraph, Subgraph, GafPath, Query
+-//! OUT  Vec<AltHaplotype>, empty unless `cfg.emit_alts`
++//! OUT  Vec<AltHaplotype>, empty unless `cfg.emit_alts`, `cfg.emit_vcf` or `cfg.emit_snv_table`
+ //!
+ //! # What counts as a site worth recovering
+ //!
+@@ -32,21 +32,23 @@
+ //! With *n* independent sites there are up to 2^n haplotypes, and a de Bruijn graph cannot
+ //! say which alternatives sit on the same molecule. Emitting combinations would invent
+ //! sequences that may not exist in any organism, which is the chimera problem the walker
+-//! exists to avoid. Every record here is the primary path with **exactly one** substitution,
+-//! so it is a real connected path through the graph and asserts only the minimal thing.
++//! exists to avoid. Every record here is the primary path with **exactly one** alternative
++//! allele (a substitution, or an in-frame indel; see below), so it is a real connected path
++//! through the graph and asserts only the minimal thing.
+ //!
+ //! In practice the cap is not the binding constraint: the measured site count is 4, 4 and 0
+ //! across the accessions looked at, not 50.
+ //!
+-//! # Why substitutions only
++//! # Which length changes are accepted
+ //!
+-//! An accepted detour must leave the stitched sequence exactly as long as the primary. That
+-//! keeps `path_start`/`path_end`, which are offsets into the stitched sequence, valid without
+-//! adjustment, and it rejects the dangerous shape: a detour that rejoins far downstream is a
+-//! path *shortcut* that silently deletes gene. Measured while prototyping, a coverage-greedy
+-//! re-walk without this constraint cut a 1,279-node path to 334 and the sequence from 2,738
+-//! to 653 nt. Every genuine allele measured so far is an equal-length substitution, so this
+-//! costs nothing real.
++//! Substitutions always. Indels only when all of these hold (`cfg.allow_indel_alts`, on by
++//! default, `--no-indel-alts` turns it off): the length change is at most `cfg.max_alt_indel`
++//! bases (30), it is a multiple of three unless `--allow-frameshift-alts`, and
++//! `shifted_window` can move `path_start`/`path_end`, which are offsets into the stitched
++//! sequence, by exactly the change. The cap is what rejects the dangerous shape: a detour that
++//! rejoins far downstream is a path *shortcut* that silently deletes gene. Measured while
++//! prototyping, a coverage-greedy re-walk without any length constraint cut a 1,279-node path
++//! to 334 and the sequence from 2,738 to 653 nt.
+ 
+ use crate::config::Config;
+ use crate::error::Result;
+@@ -421,8 +423,8 @@
+             }
+             steps.extend_from_slice(&path.steps[rejoin_at..]);
+ 
+-            // Substitutions only. See the module note: this keeps path_start/path_end valid
+-            // and rejects shortcuts that delete gene.
++            // A length change is allowed only within the module note's limits: that keeps
++            // path_start/path_end valid and rejects shortcuts that delete gene.
+             let spliced_len = stitched_len(cfg, &steps, subgraph);
+             let delta = spliced_len as i64 - baseline_len as i64;
+ 
+diff --git a/walker/src/stages/mod.rs b/walker/src/stages/mod.rs
+--- a/walker/src/stages/mod.rs
++++ b/walker/src/stages/mod.rs
+@@ -8,7 +8,7 @@
+ //!   align    GraphAligner (C++)   -> GafPath
+ //!   stitch   path -> sequence     -> Haplotype
+ //!   phase    forks + VAF          -> Vec<Bubble>
+-//!   variants on-path forks       -> Vec<AltHaplotype>  (opt-in)
++//!   variants on-path forks       -> Vec<AltHaplotype>  (on by default)
+ //! ```
+ //!
+ //! `phase` reads the `UnitigGraph` and `Subgraph`, not the `GafPath`, so it does not

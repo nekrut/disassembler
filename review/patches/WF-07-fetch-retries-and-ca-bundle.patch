@@ -1,0 +1,184 @@
+diff --git a/walker/src/stages/stream.rs b/walker/src/stages/stream.rs
+--- a/walker/src/stages/stream.rs
++++ b/walker/src/stages/stream.rs
+@@ -51,6 +51,7 @@
+             // Inspect the status ourselves so 404 (no Logan data) is distinguishable from
+             // 5xx (transient, worth retrying).
+             .http_status_as_error(false)
++            .tls_config(tls_config())
+             .build();
+         Self {
+             agent: ureq::Agent::new_with_config(agent_config),
+@@ -153,12 +154,10 @@
+                         detail,
+                     })
+                 }
+-                Err(FetchAttempt::Transient(detail)) => {
++                Err(FetchAttempt::Transient(detail, retry_after)) => {
+                     last = detail;
+                     if attempt < self.attempts {
+-                        // Linear backoff is enough here; S3 throttling is rare and the
+-                        // dominant transient is a dropped connection.
+-                        std::thread::sleep(Duration::from_millis(500 * attempt as u64));
++                        std::thread::sleep(retry_after.unwrap_or_else(|| backoff(attempt)));
+                     }
+                 }
+             }
+@@ -174,15 +173,35 @@
+             .agent
+             .get(url)
+             .call()
+-            .map_err(|e| FetchAttempt::Transient(format!("request failed: {e}")))?;
++            .map_err(|e| {
++                let msg = format!("request failed: {e}");
++                // A certificate the trust store rejects will be rejected again: say so once.
++                if msg.contains("invalid peer certificate") {
++                    FetchAttempt::Permanent(format!(
++                        "{msg} (behind a TLS-inspecting proxy? set SSL_CERT_FILE to its CA bundle)"
++                    ))
++                } else {
++                    FetchAttempt::Transient(msg, None)
++                }
++            })?;
+ 
+         let status = resp.status().as_u16();
+         match status {
+             200 => {}
+             404 => return Err(FetchAttempt::Missing),
+-            // 4xx other than 404 is our fault and will not improve on retry.
++            // Throttling and request timeouts are worth waiting out; honour Retry-After.
++            408 | 429 => {
++                let ra = resp
++                    .headers()
++                    .get("retry-after")
++                    .and_then(|v| v.to_str().ok())
++                    .and_then(|v| v.trim().parse::<u64>().ok())
++                    .map(|s| Duration::from_secs(s.min(300)));
++                return Err(FetchAttempt::Transient(format!("HTTP {status}"), ra));
++            }
++            // Other 4xx are our fault and will not improve on retry.
+             400..=499 => return Err(FetchAttempt::Permanent(format!("HTTP {status}"))),
+-            _ => return Err(FetchAttempt::Transient(format!("HTTP {status}"))),
++            _ => return Err(FetchAttempt::Transient(format!("HTTP {status}"), None)),
+         }
+ 
+         // Refuse oversized accessions before transferring them, when the server says how big.
+@@ -213,11 +232,11 @@
+                      Content-Length, so this was found by downloading)",
+                     self.max_compressed_bytes
+                 )),
+-                e => FetchAttempt::Transient(format!("body read failed: {e}")),
++                e => FetchAttempt::Transient(format!("body read failed: {e}"), None),
+             })?;
+ 
+         if compressed.is_empty() {
+-            return Err(FetchAttempt::Transient("empty body".to_string()));
++            return Err(FetchAttempt::Transient("empty body".to_string(), None));
+         }
+ 
+         Ok(FetchedUnitigs {
+@@ -230,10 +249,40 @@
+     }
+ }
+ 
++/// Exponential backoff with +/-50% jitter: about 1, 2, 4, 8, 16 s ... capped at 60 s.
++fn backoff(attempt: u32) -> Duration {
++    let base = 1000u64.saturating_mul(1 << attempt.saturating_sub(1).min(6)).min(60_000);
++    let ns = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.subsec_nanos() as u64)
++        .unwrap_or(0);
++    Duration::from_millis(base / 2 + ns % base.max(1))
++}
++
++/// Trust the PEM bundle named by SSL_CERT_FILE when set (as curl, OpenSSL and Python do);
++/// otherwise the compiled-in Mozilla roots.
++fn tls_config() -> ureq::tls::TlsConfig {
++    use ureq::tls::{parse_pem, PemItem, RootCerts, TlsConfig};
++    let roots = std::env::var_os("SSL_CERT_FILE")
++        .and_then(|p| std::fs::read(p).ok())
++        .map(|pem| {
++            parse_pem(&pem)
++                .filter_map(|i| match i {
++                    Ok(PemItem::Certificate(c)) => Some(c),
++                    _ => None,
++                })
++                .collect::<Vec<_>>()
++        })
++        .filter(|certs| !certs.is_empty())
++        .map(|certs| RootCerts::new_with_certs(&certs))
++        .unwrap_or(RootCerts::WebPki);
++    TlsConfig::builder().root_certs(roots).build()
++}
++
+ /// Whether a failed attempt is worth repeating.
+ enum FetchAttempt {
+-    /// Transport error or 5xx. Retry.
+-    Transient(String),
++    /// Transport error, 5xx, 408 or 429. Retry, after the server's Retry-After if it sent one.
++    Transient(String, Option<Duration>),
+     /// A 4xx other than 404. Retrying cannot help.
+     Permanent(String),
+     /// HTTP 404: Logan has no unitigs for this accession. Not an error of the run.
+@@ -419,13 +468,48 @@
+         let url = serve_without_length(vec![b'A'; 100]);
+         match fetcher(10).try_once(0, &"X".to_string(), &url) {
+             Err(FetchAttempt::TooLarge(d)) => assert!(d.contains("no Content-Length"), "{d}"),
+-            Err(FetchAttempt::Transient(d)) => panic!("retried as transient: {d}"),
++            Err(FetchAttempt::Transient(d, _)) => panic!("retried as transient: {d}"),
+             Err(_) => panic!("wrong failure"),
+             Ok(f) => panic!("accepted {} bytes over a 10-byte cap", f.compressed_len),
+         }
+     }
+ 
+     #[test]
++    fn throttling_is_transient_and_honours_retry_after() {
++        for (code, ra) in [("429 Too Many Requests", Some(7)), ("408 Request Timeout", None)] {
++            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++            let port = listener.local_addr().unwrap().port();
++            let head = match ra {
++                Some(s) => format!("HTTP/1.1 {code}\r\nRetry-After: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
++                None => format!("HTTP/1.1 {code}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
++            };
++            std::thread::spawn(move || {
++                let (mut sock, _) = listener.accept().unwrap();
++                let mut reader = BufReader::new(sock.try_clone().unwrap());
++                let mut line = String::new();
++                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
++                    line.clear();
++                }
++                let _ = sock.write_all(head.as_bytes());
++            });
++            let url = format!("http://127.0.0.1:{port}/u/X/X.unitigs.fa.zst");
++            match fetcher(10).try_once(0, &"X".to_string(), &url) {
++                Err(FetchAttempt::Transient(_, got)) => {
++                    assert_eq!(got, ra.map(Duration::from_secs), "{code}")
++                }
++                _ => panic!("{code} not retried"),
++            }
++        }
++    }
++
++    #[test]
++    fn backoff_grows_and_is_capped() {
++        assert!(backoff(1) >= Duration::from_millis(500) && backoff(1) < Duration::from_millis(1500));
++        assert!(backoff(4) >= Duration::from_secs(4));
++        assert!(backoff(30) < Duration::from_secs(90));
++    }
++
++    #[test]
+     fn a_body_of_exactly_the_cap_is_accepted() {
+         let url = serve_without_length(vec![b'A'; 10]);
+         let got = fetcher(10).try_once(0, &"X".to_string(), &url).ok().expect("refused at the cap");
+diff --git a/walker/src/config.rs b/walker/src/config.rs
+--- a/walker/src/config.rs
++++ b/walker/src/config.rs
+@@ -473,7 +473,7 @@
+             graphaligner_threads: 1,
+             fetch_timeout_secs: 900,
+             fetch_connect_timeout_secs: 15,
+-            fetch_attempts: 3,
++            fetch_attempts: 6,
+             max_compressed_bytes: 1024 * 1024 * 1024,
+             scratch_dir: std::env::temp_dir().join("logan-walker-test"),
+             graphaligner_bin: String::from("GraphAligner"),

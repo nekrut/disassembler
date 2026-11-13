@@ -1,0 +1,145 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -921,8 +921,11 @@
+                 )
+ 
+     finally:
+-        if raw is not sys.stdin.buffer:
++        if raw is sys.stdin.buffer:
++            stream.detach()  # leave the process's stdin open
++        else:
+             stream.close()
++            raw.close()
+         f_clean_fa.close()
+         f_clean_exp_fa.close()
+         f_flagged_fa.close()
+diff --git a/src/disassembler/cmd/pipe_from_kmindex.py b/src/disassembler/cmd/pipe_from_kmindex.py
+index 623dfc862f08..000000000000 100644
+--- a/src/disassembler/cmd/pipe_from_kmindex.py
++++ b/src/disassembler/cmd/pipe_from_kmindex.py
+@@ -343,7 +343,8 @@
+         print(f"from-kmindex: expected accession list not found: {acc_list}",
+               file=sys.stderr)
+         return 1
+-    n_acc = sum(1 for line in acc_list.open() if line.strip())
++    with acc_list.open() as fh:
++        n_acc = sum(1 for line in fh if line.strip())
+     print(f"[from-kmindex] target '{args.target}': {n_acc} accessions from {acc_list}",
+           flush=True)
+ 
+diff --git a/src/disassembler/cmd/pipe_from_lexicmap.py b/src/disassembler/cmd/pipe_from_lexicmap.py
+index 73afa2c25a57..000000000000 100644
+--- a/src/disassembler/cmd/pipe_from_lexicmap.py
++++ b/src/disassembler/cmd/pipe_from_lexicmap.py
+@@ -308,7 +308,8 @@
+     aln = out_dir / f"{stem}_codon_msa.fasta"
+     tree = out_dir / f"{stem}_fasttree.nwk"
+ 
+-    n_cohort = sum(1 for line in cohort.open() if line.startswith(">"))
++    with cohort.open() as fh:
++        n_cohort = sum(1 for line in fh if line.startswith(">"))
+     print(f"[from-lexicmap] cohort: {n_cohort} sequences from {cohort.name}", flush=True)
+     if n_cohort == 0:
+         # lexicmap's own check counts full-length and partial sequences together, so a cohort
+diff --git a/src/disassembler/cmd/pipe_reconstruct.py b/src/disassembler/cmd/pipe_reconstruct.py
+index ec0cd7c15617..000000000000 100644
+--- a/src/disassembler/cmd/pipe_reconstruct.py
++++ b/src/disassembler/cmd/pipe_reconstruct.py
+@@ -389,7 +389,10 @@
+     if rc != 0:
+         return _die(f"logan-walker (stage 1) failed (exit {rc}); see its output above.")
+ 
+-    n_recon = sum(1 for line in recon.open() if line.startswith(">")) if recon.is_file() else 0
++    n_recon = 0
++    if recon.is_file():
++        with recon.open() as fh:
++            n_recon = sum(1 for line in fh if line.startswith(">"))
+     print(f"[reconstruct] reconstructed {n_recon} haplotype(s) -> {recon}", flush=True)
+     if n_recon == 0:
+         return _die("no haplotypes reconstructed; nothing to align.")
+diff --git a/src/disassembler/cmd/sieve.py b/src/disassembler/cmd/sieve.py
+index 54e68d33850f..000000000000 100644
+--- a/src/disassembler/cmd/sieve.py
++++ b/src/disassembler/cmd/sieve.py
+@@ -231,7 +231,8 @@
+         for rf in shards():
+             rf.unlink(missing_ok=True)
+ 
+-    n_out = sum(1 for line in output_fasta.open() if line.startswith(">"))
++    with output_fasta.open() as fh:
++        n_out = sum(1 for line in fh if line.startswith(">"))
+     print(f"[sieve] {n_in} -> {n_out} haplotypes "
+           f"(tau={threshold}, sketch={sketch}) -> {output_fasta}", flush=True)
+     if n_out == 0:
+diff --git a/src/disassembler/textio.py b/src/disassembler/textio.py
+index 04e5c5abf337..000000000000 100644
+--- a/src/disassembler/textio.py
++++ b/src/disassembler/textio.py
+@@ -12,6 +12,7 @@
+ 
+ import gzip
+ import io
++import zlib
+ from pathlib import Path
+ 
+ GZIP_MAGIC = b"\x1f\x8b"
+@@ -20,7 +21,38 @@
+                 "Decompress it first (zstd -d)")
+ 
+ 
+-def text_stream(raw) -> io.TextIOWrapper:
++class _GzipReader(gzip.GzipFile):
++    """GzipFile that reports truncated or corrupt data as OSError and, when it owns its
++    source (open_text), closes that source too."""
++
++    def __init__(self, fileobj, owns=False):
++        super().__init__(fileobj=fileobj, mode="rb")
++        self._owned = fileobj if owns else None
++
++    def _wrap(self, fn, *a):
++        try:
++            return fn(*a)
++        except (EOFError, zlib.error) as e:
++            raise OSError(f"truncated or corrupt gzip data ({e})") from None
++
++    def read(self, size=-1):
++        return self._wrap(super().read, size)
++
++    def read1(self, size=-1):
++        return self._wrap(super().read1, size)
++
++    def readinto(self, b):
++        return self._wrap(super().readinto, b)
++
++    def close(self):
++        try:
++            super().close()
++        finally:
++            if self._owned is not None:
++                self._owned.close()
++
++
++def text_stream(raw, owns=False) -> io.TextIOWrapper:
+     """UTF-8 text from a binary stream, gunzipped when it starts with the gzip magic bytes.
+     A stream without `peek` (an HTTP body) is buffered first."""
+     buf = raw if hasattr(raw, "peek") else io.BufferedReader(raw)
+@@ -28,7 +60,7 @@
+     if head.startswith(ZSTD_MAGIC):
+         raise ValueError(f"the input is {ZSTD_REFUSED}")
+     if head.startswith(GZIP_MAGIC):
+-        buf = gzip.GzipFile(fileobj=buf)
++        buf = _GzipReader(buf, owns=owns)
+     return io.TextIOWrapper(buf, encoding="utf-8")
+ 
+ 
+@@ -36,7 +68,7 @@
+     """`open(path)` for reading text, except that a gzipped file is decompressed."""
+     raw = open(path, "rb")
+     try:
+-        return text_stream(raw)
++        return text_stream(raw, owns=True)
+     except ValueError:
+         raw.close()
+         raise ValueError(f"{path}: {ZSTD_REFUSED}") from None

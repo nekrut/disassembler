@@ -1,0 +1,48 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -546,7 +546,10 @@
+     print("=" * 80)
+     print(f" Reference Sequence : {ref_name} ({ref_len} bp, {len(ref_aa)} codons)")
+     print(f" Reference Header   : {ref_header}")
+-    print(f" Target QC Settings : full_length_cov={min_coverage*100:.1f}%, partial_cov={min_coverage_partial*100:.1f}%, "
++    # The tier 1 gate: --require-full-length raises it to complete coverage.
++    full_cov = 1.0 if full_length_only else min_coverage
++    full_note = " (--require-full-length)" if full_length_only else ""
++    print(f" Target QC Settings : full_length_cov={full_cov*100:.1f}%{full_note}, partial_cov={min_coverage_partial*100:.1f}%, "
+           f"min_pident={min_pident:.1f}%, max_stops={max_internal_stops if ref_is_cds else 'N/A'}")
+ 
+     if dataset_id:
+@@ -744,7 +747,6 @@
+         # so it never shows one as a run of stop codons. Only a shift lasting
+         # FRAMESHIFT_MIN_SPAN bases counts. --allow-frameshift-alts waives that tier only;
+         # premature stops still flag.
+-        full_cov = 1.0 if full_length_only else min_coverage
+         stops_ok = n_stops <= max_internal_stops
+         frame_ok = not frameshifts or allow_frameshifts
+         if cov >= full_cov and stops_ok and frame_ok:
+@@ -952,7 +954,7 @@
+     print(f"    1. Clean Full-Length Cohort   : {count_clean_full:,} accessions ({pct_of_total(count_clean_full):.2f}% of total)")
+     print(f"       - Multi-HSP rescued        : {total_rescued_multihsp:,} accessions")
+     print(f"       - Single-HSP full-length   : {total_single_hsp_full:,} accessions")
+-    print(f"    2. Clean Partials ({min_coverage_partial:.0%}-{min_coverage:.0%} cov): {count_clean_partial:,} accessions")
++    print(f"    2. Clean Partials ({min_coverage_partial:.0%}-<{full_cov:.0%} cov): {count_clean_partial:,} accessions")
+     print(f"       --> Combined Clean Cohort  : {count_clean_full + count_clean_partial:,} accessions ({pct_of_total(count_clean_full + count_clean_partial):.2f}%)")
+     print(f"    3. Flagged for Premature Stops: {count_flagged_stops:,} accessions")
+     print(f"    4. Low-Coverage Fragments (<{min_coverage_partial:.0%}): {count_flagged_low_cov:,} accessions")
+@@ -1143,6 +1145,14 @@
+         "regime_warning": warning_msg,
+         "total_streamed_rows": total_rows,
+         "total_accessions_evaluated": total_accessions,
++        "gates": {
++            "full_length_cov": full_cov,
++            "partial_cov": min_coverage_partial,
++            "require_full_length": full_length_only,
++            "min_pident": min_pident,
++            "max_internal_stops": max_internal_stops,
++            "allow_frameshift_alts": allow_frameshifts,
++        },
+         "cohort_breakdown": {
+             "clean_full_length": count_clean_full,
+             "clean_partial": count_clean_partial,

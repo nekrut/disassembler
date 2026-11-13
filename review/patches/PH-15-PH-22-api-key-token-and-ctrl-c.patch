@@ -1,0 +1,129 @@
+diff --git a/src/disassembler/validators.py b/src/disassembler/validators.py
+index e530f671b63a..000000000000 100644
+--- a/src/disassembler/validators.py
++++ b/src/disassembler/validators.py
+@@ -154,4 +154,23 @@
+             f"--api-key-file {path!r} is empty (or whitespace-only). The Galaxy API "
+             f"key must be a non-empty token."
+         )
++    try:
++        check_api_key(content, f"--api-key-file {path!r}")
++    except ValueError as e:
++        return str(e)
+     return None
++
++
++def check_api_key(key: str, source: str) -> str:
++    """`key` stripped, or ValueError if it cannot be one HTTP header token. The message
++    never contains the value: the HTTP libraries quote the whole header value in their
++    own errors, which then reached stderr (a Galaxy job log, a CI log)."""
++    key = key.strip()
++    if not key:
++        raise ValueError(f"the Galaxy API key from {source} is empty")
++    if any(c.isspace() or not c.isprintable() for c in key):
++        n = len(key.splitlines())
++        raise ValueError(f"the Galaxy API key from {source} is not a single token "
++                         f"({n} line(s), or whitespace/control characters inside); "
++                         f"the value is not shown")
++    return key
+diff --git a/src/disassembler/cmd/harvest.py b/src/disassembler/cmd/harvest.py
+index a384857a04e9..000000000000 100644
+--- a/src/disassembler/cmd/harvest.py
++++ b/src/disassembler/cmd/harvest.py
+@@ -34,19 +34,22 @@
+ from requests.adapters import HTTPAdapter
+ 
+ from disassembler.textio import decode_bytes, read_text
+-from disassembler.validators import positive_int, validate_api_key_file
++from disassembler.validators import check_api_key, positive_int, validate_api_key_file
+ 
+ ATTEMPTS = 5
+ 
+ 
+ def get_galaxy_api_key(key_file: str | None = None) -> str:
+-    if key_file and Path(key_file).exists():
+-        return Path(key_file).read_text().strip()
+-    if os.environ.get("GALAXY_API_KEY"):
+-        return os.environ["GALAXY_API_KEY"].strip()
+-    default_tmp = Path("/tmp/gxy.txt")
+-    if default_tmp.exists():
+-        return default_tmp.read_text().strip()
++    try:
++        if key_file and Path(key_file).exists():
++            return check_api_key(Path(key_file).read_text(), f"--api-key-file {key_file}")
++        if os.environ.get("GALAXY_API_KEY"):
++            return check_api_key(os.environ["GALAXY_API_KEY"], "$GALAXY_API_KEY")
++        default_tmp = Path("/tmp/gxy.txt")
++        if default_tmp.exists():
++            return check_api_key(default_tmp.read_text(), str(default_tmp))
++    except ValueError as e:
++        raise RuntimeError(str(e)) from None
+     raise RuntimeError(
+         "Galaxy API key not found. Provide --api-key-file, set GALAXY_API_KEY, "
+         "or write /tmp/gxy.txt."
+@@ -337,8 +366,9 @@
+     print(f"[*] Streaming and merging shard JSONs across {max_workers} threads...",
+           flush=True)
+     start_t = time.time()
++    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+     try:
+-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
++        if True:
+             futures = {ex.submit(fetch_shard, it, base_url, sess): it for it in items}
+             for fut in concurrent.futures.as_completed(futures):
+                 n += 1
+@@ -372,6 +402,13 @@
+                     print(f"    [!] shard payload unusable "
+                           f"({type(e).__name__}: {e})", file=sys.stderr)
+                     continue
++    except BaseException:
++        # Ctrl-C (or any error here): drop the shards still queued instead of letting
++        # the executor fetch the whole collection before the exception surfaces.
++        ex.shutdown(wait=False, cancel_futures=True)
++        raise
++    else:
++        ex.shutdown()
+     finally:
+         # 32 pooled connections against one host outlive the harvest otherwise.
+         sess.close()
+@@ -499,4 +536,7 @@
+     except RuntimeError as e:
+         print(f"harvest: {e}", file=sys.stderr)
+         return 1
++    except KeyboardInterrupt:
++        print("harvest: interrupted; nothing was written", file=sys.stderr)
++        return 130
+     return 0
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -129,15 +129,19 @@
+     """The Galaxy API key: --api-key, then --api-key-file, then $GALAXY_API_KEY, then
+     /tmp/gxy.txt, the order the help gives and `harvest` uses. The environment variable used
+     to win over an explicitly named file."""
+-    if api_key:
+-        return api_key.strip()
+-    if key_file and Path(key_file).exists():
+-        return Path(key_file).read_text().strip()
+-    if os.environ.get("GALAXY_API_KEY"):
+-        return os.environ["GALAXY_API_KEY"].strip()
+-    default_tmp = Path("/tmp/gxy.txt")
+-    if default_tmp.exists():
+-        return default_tmp.read_text().strip()
++    from disassembler.validators import check_api_key
++    try:
++        if api_key:
++            return check_api_key(api_key, "--api-key")
++        if key_file and Path(key_file).exists():
++            return check_api_key(Path(key_file).read_text(), f"--api-key-file {key_file}")
++        if os.environ.get("GALAXY_API_KEY"):
++            return check_api_key(os.environ["GALAXY_API_KEY"], "$GALAXY_API_KEY")
++        default_tmp = Path("/tmp/gxy.txt")
++        if default_tmp.exists():
++            return check_api_key(default_tmp.read_text(), str(default_tmp))
++    except ValueError as e:
++        raise RuntimeError(str(e)) from None
+     raise RuntimeError(
+         "Galaxy API key not found. Provide --api-key or --api-key-file, set GALAXY_API_KEY, "
+         "or write /tmp/gxy.txt."

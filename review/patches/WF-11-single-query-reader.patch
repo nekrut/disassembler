@@ -1,0 +1,405 @@
+diff --git a/walker/src/io/input.rs b/walker/src/io/input.rs
+--- a/walker/src/io/input.rs
++++ b/walker/src/io/input.rs
+@@ -113,26 +113,15 @@
+     Ok(())
+ }
+ 
+-/// Read the reference CDS: the first record, with `n_records` saying how many the file holds.
+-///
+-/// It does not warn about the others. `main` sends a file with more than one record to
+-/// [`read_query_set`] instead, which uses all of them (multi-anchor mode); a warning here
+-/// that only the first was used was printed on exactly the runs that used every record.
+-///
+-/// The sequence is uppercased and stripped of whitespace, so downstream k-mer code needs
+-/// no case folding.
+-pub fn read_query(path: &Path) -> Result<Query> {
++/// The FASTA records of one query file as `(first header word, uppercased sequence)`.
++/// The single parser behind [`read_query`] and [`read_query_set`].
++fn fasta_records(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+     let bytes = read_input(path, "query")?;
+-
+     let mut records: Vec<(String, Vec<u8>)> = Vec::new();
+     let mut header: Option<String> = None;
+     let mut seq: Vec<u8> = Vec::new();
+-
+     for line in bytes.split(|&b| b == b'\n') {
+-        let line = match line.strip_suffix(b"\r") {
+-            Some(l) => l,
+-            None => line,
+-        };
++        let line = line.strip_suffix(b"\r").unwrap_or(line);
+         if line.first() == Some(&b'>') {
+             if let Some(h) = header.take() {
+                 records.push((h, std::mem::take(&mut seq)));
+@@ -140,7 +129,11 @@
+             let text = String::from_utf8_lossy(&line[1..]).to_string();
+             header = Some(text.split_whitespace().next().unwrap_or("").to_string());
+         } else if header.is_some() {
+-            seq.extend(line.iter().filter(|b| !b.is_ascii_whitespace()).map(|b| b.to_ascii_uppercase()));
++            seq.extend(
++                line.iter()
++                    .filter(|b| !b.is_ascii_whitespace())
++                    .map(|b| b.to_ascii_uppercase()),
++            );
+         } else if !line.iter().all(|b| b.is_ascii_whitespace()) {
+             return Err(Error::Usage(format!(
+                 "{}: sequence data before any '>' header; is this FASTA?",
+@@ -151,28 +144,27 @@
+     if let Some(h) = header.take() {
+         records.push((h, seq));
+     }
+-
+     if records.is_empty() {
+-        return Err(Error::Usage(format!(
+-            "{}: no FASTA records found",
+-            path.display()
+-        )));
++        return Err(Error::Usage(format!("{}: no FASTA records found", path.display())));
+     }
+-    let n_records = records.len();
+-    let (record_id, seq) = records.swap_remove(0);
++    Ok(records)
++}
++
++/// Reject an empty record and warn about frame and ambiguity, once per record.
++fn check_record(path: &Path, record_id: &str, seq: &[u8]) -> Result<()> {
+     if seq.is_empty() {
+         return Err(Error::Usage(format!(
+             "{}: record {record_id:?} has no sequence",
+             path.display()
+         )));
+     }
+-
+     // Everything downstream is codon-based, so a frame violation matters. Warn rather than
+     // reject: the walker itself is frame-agnostic, and it is the codon MSA (`disassembler
+     // msa`) that ultimately depends on this.
+-    if seq.len() % 3 != 0 {
++    if !seq.len().is_multiple_of(3) {
+         eprintln!(
+-            "[warn] {}: length {} is not a multiple of 3; codon analysis downstream expects a CDS",
++            "[warn] {}: record {record_id:?} length {} is not a multiple of 3; \
++             codon analysis downstream expects a CDS",
+             path.display(),
+             seq.len()
+         );
+@@ -180,33 +172,35 @@
+     let ambiguous = seq.iter().filter(|b| !matches!(b, b'A' | b'C' | b'G' | b'T')).count();
+     if ambiguous > 0 {
+         eprintln!(
+-            "[warn] {}: {ambiguous} non-ACGT base(s); k-mers spanning them cannot match \
+-             Logan unitigs, which are pure ACGT",
++            "[warn] {}: record {record_id:?} has {ambiguous} non-ACGT base(s); \
++             k-mers spanning them cannot match Logan unitigs",
+             path.display()
+         );
+     }
++    Ok(())
++}
+ 
+-    let name = path
+-        .file_stem()
++fn file_stem(path: &Path) -> Result<String> {
++    path.file_stem()
+         .map(|s| s.to_string_lossy().to_string())
+-        .ok_or_else(|| Error::Usage(format!("{}: cannot derive a name", path.display())))?;
++        .ok_or_else(|| Error::Usage(format!("{}: cannot derive a name", path.display())))
++}
+ 
+-    Ok(Query {
+-        name,
+-        record_id,
+-        seq,
+-        path: path.to_path_buf(),
+-        n_records,
+-    })
++/// The first record of one query file, with `n_records` saying how many the file holds.
++/// Used by tests only; `main` reads every query through [`read_query_set`].
++#[cfg(test)]
++pub fn read_query(path: &Path) -> Result<Query> {
++    let mut records = fasta_records(path)?;
++    let n_records = records.len();
++    let (record_id, seq) = records.swap_remove(0);
++    check_record(path, &record_id, &seq)?;
++    Ok(Query { name: file_stem(path)?, record_id, seq, path: path.to_path_buf(), n_records })
+ }
+ 
+ /// Load every record from every input FASTA as its own single-record [`Query`].
+ ///
+-/// Used by multi-anchor mode: `read_query` keeps only the first record of a FASTA (matching
+-/// legacy behaviour and warning about the rest), which is what we want on today's single-`-q`
+-/// single-record path. `read_query_set` is what runs when the collected reference set is
+-/// wider than that — repeated `-q file.fa`, or a multi-record FASTA passed intentionally.
+-/// Each returned [`Query`] holds one record, so the "one record per Query" contract every
++/// The only query reader `main` uses: each input is read exactly once, so a pipe or process
++/// substitution works for a multi-record panel too. Each returned [`Query`] holds one record, so the "one record per Query" contract every
+ /// stage assumes is preserved by splitting up front here. Its `n_records` is still the count
+ /// of records in its file, as the field promises: it used to be 1, which told
+ /// `align::run` the file could be handed to GraphAligner as is, so the prune pass's
+@@ -222,73 +216,11 @@
+     }
+     let mut out: Vec<Query> = Vec::new();
+     for path in paths {
+-        let bytes = read_input(path, "query")?;
+-
+-        let mut records: Vec<(String, Vec<u8>)> = Vec::new();
+-        let mut header: Option<String> = None;
+-        let mut seq: Vec<u8> = Vec::new();
+-        for line in bytes.split(|&b| b == b'\n') {
+-            let line = line.strip_suffix(b"\r").unwrap_or(line);
+-            if line.first() == Some(&b'>') {
+-                if let Some(h) = header.take() {
+-                    records.push((h, std::mem::take(&mut seq)));
+-                }
+-                let text = String::from_utf8_lossy(&line[1..]).to_string();
+-                header = Some(text.split_whitespace().next().unwrap_or("").to_string());
+-            } else if header.is_some() {
+-                seq.extend(
+-                    line.iter()
+-                        .filter(|b| !b.is_ascii_whitespace())
+-                        .map(|b| b.to_ascii_uppercase()),
+-                );
+-            } else if !line.iter().all(|b| b.is_ascii_whitespace()) {
+-                return Err(Error::Usage(format!(
+-                    "{}: sequence data before any '>' header; is this FASTA?",
+-                    path.display()
+-                )));
+-            }
+-        }
+-        if let Some(h) = header.take() {
+-            records.push((h, seq));
+-        }
+-        if records.is_empty() {
+-            return Err(Error::Usage(format!(
+-                "{}: no FASTA records found",
+-                path.display()
+-            )));
+-        }
+-
+-        let stem = path
+-            .file_stem()
+-            .map(|s| s.to_string_lossy().to_string())
+-            .ok_or_else(|| Error::Usage(format!("{}: cannot derive a name", path.display())))?;
++        let records = fasta_records(path)?;
++        let stem = file_stem(path)?;
+         let n_in_file = records.len();
+         for (record_id, seq) in records {
+-            if seq.is_empty() {
+-                return Err(Error::Usage(format!(
+-                    "{}: record {record_id:?} has no sequence",
+-                    path.display()
+-                )));
+-            }
+-            if seq.len() % 3 != 0 {
+-                eprintln!(
+-                    "[warn] {}: record {record_id:?} length {} is not a multiple of 3; \
+-                     codon analysis downstream expects a CDS",
+-                    path.display(),
+-                    seq.len()
+-                );
+-            }
+-            let ambiguous = seq
+-                .iter()
+-                .filter(|b| !matches!(b, b'A' | b'C' | b'G' | b'T'))
+-                .count();
+-            if ambiguous > 0 {
+-                eprintln!(
+-                    "[warn] {}: record {record_id:?} has {ambiguous} non-ACGT base(s); \
+-                     k-mers spanning them cannot match Logan unitigs",
+-                    path.display()
+-                );
+-            }
++            check_record(path, &record_id, &seq)?;
+             let name = if n_in_file == 1 {
+                 stem.clone()
+             } else {
+@@ -411,7 +343,7 @@
+     }
+ 
+     #[test]
+-    fn multi_record_uses_first_and_warns() {
++    fn multi_record_read_query_uses_first_and_counts_all() {
+         let p = tmp("multi.fasta", b">one\nAAA\n>two\nCCC\n");
+         let q = read_query(&p).unwrap();
+         assert_eq!(q.record_id, "one");
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -445,27 +445,18 @@
+     //
+     // Multi-anchor is auto-enabled when the collected reference set has more than one
+     // record, from any combination: several -q files, one multi-record file, or both.
+-    // The single-file/single-record legacy path stays byte-identical (uses `read_query`).
+-    // Any wider intake uses `read_query_set`, and is announced below.
++    // Every intake goes through `read_query_set`; a lone single-record file still has
++    // `n_records == 1`, so the single-anchor path stays byte-identical. Wider intake is
++    // announced below.
+     let queries: Option<Vec<crate::types::Query>> = if args.cfg.fetch_only {
+         None
+     } else {
+         if args.query.is_empty() {
+             return Err(error::Error::Usage("--query is required".into()));
+         }
+-        // Try the legacy single-file path first for its n_records semantics.
+-        // If that file turns out to hold more than one record, re-load through
+-        // read_query_set so the whole pool goes into anchor union / align fan-out.
+-        Some(if args.query.len() == 1 {
+-            let first = io::input::read_query(&args.query[0])?;
+-            if first.n_records > 1 {
+-                io::input::read_query_set(&args.query)?
+-            } else {
+-                vec![first]
+-            }
+-        } else {
+-            io::input::read_query_set(&args.query)?
+-        })
++        // One read per file. A single single-record file keeps `n_records == 1`, which is what
++        // keeps align's byte-identical single-anchor path (align.rs `queries.len() == 1`).
++        Some(io::input::read_query_set(&args.query)?)
+     };
+ 
+     let accessions = match (&args.accession, &args.accession_list) {
+diff --git a/walker/src/pipeline.rs b/walker/src/pipeline.rs
+--- a/walker/src/pipeline.rs
++++ b/walker/src/pipeline.rs
+@@ -740,11 +740,10 @@
+             // out keeps the unpruned subgraph in that branch, which is the same "never a
+             // regression" rule the failed-realign path applies.
+             //
+-            // Predicate must match `prune_nodes` exactly.
+             let surviving = subgraph
+                 .nodes
+                 .iter()
+-                .filter(|&&id| graph.abundance[id as usize] >= floor)
++                .filter(|&&id| stages::extract::survives_prune(&graph, id, floor))
+                 .count();
+ 
+             let unpruned_span = (path.query_start, path.query_end);
+@@ -994,7 +993,7 @@
+ mod prune_outcome_tests {
+     use super::{prune_outcome, pruned_covers_as_much, PruneOutcome};
+     use crate::config::Config;
+-    use crate::stages::extract::{depth_floor, prune_nodes};
++    use crate::stages::extract::{depth_floor, prune_nodes, survives_prune};
+     use crate::stages::parse;
+     use crate::types::UnitigGraph;
+ 
+@@ -1074,7 +1073,7 @@
+         let nodes = vec![0u32, 1, 2];
+         let surviving = nodes
+             .iter()
+-            .filter(|&&id| g.abundance[id as usize] >= floor)
++            .filter(|&&id| survives_prune(&g, id, floor))
+             .count();
+         assert_eq!(surviving, 0);
+         assert_eq!(prune_outcome(surviving, nodes.len()), PruneOutcome::WouldEmpty);
+diff --git a/walker/src/stages/extract.rs b/walker/src/stages/extract.rs
+--- a/walker/src/stages/extract.rs
++++ b/walker/src/stages/extract.rs
+@@ -155,13 +155,25 @@
+ ///
+ /// Never below `min_abund`: this can only tighten the existing floor, never loosen it.
+ pub fn depth_floor(cfg: &Config, depth: f32) -> f32 {
+-    if cfg.prune_frac > 0.0 {
+-        (cfg.prune_frac as f32 * depth).max(cfg.min_abund)
++    relative_floor(cfg.prune_frac, depth, cfg.min_abund)
++}
++
++/// `frac` of `depth`, never below `min_abund`; `min_abund` alone when `frac` is off.
++/// Shared by the prune floor (`--prune-frac`) and the allele floor (`--min-abund-frac`).
++pub fn relative_floor(frac: f64, depth: f32, min_abund: f32) -> f32 {
++    if frac > 0.0 {
++        (frac as f32 * depth).max(min_abund)
+     } else {
+-        cfg.min_abund
++        min_abund
+     }
+ }
+ 
++/// Whether unitig `id` is kept by a prune at `floor`. The single definition of the predicate:
++/// `prune_nodes` and the pipeline's survivor count both call it.
++pub fn survives_prune(graph: &UnitigGraph, id: UnitigId, floor: f32) -> bool {
++    graph.abundance[id as usize] >= floor
++}
++
+ /// Keep only the unitigs carrying at least `floor` coverage.
+ ///
+ /// Node-level, not edge-level: an error branch is a *unitig* that should not be in the
+@@ -175,7 +187,7 @@
+     let mut kn = Vec::with_capacity(nodes.len());
+     let mut ks = Vec::with_capacity(seqs.len());
+     for (id, seq) in nodes.into_iter().zip(seqs) {
+-        if graph.abundance[id as usize] >= floor {
++        if survives_prune(graph, id, floor) {
+             kn.push(id);
+             ks.push(seq);
+         }
+diff --git a/walker/src/stages/variants.rs b/walker/src/stages/variants.rs
+--- a/walker/src/stages/variants.rs
++++ b/walker/src/stages/variants.rs
+@@ -170,7 +170,7 @@
+     for _ in 0..cfg.max_alts.max(1) * 2 {
+         let Some(v) = view(graph, subgraph, &current) else { break };
+         let abund = |o: Oriented| graph.abundance[subgraph.nodes[(o as usize) / 2] as usize];
+-        let depth = path_depth(graph, subgraph, &v.walk);
++        let depth = crate::stages::extract::path_depth(graph, &current.steps);
+         let floor = abundance_floor(cfg, depth);
+ 
+         let mut applied = false;
+@@ -360,7 +360,7 @@
+     let baseline_len = stitched_len(cfg, &path.steps, subgraph);
+ 
+     let abund = |o: Oriented| graph.abundance[subgraph.nodes[(o as usize) / 2] as usize];
+-    let depth = path_depth(graph, subgraph, &walk);
++    let depth = crate::stages::extract::path_depth(graph, &path.steps);
+     let floor = abundance_floor(cfg, depth);
+ 
+     // Counters, so a zero result can be told apart from a filtered one. Calibration needs
+@@ -530,32 +530,11 @@
+     Ok(alts)
+ }
+ 
+-/// The gene's own sequencing depth: median `ka:f` over the nodes the walk uses.
+-///
+-/// The walked path is the gene, so this measures the quantity the floor is relative to.
+-/// Median rather than mean because a single repeat-collapsed unitig at 25,000x should not
+-/// drag the estimate for an otherwise ordinary accession.
+-fn path_depth(graph: &UnitigGraph, subgraph: &Subgraph, walk: &[Oriented]) -> f32 {
+-    let mut ab: Vec<f32> = walk
+-        .iter()
+-        .map(|&o| graph.abundance[subgraph.nodes[(o as usize) / 2] as usize])
+-        .collect();
+-    if ab.is_empty() {
+-        return 0.0;
+-    }
+-    ab.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+-    ab[ab.len() / 2]
+-}
+-
+ /// The abundance a branch must clear to count as an allele.
+ ///
+ /// Never below `min_abund`: this can only tighten the existing gate, never loosen it.
+ fn abundance_floor(cfg: &Config, depth: f32) -> f32 {
+-    if cfg.min_abund_frac > 0.0 {
+-        (cfg.min_abund_frac as f32 * depth).max(cfg.min_abund)
+-    } else {
+-        cfg.min_abund
+-    }
++    crate::stages::extract::relative_floor(cfg.min_abund_frac, depth, cfg.min_abund)
+ }
+ 
+ fn strand_of(o: Oriented) -> Strand {
+@@ -1011,8 +990,11 @@
+     fn depth_is_the_median_of_the_walked_path() {
+         let g = diamond(60.0, 40.0);
+         let s = subgraph_of(&g);
+-        let walk = vec![1u32, 3, 7]; // nodes 0, 1, 3 forward: ka:f 100, 60, 100
+-        assert_eq!(path_depth(&g, &s, &walk), 100.0);
++        let walk = [1u32, 3, 7]; // nodes 0, 1, 3 forward: ka:f 100, 60, 100
++        let steps: Vec<PathStep> = walk.iter()
++            .map(|&o| PathStep { node: s.nodes[(o as usize) / 2], orient: Orient::Forward })
++            .collect();
++        assert_eq!(crate::stages::extract::path_depth(&g, &steps), 100.0);
+     }
+ 
+     /// End to end: the same 60/40 site is recovered at the default floor and suppressed once

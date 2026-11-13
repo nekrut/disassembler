@@ -1,0 +1,26 @@
+diff --git a/walker/src/stages/extract.rs b/walker/src/stages/extract.rs
+--- a/walker/src/stages/extract.rs
++++ b/walker/src/stages/extract.rs
+@@ -563,13 +563,16 @@
+ 
+     fn load(dir: &str, acc: &str) -> Option<UnitigGraph> {
+         let p = format!("{dir}/{acc}.unitigs.fa.zst");
+-        let compressed = std::fs::read(&p).ok()?;
+-        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
+-        let g = {
+-            let rd = stream::decoder(&f).ok()?;
+-            parse::build(&f.accession, rd).ok()
++        // Only an absent file is "no data"; a file that is present but unreadable, truncated
++        // or corrupt must fail the test, as it does in phase_real and stitch_real.
++        let compressed = match std::fs::read(&p) {
++            Ok(b) => b,
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
++            Err(e) => panic!("{p}: {e}"),
+         };
+-        g
++        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
++        let rd = stream::decoder(&f).unwrap_or_else(|e| panic!("{p}: {e}"));
++        Some(parse::build(&f.accession, rd).unwrap_or_else(|e| panic!("{p}: {e}")))
+     }
+ 
+     #[test]

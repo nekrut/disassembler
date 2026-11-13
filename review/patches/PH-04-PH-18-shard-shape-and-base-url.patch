@@ -1,0 +1,100 @@
+diff --git a/src/disassembler/cmd/harvest.py b/src/disassembler/cmd/harvest.py
+index a384857a04e9..000000000000 100644
+--- a/src/disassembler/cmd/harvest.py
++++ b/src/disassembler/cmd/harvest.py
+@@ -138,32 +138,46 @@
+     return None
+ 
+ 
++class ShardShapeError(ValueError):
++    """A shard JSON object that is not {index: {query: {sample: number}}}."""
++
++
+ def _merge_payload(d, per_target):
+     """Fold one shard payload into per_target in place. Returns the count of
+     target names that were skipped as unusable (dict key / filename).
+ 
+-    Pulled out of harvest_collection so the local-files path can reuse the
+-    exact same merge semantics. Malformed-payload handling stays at the call
+-    site, where it is wired to the per-mode failure counter.
++    Raises ShardShapeError, before touching per_target, when the payload is not
++    kmindex's `--format json` shape {index: {query: {sample: number}}}: a level of
++    the wrong type, or a score that is not a number, used to be skipped silently,
++    so a harvest of `json_vec` shards (sample -> {"R": .., "P": [..]}) ended
++    with 0 targets and exit 0.
+     """
+-    n_bad_target = 0
++    staged = []
+     for shard, q in d.items():
+         if not isinstance(q, dict):
+-            continue
++            raise ShardShapeError(f"index {shard!r} maps to a {type(q).__name__}, "
++                                  f"not {{query: {{sample: score}}}}")
+         for target_name, hits in q.items():
+             if not isinstance(hits, dict):
+-                continue
+-            clean_target = safe_target_name(target_name)
+-            if clean_target is None:
+-                n_bad_target += 1
+-                continue
++                raise ShardShapeError(f"query {target_name!r} maps to a "
++                                      f"{type(hits).__name__}, not {{sample: score}}")
+             for acc, score in hits.items():
+-                try:
+-                    sc = float(score)
+-                except Exception:
+-                    continue
+-                if sc > per_target[clean_target].get(acc, 0.0):
+-                    per_target[clean_target][acc] = sc
++                if isinstance(score, bool) or not isinstance(score, (int, float)):
++                    hint = (" (was kmindex run with --format json_vec?)"
++                            if isinstance(score, dict) and "R" in score else "")
++                    raise ShardShapeError(f"sample {acc!r} has a {type(score).__name__} "
++                                          f"score, not a number{hint}")
++            staged.append((target_name, hits))
++    n_bad_target = 0
++    for target_name, hits in staged:
++        clean_target = safe_target_name(target_name)
++        if clean_target is None:
++            n_bad_target += 1
++            continue
++        for acc, score in hits.items():
++            sc = float(score)
++            if sc > per_target[clean_target].get(acc, 0.0):
++                per_target[clean_target][acc] = sc
+     return n_bad_target
+ 
+ 
+@@ -288,6 +302,8 @@
+     """Walk a dataset collection via the history endpoint; fetch all shard JSONs in parallel."""
+     print(f"[*] Fetching collection elements for {coll_id} in history {history_id}...")
+     headers = {"x-api-key": api_key}
++    # A trailing slash made `//api/...`, which usegalaxy.org answers with its HTML client.
++    base_url = base_url.rstrip("/")
+     url = f"{base_url}/api/histories/{history_id}/contents/dataset_collections/{coll_id}"
+     # Wrap the initial GET: `requests.get` can raise ConnectionError / Timeout / etc. on a
+     # bad --base-url or a dead network, which used to surface as a raw Python traceback
+@@ -300,12 +316,21 @@
+         ) from e
+     if r.status_code != 200:
+         raise RuntimeError(f"Galaxy API error ({r.status_code}): {r.text}")
+-    dc = r.json()
++    try:
++        dc = r.json()
++    except ValueError as e:
++        raise RuntimeError(
++            f"{url} answered HTTP 200 but not with JSON (Content-Type "
++            f"{r.headers.get('Content-Type')!r}); check --base-url"
++        ) from e
++    if not isinstance(dc, dict):
++        raise RuntimeError(f"unexpected Galaxy collection answer: JSON "
++                           f"{type(dc).__name__}, not an object")
+     items = []
+ 
+     def walk(elems):
+         for e in elems:
+-            o = e.get("object", {})
++            o = e.get("object") or {}
+             if "elements" in o and o.get("history_content_type") != "dataset":
+                 walk(o.get("elements", []))
+             else:

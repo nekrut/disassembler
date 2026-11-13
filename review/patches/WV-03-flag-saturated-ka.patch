@@ -1,0 +1,231 @@
+diff --git a/walker/src/io/output.rs b/walker/src/io/output.rs
+--- a/walker/src/io/output.rs
++++ b/walker/src/io/output.rs
+@@ -134,7 +134,7 @@
+             writeln!(
+                 w,
+                 ">{} cov={:.3} inherited_pident={:.1} nodes={} vaf={:.3} alt_kaf={:.1} \
+-                 primary_vaf={:.3} fork={}{} alt_node={}{} detour={} dlen={:+} span={}{}",
++                 primary_vaf={:.3} fork={}{} alt_node={}{} detour={} dlen={:+} span={}{}{}",
+                 h.id, h.cov, h.pident, h.nodes,
+                 a.alt_vaf, a.alt_abundance, a.taken_vaf,
+                 a.fork, strand_str(a.fork_strand),
+@@ -142,6 +142,7 @@
+                 a.detour_nodes,
+                 a.length_delta,
+                 a.replaced_span,
++                if a.ka_saturated { " ka_sat=1" } else { "" },
+                 anchor_suffix,
+             )?;
+             w.write_all(&h.seq)?;
+@@ -335,14 +336,15 @@
+                 w,
+                 "      \"prune\": {{\"outcome\": \"{}\", \"depth\": {:.1}, \"floor\": {:.1}, \
+                  \"unitigs\": {}, \"unitigs_kept\": {}, \"unpruned_span\": {}, \
+-                 \"pruned_span\": {}}},",
++                 \"pruned_span\": {}, \"depth_saturated\": {}}},",
+                 p.result.as_str(),
+                 p.depth,
+                 p.floor,
+                 p.unitigs,
+                 p.unitigs_kept,
+                 span(Some(p.unpruned_span)),
+-                span(p.pruned_span)
++                span(p.pruned_span),
++                p.depth >= crate::types::KA_CEILING
+             )?;
+         }
+     }
+@@ -490,11 +492,12 @@
+             let aos: Vec<String> = row.alts.iter().map(|&(_, _, ka)| format!("{ka:.1}")).collect();
+             writeln!(
+                 w,
+-                "{}\t{}\t.\t{}\t{}\t.\tPASS\tAF={};AO={};RO={:.1};FORK={}\tGT:AF:AO:RO\t.:{}:{}:{:.1}",
++                "{}\t{}\t.\t{}\t{}\t.\t{}\tAF={};AO={};RO={:.1};FORK={}\tGT:AF:AO:RO\t.:{}:{}:{:.1}",
+                 chrom,
+                 row.pos,
+                 row.ref_base as char,
+                 alt_bases.join(","),
++                if row.ka_saturated { "KaSat" } else { "PASS" },
+                 afs.join(","),
+                 aos.join(","),
+                 row.ref_ka,
+@@ -534,14 +537,14 @@
+         }
+     }
+     let mut w = BufWriter::new(std::fs::File::create(path)?);
+-    writeln!(w, "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork")?;
++    writeln!(w, "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork\tka_saturated")?;
+     for (r, rows) in summary.results.iter().zip(sites) {
+         let chrom = chrom_of(reference_of(r, queries));
+         for row in rows {
+             for &(alt, af, ka_alt) in &row.alts {
+                 writeln!(
+                     w,
+-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.1}\t{:.1}\t{}",
++                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.1}\t{:.1}\t{}\t{}",
+                     chrom,
+                     row.pos,
+                     row.ref_base as char,
+@@ -551,6 +554,7 @@
+                     ka_alt,
+                     row.ref_ka,
+                     row.fork,
++                    u8::from(row.ka_saturated),
+                 )?;
+             }
+         }
+@@ -638,7 +642,7 @@
+         } else {
+             0.0
+         };
+-        rows.push(VcfRow { pos: qpos + 1, ref_base, alts, ref_ka, fork: a.fork });
++        rows.push(VcfRow { pos: qpos + 1, ref_base, alts, ref_ka, fork: a.fork, ka_saturated: a.ka_saturated });
+     }
+     rows.sort_by_key(|r| (r.pos, r.fork));
+ 
+@@ -654,6 +658,7 @@
+         if let Some(last) = merged.last_mut() {
+             if last.pos == row.pos {
+                 last.ref_ka = last.ref_ka.max(row.ref_ka);
++                last.ka_saturated |= row.ka_saturated;
+                 for (base, af, ka) in row.alts {
+                     if !last.alts.iter().any(|&(b, _, _)| b == base) {
+                         last.alts.push((base, af, ka));
+@@ -674,6 +679,8 @@
+     alts: Vec<(u8, f64, f32)>,
+     ref_ka: f32,
+     fork: crate::types::UnitigId,
++    /// A branch at the fork is at `KA_CEILING`: AF is a bound.
++    ka_saturated: bool,
+ }
+ 
+ fn write_vcf_header<W: Write>(w: &mut W, chrom: &str, len: usize, sample: &str) -> Result<()> {
+@@ -685,6 +692,8 @@
+          and NOT phased: two rows do not assert co-occurrence on one molecule."
+     )?;
+     writeln!(w, "##contig=<ID={chrom},length={len}>")?;
++    writeln!(w, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
++    writeln!(w, "##FILTER=<ID=KaSat,Description=\"A branch at the fork is at Logan's ka:f ceiling (25000): AF and RO are bounds, the minor allele's AF an overestimate\">")?;
+     writeln!(w, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency, ka:f ratio at the fork\">")?;
+     writeln!(w, "##INFO=<ID=AO,Number=A,Type=Float,Description=\"Alternate allele k-mer coverage (ka:f)\">")?;
+     writeln!(w, "##INFO=<ID=RO,Number=1,Type=Float,Description=\"Reference allele k-mer coverage (ka:f); 0 if the gene base is not observed\">")?;
+@@ -962,7 +971,7 @@
+ 
+ #[cfg(test)]
+ mod vcf_tests {
+-    use super::{align_primary_to_query, chrom_of, reference_of, snv_sites, snv_sites_all, write_vcfs};
++    use super::{align_primary_to_query, chrom_of, reference_of, snv_sites, snv_sites_all, write_alts, write_snv_table, write_vcfs};
+     use crate::pipeline::Summary;
+     use crate::types::{
+         AccessionResult, AltHaplotype, Haplotype, Outcome, Query, Strand, Timing,
+@@ -997,6 +1006,7 @@
+             detour_nodes: 1,
+             length_delta: 0,
+             replaced_span: 1,
++            ka_saturated: false,
+         }
+     }
+ 
+@@ -1083,6 +1093,32 @@
+         std::fs::remove_dir_all(&dir).ok();
+     }
+ 
++    /// A fork with a branch at Logan's ka:f ceiling is not a clean frequency call: its AF is
++    /// a bound. The VCF must say so in FILTER and the long table in `ka_saturated`.
++    #[test]
++    fn a_saturated_fork_is_flagged_not_passed() {
++        let dir = std::env::temp_dir().join(format!("logan-vcf-sat-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        let q = [query(b"TTTATTT")];
++        let mut a = alt(b"TTTGTTT", 0.1071, 3000.0);
++        a.taken_abundance = crate::types::KA_CEILING;
++        a.ka_saturated = true;
++        let s = Summary { total: 1, success: 1, results: vec![result(b"TTTATTT", vec![a])] };
++        let sites = snv_sites_all(&s, &q);
++        write_vcfs(&s, &q, &dir, &sites).unwrap();
++        write_snv_table(&s, &q, &dir.join("snvs.tsv"), &sites).unwrap();
++        write_alts(&s, &dir.join("alts.fa")).unwrap();
++        let vcf = std::fs::read_to_string(dir.join("ACC.vcf")).unwrap();
++        let row = vcf.lines().find(|l| !l.starts_with('#')).unwrap();
++        assert_eq!(row.split('\t').nth(6), Some("KaSat"), "{row}");
++        assert!(vcf.contains("##FILTER=<ID=KaSat"), "{vcf}");
++        let tsv = std::fs::read_to_string(dir.join("snvs.tsv")).unwrap();
++        assert!(tsv.lines().next().unwrap().ends_with("\tka_saturated"), "{tsv}");
++        assert!(tsv.lines().nth(1).unwrap().ends_with("\t1"), "{tsv}");
++        assert!(std::fs::read_to_string(dir.join("alts.fa")).unwrap().contains(" ka_sat=1"));
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
+     /// Two forks at DIFFERENT positions stay two records.
+     #[test]
+     fn distinct_positions_stay_separate() {
+@@ -1217,7 +1253,7 @@
+             "\"provisional\": true",
+             "\"prune\": {\"outcome\": \"refused_shorter_span\", \"depth\": 1700.0, \"floor\": 17.0, \
+              \"unitigs\": 4976, \"unitigs_kept\": 1734, \"unpruned_span\": [0, 3821], \
+-             \"pruned_span\": [424, 3821]}",
++             \"pruned_span\": [424, 3821], \"depth_saturated\": false}",
+         ] {
+             assert!(out.contains(want), "missing {want}: {out}");
+         }
+@@ -1237,6 +1273,7 @@
+             detour_nodes: 1,
+             length_delta: 0,
+             replaced_span: 1,
++            ka_saturated: false,
+         }
+     }
+ 
+diff --git a/walker/src/stages/variants.rs b/walker/src/stages/variants.rs
+--- a/walker/src/stages/variants.rs
++++ b/walker/src/stages/variants.rs
+@@ -393,6 +393,9 @@
+         if taken_ab < floor || taken_vaf < cfg.min_vaf {
+             continue;
+         }
++        // A branch at Logan's ceiling makes `total` a lower bound, so every share computed
++        // from it is a bound too. Keep the call (recall) but say so in every output.
++        let ka_saturated = branches.iter().any(|&b| abund(b) >= crate::types::KA_CEILING);
+ 
+         for &alt in branches {
+             if alt == taken || alts.len() >= cfg.max_alts {
+@@ -512,6 +515,7 @@
+                 detour_nodes: detour.len(),
+                 length_delta: delta,
+                 replaced_span,
++                ka_saturated,
+             });
+         }
+     }
+diff --git a/walker/src/types.rs b/walker/src/types.rs
+--- a/walker/src/types.rs
++++ b/walker/src/types.rs
+@@ -103,7 +103,8 @@
+     /// in bit 31. Use `stages::parse::{pack_edge, unpack_edge}` rather than doing it by hand.
+     /// 30 bits caps an accession at 2^30 unitigs, which `parse::build` enforces.
+     pub targets: Vec<u32>,
+-    /// Mean k-mer coverage (`ka:f:`) per unitig.
++    /// Mean k-mer coverage (`ka:f:`) per unitig. Approximate (Logan: within ~5%, on a coarse
++    /// grid) and clipped at [`KA_CEILING`]: a value there is a lower bound, not a depth.
+     pub abundance: Vec<f32>,
+     /// All unitig sequences, 2 bits per base, 4 bases per byte.
+     ///
+@@ -329,8 +330,17 @@
+     /// No cap is applied, because one would discard the phased blocks along with the
+     /// reroutings; the number is emitted so a reader can tell them apart.
+     pub replaced_span: usize,
++    /// Some branch at the fork sits at [`KA_CEILING`], so `alt_vaf`/`taken_vaf` are bounds
++    /// (the unsaturated allele's share is overestimated), not estimates.
++    pub ka_saturated: bool,
+ }
+ 
++/// The largest `ka:f` Logan publishes. Cuttlefish2 caps its (k+1)-mer counts (Logan
++/// Unitigs.md, "Theoretical guarantees") and the k-mer value is a half-sum of them; every
++/// accession measured tops out at exactly 25000.0 with hundreds of unitigs piled there
++/// (SRR8209082: 802 of 81,534; SRR6251967, SRR6007473, ERR2028820 likewise), none above.
++pub const KA_CEILING: f32 = 25_000.0;
++
+ // ---------------------------------------------------------------------------
+ // stage 7 output: phase
+ // ---------------------------------------------------------------------------

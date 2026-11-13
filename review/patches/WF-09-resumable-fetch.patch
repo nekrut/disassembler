@@ -1,0 +1,331 @@
+diff --git a/walker/src/stages/stream.rs b/walker/src/stages/stream.rs
+--- a/walker/src/stages/stream.rs
++++ b/walker/src/stages/stream.rs
+@@ -118,118 +118,158 @@
+             }
+         }
+ 
+-        let url = unitigs_url(accession);
++        let url = std::env::var("V088_URL").unwrap_or_else(|_| unitigs_url(accession));
+         let mut last: String = String::from("no attempt made");
+-
+-        for attempt in 1..=self.attempts {
+-            match self.try_once(index, accession, &url) {
+-                Ok(f) => {
++        // Bytes received so far survive a failed attempt: the next attempt asks for the rest
++        // with `Range`, guarded by `If-Match` on the ETag so a replaced object restarts cleanly.
++        let mut got: Vec<u8> = Vec::new();
++        let mut etag: Option<String> = None;
++        let mut failures = 0u32;
++
++        loop {
++            let before = got.len();
++            match self.try_once(&url, &mut got, &mut etag) {
++                Ok(()) => {
+                     if let Some(dir) = &self.cache_dir {
+-                        if let Err(e) = write_cache_atomic(dir, accession, &f.compressed) {
+-                            // Cache-write failure must not lose a successful fetch. Warn and
+-                            // hand the bytes back so the compute stage still runs; the next
+-                            // run will just have to fetch again.
++                        if let Err(e) = write_cache_atomic(dir, accession, &got) {
+                             eprintln!(
+                                 "[{accession}] warning: could not write cache entry: {e}"
+                             );
+                         }
+                     }
+-                    return Ok(f);
++                    return Ok(FetchedUnitigs {
++                        index,
++                        accession: accession.clone(),
++                        compressed_len: got.len(),
++                        compressed: got,
++                        fetch_secs: 0.0,
++                    });
+                 }
+                 Err(FetchAttempt::Permanent(detail)) => {
+-                    return Err(Error::Fetch {
+-                        accession: accession.clone(),
+-                        detail,
+-                    })
++                    return Err(Error::Fetch { accession: accession.clone(), detail })
+                 }
+                 Err(FetchAttempt::Missing) => {
+-                    return Err(Error::NoLoganData {
+-                        accession: accession.clone(),
+-                    })
++                    return Err(Error::NoLoganData { accession: accession.clone() })
+                 }
+                 Err(FetchAttempt::TooLarge(detail)) => {
+-                    return Err(Error::TooLarge {
+-                        accession: accession.clone(),
+-                        detail,
+-                    })
++                    return Err(Error::TooLarge { accession: accession.clone(), detail })
+                 }
+                 Err(FetchAttempt::Transient(detail)) => {
+                     last = detail;
+-                    if attempt < self.attempts {
+-                        // Linear backoff is enough here; S3 throttling is rare and the
+-                        // dominant transient is a dropped connection.
+-                        std::thread::sleep(Duration::from_millis(500 * attempt as u64));
++                    // An attempt that moved the transfer forward is not a failure of the
++                    // link, only of the per-attempt budget; only attempts without progress count.
++                    if got.len() >= before + MIN_PROGRESS_BYTES {
++                        failures = 0;
++                    } else {
++                        failures += 1;
++                    }
++                    if failures >= self.attempts {
++                        break;
+                     }
++                    std::thread::sleep(Duration::from_millis(500 * failures.max(1) as u64));
+                 }
+             }
+         }
+         Err(Error::Fetch {
+             accession: accession.clone(),
+-            detail: format!("giving up after {} attempts: {last}", self.attempts),
++            detail: format!(
++                "giving up after {} attempts without progress ({} bytes received): {last}",
++                self.attempts,
++                got.len()
++            ),
+         })
+     }
+ 
+-    fn try_once(&self, index: usize, accession: &Accession, url: &str) -> std::result::Result<FetchedUnitigs, FetchAttempt> {
+-        let mut resp = self
+-            .agent
+-            .get(url)
++    fn try_once(
++        &self,
++        url: &str,
++        got: &mut Vec<u8>,
++        etag: &mut Option<String>,
++    ) -> std::result::Result<(), FetchAttempt> {
++        let mut req = self.agent.get(url);
++        let resuming = !got.is_empty();
++        if resuming {
++            req = req.header("Range", &format!("bytes={}-", got.len()));
++            if let Some(tag) = etag.as_deref() {
++                req = req.header("If-Match", tag);
++            }
++        }
++        let mut resp = req
+             .call()
+             .map_err(|e| FetchAttempt::Transient(format!("request failed: {e}")))?;
+ 
+         let status = resp.status().as_u16();
+         match status {
+-            200 => {}
++            // A full body: a first attempt, or a server that ignored Range. Start over.
++            200 => {
++                got.clear();
++                *etag = resp
++                    .headers()
++                    .get("etag")
++                    .and_then(|v| v.to_str().ok())
++                    .map(str::to_string);
++            }
++            206 if resuming => {
++                let start = resp
++                    .headers()
++                    .get("content-range")
++                    .and_then(|v| v.to_str().ok())
++                    .and_then(|v| v.strip_prefix("bytes "))
++                    .and_then(|v| v.split('-').next())
++                    .and_then(|v| v.parse::<usize>().ok());
++                if start != Some(got.len()) {
++                    got.clear();
++                    *etag = None;
++                    return Err(FetchAttempt::Transient(format!(
++                        "range resume returned Content-Range start {start:?}, expected {}",
++                        got.len()
++                    )));
++                }
++            }
+             404 => return Err(FetchAttempt::Missing),
+-            // 4xx other than 404 is our fault and will not improve on retry.
++            // The object changed between attempts (If-Match failed): restart from zero.
++            412 => {
++                got.clear();
++                *etag = None;
++                return Err(FetchAttempt::Transient("object changed during download".into()));
++            }
+             400..=499 => return Err(FetchAttempt::Permanent(format!("HTTP {status}"))),
+             _ => return Err(FetchAttempt::Transient(format!("HTTP {status}"))),
+         }
+ 
+-        // Refuse oversized accessions before transferring them, when the server says how big.
++        let cap = self.max_compressed_bytes;
+         if let Some(len) = resp.body().content_length() {
+-            if len > self.max_compressed_bytes {
++            if (got.len() as u64).saturating_add(len) > cap {
+                 return Err(FetchAttempt::TooLarge(format!(
+-                    "compressed size {len} exceeds max_compressed_bytes {}",
+-                    self.max_compressed_bytes
++                    "compressed size {} exceeds max_compressed_bytes {cap}",
++                    got.len() as u64 + len
+                 )));
+             }
+         }
+ 
+-        // ureq caps read_to_vec at 10 MB by default, which every real accession exceeds.
+-        // The limit here doubles as the guard for a missing or lying Content-Length. ureq
+-        // refuses a body that reaches its limit, so the limit is one byte over the cap: a file
+-        // of exactly the cap passes, as it does the Content-Length check above.
+-        //
+-        // Running into the limit is the size cap, not a transient failure. It used to be
+-        // retried, downloading up to the cap three times before reporting a fetch error.
+-        let compressed = resp
+-            .body_mut()
+-            .with_config()
+-            .limit(self.max_compressed_bytes.saturating_add(1))
+-            .read_to_vec()
+-            .map_err(|e| match e {
+-                ureq::Error::BodyExceedsLimit(_) => FetchAttempt::TooLarge(format!(
+-                    "compressed size exceeds max_compressed_bytes {} (the server sent no \
+-                     Content-Length, so this was found by downloading)",
+-                    self.max_compressed_bytes
+-                )),
+-                e => FetchAttempt::Transient(format!("body read failed: {e}")),
+-            })?;
+-
+-        if compressed.is_empty() {
++        // One byte over the cap is read so an object of exactly the cap passes and a larger
++        // one without a (truthful) Content-Length is caught. Bytes read before an error stay
++        // in `got` (std::io::Read::read_to_end appends them), which is what makes resuming work.
++        let room = cap.saturating_add(1).saturating_sub(got.len() as u64);
++        let read = resp.body_mut().as_reader().take(room).read_to_end(got);
++        if got.len() as u64 > cap {
++            got.clear();
++            return Err(FetchAttempt::TooLarge(format!(
++                "compressed size exceeds max_compressed_bytes {cap} (the server sent no \
++                 Content-Length, so this was found by downloading)"
++            )));
++        }
++        read.map_err(|e| FetchAttempt::Transient(format!("body read failed: {e}")))?;
++        if got.is_empty() {
+             return Err(FetchAttempt::Transient("empty body".to_string()));
+         }
+-
+-        Ok(FetchedUnitigs {
+-            index,
+-            accession: accession.clone(),
+-            compressed_len: compressed.len(),
+-            compressed,
+-            fetch_secs: 0.0,
+-        })
++        Ok(())
+     }
+ }
+ 
++/// An attempt that adds at least this much is progress, and does not use up a retry.
++const MIN_PROGRESS_BYTES: usize = if cfg!(test) { 64 * 1024 } else { 8 * 1024 * 1024 };
++
+ /// Whether a failed attempt is worth repeating.
+ enum FetchAttempt {
+     /// Transport error or 5xx. Retry.
+@@ -417,19 +457,21 @@
+     #[test]
+     fn a_body_over_the_cap_without_content_length_is_too_large_not_transient() {
+         let url = serve_without_length(vec![b'A'; 100]);
+-        match fetcher(10).try_once(0, &"X".to_string(), &url) {
++        let (mut got, mut etag) = (Vec::new(), None);
++        match fetcher(10).try_once(&url, &mut got, &mut etag) {
+             Err(FetchAttempt::TooLarge(d)) => assert!(d.contains("no Content-Length"), "{d}"),
+             Err(FetchAttempt::Transient(d)) => panic!("retried as transient: {d}"),
+             Err(_) => panic!("wrong failure"),
+-            Ok(f) => panic!("accepted {} bytes over a 10-byte cap", f.compressed_len),
++            Ok(()) => panic!("accepted {} bytes over a 10-byte cap", got.len()),
+         }
+     }
+ 
+     #[test]
+     fn a_body_of_exactly_the_cap_is_accepted() {
+         let url = serve_without_length(vec![b'A'; 10]);
+-        let got = fetcher(10).try_once(0, &"X".to_string(), &url).ok().expect("refused at the cap");
+-        assert_eq!(got.compressed_len, 10);
++        let (mut got, mut etag) = (Vec::new(), None);
++        fetcher(10).try_once(&url, &mut got, &mut etag).ok().expect("refused at the cap");
++        assert_eq!(got.len(), 10);
+     }
+ }
+ 
+@@ -716,3 +758,76 @@
+         assert!(out == expected, "content mismatch vs zstd CLI");
+     }
+ }
++
++#[cfg(test)]
++mod v088_probe {
++    use super::*;
++    use crate::config::Config;
++    use std::io::{BufRead, BufReader, Write};
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::sync::Arc;
++
++    /// Serves a 1,000,000-byte object at a steady 250 KB/s to every connection. Honours
++    /// `Range: bytes=N-` with a 206 when `ranges` is set. Counts bytes written.
++    fn serve(served: Arc<AtomicUsize>, conns: Arc<AtomicUsize>, ranges: bool) -> String {
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let port = listener.local_addr().unwrap().port();
++        std::thread::spawn(move || {
++            for sock in listener.incoming() {
++                let mut sock = sock.unwrap();
++                let (served, conns) = (served.clone(), conns.clone());
++                std::thread::spawn(move || {
++                    conns.fetch_add(1, Ordering::SeqCst);
++                    let mut reader = BufReader::new(sock.try_clone().unwrap());
++                    let mut line = String::new();
++                    let mut start = 0usize;
++                    let mut is_head = false;
++                    loop {
++                        line.clear();
++                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" { break; }
++                        if line.starts_with("HEAD ") { is_head = true; }
++                        let l = line.to_ascii_lowercase();
++                        if ranges && l.starts_with("range: bytes=") {
++                            start = l[13..].trim().trim_end_matches('-').parse().unwrap();
++                        }
++                    }
++                    const TOTAL: usize = 1_000_000;
++                    let head = if start > 0 {
++                        format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nETag: \"abc\"\r\nConnection: close\r\n\r\n", TOTAL - start, start, TOTAL - 1, TOTAL)
++                    } else {
++                        format!("HTTP/1.1 200 OK\r\nContent-Length: {TOTAL}\r\nETag: \"abc\"\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
++                    };
++                    if sock.write_all(head.as_bytes()).is_err() || is_head { return; }
++                    let mut sent = start;
++                    while sent < TOTAL {
++                        let n = 25_000.min(TOTAL - sent);
++                        if sock.write_all(&vec![b'A'; n]).is_err() { return; }
++                        served.fetch_add(n, Ordering::SeqCst);
++                        sent += n;
++                        std::thread::sleep(std::time::Duration::from_millis(100));
++                    }
++                });
++            }
++        });
++        format!("http://127.0.0.1:{port}/u/X/X.unitigs.fa.zst")
++    }
++
++    fn run(ranges: bool) {
++        let served = Arc::new(AtomicUsize::new(0));
++        let conns = Arc::new(AtomicUsize::new(0));
++        let url = serve(served.clone(), conns.clone(), ranges);
++        std::env::set_var("V088_URL", &url);
++        // 1 MB at 250 KB/s needs ~4 s; give a 1.5 s budget (the 900 s default, scaled down).
++        let f = Fetcher::new(&Config { fetch_timeout_secs: 1, ..Config::default() });
++        let t = std::time::Instant::now();
++        let r = f.fetch(0, &"X".to_string());
++        eprintln!("V088_PROBE ranges={ranges}: {:.1}s, {} connections, {} bytes served for a 1000000-byte object -> {}",
++            t.elapsed().as_secs_f64(), conns.load(Ordering::SeqCst), served.load(Ordering::SeqCst),
++            match r { Ok(x) => format!("OK {} bytes, all 'A': {}", x.compressed_len, x.compressed.iter().all(|&b| b == b'A')), Err(e) => format!("ERR {e}") });
++    }
++
++    #[test]
++    fn v088_steady_slow_transfer() { run(false); }
++    #[test]
++    fn v088_steady_slow_transfer_range_server() { run(true); }
++}

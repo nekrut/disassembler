@@ -1,0 +1,79 @@
+diff --git a/bench/simulated_kmer_sensitivity/harness.py b/bench/simulated_kmer_sensitivity/harness.py
+index 149302076ca1..000000000000 100644
+--- a/bench/simulated_kmer_sensitivity/harness.py
++++ b/bench/simulated_kmer_sensitivity/harness.py
+@@ -25,9 +25,8 @@
+ 
+ # Paths
+ HERE = Path(__file__).resolve().parent
+-REPO_ROOT = HERE.parent.parent.parent
+-CDS_DIR = REPO_ROOT / "work" / "cds" / "individual"
+-ECOLI_PATH = REPO_ROOT / "work" / "galaxytools" / "tools" / "gotohscan" / "test-data" / "NC_000913.fna"
++REPO_ROOT = HERE.parents[1]
++CDS_DIR = REPO_ROOT / "queries" / "markers"
+ 
+ # Reverse complement translation table
+ COMPLEMENT = str.maketrans("ACGTacgt", "TGCAtgca")
+@@ -468,16 +467,24 @@
+ 
+ def main():
+     parser = argparse.ArgumentParser(description="Run simulated k-mer sensitivity experiment.")
+-    parser.add_argument("--replicates", type=int, default=30, help="Number of replicates per condition")
++    parser.add_argument("--replicates", type=int, default=25, help="Number of replicates per condition (committed results: 25)")
+     parser.add_argument("--bg-unitigs", type=int, default=30000, help="Number of background unitigs")
+-    parser.add_argument("--out-dir", type=str, default=str(HERE), help="Output directory")
++    parser.add_argument("--out-dir", type=str, required=True, help="Output directory")
++    parser.add_argument("--genes-dir", type=str, default=str(CDS_DIR), help="Directory holding bla_vim.fasta and bla_kpc.fasta")
++    bg = parser.add_mutually_exclusive_group(required=True)
++    bg.add_argument("--background-fasta", type=str, help="E. coli K-12 MG1655 genome (NC_000913.3) FASTA")
++    bg.add_argument("--synthetic-background", action="store_true", help="Use a random 4.6 Mb background (smoke tests only)")
++    parser.add_argument("--force", action="store_true", help="Overwrite existing results in --out-dir")
+     args = parser.parse_args()
+-    
++
+     out_dir = Path(args.out_dir)
+     out_dir.mkdir(parents=True, exist_ok=True)
++    if not args.force and any((out_dir / n).exists() for n in ("simulation_results.json", "simulation_results.csv")):
++        parser.error(f"results already exist in {out_dir}; pass --force to overwrite")
++    genes_dir = Path(args.genes_dir)
+     
+-    vim_path = CDS_DIR / "bla_vim.fasta"
+-    kpc_path = CDS_DIR / "bla_kpc.fasta"
++    vim_path = genes_dir / "bla_vim.fasta"
++    kpc_path = genes_dir / "bla_kpc.fasta"
+     
+     vim_seq = load_fasta_seq(vim_path)
+     kpc_seq = load_fasta_seq(kpc_path)
+@@ -485,13 +492,15 @@
+     print(f"Loaded bla_vim: {len(vim_seq)} bp")
+     print(f"Loaded bla_kpc: {len(kpc_seq)} bp")
+     
+-    if not ECOLI_PATH.exists():
+-        print(f"Warning: E. coli genome not found at {ECOLI_PATH}. Generating synthetic background.")
++    if args.synthetic_background:
++        print("Using a SYNTHETIC random background (not the E. coli genome the README reports).")
+         rng = random.Random(1337)
+         ecoli_seq = "".join(rng.choices("ACGT", weights=[0.24, 0.26, 0.26, 0.24], k=4600000))
++        background = "synthetic"
+     else:
+-        print(f"Loading real E. coli K-12 genome from {ECOLI_PATH}...")
+-        ecoli_seq = load_fasta_seq(ECOLI_PATH)
++        print(f"Loading real E. coli K-12 genome from {args.background_fasta}...")
++        ecoli_seq = load_fasta_seq(Path(args.background_fasta))
++        background = args.background_fasta
+         print(f"E. coli genome: {len(ecoli_seq)} bp")
+         
+     print(f"Building background graph with {args.bg_unitigs} unitigs...")
+@@ -545,6 +554,12 @@
+     df = pd.DataFrame(all_results)
+     df.to_csv(csv_path, index=False)
+     print(f"Saved CSV results to {csv_path} ({len(df)} rows)")
++    import hashlib
++    with open(out_dir / "simulation_run.json", "w") as f:
++        json.dump({"replicates": args.replicates, "bg_unitigs": args.bg_unitigs,
++                   "background": background,
++                   "background_sha256": hashlib.sha256(ecoli_seq.encode()).hexdigest(),
++                   "genes_dir": str(genes_dir)}, f, indent=2)
+ 
+ if __name__ == "__main__":
+     main()

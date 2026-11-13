@@ -1,0 +1,315 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -186,6 +186,9 @@
+         "mean": round(sum(s) / n, 4)
+     }
+ 
++# How many conflict sites the ledger names per accession before it writes ",...".
++CONFLICT_REPORT_LIMIT = 20
++
+ # How many malformed rows to name individually before falling back to a count.
+ MALFORMED_REPORT_LIMIT = 5
+ 
+@@ -326,42 +329,67 @@
+     single_ge_min_cov: bool
+     single_full: bool
+     indels: list         # Indel, in reference order
++    conflicts: list = [] # 0-based reference positions where two qualifying HSPs disagree
+ 
+ 
+ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverage: float) -> Tiling:
+     """
+     Tiles all qualifying HSPs of an accession onto the reference coordinate system.
+-    Overlapping positions between HSPs are resolved by selecting the base from
+-    the HSP with higher pident (the first HSP wins a tie).
++
++    Where HSPs overlap, a position goes to the HSP it lies deepest inside (the larger distance,
++    in reference positions, to the nearer end of that HSP), then to the higher pident, then to
++    the first HSP. Depth, not identity, decides because identity is how close an HSP is to the
++    REFERENCE: ranking by it made every short reference-identical contig override a longer
++    contig's variant, deletion or stop codon, and made the reference allele win at every
++    unpopped bubble whose two branches LexicMap reports as two contigs.
++
++    A position where two HSPs place different symbols, and that lies at least
++    INDEL_EDGE_WINDOW positions inside both, is a conflict: the accession's contigs disagree
++    there (both branches of a bubble, two strains, a paralog). A LexicMap table carries no
++    abundance to choose between them, so the sites are returned in `conflicts` rather than
++    resolved silently. Disagreements nearer an HSP end are alignment-end artefacts, as for
++    edge indels, and are resolved by depth alone.
+ 
+     Indels are read from the aligned qseq/sseq: a run of '-' in qseq is an insertion in the
+     sample (its bases have no reference position, so they are left out of `seq`), and a run of
+     '-' in sseq is a deletion (written into `seq` as '-'). An indel is kept only when its own HSP
+     supplied the positions it affects: both flanks of an insertion, every position of a
+-    deletion. Otherwise another HSP's bases are what the row shows there.
++    deletion. An interior insertion that another HSP spans without carrying it is a conflict.
+     """
+-    grid = [None] * ref_len   # (base, pident, index of the HSP that supplied it)
++    W = INDEL_EDGE_WINDOW
++    grid = [None] * ref_len   # (base, pident, index of the HSP that supplied it, depth)
+     spans = {}                # HSP index -> (first query position, one past the last)
+     raw = []                  # (HSP index, kind, pos, length, bases)
++    conflicts = set()
+     single_ge_min_cov = False
+     single_full = False
+ 
++    def place(q_pos, sym, pident, k, first, last):
++        depth = min(q_pos - first, last - q_pos)
++        ex = grid[q_pos]
++        if ex is None:
++            grid[q_pos] = (sym, pident, k, depth)
++            return
++        if ex[0] != sym and depth >= W and ex[3] >= W and 'N' not in (sym, ex[0]):
++            conflicts.add(q_pos)
++        if (depth, pident) > (ex[3], ex[1]):
++            grid[q_pos] = (sym, pident, k, depth)
++
+     for k, (pident, qcov, qstart, qend, qseq, sseq) in enumerate(hsps):
+         if pident < min_pident:
+             continue
+         if qcov >= (min_coverage * 100.0):
+             single_ge_min_cov = True
+-        if qstart == 1 and qend == ref_len and pident >= min_pident:
++        if qstart == 1 and qend == ref_len:
+             single_full = True
++        first, last = qstart - 1, qend - 1
+ 
+         q_pos = qstart - 1
+         if '-' not in qseq and '-' not in sseq:
+             # Most HSPs carry no gap at all; skip the indel bookkeeping for them.
+             for sc in sseq:
+                 if 0 <= q_pos < ref_len:
+-                    ex = grid[q_pos]
+-                    if ex is None or pident > ex[1]:
+-                        grid[q_pos] = (sc.upper(), pident, k)
++                    place(q_pos, sc.upper(), pident, k, first, last)
+                 q_pos += 1
+             spans[k] = (qstart - 1, q_pos)
+             continue
+@@ -384,9 +412,7 @@
+                 raw.append((k, "del", del_start, len(dele), "".join(dele).upper()))
+                 dele = []
+             if 0 <= q_pos < ref_len:
+-                ex = grid[q_pos]
+-                if ex is None or pident > ex[1]:
+-                    grid[q_pos] = (sc.upper(), pident, k)
++                place(q_pos, sc.upper(), pident, k, first, last)
+             q_pos += 1
+         if dele:
+             raw.append((k, "del", del_start, len(dele), "".join(dele).upper()))
+@@ -398,16 +424,24 @@
+         return 0 <= p < ref_len and grid[p] is not None and grid[p][2] == k
+ 
+     indels = []
++    carried = {(k, pos, bases) for k, kind, pos, _l, bases in raw if kind == "ins"}
+     for k, kind, pos, length, bases in raw:
+         first, end = spans[k]
+         if kind == "ins":
+             owned = supplied_by(pos - 1, k) and supplied_by(pos, k)
+             margin = min(pos - first, end - pos)
++            if margin >= W:
++                # Another HSP that runs through this junction, well inside itself, without
++                # the same insertion disagrees with this one.
++                for j, (jf, je) in spans.items():
++                    if (j != k and jf + W <= pos - 1 and pos + W <= je
++                            and (j, pos, bases) not in carried):
++                        conflicts.add(min(pos, ref_len - 1))
+         else:
+             owned = all(supplied_by(p, k) for p in range(pos, pos + length))
+             margin = min(pos - first, end - (pos + length))
+         if owned:
+-            indels.append(Indel(kind, pos, length, bases, margin < INDEL_EDGE_WINDOW))
++            indels.append(Indel(kind, pos, length, bases, margin < W))
+     indels.sort(key=lambda e: e.pos)
+ 
+     # Mean identity over the positions that actually carry a subject base. Summing pident over
+@@ -420,7 +454,8 @@
+     covered = len(based) + sum(e.length for e in indels if e.kind == "del" and not e.edge)
+     merged_seq = "".join(grid[i][0] if grid[i] is not None else '-' for i in range(ref_len))
+ 
+-    return Tiling(merged_seq, covered, mean_pid, single_ge_min_cov, single_full, indels)
++    return Tiling(merged_seq, covered, mean_pid, single_ge_min_cov, single_full, indels,
++                  sorted(conflicts))
+ 
+ 
+ def merge_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverage: float):
+@@ -517,6 +552,7 @@
+     min_pident: float = 60.0,
+     max_internal_stops: int = 0,
+     allow_frameshifts: bool = False,
++    allow_mixed: bool = False,
+     full_length_only: bool = False,
+     max_records: int = None,
+     sample_cap: int = 10,
+@@ -649,8 +685,8 @@
+     f_flagged_tsv = open(f"{out_prefix}.flagged.tsv", "w", encoding="utf-8")
+     f_cohort_tsv = open(f"{out_prefix}.cohort_ledger.tsv", "w", encoding="utf-8")
+ 
+-    f_flagged_tsv.write("accession\tcoverage\tmean_pident\tflag\tn_stops\tstop_codons\thsps_merged\tindels\n")
+-    f_cohort_tsv.write("accession\tcoverage\tmean_pident\tstatus\ttier\tn_stops\tstop_codons\thsps_merged\tindels\n")
++    f_flagged_tsv.write("accession\tcoverage\tmean_pident\tflag\tn_stops\tstop_codons\thsps_merged\tindels\tconflict_sites\n")
++    f_cohort_tsv.write("accession\tcoverage\tmean_pident\tstatus\ttier\tn_stops\tstop_codons\thsps_merged\tindels\tconflict_sites\n")
+ 
+     # Tracking & State. A clean haplotype is keyed by its row AND its trusted indels: an
+     # insertion has no column in the row, so two accessions that differ only by one would
+@@ -675,6 +711,8 @@
+     count_flagged_stops = 0
+     count_flagged_low_cov = 0
+     count_flagged_frameshift = 0
++    count_flagged_mixed = 0
++    count_with_conflicts = 0
+     count_clean_full_with_indels = 0
+     total_rescued_multihsp = 0
+     total_single_hsp_full = 0
+@@ -695,7 +733,7 @@
+     def process_accession_block(acc, hsps):
+         nonlocal total_accessions, count_clean_full, count_clean_partial
+         nonlocal count_flagged_stops, count_flagged_low_cov, count_flagged_frameshift
+-        nonlocal count_clean_full_with_indels
++        nonlocal count_clean_full_with_indels, count_flagged_mixed, count_with_conflicts
+         nonlocal total_rescued_multihsp, total_single_hsp_full
+         nonlocal cov_ge_50_count, cov_ge_50_stops
+ 
+@@ -726,6 +764,17 @@
+         _in_frame, frameshifts = split_by_frame(tiling.indels)
+         indel_str = ",".join(e.notation() for e in tiling.indels) if tiling.indels else "None"
+         indel_tag = f" indels={indel_str}" if tiling.indels else ""
++        # Sites where this accession's HSPs disagree: 1-based, the first CONFLICT_REPORT_LIMIT
++        # named. Such a row is one contig's reading of a sample that holds at least two.
++        n_conf = len(tiling.conflicts)
++        if n_conf:
++            count_with_conflicts += 1
++            shown = ",".join(str(p + 1) for p in tiling.conflicts[:CONFLICT_REPORT_LIMIT])
++            conflict_str = f"{n_conf}:{shown}{',...' if n_conf > CONFLICT_REPORT_LIMIT else ''}"
++            indel_tag += f" conflicts={n_conf}"
++        else:
++            conflict_str = "None"
++        mixed_ok = not n_conf or allow_mixed
+ 
+         # Check premature stop codons in coding body
+         stop_codons = (find_internal_stops_with_indels(merged_seq, ref_len, tiling.indels)
+@@ -747,7 +796,7 @@
+         full_cov = 1.0 if full_length_only else min_coverage
+         stops_ok = n_stops <= max_internal_stops
+         frame_ok = not frameshifts or allow_frameshifts
+-        if cov >= full_cov and stops_ok and frame_ok:
++        if cov >= full_cov and stops_ok and frame_ok and mixed_ok:
+             status = "CLEAN_FULL_LENGTH"
+             tier = 1
+             count_clean_full += 1
+@@ -769,7 +818,7 @@
+             f_clean_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_FULL_LENGTH{indel_tag}\n{merged_seq}\n")
+             f_clean_exp_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_FULL_LENGTH{indel_tag}\n{merged_seq}\n")
+ 
+-        elif cov >= min_coverage_partial and stops_ok and frame_ok:
++        elif cov >= min_coverage_partial and stops_ok and frame_ok and mixed_ok:
+             status = "CLEAN_PARTIAL"
+             tier = 2
+             count_clean_partial += 1
+@@ -787,23 +836,30 @@
+             tier = 4
+             count_flagged_low_cov += 1
+             f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=LOW_COVERAGE{indel_tag}\n{merged_seq}\n")
+-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tLOW_COVERAGE\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
++            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tLOW_COVERAGE\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\t{conflict_str}\n")
+ 
+         elif not frame_ok:
+             status = "FLAGGED_FRAMESHIFT"
+             tier = 5
+             count_flagged_frameshift += 1
+             f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=FRAMESHIFT{indel_tag}\n{merged_seq}\n")
+-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tFRAMESHIFT\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
++            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tFRAMESHIFT\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\t{conflict_str}\n")
+ 
+-        else:  # covered, in frame, so `stops_ok` is false by elimination
++        elif not stops_ok:
+             status = "FLAGGED_PREMATURE_STOPS"
+             tier = 3
+             count_flagged_stops += 1
+             f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=PREMATURE_STOPS stops={n_stops} codons={stop_str}{indel_tag}\n{merged_seq}\n")
+-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tPREMATURE_STOPS\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
++            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tPREMATURE_STOPS\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\t{conflict_str}\n")
++
++        else:  # covered, in frame, no stop over the limit: only the HSP conflicts are left
++            status = "FLAGGED_MIXED_HSPS"
++            tier = 6
++            count_flagged_mixed += 1
++            f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=MIXED_HSPS{indel_tag}\n{merged_seq}\n")
++            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tMIXED_HSPS\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\t{conflict_str}\n")
+ 
+-        f_cohort_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\t{status}\t{tier}\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
++        f_cohort_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\t{status}\t{tier}\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\t{conflict_str}\n")
+ 
+     try:
+         while True:
+@@ -957,6 +1013,8 @@
+     print(f"    3. Flagged for Premature Stops: {count_flagged_stops:,} accessions")
+     print(f"    4. Low-Coverage Fragments (<{min_coverage_partial:.0%}): {count_flagged_low_cov:,} accessions")
+     print(f"    5. Flagged for Frameshifts    : {count_flagged_frameshift:,} accessions")
++    print(f"    6. Flagged, HSPs disagree     : {count_flagged_mixed:,} accessions "
++          f"({count_with_conflicts:,} with a conflict in any tier)")
+     print(f"    Clean full-length with in-frame indels: {count_clean_full_with_indels:,} accessions")
+     print(f"    Coverage Distribution (All)   : p10={cov_stats['p10']:.2f}, median={med_cov:.2f}, p90={cov_stats['p90']:.2f}")
+     print(f"    Identity Distribution (All)   : p10={pid_stats['p10']:.1f}%, median={med_pid:.1f}%, p90={pid_stats['p90']:.1f}%")
+@@ -1149,12 +1207,14 @@
+             "combined_clean_cohort": count_clean_full + count_clean_partial,
+             "flagged_premature_stops": count_flagged_stops,
+             "flagged_low_coverage": count_flagged_low_cov,
+-            "flagged_frameshift": count_flagged_frameshift
++            "flagged_frameshift": count_flagged_frameshift,
++            "flagged_mixed_hsps": count_flagged_mixed
+         },
+         "recovery_metrics": {
+             "multi_hsp_rescued_accessions": total_rescued_multihsp,
+             "single_hsp_full_length_accessions": total_single_hsp_full,
+             "clean_full_length_with_indels": count_clean_full_with_indels,
++            "accessions_with_hsp_conflicts": count_with_conflicts,
+             "premature_stop_rate_pct_at_50cov": round(stop_rate_ge_50, 2)
+         },
+         "coverage_quantiles": cov_stats,
+@@ -1239,6 +1299,12 @@
+                              "indel into the clean tiers instead of FLAGGED_FRAMESHIFT (a "
+                              "reading-frame shift lasting 30 or more bases). "
+                              "Premature stops still flag. Off by default.")
++    parser.add_argument("--allow-mixed", action="store_true",
++                        help="Let accessions whose HSPs disagree at an overlapping position "
++                             "(two strains, a paralog, both branches of a bubble) into the "
++                             "clean tiers instead of FLAGGED_MIXED_HSPS. Their row shows the "
++                             "longest HSP's bases and may be a chimera; the sites are listed "
++                             "in the ledger's conflict_sites column. Off by default.")
+     parser.add_argument("--require-full-length", action="store_true",
+                         help="Require 100%% reference coverage (every position tiled) for the "
+                              "clean full-length tier, instead of the --min-cov threshold. "
+@@ -1308,6 +1374,7 @@
+             min_pident=args.min_pident,
+             max_internal_stops=args.max_internal_stops,
+             allow_frameshifts=args.allow_frameshift_alts,
++            allow_mixed=getattr(args, "allow_mixed", False),
+             full_length_only=args.require_full_length,
+             max_records=args.max_records,
+             sample_cap=args.samples_per_haplotype,
+diff --git a/src/disassembler/cmd/pipe_from_lexicmap.py b/src/disassembler/cmd/pipe_from_lexicmap.py
+index 73afa2c25a57..000000000000 100644
+--- a/src/disassembler/cmd/pipe_from_lexicmap.py
++++ b/src/disassembler/cmd/pipe_from_lexicmap.py
+@@ -117,6 +117,10 @@
+                             "indel into the clean tiers instead of FLAGGED_FRAMESHIFT (a "
+                             "reading-frame shift lasting 30 or more bases). "
+                             "Premature stops still flag. Off by default.")
++    g_lex.add_argument("--allow-mixed", action="store_true",
++                       help="Let accessions whose HSPs disagree at an overlapping position "
++                            "into the clean tiers instead of FLAGGED_MIXED_HSPS. "
++                            "Off by default.")
+     g_lex.add_argument("--require-full-length", action="store_true",
+                        help="Require 100%% reference coverage (every position tiled) for "
+                             "the clean full-length tier, instead of the --min-cov "
+@@ -280,6 +284,7 @@
+         min_pident=args.min_pident,
+         max_internal_stops=args.max_internal_stops,
+         allow_frameshift_alts=args.allow_frameshift_alts,
++        allow_mixed=args.allow_mixed,
+         require_full_length=args.require_full_length,
+         max_records=args.max_records,
+         samples_per_haplotype=args.samples_per_haplotype,

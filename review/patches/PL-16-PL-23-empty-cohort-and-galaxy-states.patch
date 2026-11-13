@@ -1,0 +1,87 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -171,7 +171,8 @@
+ def compute_quantiles(values: list) -> dict:
+     """Calculates summary percentiles for a metric."""
+     if not values:
+-        return {"p10": 0.0, "p25": 0.0, "p50_median": 0.0, "p75": 0.0, "p90": 0.0, "mean": 0.0}
++        # No values is not a value of 0: callers print "n/a" and summary.json gets nulls.
++        return {"p10": None, "p25": None, "p50_median": None, "p75": None, "p90": None, "mean": None}
+     s = sorted(values)
+     n = len(s)
+     def q(p):
+@@ -249,8 +250,16 @@
+                            f"{base_url}: {e}") from e
+ 
+ # Galaxy dataset states that mean "not finished yet", as opposed to "failed".
+-GALAXY_PENDING_STATES = {"new", "upload", "queued", "running", "paused", "setting_metadata",
+-                         "deferred"}
++# Galaxy's own Dataset.non_ready_states: these end on their own.
++GALAXY_PENDING_STATES = {"new", "upload", "queued", "running", "setting_metadata"}
++# States waiting cannot end: a deferred dataset stays deferred until it is materialized, and a
++# paused job waits for the user to resume it. Retrying on exit 75 would loop forever.
++GALAXY_NEEDS_ACTION = {
++    "deferred": "it is a deferred (not yet materialized) dataset; materialize it in Galaxy, "
++                "e.g. by running a tool on it, and pass the id of the new dataset",
++    "paused": "its job is paused; resume it in Galaxy (or fix the input that paused it) and "
++              "rerun once the dataset is 'ok'",
++}
+ 
+ 
+ class DatasetNotReady(RuntimeError):
+@@ -278,6 +287,8 @@
+     state was streamed as if it were finished."""
+     if state == "ok":
+         return
++    if state in GALAXY_NEEDS_ACTION:
++        raise ValueError(f"Galaxy dataset {dataset_id} is '{state}': {GALAXY_NEEDS_ACTION[state]}.")
+     if state in GALAXY_PENDING_STATES:
+         raise DatasetNotReady(f"Galaxy dataset {dataset_id} is '{state}', not finished yet. "
+                               f"Rerun once it is 'ok'.")
+@@ -938,8 +949,17 @@
+     med_pid = pid_stats["p50_median"]
+     stop_rate_ge_50 = (cov_ge_50_stops / cov_ge_50_count * 100.0) if cov_ge_50_count > 0 else 0.0
+ 
+-    is_divergent = (med_pid < 85.0 or med_cov < 0.60)
+-    regime = "divergent" if is_divergent else "conserved"
++    if total_accessions == 0:
++        # No accession at all: there is nothing to diagnose, and quoting 0.0 medians
++        # would call a no-hit search 'divergent'.
++        is_divergent = False
++        regime = "no_data"
++    else:
++        is_divergent = (med_pid is None or med_pid < 85.0 or med_cov < 0.60)
++        regime = "divergent" if is_divergent else "conserved"
++
++    def _q(v, spec):
++        return "n/a" if v is None else format(v, spec)
+ 
+     # A valid stream can carry a header and no data rows; guard every by-total percentage so an
+     # empty cohort reports zeros rather than raising ZeroDivisionError.
+@@ -958,8 +978,8 @@
+     print(f"    4. Low-Coverage Fragments (<{min_coverage_partial:.0%}): {count_flagged_low_cov:,} accessions")
+     print(f"    5. Flagged for Frameshifts    : {count_flagged_frameshift:,} accessions")
+     print(f"    Clean full-length with in-frame indels: {count_clean_full_with_indels:,} accessions")
+-    print(f"    Coverage Distribution (All)   : p10={cov_stats['p10']:.2f}, median={med_cov:.2f}, p90={cov_stats['p90']:.2f}")
+-    print(f"    Identity Distribution (All)   : p10={pid_stats['p10']:.1f}%, median={med_pid:.1f}%, p90={pid_stats['p90']:.1f}%")
++    print(f"    Coverage Distribution (All)   : p10={_q(cov_stats['p10'], '.2f')}, median={_q(med_cov, '.2f')}, p90={_q(cov_stats['p90'], '.2f')}")
++    print(f"    Identity Distribution (All)   : p10={_q(pid_stats['p10'], '.1f')}%, median={_q(med_pid, '.1f')}%, p90={_q(pid_stats['p90'], '.1f')}%")
+ 
+     warning_msg = None
+     if is_divergent:
+@@ -967,9 +987,11 @@
+         # one it was, so a cohort tripped by coverage alone read as "Median identity is 99.6%
+         # (< 85%)", which is simply false and sent people looking at the wrong number.
+         fired = []
+-        if med_pid < 85.0:
++        if med_pid is None:
++            fired.append(f"no HSP reached --min-pident {min_pident:.1f}%")
++        elif med_pid < 85.0:
+             fired.append(f"median identity is {med_pid:.1f}% (< 85%)")
+-        if med_cov < 0.60:
++        if med_cov is not None and med_cov < 0.60:
+             fired.append(f"median coverage is {med_cov:.2f} (< 0.60)")
+         warning_msg = (
+             f"DIVERGENT REGIME DETECTED: {' and '.join(fired)}, with {stop_rate_ge_50:.1f}% premature stops in >=50% covered accessions. "

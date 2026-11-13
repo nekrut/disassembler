@@ -1,0 +1,261 @@
+diff --git a/walker/src/stages/stream.rs b/walker/src/stages/stream.rs
+--- a/walker/src/stages/stream.rs
++++ b/walker/src/stages/stream.rs
+@@ -51,7 +51,13 @@
+             // Inspect the status ourselves so 404 (no Logan data) is distinguishable from
+             // 5xx (transient, worth retrying).
+             .http_status_as_error(false)
++            // Never follow a redirect. The URL is a fixed https URL on one bucket; a 3xx would
++            // move the download to another origin, or to cleartext http, unannounced.
++            .max_redirects(0)
+             .build();
++        if let Some(dir) = &cfg.unitigs_cache {
++            sweep_stale_tempfiles(dir);
++        }
+         Self {
+             agent: ureq::Agent::new_with_config(agent_config),
+             max_compressed_bytes: cfg.max_compressed_bytes,
+@@ -93,12 +99,24 @@
+                     accession: accession.clone(),
+                     detail: format!("cache read {}: {e}", path.display()),
+                 })?;
+-                if compressed.is_empty() {
+-                    return Err(Error::Fetch {
+-                        accession: accession.clone(),
+-                        detail: format!("cache file is empty: {}", path.display()),
+-                    });
+-                }
++                if !looks_like_zstd(&compressed) {
++                    let what = if compressed.is_empty() { "is empty" } else { "is not a zstd file" };
++                    if self.offline {
++                        return Err(Error::Fetch {
++                            accession: accession.clone(),
++                            detail: format!(
++                                "cache file {} {what}; delete it, or rerun without --offline \
++                                 to fetch it again",
++                                path.display()
++                            ),
++                        });
++                    }
++                    eprintln!(
++                        "[{accession}] warning: cache file {} {what}; fetching it again",
++                        path.display()
++                    );
++                    let _ = std::fs::remove_file(&path);
++                } else {
+                 return Ok(FetchedUnitigs {
+                     index,
+                     accession: accession.clone(),
+@@ -106,8 +124,8 @@
+                     compressed,
+                     fetch_secs: 0.0,
+                 });
+-            }
+-            if self.offline {
++                }
++            } else if self.offline {
+                 return Err(Error::Fetch {
+                     accession: accession.clone(),
+                     detail: format!(
+@@ -180,6 +198,12 @@
+         match status {
+             200 => {}
+             404 => return Err(FetchAttempt::Missing),
++            300..=399 => {
++                let loc = resp.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or("-");
++                return Err(FetchAttempt::Permanent(format!(
++                    "unexpected redirect, HTTP {status} to {loc}; not followed"
++                )));
++            }
+             // 4xx other than 404 is our fault and will not improve on retry.
+             400..=499 => return Err(FetchAttempt::Permanent(format!("HTTP {status}"))),
+             _ => return Err(FetchAttempt::Transient(format!("HTTP {status}"))),
+@@ -219,6 +243,14 @@
+         if compressed.is_empty() {
+             return Err(FetchAttempt::Transient("empty body".to_string()));
+         }
++        if !looks_like_zstd(&compressed) {
++            // A proxy or captive portal answering 200 with a page of its own. Never cached.
++            return Err(FetchAttempt::Transient(format!(
++                "response is not a zstd stream ({} bytes, starts {:02x?})",
++                compressed.len(),
++                &compressed[..compressed.len().min(4)]
++            )));
++        }
+ 
+         Ok(FetchedUnitigs {
+             index,
+@@ -259,7 +291,14 @@
+     let tmp = dir.join(format!(".{accession}.{}.{ns}.tmp", std::process::id()));
+     // Written-then-renamed. Errors during write must not leave the tempfile around either;
+     // the finally-style branch below handles that.
+-    let write_result = std::fs::write(&tmp, bytes);
++    let write_result = (|| {
++        use std::io::Write;
++        let mut f = std::fs::File::create(&tmp)?;
++        f.write_all(bytes)?;
++        // Data on disk before the rename publishes the name; otherwise a node crash can leave
++        // an empty or short entry under the final name.
++        f.sync_all()
++    })();
+     match write_result {
+         Ok(()) => std::fs::rename(&tmp, &final_path).inspect_err(|_| {
+             let _ = std::fs::remove_file(&tmp);
+@@ -271,6 +310,45 @@
+     }
+ }
+ 
++/// zstd frame magic (28 b5 2f fd) or a skippable frame (0x184D2A50..=0x184D2A5F, LE).
++fn looks_like_zstd(b: &[u8]) -> bool {
++    if b.len() < 4 {
++        return false;
++    }
++    let m = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
++    m == 0xFD2F_B528 || (m & 0xFFFF_FFF0) == 0x184D_2A50
++}
++
++/// Remove `.<ACC>.<pid>.<ns>.tmp` files left by a writer killed between write and rename.
++/// Only files older than a day: a live writer on this or another host finishes in minutes.
++fn sweep_stale_tempfiles(dir: &Path) {
++    let Ok(rd) = std::fs::read_dir(dir) else { return };
++    let day = Duration::from_secs(24 * 3600);
++    for e in rd.flatten() {
++        let name = e.file_name();
++        let name = name.to_string_lossy();
++        // Exactly the shape write_cache_atomic makes: .<ACC>.<pid>.<ns>.tmp
++        let parts: Vec<&str> = name.split('.').collect();
++        let ours = parts.len() == 5
++            && parts[0].is_empty()
++            && parts[4] == "tmp"
++            && parts[2].bytes().all(|c| c.is_ascii_digit())
++            && parts[3].bytes().all(|c| c.is_ascii_digit());
++        if !ours {
++            continue;
++        }
++        let old = e
++            .metadata()
++            .and_then(|m| m.modified())
++            .ok()
++            .and_then(|t| t.elapsed().ok())
++            .is_some_and(|a| a > day);
++        if old {
++            let _ = std::fs::remove_file(e.path());
++        }
++    }
++}
++
+ /// A streaming zstd decoder over the compressed buffer.
+ ///
+ /// Deliberately a `Read`, not a `Vec<u8>`. `ERR2028820` decompresses to 145 MB and the
+@@ -427,7 +505,8 @@
+ 
+     #[test]
+     fn a_body_of_exactly_the_cap_is_accepted() {
+-        let url = serve_without_length(vec![b'A'; 10]);
++        let mut body = vec![0x28, 0xb5, 0x2f, 0xfd]; body.resize(10, b'A');
++        let url = serve_without_length(body);
+         let got = fetcher(10).try_once(0, &"X".to_string(), &url).ok().expect("refused at the cap");
+         assert_eq!(got.compressed_len, 10);
+     }
+@@ -716,3 +795,101 @@
+         assert!(out == expected, "content mismatch vs zstd CLI");
+     }
+ }
++
++#[cfg(test)]
++mod v112_probe {
++    use super::*;
++    use std::io::{Read as _, Write as _};
++    use std::net::TcpListener;
++
++    /// One-shot HTTP server: answers every connection with `resp`, `n` times.
++    fn serve(resp: Vec<u8>, n: usize) -> u16 {
++        let l = TcpListener::bind("127.0.0.1:0").unwrap();
++        let port = l.local_addr().unwrap().port();
++        std::thread::spawn(move || {
++            for _ in 0..n {
++                let (mut s, _) = match l.accept() { Ok(x) => x, Err(_) => return };
++                let mut buf = [0u8; 4096];
++                let mut got = Vec::new();
++                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
++                    let k = s.read(&mut buf).unwrap_or(0);
++                    if k == 0 { break; }
++                    got.extend_from_slice(&buf[..k]);
++                }
++                eprintln!("server {port} got: {}", String::from_utf8_lossy(&got).lines().next().unwrap_or(""));
++                let _ = s.write_all(&resp);
++            }
++        });
++        port
++    }
++
++    #[test]
++    fn v112_redirect_is_not_followed() {
++        let b = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n(\xb5/\xfd".to_vec(), 1);
++        let redir = format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{b}/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes();
++        let a = serve(redir, 3);
++        let f = Fetcher::new(&Config { fetch_attempts: 1, ..Config::default() });
++        match f.try_once(0, &"SRR1".to_string(), &format!("http://127.0.0.1:{a}/u/SRR1/SRR1.unitigs.fa.zst")) {
++            Err(FetchAttempt::Permanent(d)) => { eprintln!("V112 FIXED: Permanent {d}"); assert!(d.contains("redirect")) }
++            Ok(_) => panic!("redirect followed"),
++            Err(_) => panic!("wrong class"),
++        }
++    }
++
++    #[test]
++    fn v112_non_zstd_200_body_is_refused() {
++        let body = b"<html>captive portal</html>";
++        let mut ok = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
++        ok.extend_from_slice(body);
++        let a = serve(ok, 1);
++        let f = Fetcher::new(&Config { fetch_attempts: 1, ..Config::default() });
++        match f.try_once(0, &"SRR1".to_string(), &format!("http://127.0.0.1:{a}/x")) {
++            Err(FetchAttempt::Transient(d)) => { eprintln!("V112 FIXED: Transient {d}"); assert!(d.contains("not a zstd")) }
++            _ => panic!("html accepted"),
++        }
++    }
++
++    #[test]
++    fn v112_bad_cache_entry_offline_names_the_file() {
++        let dir = std::env::temp_dir().join(format!("v112-cache-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(cache_path(&dir, "SRR8209083"), b"<html>proxy error page</html>\n").unwrap();
++        let f = Fetcher::new(&Config { unitigs_cache: Some(dir.clone()), offline: true, ..Config::default() });
++        match f.fetch(0, &"SRR8209083".to_string()) {
++            Err(e) => { let m = e.to_string(); eprintln!("V112 FIXED: {m}"); assert!(m.contains("SRR8209083.unitigs.fa.zst") && m.contains("not a zstd")) }
++            Ok(_) => panic!("bad cache entry trusted"),
++        }
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
++    #[test]
++    fn v112_stale_tempfiles_are_swept() {
++        let dir = std::env::temp_dir().join(format!("v112-sweep-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let old = dir.join(".SRR1.123.456.tmp");
++        let new = dir.join(".SRR2.123.789.tmp");
++        let other = dir.join(".notes.tmp");
++        for p in [&old, &new, &other] { std::fs::write(p, b"x").unwrap(); }
++        let f = std::fs::File::options().write(true).open(&old).unwrap();
++        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 3600)).unwrap();
++        let other_f = std::fs::File::options().write(true).open(&other).unwrap();
++        other_f.set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 3600)).unwrap();
++        let _ = Fetcher::new(&Config { unitigs_cache: Some(dir.clone()), ..Config::default() });
++        assert!(!old.exists() && new.exists() && other.exists());
++        std::fs::remove_dir_all(&dir).ok();
++    }
++
++    /// Network: a bad cache entry is replaced when online.
++    #[test]
++    #[ignore]
++    fn v112_bad_cache_entry_online_self_heals() {
++        let dir = std::env::temp_dir().join(format!("v112-heal-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(cache_path(&dir, "SRR8209082"), b"<html>x</html>").unwrap();
++        let f = Fetcher::new(&Config { unitigs_cache: Some(dir.clone()), offline: false, ..Config::default() });
++        let got = f.fetch(0, &"SRR8209082".to_string()).expect("refetched");
++        eprintln!("V112 HEALED: {} bytes; cache now {} bytes", got.compressed_len, std::fs::metadata(cache_path(&dir, "SRR8209082")).unwrap().len());
++        assert_eq!(got.compressed_len, 1861058);
++        std::fs::remove_dir_all(&dir).ok();
++    }
++}

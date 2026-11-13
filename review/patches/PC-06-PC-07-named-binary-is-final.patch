@@ -1,0 +1,73 @@
+diff --git a/src/disassembler/cmd/walker.py b/src/disassembler/cmd/walker.py
+index e7747339f568..000000000000 100644
+--- a/src/disassembler/cmd/walker.py
++++ b/src/disassembler/cmd/walker.py
+@@ -74,13 +74,18 @@
+ def run(args) -> int:
+     argv = list(args.passthrough)
+     walker_bin: str | None = None
+-    if "--walker-bin" in argv:
+-        i = argv.index("--walker-bin")
+-        if i + 1 >= len(argv):
+-            print("walker: --walker-bin needs a value", file=sys.stderr)
+-            return 2
+-        walker_bin = argv[i + 1]
+-        del argv[i:i + 2]
++    for i, tok in enumerate(argv):
++        if tok == "--walker-bin":
++            if i + 1 >= len(argv):
++                print("walker: --walker-bin needs a value", file=sys.stderr)
++                return 2
++            walker_bin = argv[i + 1]
++            del argv[i:i + 2]
++            break
++        if tok.startswith("--walker-bin="):
++            walker_bin = tok.split("=", 1)[1]
++            del argv[i]
++            break
+ 
+     resolved = _resolved_or_report(walker_bin)
+     if not resolved:
+diff --git a/src/disassembler/resolve.py b/src/disassembler/resolve.py
+index a6917b60d3f0..000000000000 100644
+--- a/src/disassembler/resolve.py
++++ b/src/disassembler/resolve.py
+@@ -34,7 +34,8 @@
+         return None
+     q = Path(p)
+     if q.is_file() and os.access(q, os.X_OK):
+-        return str(q)
++        # Absolute: subprocess looks a bare name up on PATH, and str(Path('./x')) is 'x'.
++        return os.path.abspath(q)
+     return None
+ 
+ 
+@@ -44,20 +45,22 @@
+ 
+ def resolve_walker(explicit: str | None = None) -> str | None:
+     """Locate `logan-walker`. See module docstring for resolution order."""
++    named = explicit or os.environ.get("DISASSEMBLER_WALKER_BIN")
++    if named:  # a path the caller named is used or refused, never silently replaced
++        return _executable(named)
+     return (
+-        _executable(explicit)
+-        or _executable(os.environ.get("DISASSEMBLER_WALKER_BIN"))
+-        or _from_path("logan-walker")
++        _from_path("logan-walker")
+         or _executable(_repo_root() / "walker" / "target" / "release" / "logan-walker")
+     )
+ 
+ 
+ def resolve_sieve(explicit: str | None = None) -> str | None:
+     """Locate `l1_pipeline_serial`. See module docstring for resolution order."""
++    named = explicit or os.environ.get("DISASSEMBLER_SIEVE_BIN")
++    if named:
++        return _executable(named)
+     return (
+-        _executable(explicit)
+-        or _executable(os.environ.get("DISASSEMBLER_SIEVE_BIN"))
+-        or _from_path("l1_pipeline_serial")
++        _from_path("l1_pipeline_serial")
+         or _executable(
+             _repo_root() / "extern" / "kmer-diversity-sieve" / "l1_pipeline_serial"
+         )

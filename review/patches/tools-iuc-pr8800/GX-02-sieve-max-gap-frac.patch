@@ -1,0 +1,18 @@
+--- a/tools/disassembler/orig.xml
++++ b/tools/disassembler/disassembler_sieve.xml
+@@ -26,6 +26,7 @@
+             #else:
+                 --min-len $length_gate.min_len
+             #end if
++            --max-gap-frac $max_gap_frac
+             --threshold $threshold
+             --sketch $sketch
+     ]]></command>
+@@ -43,6 +44,7 @@
+                 <param argument="--min-len" type="integer" value="1" min="1" label="Minimum sequence length (nt)"/>
+             </when>
+         </conditional>
++        <param argument="--max-gap-frac" type="float" value="0.05" min="0" max="1" label="Maximum share of gaps or other non-ACGT characters" help="Sequences with more are dropped before sketching. 0.05 suits walker haplotypes. LexicMap rows carry '-' wherever no hit reached, so set 1 - coverage gate + 0.05: 0.25 for a default lexicmap clean cohort (--min-cov 0.80)."/>
+         <param argument="--threshold" type="float" value="0.005" min="0" max="1" label="Promotion threshold (tau)" help="A sequence is kept only if its estimated novelty against what is already kept exceeds this. The default suits gene-scale cohorts; the sieve's own archive-scale default of 0.15 collapses a gene cohort to almost nothing."/>
+         <param argument="--sketch" type="integer" value="256" min="1" label="MinHash sketch size" help="Novelty finer than 1/sketch size cannot be resolved."/>
+     </inputs>

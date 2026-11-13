@@ -1,0 +1,61 @@
+diff --git a/src/disassembler/cmd/lexicmap.py b/src/disassembler/cmd/lexicmap.py
+index 538c16421a32..000000000000 100755
+--- a/src/disassembler/cmd/lexicmap.py
++++ b/src/disassembler/cmd/lexicmap.py
+@@ -237,6 +237,15 @@
+     ref_name = header.split()[0] if header else path.stem
+     return ref_name, header, ref_seq
+ 
++
++def file_safe_name(name: str, limit: int = 200) -> str:
++    """One path component from a FASTA record id, changed as little as possible: path
++    separators become '_', leading/trailing dots and spaces go (no '.', '..' or hidden
++    file), and the name is capped at `limit` bytes so the longest suffix stays under
++    NAME_MAX. Returns '' when nothing usable is left. Same rule as harvest.safe_target_name."""
++    name = name.replace("/", "_").replace("\\", "_").replace("\0", "_").strip(". ")
++    return name.encode()[:limit].decode(errors="ignore").rstrip(". ")
++
+ def get_galaxy_stream(dataset_id: str, base_url: str = "https://usegalaxy.org", api_key: str = None, key_file: str = None):
+     """Opens a buffered HTTP streaming connection to Galaxy dataset display endpoint."""
+     key = get_galaxy_api_key(api_key, key_file)
+@@ -567,15 +576,23 @@
+             raw.close()
+         raise
+ 
++    # The record id names the files in directory mode, and it is not a file name: '/'
++    # (GISAID, influenza strain names) failed with ENOENT, and '../' or an absolute id
++    # wrote every output outside the requested directory.
++    file_stem = (file_safe_name(ref_name) or file_safe_name(Path(ref_path).stem)
++                 or "lexicmap")
++    if file_stem != ref_name and (not out_prefix or Path(out_prefix).is_dir()
++                                  or str(out_prefix).endswith("/")):
++        print(f"[*] output files are named '{file_stem}', not the record id '{ref_name}'.")
+     if not out_prefix:
+         out_dir = Path("msa")
+         out_dir.mkdir(parents=True, exist_ok=True)
+-        out_prefix = f"msa/{ref_name}"
++        out_prefix = f"msa/{file_stem}"
+     else:
+         out_path = Path(out_prefix)
+         if out_path.is_dir() or str(out_prefix).endswith("/"):
+             out_path.mkdir(parents=True, exist_ok=True)
+-            out_prefix = str(out_path / ref_name)
++            out_prefix = str(out_path / file_stem)
+         else:
+             out_path.parent.mkdir(parents=True, exist_ok=True)
+ 
+@@ -1255,12 +1272,12 @@
+     out.add_argument("-o", "--out-prefix", dest="out_prefix", type=str, default=None,
+                      help="Output prefix: all lexicmap outputs land at <prefix>.*. An existing "
+                           "directory, or a path ending in '/', is taken as --out-dir "
+-                          "(default: msa/<ref_name>).")
++                          "(default: msa/<ref_name>, path separators in the record id made '_').")
+     # `--out-dir` was once a third spelling of --out-prefix, so a directory that did not
+     # exist yet became a prefix: `--out-dir out/new` wrote out/new.clean.msa.fasta and the rest.
+     out.add_argument("--out-dir", dest="out_dir", type=str, default=None,
+                      help="Output directory, created if needed: outputs land at "
+-                          "<dir>/<ref_name>.*.")
++                          "<dir>/<ref_name>.*, path separators in the record id made '_'.")
+     parser.add_argument("--no-a2m", action="store_true",
+                         help="Skip writing the .a2m formatted MSA files "
+                              "(<prefix>.clean.a2m and the .a2m compat alias).")

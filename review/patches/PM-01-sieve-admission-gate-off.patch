@@ -1,0 +1,55 @@
+diff --git a/src/disassembler/cmd/sieve.py b/src/disassembler/cmd/sieve.py
+index 54e68d33850f..000000000000 100644
+--- a/src/disassembler/cmd/sieve.py
++++ b/src/disassembler/cmd/sieve.py
+@@ -15,6 +15,7 @@
+ 
+ import argparse
+ import os
++import re
+ import subprocess
+ import sys
+ from pathlib import Path
+@@ -29,6 +30,15 @@
+ # coverage gate; from-lexicmap derives its value from the cohort's own coverage gate instead.
+ DEFAULT_MAX_GAP_FRAC = 0.05
+ 
++# The binary's admission test rejects, once `--warmup` records have been seen, any sequence
++# whose count of never-seen k-mers exceeds mean + 5 SD of the running counts. Upstream built it
++# to drop error-laden genome assemblies. On a gene cohort the first record contributes every
++# k-mer and the rest almost none, so SD ~ L/sqrt(n) and a genuinely new lineage arriving late
++# is rejected, together with every later member of it (a rejected record never enters the
++# count-min sketch). Walker and LexicMap rows have already been checked, so admission is off:
++# a warmup the run can never reach (the binary parses it with atoi, so INT_MAX).
++ADMISSION_OFF_WARMUP = 2**31 - 1
++
+ 
+ def auto_min_len(ref: Path) -> int | None:
+     """95% of the shortest record in `ref`, or None (with the reason printed) if it has none.
+@@ -211,15 +221,24 @@
+             "--min-len", str(min_len),
+             "--max-n-frac", str(max_gap_frac),
+             "--threshold", str(threshold),
+-            "--warmup", "2000",
++            "--warmup", str(ADMISSION_OFF_WARMUP),
+             "--sketch", str(sketch),
+             "--emit-promoted", str(emit_prefix),
+         ]
+         print(f"[sieve] {' '.join(cmd)}", flush=True)
+-        rc = subprocess.run(cmd).returncode
++        proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
++        sys.stdout.write(proc.stdout)
++        sys.stdout.flush()
++        rc = proc.returncode
+         if rc != 0:
+             print(f"sieve: kmer-diversity-sieve exited {rc}", file=sys.stderr)
+             return rc
++        m = re.search(r"REJECT \(error\)\s*:\s*(\d+)", proc.stdout)
++        if m and int(m.group(1)):
++            print(f"sieve: the binary's admission test rejected {m.group(1)} sequences "
++                  "although it should be off; refusing to write a thinned cohort.",
++                  file=sys.stderr)
++            return 1
+ 
+         with output_fasta.open("w") as fh:
+             for rf in shards():

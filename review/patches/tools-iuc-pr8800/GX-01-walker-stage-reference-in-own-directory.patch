@@ -1,0 +1,28 @@
+--- a/tools/disassembler/disassembler_walker.xml
++++ b/tools/disassembler/disassembler_walker.xml
+@@ -49,10 +49,14 @@
+         ## .gz too so a reference_name derived from foo.fasta.gz is just foo, not foo.fasta.
+         #import re
+         #set $reference_name = re.sub(r'\.(fasta|fas|fa|fna)(\.gz)?$', '', re.sub(r'[^\w.\-]', '_', str($query.element_identifier)))
++        ## Staged in its own directory: the walker writes reconstructed.fasta and walker_out/
++        ## into the working directory, and a reference named reconstructed.fasta must not be
++        ## overwritten through its symlink.
++        mkdir ref &&
+         #if $query.is_of_type('fasta.gz'):
+-            gunzip -c '$query' > '${reference_name}.fasta' &&
++            gunzip -c '$query' > 'ref/${reference_name}.fasta' &&
+         #else:
+-            ln -s '$query' '${reference_name}.fasta' &&
++            ln -s '$query' 'ref/${reference_name}.fasta' &&
+         #end if
+ 
+         logan-walker
+@@ -61,7 +65,7 @@
+             #else:
+                 --accession-list '$input.accession_list'
+             #end if
+-            --query '${reference_name}.fasta'
++            --query 'ref/${reference_name}.fasta'
+             --out-dir walker_out
+             --out-fasta reconstructed.fasta
+             ## Scratch dir for shard payloads. The CLI default, /dev/shm/logan-walker, is

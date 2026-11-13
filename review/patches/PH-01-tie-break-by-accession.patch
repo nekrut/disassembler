@@ -1,0 +1,62 @@
+diff --git a/src/disassembler/cmd/harvest.py b/src/disassembler/cmd/harvest.py
+index a384857a04e9..000000000000 100644
+--- a/src/disassembler/cmd/harvest.py
++++ b/src/disassembler/cmd/harvest.py
+@@ -177,13 +177,17 @@
+     all_union = set()
+     summary = {}
+     for target, acc_dict in sorted(per_target.items()):
+-        accs = sorted(acc_dict, key=lambda a: -acc_dict[a])
++        # Ties broken on the accession: shards are merged in arrival order (thread
++        # completion over the API, file-name order on disk), and kmindex scores are
++        # k-mer ratios that tie in bulk, so score alone left the order to the network.
++        accs = sorted(acc_dict, key=lambda a: (-acc_dict[a], a))
+         all_union.update(accs)
+         acc_file = out_dir / f"{target}.accessions.txt"
+         score_file = out_dir / f"{target}.scores.json"
+         acc_file.write_text("\n".join(accs) + "\n")
+         # The target goes inside, so stratify never has to read it off the file name.
+-        score_file.write_text(json.dumps({"target": target, "scores": acc_dict}, indent=2))
++        score_file.write_text(json.dumps(
++            {"target": target, "scores": {a: acc_dict[a] for a in accs}}, indent=2))
+         summary[target] = {
+             "n": len(accs),
+             "max_score": max(acc_dict.values()) if acc_dict else 0.0,
+diff --git a/src/disassembler/cmd/stratify.py b/src/disassembler/cmd/stratify.py
+index 3e624b165abd..000000000000 100644
+--- a/src/disassembler/cmd/stratify.py
++++ b/src/disassembler/cmd/stratify.py
+@@ -108,6 +108,15 @@
+             )
+ 
+ 
++def _by_score_then_accession(item):
++    """Sort key for `(accession, score)`: score descending, then accession.
++
++    The accession breaks ties so that the rank of an accession, and so which ones a
++    bin samples, depends on the scores alone and not on the order of the score file.
++    """
++    return (-item[1], item[0])
++
++
+ def sample_bins_from_scores(scores, bins):
+     """Sample per bin. Zero-score accessions are excluded up front.
+ 
+@@ -122,7 +131,7 @@
+     for lo, hi, n in bins:
+         in_range = sorted(
+             ((a, s) for a, s in nonzero.items() if in_bin(s, lo, hi)),
+-            key=lambda x: -x[1],
++            key=_by_score_then_accession,
+         )
+         selected = stratified_sample(in_range, n)
+         per_bin.append({
+@@ -134,7 +143,7 @@
+             "accessions": [{"acc": a, "score": s} for a, s in selected],
+         })
+         picks.extend(selected)
+-    picks.sort(key=lambda x: -x[1])
++    picks.sort(key=_by_score_then_accession)
+     return picks, per_bin
+ 
+ 

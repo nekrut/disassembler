@@ -1,0 +1,127 @@
+diff --git a/src/disassembler/cmd/msa.py b/src/disassembler/cmd/msa.py
+index 6d19ea4f357a..000000000000 100644
+--- a/src/disassembler/cmd/msa.py
++++ b/src/disassembler/cmd/msa.py
+@@ -169,6 +169,12 @@
+                         "the alignment if the median does (default 0.60). Same-gene cohorts "
+                         "measure 0.88 or more; a sequence on the wrong strand, or of another "
+                         "gene, aligns at 0.40-0.50. 0 disables the check.")
++    p.add_argument("--aligned", action="store_true",
++                   help="The input is already on the reference's coordinate grid (lexicmap "
++                        "output): every row must be exactly the reference length. MAFFT is "
++                        "skipped and the rows are kept as given, so '-' at uncovered positions "
++                        "and deletions stay where lexicmap put them. Coverage and identity "
++                        "checks still apply.")
+     p.set_defaults(func=run)
+ 
+ 
+@@ -183,7 +189,7 @@
+     out_tree.parent.mkdir(parents=True, exist_ok=True)
+ 
+     try:
+-        mafft_bin = find_bin("mafft")
++        mafft_bin = None if args.aligned else find_bin("mafft")
+         fasttree_bin = find_bin("fasttree", "FastTree")
+     except FileNotFoundError as e:
+         print(f"Error: {e}", file=sys.stderr)
+@@ -234,6 +240,7 @@
+     tmp_aln = out_aln.with_name(f".tmp_{out_aln.name}.{os.getpid()}")
+     try:
+         retained = flipped = unoriented = 0
++        off_grid = []
+         with open(clean_input_p, "w") as fh:
+             for r in input_records:
+                 seq = str(r.seq).upper()
+@@ -241,6 +248,13 @@
+                 # where no HSP reached, so its length passed this gate whatever its coverage.
+                 if real_bases(seq) < ref_len * args.msa_min_cov:
+                     continue
++                if args.aligned:
++                    # On the grid already: no orientation pass, no re-alignment.
++                    if len(seq) != ref_len:
++                        off_grid.append(f"{r.id} ({len(seq)} nt)")
++                    fh.write(f">{sanitize_id(r.id, used_ids)}\n{seq}\n")
++                    retained += 1
++                    continue
+                 strand = orientation(seq, fwd_kmers, rev_kmers)
+                 if strand < 0:
+                     seq = revcomp(seq)
+@@ -254,6 +268,12 @@
+         if retained == 0:
+             print("Error: no sequences passed quality/coverage filtering", file=sys.stderr)
+             return 1
++        if off_grid:
++            print(f"Error: --aligned needs every row to be the reference length ({ref_len} nt); "
++                  f"{len(off_grid)} are not: {', '.join(off_grid[:5])}"
++                  f"{' ...' if len(off_grid) > 5 else ''}. Drop --aligned to align them "
++                  f"with MAFFT.", file=sys.stderr)
++            return 1
+ 
+         print(
+             f"[*] {retained}/{len(input_records)} sequences passed coverage filter "
+@@ -275,26 +295,34 @@
+         with open(clean_ref_p, "w") as fh:
+             fh.write(f">Reference\n{str(ref_rec.seq).upper()}\n")
+ 
+-        print("[*] Running MAFFT --keeplength --addfragments...")
+-        mafft_cmd = [
+-            mafft_bin,
+-            "--auto",
+-            "--keeplength",
+-            "--thread", str(args.mafft_threads),
+-            "--addfragments", str(clean_input_p),
+-            str(clean_ref_p),
+-        ]
+-
+-        with open(tmp_aln, "w") as fh:
+-            res = subprocess.run(mafft_cmd, stdout=fh, stderr=subprocess.PIPE, text=True)
+-
+-        if res.returncode != 0:
+-            print(f"MAFFT failed: {res.stderr}", file=sys.stderr)
+-            return 1
++        if args.aligned:
++            # Same shape as MAFFT's output (lower case), rows exactly as given.
++            print("[*] Input is on the reference grid (--aligned): MAFFT skipped")
++            with open(tmp_aln, "w") as out:
++                for part in (clean_ref_p, clean_input_p):
++                    for line in part.read_text().splitlines():
++                        out.write((line if line.startswith(">") else line.lower()) + "\n")
++        else:
++            print("[*] Running MAFFT --keeplength --addfragments...")
++            mafft_cmd = [
++                mafft_bin,
++                "--auto",
++                "--keeplength",
++                "--thread", str(args.mafft_threads),
++                "--addfragments", str(clean_input_p),
++                str(clean_ref_p),
++            ]
++
++            with open(tmp_aln, "w") as fh:
++                res = subprocess.run(mafft_cmd, stdout=fh, stderr=subprocess.PIPE, text=True)
++
++            if res.returncode != 0:
++                print(f"MAFFT failed: {res.stderr}", file=sys.stderr)
++                return 1
+ 
+         # Checked before the rename, so a failed check never replaces a good alignment.
+         aligned_recs = list(SeqIO.parse(tmp_aln, "fasta"))
+-        print(f"[✓] MAFFT aligned {len(aligned_recs)} records. Validating codon lengths...")
++        print(f"[✓] {'Collected' if args.aligned else 'MAFFT aligned'} {len(aligned_recs)} records. Validating codon lengths...")
+         for r in aligned_recs:
+             if len(r.seq) != ref_len:
+                 print(
+diff --git a/src/disassembler/cmd/pipe_from_lexicmap.py b/src/disassembler/cmd/pipe_from_lexicmap.py
+index 73afa2c25a57..000000000000 100644
+--- a/src/disassembler/cmd/pipe_from_lexicmap.py
++++ b/src/disassembler/cmd/pipe_from_lexicmap.py
+@@ -368,6 +368,9 @@
+         out_tree=str(tree),
+         mafft_threads=args.mafft_threads,
+         msa_min_cov=msa_min_cov,
++        # lexicmap rows (and the sieve's, which keeps them verbatim) are on the reference
++        # grid; re-aligning them let MAFFT move bases across uncovered stretches.
++        aligned=True,
+     )
+     rc = msa_cmd.run(msa_ns)
+     if rc != 0:

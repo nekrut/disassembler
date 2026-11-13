@@ -1,0 +1,73 @@
+diff --git a/walker/src/io/input.rs b/walker/src/io/input.rs
+--- a/walker/src/io/input.rs
++++ b/walker/src/io/input.rs
+@@ -102,6 +102,14 @@
+             "{source}: {s:?} is not a usable accession (unexpected characters)"
+         )));
+     }
++    // SRA run ids are ~12 characters; anything this long is a mangled line, and as
++    // `<out_dir>/<acc>.vcf` or `<cache>/<acc>.unitigs.fa.zst` it would exceed NAME_MAX.
++    if s.len() > 64 {
++        return Err(Error::Usage(format!(
++            "{source}: accession of {} characters is not usable (at most 64)",
++            s.len()
++        )));
++    }
+     // Logan run accessions are SRR/ERR/DRR followed by digits. Warn rather than reject,
+     // since the bucket's naming is not ours to constrain.
+     let looks_right = s.len() > 3
+diff --git a/walker/src/io/output.rs b/walker/src/io/output.rs
+--- a/walker/src/io/output.rs
++++ b/walker/src/io/output.rs
+@@ -473,7 +473,9 @@
+             // A VCF an earlier run left in this --out-dir would claim sites this run did not
+             // find, beside a primary that no longer has them.
+             match std::fs::remove_file(&path) {
+-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
++                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
++                    eprintln!("[warn] cannot remove stale {}: {e}", path.display())
++                }
+                 _ => {}
+             }
+             continue;
+@@ -612,7 +614,11 @@
+         let (Some(i), false) = (diff, multiple) else { continue };
+         let Some(qpos) = map[i] else { continue }; // primary base has no query coordinate
+ 
+-        let ref_base = query.seq[qpos];
++        // VCF REF allows only A,C,G,T,N; an ambiguity code in the gene is written as N.
++        let ref_base = match query.seq[qpos] {
++            b @ (b'A' | b'C' | b'G' | b'T') => b,
++            _ => b'N',
++        };
+         let major = primary.seq[i]; // the primary carries the majority allele
+         let minor = alt_seq[i];
+         let major_ka = a.taken_abundance;
+diff --git a/walker/src/main.rs b/walker/src/main.rs
+--- a/walker/src/main.rs
++++ b/walker/src/main.rs
+@@ -468,6 +468,24 @@
+         })
+     };
+ 
++    if let Some(qs) = &queries {
++        for q in qs {
++            let id = if q.record_id.is_empty() { q.name.as_str() } else { q.record_id.as_str() };
++            let ok = id.bytes().enumerate().all(|(i, b)| {
++                b.is_ascii_alphanumeric()
++                    || b"!#$%&+./:;?@^_|~-".contains(&b)
++                    || (i > 0 && (b == b'*' || b == b'='))
++            }) && !id.is_empty();
++            if !ok {
++                return Err(error::Error::Usage(format!(
++                    "{}: reference id {id:?} is not a valid VCF contig name (no spaces, commas, \
++                     quotes or angle brackets)",
++                    q.path.display()
++                )));
++            }
++        }
++    }
++
+     let accessions = match (&args.accession, &args.accession_list) {
+         // `-a` used to win silently, so a run meant for a whole list did one accession.
+         (Some(_), Some(_)) => {

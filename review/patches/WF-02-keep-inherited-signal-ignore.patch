@@ -1,0 +1,78 @@
+diff --git a/walker/src/scratch.rs b/walker/src/scratch.rs
+--- a/walker/src/scratch.rs
++++ b/walker/src/scratch.rs
+@@ -68,9 +68,19 @@
+ 
+     /// On SIGINT, SIGTERM or SIGHUP, remove the directory, then end the process as the
+     /// signal would have, so the caller still sees "terminated by SIGTERM".
++    ///
++    /// A signal the parent set to ignored stays ignored, as with any POSIX tool: `nohup`
++    /// ignores SIGHUP so a run outlives the login session, and a script's background job
++    /// ignores SIGINT. Catching it would turn that hangup into the end of the run, and
++    /// GraphAligner would no longer inherit the ignore either.
+     pub fn remove_on_signal(&self) -> Result<()> {
+         use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+-        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
++        let wanted: Vec<i32> =
++            [SIGINT, SIGTERM, SIGHUP].into_iter().filter(|&s| !is_ignored(s)).collect();
++        if wanted.is_empty() {
++            return Ok(());
++        }
++        let mut signals = signal_hook::iterator::Signals::new(&wanted)?;
+         let (path, keep) = (self.path.clone(), self.keep);
+         std::thread::spawn(move || {
+             if let Some(sig) = signals.forever().next() {
+@@ -95,6 +105,15 @@
+     }
+ }
+ 
++/// Whether `sig` is currently SIG_IGN (inherited from the parent across exec).
++fn is_ignored(sig: libc::c_int) -> bool {
++    // SAFETY: a null new action only reads the current disposition into `old`.
++    unsafe {
++        let mut old: libc::sigaction = std::mem::zeroed();
++        libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
++    }
++}
++
+ /// `remove_dir_all`, tried twice: a worker can create a file in the directory while it is
+ /// being emptied, which makes the first attempt fail with "directory not empty".
+ fn remove(path: &Path) {
+diff --git a/walker/tests/cli.rs b/walker/tests/cli.rs
+--- a/walker/tests/cli.rs
++++ b/walker/tests/cli.rs
+@@ -215,6 +215,34 @@
+     assert_eq!(run_dirs(&base), Vec::<PathBuf>::new(), "the run's scratch directory was left behind");
+ }
+ 
++/// `nohup` sets SIGHUP to ignored so a run outlives its login session; the shell's hangup then
++/// reaches the whole job. 0.1.1 caught SIGHUP regardless, so the run ended on the hangup and
++/// GraphAligner, no longer inheriting the ignore, died with it. An ignored signal stays ignored.
++#[test]
++fn an_inherited_sighup_ignore_survives_a_hangup() {
++    use std::os::unix::process::CommandExt;
++    let fx = Fixture::matching("nohup", 1);
++    let base = fx.dir.join("scratch");
++    let base_arg = base.to_string_lossy().into_owned();
++    let mut cmd = fx.cmd_ga("ga_slow", "cache", &["--scratch-dir", &base_arg, "--allow-empty"]);
++    cmd.process_group(0).stdout(Stdio::null()).stderr(Stdio::null());
++    // SAFETY: signal() is async-signal-safe; between fork and exec, this is what nohup does.
++    unsafe {
++        cmd.pre_exec(|| {
++            libc::signal(libc::SIGHUP, libc::SIG_IGN);
++            Ok(())
++        });
++    }
++    let mut child = cmd.spawn().unwrap();
++    wait_for_scratch_file(&base);
++    // SAFETY: plain kill(2) on the child's process group, as the shell sends it to a job.
++    assert_eq!(unsafe { libc::kill(-(child.id() as i32), libc::SIGHUP) }, 0);
++    let status = wait_or_kill(&mut child, Duration::from_secs(60)).expect("walker hung");
++    assert_eq!(status.code(), Some(0), "the run must outlive an ignored SIGHUP: {status:?}");
++    let summary = std::fs::read_to_string(fx.dir.join("out").join("q_walker_summary.json")).unwrap();
++    assert!(!summary.contains("\"error\""), "GraphAligner must inherit the ignore: {summary}");
++}
++
+ /// A run killed outright (SIGKILL, the OOM killer) cannot clean up after itself; the next run
+ /// over the same --scratch-dir removes what it left, and its own directory when it ends.
+ #[test]

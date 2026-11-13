@@ -1,0 +1,320 @@
+diff --git a/walker/src/scratch.rs b/walker/src/scratch.rs
+--- a/walker/src/scratch.rs
++++ b/walker/src/scratch.rs
+@@ -9,17 +9,33 @@
+ //! Each run now makes its own directory, `logan-walker.<pid>.<suffix>` with mode 0700, under
+ //! `--scratch-dir` (default `/dev/shm` where it exists, else the system temp directory). It is
+ //! removed when the run ends, on SIGINT, SIGTERM or SIGHUP, and, if a SIGKILL or the OOM
+-//! killer left it behind, by the next run over the same base once that PID is gone.
++//! killer left it behind, by the next run over the same base on the same machine.
+ //! `LOGAN_KEEP_SCRATCH` keeps it, for debugging.
++//!
++//! "Left behind" is decided by a lock, not by the PID in the name. The sweep used to ask
++//! `kill(pid, 0)`, which answers for the caller's PID namespace only: a run in another
++//! container, or on another node sharing the base, looked dead and lost its files while it
++//! was aligning, and any directory of the user's called `logan-walker.<number>` was removed
++//! with its contents. Each run now holds `flock` on `.lock` in its directory, and a
++//! directory is swept only if that file exists, names this kernel, and the lock is free.
+ 
+ use crate::error::{file_err, Error, Result};
+ use std::path::{Path, PathBuf};
+ 
+ const PREFIX: &str = "logan-walker.";
+ 
++/// Inside a run's directory. The run holds an exclusive `flock` on it for as long as it
++/// lives; its content names the kernel whose lock table that `flock` is in.
++const LOCK_NAME: &str = ".lock";
++/// Inside a `LOGAN_KEEP_SCRATCH` run's directory: never swept.
++const KEEP_NAME: &str = ".keep";
++
+ pub struct Scratch {
+     path: PathBuf,
+     keep: bool,
++    /// The run's proof of life. The kernel drops the lock however the process ends, and it
++    /// is visible from every PID namespace on this kernel, which a PID is not.
++    _lock: Option<std::fs::File>,
+ }
+ 
+ impl Scratch {
+@@ -45,7 +61,13 @@
+         for attempt in 0..16u32 {
+             let path = base.join(format!("{PREFIX}{pid}.{nanos:08x}{attempt:x}"));
+             match make_private_dir(&path) {
+-                Ok(()) => return Ok(Scratch { path, keep }),
++                Ok(()) => {
++                    let _lock = hold_lock(&path);
++                    if keep {
++                        let _ = std::fs::write(path.join(KEEP_NAME), b"");
++                    }
++                    return Ok(Scratch { path, keep, _lock });
++                }
+                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                 Err(e) => {
+                     return Err(Error::Usage(format!(
+@@ -124,31 +146,29 @@
+     std::fs::create_dir(path)
+ }
+ 
+-/// Remove run directories in `base` that are ours and whose process no longer exists.
+-/// Another user's directory, or one whose PID is alive (even if reused by another program),
+-/// is left alone. Returns how many were removed.
++/// Remove run directories in `base` that are ours and whose run has ended without cleaning
++/// up. A directory qualifies only if it is named as `Scratch::create` names one, belongs to
++/// this user, holds a lock file written under this kernel, is not marked to be kept, and
++/// nobody holds the lock. Everything else is left alone: a directory that merely has a
++/// similar name, a run alive in another container (its lock is held) or on another host (its
++/// lock file names another kernel). Returns how many were removed.
+ #[cfg(unix)]
+ fn sweep_stale(base: &Path) -> usize {
+     use std::os::unix::fs::MetadataExt;
+     let Ok(entries) = std::fs::read_dir(base) else { return 0 };
++    let Some(me) = kernel_id() else { return 0 };
+     // SAFETY: getuid cannot fail and has no preconditions.
+     let uid = unsafe { libc::getuid() };
+     let mut removed = 0;
+     for entry in entries.flatten() {
+-        let name = entry.file_name();
+-        let Some(pid) = name
+-            .to_str()
+-            .and_then(|n| n.strip_prefix(PREFIX))
+-            .and_then(|rest| rest.split('.').next())
+-            .and_then(|p| p.parse::<i32>().ok())
+-        else {
++        if !entry.file_name().to_str().is_some_and(is_run_dir_name) {
+             continue;
+-        };
++        }
+         let Ok(meta) = entry.metadata() else { continue };
+-        if !meta.is_dir() || meta.uid() != uid || pid as u32 == std::process::id() {
++        if !meta.is_dir() || meta.uid() != uid {
+             continue;
+         }
+-        if !process_exists(pid) {
++        if owner_is_gone(&entry.path(), &me) {
+             remove(&entry.path());
+             removed += 1;
+         }
+@@ -161,13 +181,83 @@
+     0
+ }
+ 
+-/// `kill(pid, 0)`: it fails with ESRCH only when no such process exists. EPERM means it
+-/// exists under another user.
++/// `logan-walker.<pid>.<9 hex digits>`, exactly what `Scratch::create` builds.
+ #[cfg(unix)]
+-fn process_exists(pid: i32) -> bool {
+-    // SAFETY: signal 0 delivers nothing; it only checks that the process exists.
+-    let r = unsafe { libc::kill(pid, 0) };
+-    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
++fn is_run_dir_name(name: &str) -> bool {
++    let Some((pid, suffix)) = name.strip_prefix(PREFIX).and_then(|rest| rest.split_once('.'))
++    else {
++        return false;
++    };
++    !pid.is_empty()
++        && pid.bytes().all(|b| b.is_ascii_digit())
++        && suffix.len() == 9
++        && suffix.bytes().all(|b| b.is_ascii_hexdigit())
++}
++
++/// Create `<dir>/.lock`, lock it, and only then write this kernel's identity into it. A
++/// sweeper ignores a lock file with no identity, so it cannot win the lock in the moment
++/// between our `open` and our `flock`. `None` (no `flock` on this filesystem, no identity)
++/// leaves a directory no sweep will ever remove, which is the safe side.
++#[cfg(unix)]
++fn hold_lock(dir: &Path) -> Option<std::fs::File> {
++    use std::io::Write;
++    use std::os::unix::io::AsRawFd;
++    let id = kernel_id()?;
++    let mut f = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(dir.join(LOCK_NAME))
++        .ok()?;
++    // SAFETY: flock on a descriptor this function owns.
++    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
++        return None;
++    }
++    f.write_all(id.as_bytes()).ok()?;
++    Some(f)
++}
++
++#[cfg(not(unix))]
++fn hold_lock(_dir: &Path) -> Option<std::fs::File> {
++    None
++}
++
++/// Whether the run that made `dir` has ended: its lock file names this kernel and the lock
++/// is free. A missing or foreign lock file, a keep marker, or a lock that cannot be tested
++/// all mean "leave it".
++#[cfg(unix)]
++fn owner_is_gone(dir: &Path, me: &str) -> bool {
++    use std::os::unix::io::AsRawFd;
++    if dir.join(KEEP_NAME).exists() {
++        return false;
++    }
++    let lock = dir.join(LOCK_NAME);
++    match std::fs::read_to_string(&lock) {
++        Ok(id) if id == me => {}
++        _ => return false,
++    }
++    let Ok(f) = std::fs::File::open(&lock) else { return false };
++    // SAFETY: flock on a descriptor this function owns; closing `f` releases the lock.
++    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
++}
++
++/// Names the kernel whose lock table a `flock` lives in. On Linux the boot id: the same in
++/// every container on a host, different on every other host and after a reboot. Elsewhere
++/// (macOS) the host name.
++#[cfg(unix)]
++fn kernel_id() -> Option<String> {
++    if let Ok(id) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
++        if !id.trim().is_empty() {
++            return Some(format!("boot {}", id.trim()));
++        }
++    }
++    let mut buf = [0u8; 256];
++    // SAFETY: `buf` is writable for `buf.len()` bytes.
++    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
++        return None;
++    }
++    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
++    let host = String::from_utf8_lossy(&buf[..end]).into_owned();
++    (!host.is_empty()).then(|| format!("host {host}"))
+ }
+ 
+ #[cfg(all(test, unix))]
+@@ -203,29 +293,85 @@
+         let _ = std::fs::remove_dir_all(&b);
+     }
+ 
++    /// A run directory as a run that ended without cleaning up leaves it: lock file with this
++    /// kernel's identity, nobody holding the lock.
++    fn fabricate(b: &Path, name: &str, id: Option<&str>) -> PathBuf {
++        let d = b.join(name);
++        std::fs::create_dir(&d).unwrap();
++        std::fs::write(d.join("left.sub.gfa"), b"H\n").unwrap();
++        if let Some(id) = id {
++            std::fs::write(d.join(LOCK_NAME), id).unwrap();
++        }
++        d
++    }
++
+     #[test]
+     fn a_dead_runs_directory_is_swept_and_a_live_ones_kept() {
++        use std::os::unix::io::AsRawFd;
+         let b = base("sweep");
+         std::fs::create_dir_all(&b).unwrap();
+-        // A PID that has just exited stands in for a run killed with SIGKILL.
+-        let mut child = std::process::Command::new("true").spawn().unwrap();
+-        let dead = child.id();
+-        child.wait().unwrap();
+-        let stale = b.join(format!("{PREFIX}{dead}.0"));
+-        std::fs::create_dir(&stale).unwrap();
+-        std::fs::write(stale.join("left.sub.gfa"), b"H\n").unwrap();
+-        let live = b.join(format!("{PREFIX}1.0")); // PID 1 always exists
+-        std::fs::create_dir(&live).unwrap();
++        let me = kernel_id().unwrap();
++        // PID 1 always exists: the PID in the name must not be what decides.
++        let stale = fabricate(&b, "logan-walker.1.0a1b2c3d0", Some(&me));
++        // A PID far above pid_max, as seen from another PID namespace: alive, because its
++        // lock is held (flock belongs to the open file description, so a second open in
++        // this process conflicts exactly as another process would).
++        let live = fabricate(&b, "logan-walker.99999999.0a1b2c3d1", Some(&me));
++        let held = std::fs::File::open(live.join(LOCK_NAME)).unwrap();
++        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
++        let other_host =
++            fabricate(&b, "logan-walker.99999998.0a1b2c3d2", Some("boot 00000000-another-host"));
+         let other = b.join("not-ours");
+         std::fs::create_dir(&other).unwrap();
+ 
+         let s = Scratch::create(Some(&b)).unwrap();
+         assert!(!stale.exists(), "the dead run's directory is removed");
+-        assert!(live.exists() && other.exists(), "only dead runs' directories are touched");
++        assert!(live.exists(), "a held lock means alive, whatever the PID says");
++        assert!(other_host.exists(), "another kernel's directory is never judged");
++        assert!(other.exists());
++        drop((s, held));
++        let _ = std::fs::remove_dir_all(&b);
++    }
++
++    #[test]
++    fn directories_that_only_look_like_ours_are_never_removed() {
++        let b = base("lookalike");
++        std::fs::create_dir_all(&b).unwrap();
++        let me = kernel_id().unwrap();
++        let kept: Vec<PathBuf> = vec![
++            // a user's dated or job-numbered results: no lock file
++            fabricate(&b, "logan-walker.20261109", None),
++            fabricate(&b, "logan-walker.8812345.results", None),
++            // our name shape, but no lock file (also what 0.1.1 left behind)
++            fabricate(&b, "logan-walker.99999997.0a1b2c3d0", None),
++            // a lock file, but not our name shape
++            fabricate(&b, "logan-walker.99999996.results", Some(&me)),
++        ];
++        // LOGAN_KEEP_SCRATCH: lock free, keep marker present
++        let keep = fabricate(&b, "logan-walker.99999995.0a1b2c3d0", Some(&me));
++        std::fs::write(keep.join(KEEP_NAME), b"").unwrap();
++
++        let s = Scratch::create(Some(&b)).unwrap();
++        for d in kept.iter().chain([&keep]) {
++            assert!(d.join("left.sub.gfa").exists(), "{} must survive", d.display());
++        }
+         drop(s);
+         let _ = std::fs::remove_dir_all(&b);
+     }
+ 
++    #[test]
++    fn a_run_holds_its_lock_until_it_ends() {
++        let b = base("held");
++        let s1 = Scratch::create(Some(&b)).unwrap();
++        let p1 = s1.path().to_path_buf();
++        assert!(!owner_is_gone(&p1, &kernel_id().unwrap()), "a live run must not look dead");
++        std::fs::write(p1.join("x.sub.gfa"), b"H\n").unwrap();
++        let s2 = Scratch::create(Some(&b)).unwrap(); // sweeps the base
++        assert!(p1.join("x.sub.gfa").exists(), "a second run must not remove a live one's files");
++        drop((s1, s2));
++        let _ = std::fs::remove_dir_all(&b);
++    }
++
+     #[test]
+     fn an_unwritable_base_names_itself() {
+         let b = base("ro");
+diff --git a/walker/src/stages/align.rs b/walker/src/stages/align.rs
+--- a/walker/src/stages/align.rs
++++ b/walker/src/stages/align.rs
+@@ -229,6 +229,20 @@
+         // other worker or process can have deleted it out from under us; keyed on the
+         // accession alone, a file another run unlinked arrived here as a biological negative.
+         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
++            // Our own inputs are still in scratch here: the GFA lives until `subgraph` is
++            // dropped, the query copy until the line below. If they are gone as well,
++            // GraphAligner did not "find nothing": the run's scratch files were removed
++            // under it, and a negative must not be reported.
++            if !subgraph.gfa_path.exists() || !query_fa.exists() {
++                return Err(Error::GraphAligner {
++                    accession: subgraph.accession.clone(),
++                    detail: format!(
++                        "the scratch files in {} were removed while GraphAligner ran, so its \
++                         result is lost; is something else cleaning that directory?",
++                        gaf_out.parent().unwrap_or(std::path::Path::new(".")).display()
++                    ),
++                });
++            }
+             let _ = std::fs::remove_file(&query_fa);
+             return Ok(HashMap::new());
+         }
+diff --git a/walker/src/stages/extract.rs b/walker/src/stages/extract.rs
+--- a/walker/src/stages/extract.rs
++++ b/walker/src/stages/extract.rs
+@@ -290,6 +290,10 @@
+         });
+     }
+ 
++    // The run's directory is made once, with mode 0700, by `Scratch::create`. It is not
++    // remade here: one that vanishes mid-run must fail the accession, not come back with
++    // the default mode. Unit tests have no `Scratch`, so they still make theirs.
++    #[cfg(test)]
+     std::fs::create_dir_all(&cfg.scratch_dir)
+         .map_err(crate::error::file_err("create", &cfg.scratch_dir))?;
+     let gfa_path = cfg.scratch_dir.join(format!("{}.sub.gfa", scratch_stem(&graph.accession)));
