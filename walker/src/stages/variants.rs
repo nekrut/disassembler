@@ -165,6 +165,20 @@ pub fn prefer_majority(
     let mut current = GafPath { steps: path.steps.clone(), ..copy_coords(path) };
     let mut swaps = 0usize;
 
+    // The sequence the aligner's window actually covers, which is what gets published.
+    // `stitch` returns `stitched[path_start..path_end]` (`stitch.rs`), not the whole path, so
+    // this is the sequence each swap must preserve the length of.
+    //
+    // WV-01: the guard below used to compare against `stitched_len`, the whole stitched
+    // path. The two are equal only when `path_start == 0` and `path_end >= path_len`, that
+    // is, only for a tip-to-tip alignment. Every real GAF row has a flank, so the guard
+    // rejected every correction, silently, leaving `_primary` on the minority allele with no
+    // `consensus:` line and output byte-identical to a `--no-prefer-majority` run.
+    let Some(first) = stitch::stitch(cfg, graph, path, subgraph, query)? else {
+        return Ok(None); // the route does not clear the coverage gate; nothing to correct
+    };
+    let mut window = first.seq;
+
     // Each swap fixes one site and makes that site's taken branch the majority, so it cannot
     // be chosen again. The cap is a backstop against a shape that defeats that reasoning.
     for _ in 0..cfg.max_alts.max(1) * 2 {
@@ -188,84 +202,118 @@ pub fn prefer_majority(
             if taken_ab < floor || (taken_ab as f64 / total) < cfg.min_vaf {
                 continue; // not a two-allele site; this is the error-branch case
             }
-            // The best-supported credible alternative, and only if it beats what we took.
-            let mut best: Option<(Oriented, f32)> = None;
-            for &alt in branches {
-                if alt == taken {
-                    continue;
-                }
-                let ab = abund(alt);
-                if ab < floor || (ab as f64 / total) < cfg.min_vaf || ab <= taken_ab {
-                    continue;
-                }
-                if best.is_none_or(|(_, b)| ab > b) {
-                    best = Some((alt, ab));
-                }
-            }
-            let Some((alt, _)) = best else { continue };
-            let Some((rejoin_at, detour)) = rejoin(&v.out, &v.at, alt, i, cfg.alt_max_detour)
-            else {
-                continue;
-            };
-            let mut steps: Vec<PathStep> = Vec::with_capacity(current.steps.len() + detour.len());
-            steps.extend_from_slice(&current.steps[..=i]);
-            for &o in &detour {
-                steps.push(PathStep {
-                    node: subgraph.nodes[(o as usize) / 2],
-                    orient: orient_of(o),
-                });
-            }
-            steps.extend_from_slice(&current.steps[rejoin_at..]);
+            // Every credible alternative that beats what we took, best first.
+            //
+            // WV-12: this kept only the single most abundant one, so when that was refused
+            // further down (no rejoin, a length or frameshift rule, the shifted window, the
+            // coverage gate) the whole fork was abandoned and a second credible branch that
+            // also beat the walked one was never tried. On a triallelic fork with a +1 nt
+            // artifact at 45x over a clean substitution at 30x, the primary kept the 25x
+            // allele and the alt reported `vaf=0.300 primary_vaf=0.250`, identical to
+            // `--no-prefer-majority`. The `continue`s in the loop below now mean "try the
+            // next alternative" rather than "give up on this fork".
+            let mut better: Vec<(Oriented, f32)> = branches
+                .iter()
+                .copied()
+                .filter(|&a| a != taken)
+                .map(|a| (a, abund(a)))
+                .filter(|&(_, ab)| {
+                    ab >= floor && (ab as f64 / total) >= cfg.min_vaf && ab > taken_ab
+                })
+                .collect();
+            // Descending abundance. `sort_by` is stable, so ties keep branch order and the
+            // choice stays deterministic.
+            better.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-            // The same length rules as `find_alts`, so the two stages agree on what counts
-            // as an allele. Without this, an indel site could not be corrected and its
-            // alternative would be emitted with a VAF above 0.5, meaning the primary had
-            // kept the rarer base there. Measured before the rules were shared: 1 of 48
-            // alternatives on `ebola_gp`, every one of them an indel.
-            let spliced_len = stitched_len(cfg, &steps, subgraph);
-            let delta = spliced_len as i64 - baseline_len as i64;
-            if delta != 0
-                && (!cfg.allow_indel_alts
-                    || delta.unsigned_abs() as usize > cfg.max_alt_indel
-                    || (delta % 3 != 0 && !cfg.allow_frameshift_alts))
-                {
+            for (alt, _) in better {
+                let Some((rejoin_at, detour)) = rejoin(&v.out, &v.at, alt, i, cfg.alt_max_detour)
+                else {
+                    continue;
+                };
+                let mut steps: Vec<PathStep> = Vec::with_capacity(current.steps.len() + detour.len());
+                steps.extend_from_slice(&current.steps[..=i]);
+                for &o in &detour {
+                    steps.push(PathStep {
+                        node: subgraph.nodes[(o as usize) / 2],
+                        orient: orient_of(o),
+                    });
+                }
+                steps.extend_from_slice(&current.steps[rejoin_at..]);
+
+                // Almost the same length rules as `find_alts`, so the two stages agree on what
+                // counts as an allele. Without that agreement an indel site could not be
+                // corrected and its alternative would be emitted with a VAF above 0.5, meaning
+                // the primary had kept the rarer base there. Measured before the rules were
+                // shared: 1 of 48 alternatives on `ebola_gp`, every one of them an indel.
+                //
+                // The one deliberate difference is the frameshift rule, below.
+                let spliced_len = stitched_len(cfg, &steps, subgraph);
+                let delta = spliced_len as i64 - baseline_len as i64;
+                if delta != 0
+                    && (!cfg.allow_indel_alts
+                        || delta.unsigned_abs() as usize > cfg.max_alt_indel
+                        // WV-11: the consensus never takes a frameshift, whatever the flags say.
+                        // `--allow-frameshift-alts` is documented as admitting such alleles to
+                        // `alt_haplotypes.fasta`, a side file; reusing it here also let one
+                        // reframe `_primary`, which is the record the codon alignment and the
+                        // selection analysis read. On the panel 190 of 203 length-changing calls
+                        // are +-1 nt homopolymer artifacts, so the flag's users would have got
+                        // out-of-frame primaries in the codon MSA. Not `&& !allow_frameshift_alts`.
+                        || delta % 3 != 0)
+                    {
+                        continue;
+                    }
+                let prefix_len = stitched_len(cfg, &current.steps[..=i], subgraph);
+                let replaced_len = tail_contrib(cfg, &current.steps[i + 1..rejoin_at], subgraph);
+                let Some((new_start, new_end)) = shifted_window(
+                    current.path_start,
+                    current.path_end,
+                    prefix_len,
+                    replaced_len,
+                    delta,
+                ) else {
+                    continue;
+                };
+                let candidate = GafPath {
+                    steps,
+                    path_start: new_start,
+                    path_end: new_end,
+                    ..copy_coords(path)
+                };
+                let Some(restitched) = stitch::stitch(cfg, graph, &candidate, subgraph, query)? else {
+                    continue; // would fail the coverage gate; leave the site alone
+                };
+                // The window arithmetic must land exactly, the same check `find_alts` makes on
+                // its own candidates. The restitched window is the sequence that would be
+                // published, so if it is not the current window's length plus the delta, the
+                // shift was wrong and the swap would truncate or reframe `_primary`, the record
+                // the codon alignment and selection analysis read.
+                //
+                // Compare windows, not whole paths. `spliced_len` is the length of the entire
+                // stitched path and belongs to the indel rules above, which are about how much
+                // sequence the detour adds or removes; it is not what `stitch` returns.
+                if restitched.seq.len() as i64 != window.len() as i64 + delta {
                     continue;
                 }
-            let prefix_len = stitched_len(cfg, &current.steps[..=i], subgraph);
-            let replaced_len = tail_contrib(cfg, &current.steps[i + 1..rejoin_at], subgraph);
-            let Some((new_start, new_end)) = shifted_window(
-                current.path_start,
-                current.path_end,
-                prefix_len,
-                replaced_len,
-                delta,
-            ) else {
-                continue;
-            };
-            let candidate = GafPath {
-                steps,
-                path_start: new_start,
-                path_end: new_end,
-                ..copy_coords(path)
-            };
-            let Some(restitched) = stitch::stitch(cfg, graph, &candidate, subgraph, query)? else {
-                continue; // would fail the coverage gate; leave the site alone
-            };
-            // Defence in depth on the consensus, mirroring the `expected` check in `find_alts`.
-            // `shifted_window` is proven correct and `stitched_len` predicts the stitch length
-            // exactly, so this cannot fire today; it is a backstop so a future change to overlap
-            // handling (or a `graph_k` larger than the graph's real k) cannot silently reframe
-            // `_primary`, which is the record the codon alignment and selection analysis read.
-            if restitched.seq.len() != spliced_len {
-                continue;
+                // A different route through identical sequence is not a correction, and counting
+                // it as one would print a `consensus:` line for a no-op. `find_alts` drops the
+                // same case as `identical`.
+                if restitched.seq == window {
+                    continue;
+                }
+                // A length-changing swap moves the baseline every later swap is measured
+                // against, so it has to be updated rather than left at the original route's. The
+                // window moves with it, for the same reason.
+                baseline_len = spliced_len;
+                window = restitched.seq;
+                current = candidate;
+                swaps += 1;
+                applied = true;
+                break;
             }
-            // A length-changing swap moves the baseline every later swap is measured
-            // against, so it has to be updated rather than left at the original route's.
-            baseline_len = spliced_len;
-            current = candidate;
-            swaps += 1;
-            applied = true;
-            break;
+            if applied {
+                break;
+            }
         }
         if !applied {
             break;
@@ -723,7 +771,9 @@ mod tests {
             owns_gfa: false,
         }
     }
-    fn walked() -> GafPath {
+    /// The walked route with an explicit alignment window, so a test can put the window
+    /// inside the path as a real GAF row does. `walked()` is the spanning case.
+    fn walked_window(path_start: usize, path_end: usize) -> GafPath {
         GafPath {
             steps: vec![
                 PathStep { orient: Orient::Forward, node: 0 },
@@ -733,11 +783,16 @@ mod tests {
             query_start: 0,
             query_end: 7,
             path_len: 7,
-            path_start: 0,
-            path_end: 7,
+            path_start,
+            path_end,
             num_matches: 99,
             aln_len: 100,
         }
+    }
+    /// A window spanning the whole path. Convenient, but NOT representative: see
+    /// `the_majority_is_swapped_in_when_the_window_is_inside_the_path` for why that matters.
+    fn walked() -> GafPath {
+        walked_window(0, 7)
     }
     fn q(seq: &str) -> Query {
         Query {
@@ -834,6 +889,15 @@ mod tests {
         let c = Config { allow_indel_alts: false, ..maj(true) };
         assert!(prefer_majority(&c, &g, &s, &walked(), &q("ACGTAG")).unwrap().is_none(),
                 "and not with indel support switched off either");
+        // WV-11. `--allow-frameshift-alts` admits a frameshifting allele to the side file; it
+        // must not reframe `_primary`. The rule used to be shared with `find_alts`, so the
+        // flag did both.
+        let c = Config { allow_frameshift_alts: true, ..maj(true) };
+        assert!(prefer_majority(&c, &g, &s, &walked(), &q("ACGTAG")).unwrap().is_none(),
+                "--allow-frameshift-alts must not let the consensus be reframed");
+        // And the same on a flanked window, now that such a window reaches the rule at all.
+        assert!(prefer_majority(&c, &g, &s, &walked_window(1, 5), &q("ACGTAG")).unwrap().is_none(),
+                "nor on a flanked window");
     }
 
     #[test]
@@ -1050,5 +1114,122 @@ mod tests {
         let mut p = walked();
         p.steps[1].node = 99;
         assert!(find_alts(&cfg(true), &g, &s, &p, &q("ACGTAG")).unwrap().is_empty());
+    }
+    /// WV-01/TW-02 regression set: the alignment window sits INSIDE the path.
+    ///
+    /// Every other test in this module uses `walked()`, whose window spans the whole path
+    /// (`path_start: 0, path_end: 7` with `path_len: 7`). Real GAF rows almost never look
+    /// like that; the one the repository records is `7..1281` of 1288. That gap is how WV-01
+    /// survived two releases: `prefer_majority` compared its restitched sequence against the
+    /// whole stitched path rather than against the window, so every correction on a flanked
+    /// alignment was silently dropped. These cases fail against 0.1.0 and 0.1.1.
+    ///
+    /// The route takes the 40% branch; after correction the window must carry the 60% one.
+    #[test]
+    fn the_majority_is_swapped_in_when_the_window_is_inside_the_path() {
+        let g = diamond(40.0, 60.0);
+        let s = subgraph_of(&g);
+        let query = q("ACGTAG");
+        let c = maj(true);
+        for (start, end, before_seq, after_seq) in [
+            // Flanked at both ends, the shape of a real row.
+            (1usize, 5usize, "CGTA", "CGTC"),
+            // Truncated only at the end: still unequal to the path, so still affected.
+            (0, 5, "ACGTA", "ACGTC"),
+        ] {
+            let w = walked_window(start, end);
+            let before = stitch::stitch(&c, &g, &w, &s, &query).unwrap().unwrap();
+            assert_eq!(
+                before.seq,
+                before_seq.as_bytes(),
+                "window [{start},{end}) of the 40% route"
+            );
+            let fixed = prefer_majority(&c, &g, &s, &w, &query)
+                .unwrap()
+                .unwrap_or_else(|| panic!("window [{start},{end}) should be corrected (WV-01)"));
+            let after = stitch::stitch(&c, &g, &fixed, &s, &query).unwrap().unwrap();
+            assert_eq!(
+                after.seq,
+                after_seq.as_bytes(),
+                "window [{start},{end}) should publish the 60% allele"
+            );
+            assert_eq!(after.seq.len(), before.seq.len(), "substitution, not indel");
+            assert!(fixed.steps.iter().any(|p| p.node == 2), "must traverse the 60% branch");
+            assert!(!fixed.steps.iter().any(|p| p.node == 1), "and not the 40% one");
+        }
+    }
+
+    /// The same, for a length-changing allele: the window must move by exactly the delta.
+    /// This is the case the old whole-path comparison could not express at all, because the
+    /// path length and the window length changed by the same amount but from different bases.
+    #[test]
+    fn an_in_frame_indel_majority_is_swapped_in_with_a_flanked_window() {
+        let fa = ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n\
+                  >T_1 ka:f:40.0   L:-:0:-  L:+:3:+\nCGTA\n\
+                  >T_2 ka:f:60.0   L:-:0:-  L:+:3:+\nCGTCAAA\n\
+                  >T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nGTAG\n";
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())))
+            .unwrap();
+        let s = subgraph_of(&g);
+        let c = maj(true);
+        let fixed = prefer_majority(&c, &g, &s, &walked_window(1, 5), &q("ACGTAG"))
+            .unwrap()
+            .expect("the 60% allele inserts a codon and should still win on a flanked window");
+        assert!(fixed.steps.iter().any(|p| p.node == 2));
+        let after = stitch::stitch(&c, &g, &fixed, &s, &q("ACGTAG")).unwrap().unwrap();
+        assert_eq!(after.seq.len(), 4 + 3, "the window grew by the inserted codon");
+    }
+
+    /// `find_alts` already compared windows, so this passed before the WV-01 fix too. It is
+    /// here so the two stages are pinned on the same shape of input: a regression that made
+    /// `find_alts` compare whole paths would otherwise be caught by nothing.
+    #[test]
+    fn recovers_the_second_allele_when_the_window_is_inside_the_path() {
+        let g = diamond(60.0, 40.0);
+        let s = subgraph_of(&g);
+        let w = walked_window(1, 5);
+        let primary = stitch::stitch(&cfg(true), &g, &w, &s, &q("ACGTAG")).unwrap().unwrap();
+        let alts = find_alts(&cfg(true), &g, &s, &w, &q("ACGTAG")).unwrap();
+        assert_eq!(alts.len(), 1, "one site, one record");
+        assert_eq!(alts[0].alt_node, 2);
+        assert_eq!(alts[0].haplotype.seq, b"CGTC", "the alt over the same window");
+        assert_ne!(alts[0].haplotype.seq, primary.seq);
+        assert_eq!(alts[0].haplotype.seq.len(), primary.seq.len());
+    }
+    /// WV-12. A triallelic fork where the most abundant alternative is refused: a +1 nt
+    /// frameshift at 45%, which WV-11 keeps out of `_primary`. The next one down, a clean
+    /// substitution at 30%, still beats the walked 25% branch and must be taken.
+    ///
+    /// Before the fix only the top alternative was considered, so its refusal abandoned the
+    /// fork: the primary kept the 25% allele and the alt reported `vaf=0.300
+    /// primary_vaf=0.250`, which is what `--no-prefer-majority` would have given.
+    #[test]
+    fn a_refused_top_alternative_falls_through_to_the_next() {
+        let fa = ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+  L:+:4:+\nACGT\n\
+                  >T_1 ka:f:25.0   L:-:0:-  L:+:3:+\nCGTA\n\
+                  >T_2 ka:f:45.0   L:-:0:-  L:+:3:+\nCGTCA\n\
+                  >T_3 ka:f:100.0  L:-:1:-  L:-:2:-  L:-:4:-\nGTAG\n\
+                  >T_4 ka:f:30.0   L:-:0:-  L:+:3:+\nCGTC\n";
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())))
+            .unwrap();
+        let s = subgraph_of(&g);
+        let c = maj(true);
+        let fixed = prefer_majority(&c, &g, &s, &walked(), &q("ACGTAG"))
+            .unwrap()
+            .expect("the 30% substitution should be taken after the 45% frameshift is refused");
+        assert!(fixed.steps.iter().any(|p| p.node == 4), "must take the 30% substitution");
+        assert!(!fixed.steps.iter().any(|p| p.node == 2), "never the frameshifting 45% branch");
+        assert!(!fixed.steps.iter().any(|p| p.node == 1), "and not the walked 25% one");
+        let after = stitch::stitch(&c, &g, &fixed, &s, &q("ACGTAG")).unwrap().unwrap();
+        assert_eq!(after.seq, b"ACGTCG", "in frame, one base changed");
+
+        // The same on a flanked window, which is where WV-01 used to stop all of this.
+        let w = walked_window(1, 5);
+        let fixed = prefer_majority(&c, &g, &s, &w, &q("ACGTAG"))
+            .unwrap()
+            .expect("the fall-through must work on a flanked window too");
+        assert!(fixed.steps.iter().any(|p| p.node == 4));
+        let after = stitch::stitch(&c, &g, &fixed, &s, &q("ACGTAG")).unwrap().unwrap();
+        assert_eq!(after.seq, b"CGTC", "the 30% allele over the flanked window");
     }
 }

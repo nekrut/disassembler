@@ -545,54 +545,48 @@ fn a_fork_is_phased_and_the_majority_allele_becomes_the_primary() {
     );
 }
 
-/// WV-01, pinned. **This test asserts a known defect, not intended behaviour.**
+/// WV-01, fixed: the majority correction must fire on a flanked window too.
 ///
-/// `variants::prefer_majority` rejects its swap unless the restitched sequence is as long as
-/// the whole stitched path (`variants.rs:259`), but `stitch` returns only the aligned window
-/// (`stitch.rs:196`). The two agree only when `path_start == 0` and `path_end >= path_len`, so
-/// the correction is silently skipped for any alignment that starts or ends inside the path.
-/// The comment above that guard says it "cannot fire today"; the only real GAF row the
-/// repository records (`align.rs:426`, ERR2028820) is `7..1281` of 1288, so it fires there.
+/// `variants::prefer_majority` used to reject its swap unless the restitched sequence was as
+/// long as the whole stitched path, but `stitch` returns only the aligned window. The two
+/// agree only when `path_start == 0` and `path_end >= path_len`, so for any alignment that
+/// started or ended inside the path, which is every real GAF row, the correction was skipped
+/// silently: `_primary` kept the minority allele, no `consensus:` line was printed, and the
+/// output was byte-identical to a `--no-prefer-majority` run. Present in 0.1.0 and 0.1.1.
 ///
-/// The window here is a 6-base flank of the same shape. Everything else is identical to
-/// `a_fork_is_phased_and_the_majority_allele_becomes_the_primary`: same graph, same
-/// frequencies, same default flags. The only difference is the window, and it changes which
-/// allele is published.
-///
-/// **When WV-01 is fixed this test must fail, and the fix is to invert it**: the primary
-/// becomes the 60% allele with a `consensus:` line, matching the full-span case above. It is
-/// written this way, rather than left out, so the defect cannot be fixed by accident or
-/// reintroduced unnoticed.
+/// This is the same graph, the same frequencies and the same default flags as
+/// `a_fork_is_phased_and_the_majority_allele_becomes_the_primary`. Only the window differs: a
+/// 6-base flank, the shape of the one real GAF row the repository records (`align.rs`,
+/// ERR2028820, `7..1281` of 1288). Both must now reach the same allele.
 #[test]
-fn wv_01_a_flanked_alignment_window_loses_the_majority_correction() {
+fn a_flanked_alignment_window_still_gets_the_majority_correction() {
     let f = Fixture::bubble("fork-flanked");
     f.set_gaf(6, 115, 6, 115);
     let out = f.cmd_ga("ga_replay", "cache", &["--emit-vcf"]).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
-
-    // The fork is still found and still reported: nothing in any output says the correction
-    // was skipped, which is what makes this silent.
-    assert!(stderr.contains("1 on-path fork(s), 1 biallelic candidate(s) -> 1 recovered"), "{stderr}");
     assert!(
-        !stderr.contains("consensus:"),
-        "WV-01 appears to be FIXED: the correction fired on a flanked window. \
-         Invert this test to assert the majority allele, as the full-span case does.\n{stderr}"
+        stderr.contains("consensus: 1 site(s) where the route carried the minority allele, corrected"),
+        "the correction did not fire on a flanked window, which is WV-01; stderr:\n{stderr}"
     );
 
+    // The published record is the window, not the whole path: 109 of 121 nt, carrying the 60%
+    // allele. Slicing the expected haplotypes by the same window is what distinguishes a
+    // correct shift from one that merely has the right length.
     let outdir = f.dir.join("out");
     let primary = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
-    let seq = primary.lines().nth(1).unwrap().to_string();
-    assert!(
-        BUBBLE_QUERY.contains(&seq),
-        "WV-01 may be FIXED: the primary is no longer the reference-matching allele.\n{primary}"
+    assert_eq!(
+        primary.lines().nth(1).unwrap(),
+        &BUBBLE_MAJORITY[6..115],
+        "the primary must be the majority allele over the aligned window"
     );
+    assert!(primary.starts_with(">SRRFAKE0_primary cov=0.901 "), "{primary}");
 
-    // The majority allele is published as the alternative, at a VAF above 0.5, which is the
-    // outward sign of the defect: `primary_vaf` is the minority.
+    // The reference-matching 40% allele is demoted to the alternative, over the same window.
     let alts = std::fs::read_to_string(outdir.join("alt_haplotypes.fasta")).unwrap();
-    assert!(alts.contains("vaf=0.600"), "{alts}");
-    assert!(alts.contains("primary_vaf=0.400"), "{alts}");
+    assert_eq!(alts.lines().nth(1).unwrap(), &BUBBLE_QUERY[6..115]);
+    assert!(alts.contains("vaf=0.400"), "{alts}");
+    assert!(alts.contains("primary_vaf=0.600"), "{alts}");
 }
 
 /// `--fetch-only` had no test at all: nothing called `pipeline::run_fetch_only`, and no case
