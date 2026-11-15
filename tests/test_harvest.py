@@ -166,7 +166,7 @@ class TestHarvestAccounting(unittest.TestCase):
         hk.fetch_shard = lambda *a, **kw: {}
         per_target = self._harvest()
         self.assertEqual(dict(per_target), {})
-        self.assertTrue((self.out / "summary.json").is_file())
+        self.assertTrue((self.out / "harvest.summary.json").is_file())
 
     def test_the_session_is_closed_when_the_harvest_finishes(self):
         # 32 pooled connections against one host outlived the harvest.
@@ -222,7 +222,7 @@ class TestHarvestLocal(unittest.TestCase):
                          {"target": "pfcrt", "scores": {"SRR1": 0.7, "SRR2": 0.9}},
                          "the score file names its own target")
         self.assertTrue((self.out / "UNION.accessions.txt").is_file())
-        self.assertTrue((self.out / "summary.json").is_file())
+        self.assertTrue((self.out / "harvest.summary.json").is_file())
 
     def test_gzipped_shard_files_are_read_whatever_they_are_called(self):
         import gzip
@@ -268,7 +268,7 @@ class TestHarvestLocal(unittest.TestCase):
         self._write_shard("b.json", {})
         per_target = hk.harvest_local(self.shards, self.out)
         self.assertEqual(dict(per_target), {})
-        self.assertTrue((self.out / "summary.json").is_file())
+        self.assertTrue((self.out / "harvest.summary.json").is_file())
 
     def test_shards_are_read_whatever_they_are_called(self):
         # Galaxy stages datasets as dataset_<uuid>.dat; a .json filter found none of them.

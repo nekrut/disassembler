@@ -15,17 +15,17 @@ path = "src/main.rs"
 # the S3 streaming and decompression in stages/stream.rs; reading gzipped inputs in io/input.rs
 # (flate2, on its pure-Rust miniz_oxide backend, so no system zlib); and the run's scratch
 # directory in scratch.rs, removed on SIGTERM (signal-hook) and swept by PID (libc, already a
-# dependency of the others).
+# dependency of the others). sha2 was test-only until 0.2.0; summaries now name a sequence by
+# its hash instead of carrying it (docs/summaries.md), so it is a normal dependency.
 [dependencies]
 flate2 = "1.1.10"
 libc = "0.2.189"
 signal-hook = "0.4.5"
 ureq = "3.4.1"
+sha2 = "0.11.0"
 zstd = "0.14.0"
 
 [dev-dependencies]
-# Test-only: verifies reconstructed haplotypes against the golden fixtures by hash.
-sha2 = "0.11.0"
 
 [profile.release]
 opt-level = 3

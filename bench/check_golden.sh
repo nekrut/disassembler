@@ -184,6 +184,40 @@ cmp_bubbles() {  # got tag
   fi
 }
 
+# summary.json is gated with its volatile fields masked: the clock, the paths, and the
+# versions under test (bench/mask_summary.py says exactly which, and why). Everything that
+# describes the WALK is gated, including every count in `discards` and `cohort`, which is the
+# point: those numbers used to exist only on stderr, so nothing could regress them visibly.
+cmp_summary() {  # got fixture label
+  local got="$1" fixture="$2" label="$3"
+  if [ ! -e "$fixture" ]; then
+    echo "  WARN $label  (no fixture; not gated)"
+    return
+  fi
+  if [ ! -e "$got" ]; then
+    echo "  FAIL $label  (fixture exists, but the walker wrote no summary)"
+    fails=$((fails+1))
+    return
+  fi
+  local a="$WORK/.mask.got.$$" b="$WORK/.mask.want.$$"
+  if ! python3 "$ROOT/bench/mask_summary.py" "$got" > "$a" 2>"$a.err"; then
+    echo "  FAIL $label  (could not mask the produced summary: $(head -n 1 "$a.err"))"
+    fails=$((fails+1)); rm -f "$a" "$a.err"; return
+  fi
+  if ! python3 "$ROOT/bench/mask_summary.py" "$fixture" > "$b" 2>"$b.err"; then
+    echo "  FAIL $label  (could not mask the fixture: $(head -n 1 "$b.err"))"
+    fails=$((fails+1)); rm -f "$a" "$b" "$a.err" "$b.err"; return
+  fi
+  if cmp -s "$a" "$b"; then
+    echo "  PASS $label  (masked summary identical)"
+  else
+    echo "  FAIL $label  (masked summary differs)"
+    diff -u "$b" "$a" | head -n 20 | sed 's/^/    | /'
+    fails=$((fails+1))
+  fi
+  rm -f "$a" "$b" "$a.err" "$b.err"
+}
+
 DEFAULT_GATES=(
   "ERR2028820  queries/pfcrt_only.fasta                   ERR2028820.pfcrt"
   "SRR12363134 queries/markers/candida_auris_erg11.fasta  SRR12363134.candida_auris_erg11"
@@ -212,6 +246,9 @@ for g in "${DEFAULT_GATES[@]}"; do
   cmp_fixture "$d/snvs.tsv"             "$F.snvs.tsv"      "$tag snvs"
   cmp_fixture "$d/$acc.vcf"             "$F.vcf"           "$tag vcf"
   cmp_bubbles "$d/bubbles.json"         "$tag"
+  # The summary names the walk's own query stem, which is the query file's stem.
+  qstem="$(basename "$query")"; qstem="${qstem%.*}"
+  cmp_summary "$d/$qstem.summary.json"  "$F.summary.json"  "$tag summary"
 done
 
 # --- informational: SRR8209082 / HIV-1 pol (not gated) ---

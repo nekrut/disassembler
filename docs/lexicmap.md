@@ -134,9 +134,27 @@ that did not exist yet was taken as a prefix.) `from-lexicmap -o DIR` writes the
 | `<prefix>.clean.haplotypes.tsv` | the haplotype catalogue: changes, class, representative accessions |
 | `<prefix>.clean.a2m` | the reference plus the collapsed haplotypes in A2M format, for protein language models and EVcouplings (`--no-a2m` skips it) |
 | `<prefix>.flagged.accessions.fasta` | tiers 3, 4 and 5 |
-| `<prefix>.flagged.tsv` | tiers 3, 4 and 5, with stop codon positions and indels |
-| `<prefix>.cohort_ledger.tsv` | every accession: coverage, identity, status, tier, stops, HSPs merged, indels |
-| `<prefix>.summary.json` | quantiles, tier counts, multi-HSP rescue counts, indel counts, entropy, regime |
+| `<prefix>.cohort_ledger.tsv` | **`--cohort-ledger` only.** Every accession: coverage, identity, status, tier, stops, HSPs merged, indels. A tabular rendering of the summary's `records[]` |
+| `<prefix>.summary.json` | the run: provenance, settings, discards, cohort statistics, and one record per accession |
+
+`<prefix>.cohort_ledger.tsv` is **off by default** from 0.2.0, because the summary's
+`records[]` carries the same row for every accession and writing both put each one on disk
+twice. Pass `--cohort-ledger` when something downstream wants tabular, such as a Galaxy
+dataset or a spreadsheet; `disassembler from-lexicmap` takes the same flag and forwards it.
+
+`<prefix>.flagged.tsv` was removed in 0.2.0. It held tiers 3, 4 and 5 with the same columns as
+the ledger, so once every accession is in the summary's `records[]` with its status it was the
+same rows written a third time. Filter `records[]` or the ledger on `status` instead.
+
+The summary follows the contract in [`summaries.md`](summaries.md), which the walker's own
+summary follows too, so one parser reads both. `tool`, `inputs` and `settings` are new in
+0.2.0: before that this file recorded no provenance at all, not its own version, not which
+dataset or file it read, and not one of the eight flags that change its answer, so two
+summaries produced under different thresholds were indistinguishable on disk. `discards.rows`
+is also new and carries `malformed`, `other_query` and `qlen_mismatch`, which were counted and
+printed but never recorded. A summary is now written even when the run fails, so the absence of
+the file is no longer the only signal; the one exception is a Galaxy dataset that is not ready
+yet, which exits `EX_TEMPFAIL` without producing anything, because no run was attempted.
 
 `<prefix>.msa.fasta`, `<prefix>.haplotypes.tsv` and `<prefix>.a2m` are compatibility copies of
 the `clean.*` files.

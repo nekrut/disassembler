@@ -28,11 +28,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import sys
 from pathlib import Path
 from typing import NamedTuple
 
 from disassembler.textio import open_text
+
+from disassembler import __version__
+from disassembler import summary as summary_io
 
 # kmindex containment scores run from 0 to 1. A bin whose upper bound is exactly this includes
 # it: `0.9:1.0` used to miss every perfect match, 274,808 of the 5.2 million accessions in the
@@ -254,7 +258,7 @@ def find_score_files(sources, target: str | None = None) -> list[ScoreFile]:
 
 def stratify_bins(out_dir: Path, bins, score_files: list[ScoreFile]) -> None:
     """Per-target bin stratification into `out_dir`. Emits `<target>.bins.txt`,
-    `<target>.bins.json`, and a combined `bins_summary.json`.
+    `<target>.bins.json`, and a combined `stratify.summary.json`.
     """
     print("\n" + "=" * 80)
     ranges = ", ".join(f"{bin_label(lo, hi)}x{n}" for lo, hi, n in bins)
@@ -262,6 +266,7 @@ def stratify_bins(out_dir: Path, bins, score_files: list[ScoreFile]) -> None:
     print("=" * 80)
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    started = time.time()
     all_summaries = {}
     for sf in sorted(score_files, key=lambda f: f.target):
         target, scores = sf.target, sf.scores
@@ -289,8 +294,37 @@ def stratify_bins(out_dir: Path, bins, score_files: list[ScoreFile]) -> None:
             "n_available_nonzero": sum(1 for s in scores.values() if s > 0.0),
         }
 
-    summary_file = out_dir / "bins_summary.json"
-    summary_file.write_text(json.dumps(all_summaries, indent=2))
+    # The shared contract (docs/summaries.md). `bins_summary.json` was a bare map of target
+    # to its bins, with no record of the bin edges that produced it, so two stratifications
+    # of the same scores were indistinguishable on disk.
+    summary_file = out_dir / "stratify.summary.json"
+    requested = sum(b["requested"] for v in all_summaries.values() for b in v["bins"])
+    selected = sum(v["total_selected"] for v in all_summaries.values())
+    summary_io.write(
+        summary_file,
+        tool=summary_io.tool("stratify", __version__),
+        inputs={"references": None,
+                "source": summary_io.source("file", str(out_dir), len(score_files))},
+        settings={"bins": [{"lo": lo, "hi": hi, "n": n} for lo, hi, n in bins]},
+        run=summary_io.run_block(
+            status=summary_io.status_of(len(all_summaries), len(all_summaries)),
+            started=started,
+            wall_seconds=time.time() - started,
+            n_records=len(all_summaries),
+            n_ok=sum(1 for v in all_summaries.values() if v["total_selected"] > 0),
+        ),
+        # A bin that could not be filled is the one thing this stage silently loses: it
+        # printed `selected/requested` per bin and recorded only the selections.
+        discards={"bins": {"underfilled": sum(
+            1 for v in all_summaries.values() for b in v["bins"]
+            if b["selected"] < b["requested"])},
+            "accessions": {"not_selected": max(0, requested - selected)}},
+        cohort={"total_selected": selected, "total_requested": requested,
+                "targets": len(all_summaries)},
+        records=[{"target": k, "total_selected": v["total_selected"],
+                  "n_available_nonzero": v["n_available_nonzero"], "bins": v["bins"]}
+                 for k, v in sorted(all_summaries.items())],
+    )
     print(f"[✓] Bins summary saved: {summary_file}")
 
 
@@ -307,7 +341,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("-o", "--out-dir", default="candidates",
                    help="Output directory for <target>.bins.txt, <target>.bins.json and a "
-                        "combined bins_summary.json. Also where the score files are read "
+                        "combined stratify.summary.json. Also where the score files are read "
                         "from when --scores is not given (pass harvest's -o).")
     p.add_argument("-s", "--scores", action="append", metavar="[NAME=]PATH",
                    help="A harvest score file, or a directory: every file in it is read, and "

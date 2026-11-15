@@ -293,6 +293,22 @@ class TestFromLexicmap(_Stubs):
         self.assertEqual((out / "gene_codon_msa.fasta").read_text().count(">"), 3)
         self.assertTrue((out / "gene_fasttree.nwk").is_file())
 
+        # The manifest ties the stage summaries together. Before 0.2.0 a composite wrote
+        # nothing of its own, so a run left per-stage files with no record of the sequence,
+        # the arguments, or which stage failed.
+        manifest = json.loads((out / "from-lexicmap.summary.json").read_text())
+        self.assertEqual(manifest["run"]["status"], "ok")
+        self.assertEqual([r["stage"] for r in manifest["records"]],
+                         ["lexicmap", "sieve", "msa"])
+        by_stage = {r["stage"]: r for r in manifest["records"]}
+        self.assertEqual(by_stage["sieve"]["status"], "skipped")
+        # Each stage that wrote a summary names it, and the file is really there.
+        for record in manifest["records"]:
+            if "summary" in record:
+                self.assertTrue((out / record["summary"]).is_file(), record)
+        self.assertIn("summary", by_stage["lexicmap"])
+        self.assertIn("summary", by_stage["msa"])
+
     def test_a_run_without_sieve_removes_an_earlier_runs_sieved_cohorts(self):
         # lexicmap rewrites both cohorts every run, so sieved copies an earlier --sieve run
         # left are stale; they used to stay beside the fresh MSA.

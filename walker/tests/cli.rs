@@ -287,7 +287,7 @@ fn gzipped_query_and_list_are_read() {
     }
     let (code, err) = fx.code("cache", &["--allow-empty"]);
     assert_eq!(code, 0, "{err}");
-    let summary = std::fs::read_to_string(fx.dir.join("out").join("q_walker_summary.json")).unwrap();
+    let summary = std::fs::read_to_string(fx.dir.join("out").join("q.summary.json")).unwrap();
     assert_eq!(summary.matches("\"status\": \"no_anchors\"").count(), 3, "{summary}");
 }
 
@@ -391,9 +391,13 @@ fn a_duplicated_accession_is_processed_once() {
     let (code, err) = fx.code("cache", &["--allow-empty"]);
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("1 duplicate accession(s)"), "{err}");
-    let summary = std::fs::read_to_string(fx.dir.join("out").join("q_walker_summary.json")).unwrap();
+    let summary = std::fs::read_to_string(fx.dir.join("out").join("q.summary.json")).unwrap();
     assert_eq!(summary.matches("\"acc\": \"SRRFAKE0\"").count(), 1, "{summary}");
-    assert!(summary.contains("\"total\": 2"), "{summary}");
+    // The duplicate was dropped with a warning and nothing else. The summary now accounts
+    // for it: three entries were listed, two accessions ran, and the gap is a discard.
+    assert!(summary.contains("\"n_requested\": 3"), "{summary}");
+    assert!(summary.contains("\"n_records\": 2"), "{summary}");
+    assert!(summary.contains("\"never_reached\": 1"), "{summary}");
 }
 
 #[test]
@@ -455,13 +459,18 @@ fn the_default_walk_reconstructs_and_writes_every_output() {
     assert_eq!(snvs, "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork\n");
     assert!(outdir.join("alt_haplotypes.fasta").exists(), "alt_haplotypes.fasta not written");
 
-    let summary = std::fs::read_to_string(outdir.join("q_walker_summary.json")).unwrap();
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
     for needle in [
-        "\"logan_walker\"",
-        "\"graphaligner\"",
+        "\"schema\": 1",
+        "\"name\": \"logan-walker\"",
+        "\"GraphAligner\"",
         "\"SRRFAKE0_primary\"",
+        "\"seq_sha256\"",
         "\"outcome\": \"nothing_to_remove\"",
         "\"subgraph_nodes\": 2",
+        "\"status\": \"ok\"",
+        "\"reconstructed\": 1",
+        "\"distinct_primaries\": 1",
     ] {
         assert!(summary.contains(needle), "summary missing {needle}:\n{summary}");
     }

@@ -251,6 +251,15 @@ pub struct Config {
     /// millions of runs would be a million-column near-empty matrix; the long form is
     /// sparse-native and concatenates across cluster shards. See `io::output::write_snv_table`.
     pub emit_snv_table: bool,
+    /// Write the literal haplotype sequence into the summary, as 0.1.x did.
+    ///
+    /// Off by default from 0.2.0. The summary carries `seq_sha256` and `length` instead, which
+    /// answer the questions the field was used for (equality between runs, counting distinct
+    /// primaries, joining a record to its FASTA entry) without duplicating
+    /// `reconstructed.fasta`. Measured on three real runs, the sequence was 50.1% to 71.4% of
+    /// the file; at walker20k scale that is roughly 67 MB of duplicate FASTA inside a 130 MB
+    /// summary. See `docs/summaries.md`.
+    pub summary_seqs: bool,
     /// Hard cap on alternative haplotypes per accession.
     ///
     /// Measured site counts are 4, 4 and 0 on the accessions looked at, so this is a
@@ -463,6 +472,7 @@ impl Default for Config {
             emit_alts: true,
             emit_vcf: false,
             emit_snv_table: false,
+            summary_seqs: false,
             max_alts: 32,
             alt_max_detour: 100,
             min_shared_kmers: 3,

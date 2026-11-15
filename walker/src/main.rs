@@ -100,6 +100,10 @@ INTRA-HOST VARIANTS:
                                   intra-host SNP across the run, one row per (accession, site,
                                   allele). The cohort output that scales; load into DuckDB
                                   [default: off]
+        --summary-seqs            Also write each haplotype's literal sequence into the
+                                  summary, as 0.1.x did. Off by default: the summary carries
+                                  seq_sha256 and length, and the sequence itself is already in
+                                  reconstructed.fasta [default: off]
         --no-indel-alts           Substitution alleles only; refuse any that change length
         --allow-frameshift-alts   Also accept indel alleles whose length change is not a
                                   multiple of 3. These reframe the CDS; off by default
@@ -277,6 +281,11 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             }
             "--emit-snv-table" | "--no-emit-snv-table" => {
                 args.cfg.emit_snv_table = flag == "--emit-snv-table";
+                i += 1;
+                continue;
+            }
+            "--summary-seqs" | "--no-summary-seqs" => {
+                args.cfg.summary_seqs = flag == "--summary-seqs";
                 i += 1;
                 continue;
             }
@@ -468,7 +477,9 @@ fn real_main(mut args: Args) -> error::Result<()> {
         })
     };
 
-    let accessions = match (&args.accession, &args.accession_list) {
+    // `n_listed` is what the user asked for, before duplicates were dropped; the summary
+    // reports the difference rather than letting it disappear (`docs/summaries.md`).
+    let (accessions, n_listed) = match (&args.accession, &args.accession_list) {
         // `-a` used to win silently, so a run meant for a whole list did one accession.
         (Some(_), Some(_)) => {
             return Err(error::Error::Usage(
@@ -479,9 +490,9 @@ fn real_main(mut args: Args) -> error::Result<()> {
             // The list path has always validated; `-a` did not, though the value reaches the
             // same URL and the same two filesystem paths.
             io::input::validate_accession(a, "--accession")?;
-            vec![a.clone()]
+            (vec![a.clone()], 1)
         }
-        (None, Some(p)) => io::input::read_accession_list(p)?,
+        (None, Some(p)) => io::input::read_accession_list_counted(p)?,
         (None, None) => {
             return Err(error::Error::Usage(
                 "provide --accession or --accession-list".into(),
@@ -523,6 +534,13 @@ fn real_main(mut args: Args) -> error::Result<()> {
 
     // Unwrap the query set for the full pipeline. The guard above ensures it is Some here.
     let queries = queries.expect("queries is Some when not --fetch-only");
+
+    // The run's own clock, for `run.started` and `run.wall_seconds` in the summary. Started
+    // here rather than at process entry so it measures the work, not the argument parsing,
+    // and `n_requested` is taken before the pipeline consumes the list.
+    let started = std::time::SystemTime::now();
+    let run_clock = std::time::Instant::now();
+    let n_requested = n_listed;
 
     // Checked before any download. GraphAligner used to be looked up per accession, after
     // its unitigs were fetched and parsed, so a missing binary failed each one in turn.
@@ -575,8 +593,16 @@ fn real_main(mut args: Args) -> error::Result<()> {
         let alts = args.out_dir.join("alt_haplotypes.fasta");
         io::output::write_alts(&summary, &alts).map_err(|e| e.at("write", &alts))?;
     }
-    let summary_path = args.out_dir.join(format!("{}_walker_summary.json", queries[0].name));
-    let run = io::output::RunInfo { graphaligner: &version, cfg: &args.cfg, queries: &queries };
+    let summary_path = args.out_dir.join(format!("{}.summary.json", queries[0].name));
+    let run = io::output::RunInfo {
+        graphaligner: &version,
+        graphaligner_path: &bin.display().to_string(),
+        cfg: &args.cfg,
+        queries: &queries,
+        started,
+        wall_seconds: run_clock.elapsed().as_secs_f64(),
+        n_requested,
+    };
     io::output::write_summary(&summary, &run, &summary_path)
         .map_err(|e| e.at("write", &summary_path))?;
 

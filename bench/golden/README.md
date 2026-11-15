@@ -61,6 +61,23 @@ Three things worth knowing before trusting a green run:
    reasons, and `SRR12363134` has no on-path fork. So a green run here says nothing about
    `prefer_majority`; the only coverage of that path is `walker/tests/cli.rs`.
 
+### The summary is gated too (new in 0.2.0)
+
+Each default-flag accession also has a `<tag>.summary.json` fixture, compared with its
+volatile fields masked by `bench/mask_summary.py`: the clock (`run.started`,
+`run.wall_seconds`, `run.stage_seconds`, each record's `timing`), the machine
+(`tool.external[].path`, `inputs.source.id` and `kind`, since a cached CI run and a cold local
+one differ there), and the versions under test (`tool.version`, `tool.disassembler`).
+
+Everything else is gated, which is the point. Every count in `discards` and `cohort`,
+every `seq_sha256`, every setting and the block order are all compared byte for byte. Those
+numbers existed only on stderr until 0.2.0, so nothing could regress them visibly: a walk that
+started refusing every candidate allele, or silently stopped majority-correcting, produced the
+same gated outputs as one that did not.
+
+To regenerate: run the gate, then copy each `<query stem>.summary.json` to
+`default/<tag>.summary.json`.
+
 `alts.fasta` is empty for the two clonal isolates, and a **missing** VCF fixture is itself an
 assertion: those two recover no SNPs, so a VCF appearing is a real change. `SRR8209082`'s
 `bubbles.json` is gated by sha256 rather than committed, because 3,632 bubbles make a 1 MB file

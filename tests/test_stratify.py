@@ -149,8 +149,11 @@ class TestBinStratification(unittest.TestCase):
         for target in ("geneA", "geneB"):
             self.assertTrue((self.out / f"{target}.bins.txt").is_file())
             self.assertTrue((self.out / f"{target}.bins.json").is_file())
-        combined = json.loads((self.out / "bins_summary.json").read_text())
-        self.assertEqual(set(combined.keys()), {"geneA", "geneB"})
+        combined = json.loads((self.out / "stratify.summary.json").read_text())
+        self.assertEqual({r["target"] for r in combined["records"]}, {"geneA", "geneB"})
+        # The bin edges that produced the selection are now on disk with it.
+        self.assertEqual(combined["settings"]["bins"],
+                         [{"lo": 0.0, "hi": 0.05, "n": 5}, {"lo": 0.05, "hi": 0.1, "n": 5}])
 
 
 
@@ -213,8 +216,8 @@ class TestScoreFiles(unittest.TestCase):
         self.write("b.json", {"target": "geneB", "scores": {"SRR2": 0.9}})
         rc, err = self.run_cli("-o", str(self.dir), "--target", "geneB", "--score-bin", "0:1:5")
         self.assertEqual(rc, 0, err)
-        self.assertEqual(json.loads((self.dir / "bins_summary.json").read_text()).keys(),
-                         {"geneB"})
+        summary = json.loads((self.dir / "stratify.summary.json").read_text())
+        self.assertEqual([r["target"] for r in summary["records"]], ["geneB"])
         rc, err = self.run_cli("-o", str(self.dir), "--target", "geneC", "--score-bin", "0:1:5")
         self.assertEqual(rc, 1)
         self.assertIn("no score file for target 'geneC'", err)

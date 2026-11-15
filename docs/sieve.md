@@ -123,3 +123,18 @@ only when the cohort is large enough for the MSA and tree to dominate the run ti
 
 The full calibration study, with the measured transition curves and the reproduction commands,
 is in [`issue_sieve_calibration.md`](issue_sieve_calibration.md).
+
+## Outputs
+
+| file | contents |
+|---|---|
+| `<output>.fasta` | the promoted haplotypes |
+| `<output>.summary.json` | the run, in the shared format of [`summaries.md`](summaries.md) |
+
+The summary is new in 0.2.0. Before it, this stage produced no machine-readable output at all:
+the dedup counts, the completeness-gate drops and the promotion rate went to stdout and nowhere
+else, so a wrapping workflow could not tell a sieve that admitted everything from one that
+dropped most of its input. `discards.records` now carries `exact_duplicates`,
+`shorter_than_min_len`, `too_gappy` and `not_promoted`, `cohort` carries the admission rate,
+and `records[]` names each promoted haplotype by id and sequence hash. It is written on every
+exit path, including the failures.

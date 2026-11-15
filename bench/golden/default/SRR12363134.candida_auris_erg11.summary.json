@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "tool": {
+    "name": "logan-walker",
+    "version": "0.1.1",
+    "disassembler": null,
+    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/disassembler/bin/GraphAligner"}]
+  },
+  "inputs": {
+    "references": [
+      {"id": "candida_auris_erg11", "length": 1575, "sha256": "764e6d1a429dcfda48e8904d8b438425aee42833d5fe1a354743e07bf629ce11"}
+    ],
+    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/logancache", "n_requested": 1}
+  },
+  "settings": {
+    "k": 21,
+    "graph_k": 31,
+    "min_shared_kmers": 3,
+    "hops": 5,
+    "subgraph_nodes_per_base_guard": 3.0,
+    "max_size_mb": 1024,
+    "min_cov": 0.85,
+    "primary_metric": "matched",
+    "prune_frac": 0.01,
+    "prefer_majority": true,
+    "min_abund": 5.0,
+    "min_abund_frac": 0.0,
+    "min_vaf": 0.1,
+    "alt_max_detour": 100,
+    "max_alts": 32,
+    "indel_alts": true,
+    "max_alt_indel": 30,
+    "allow_frameshift_alts": false,
+    "graphaligner_threads": 1,
+    "summary_seqs": false
+  },
+  "run": {
+    "status": "ok",
+    "exit_code": 0,
+    "started": "2026-11-15T20:21:36Z",
+    "wall_seconds": 1.179,
+    "stage_seconds": {"stream": 0.018, "parse": 0.780, "anchor": 0.339, "extract": 0.000, "align": 0.036, "stitch": 0.000, "phase": 0.000},
+    "n_records": 1,
+    "n_ok": 1
+  },
+  "discards": {
+    "accessions": {"never_reached": 0, "no_anchors": 0, "no_path": 0, "no_logan_data": 0, "too_large": 0, "error": 0},
+    "alleles": {"no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0}
+  },
+  "cohort": {
+    "reconstructed": 1,
+    "provisional": 0,
+    "majority_corrected": 0,
+    "majority_corrections": 0,
+    "distinct_primaries": 1,
+    "singleton_primaries": 1,
+    "alts_recovered": 0,
+    "bubbles": 0,
+    "cov": {"p10": 1.0000, "p25": 1.0000, "p50": 1.0000, "p75": 1.0000, "p90": 1.0000, "mean": 1.0000},
+    "pident": {"p10": 100.0000, "p25": 100.0000, "p50": 100.0000, "p75": 100.0000, "p90": 100.0000, "mean": 100.0000}
+  },
+  "records": [
+    {
+      "acc": "SRR12363134",
+      "status": "success",
+      "n_unitigs": 1949813,
+      "n_anchors": 272,
+      "subgraph_nodes": 296,
+      "subgraph_fraction": 0.000152,
+      "provisional": false,
+      "reconstructed": [
+        {"haplotype_id": "SRR12363134_primary", "seq_sha256": "764e6d1a429dcfda48e8904d8b438425aee42833d5fe1a354743e07bf629ce11", "length": 1575, "cov": 1.0000, "pident": 100.0000, "pident_inherited": false, "nodes": 121, "mean_ka": 43.2, "vaf": 1.00}
+      ],
+      "alts": 0,
+      "bubbles": 0,
+      "majority_corrections": 0,
+      "prune": {"outcome": "applied", "depth": 42.2, "floor": 5.0, "unitigs": 296, "unitigs_kept": 135, "unpruned_span": [0, 1575], "pruned_span": [0, 1575]},
+      "timing": {"stream": 0.018, "parse": 0.780, "anchor": 0.339, "extract": 0.000, "align": 0.036, "stitch": 0.000, "phase": 0.000, "total": 1.156}
+    }
+  ]
+}

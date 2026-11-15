@@ -16,12 +16,16 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import time
 import sys
 from pathlib import Path
 
 from disassembler.resolve import resolve_sieve
 from disassembler.textio import open_text
 from disassembler.validators import fasta_record_lengths, fraction, positive_int
+
+from disassembler import __version__
+from disassembler import summary as summary_io
 
 # The binary's completeness gate (`--max-n-frac`) counts every character other than A/C/G/T,
 # '-' included. Walker rows carry no gaps, so there 5% is a sequence-quality gate. A LexicMap
@@ -178,6 +182,39 @@ def sieve_run(
 
     emit_prefix = output_fasta.with_suffix("")
 
+    started = time.time()
+
+    def emit_summary(status, n_in=0, n_unique=0, n_out=0, short=0, gappy=0, error=None,
+                     records=()):
+        """The summary, on every exit path including the failures (docs/summaries.md).
+
+        Before 0.2.0 this stage wrote no machine-readable output at all: the dedup counts,
+        the completeness-gate drops and the promotion rate went to stdout and nowhere else,
+        so a wrapping workflow could not tell a sieve that admitted everything from one that
+        dropped most of its input.
+        """
+        try:
+            summary_io.write(
+                output_fasta.with_suffix(".summary.json"),
+                tool=summary_io.tool("sieve", __version__, external=[
+                    {"name": "l1_pipeline_serial", "version": None, "path": str(resolved)}]),
+                inputs={"references": None,
+                        "source": summary_io.source("file", str(input_fasta), n_in)},
+                settings={"min_len": min_len, "max_gap_frac": max_gap_frac,
+                          "threshold": threshold, "sketch": sketch},
+                run=summary_io.run_block(status, started, time.time() - started,
+                                         n_records=n_out, n_ok=n_out, error=error),
+                discards={"records": {"exact_duplicates": n_in - n_unique,
+                                      "shorter_than_min_len": short,
+                                      "too_gappy": gappy,
+                                      "not_promoted": max(0, n_unique - short - gappy - n_out)}},
+                cohort={"n_in": n_in, "n_unique": n_unique, "n_promoted": n_out,
+                        "admission_rate": round(n_out / n_in, 6) if n_in else 0.0},
+                records=list(records),
+            )
+        except OSError:
+            pass
+
     def shards() -> list[Path]:
         return sorted(output_fasta.parent.glob(f"{emit_prefix.name}.rank*.fasta"))
 
@@ -192,9 +229,11 @@ def sieve_run(
             n_in, n_unique = byte_exact_dedup(input_fasta, deduped)
         except (OSError, ValueError) as e:
             print(f"sieve: cannot read the input FASTA: {e}", file=sys.stderr)
+            emit_summary("failed", error=f"cannot read the input FASTA: {e}")
             return 1
         if n_unique == 0:
             print(f"sieve: {input_fasta} has no sequences.", file=sys.stderr)
+            emit_summary("failed", n_in=n_in, error="the input FASTA has no sequences")
             return 1
         print(f"[sieve] dedup: {n_in} -> {n_unique} records "
               f"({n_in - n_unique} exact duplicates removed, first copy kept)", flush=True)
@@ -219,6 +258,8 @@ def sieve_run(
         rc = subprocess.run(cmd).returncode
         if rc != 0:
             print(f"sieve: kmer-diversity-sieve exited {rc}", file=sys.stderr)
+            emit_summary("failed", n_in=n_in, n_unique=n_unique, short=short, gappy=gappy,
+                         error=f"kmer-diversity-sieve exited {rc}")
             return rc
 
         with output_fasta.open("w") as fh:
@@ -231,9 +272,27 @@ def sieve_run(
         for rf in shards():
             rf.unlink(missing_ok=True)
 
-    n_out = sum(1 for line in output_fasta.open() if line.startswith(">"))
+    # One record per promoted haplotype: its id and the hash of its sequence, which is how
+    # a summary names a sequence without carrying it (docs/summaries.md).
+    promoted = []
+    ident, seq = None, []
+    for line in output_fasta.open():
+        if line.startswith(">"):
+            if ident is not None:
+                promoted.append({"id": ident, "seq_sha256": summary_io.seq_sha256("".join(seq)),
+                                 "length": len("".join(seq))})
+            ident, seq = line[1:].split()[0], []
+        else:
+            seq.append(line.strip())
+    if ident is not None:
+        promoted.append({"id": ident, "seq_sha256": summary_io.seq_sha256("".join(seq)),
+                         "length": len("".join(seq))})
+    n_out = len(promoted)
     print(f"[sieve] {n_in} -> {n_out} haplotypes "
           f"(tau={threshold}, sketch={sketch}) -> {output_fasta}", flush=True)
+    emit_summary("ok" if n_out else "failed", n_in=n_in, n_unique=n_unique, n_out=n_out,
+                 short=short, gappy=gappy, records=promoted,
+                 error=None if n_out else "promoted 0 haplotypes")
     if n_out == 0:
         print("sieve: promoted 0 haplotypes; try a lower --threshold, a lower --min-len "
               "(reconstructions may be shorter than the reference), or a higher "

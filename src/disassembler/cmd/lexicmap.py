@@ -51,7 +51,8 @@ Outputs generated:
   - <out-prefix>.clean_expanded.accessions.fasta (clean cohort including >=50% partials)
   - <out-prefix>.flagged.accessions.fasta    (flagged sequences: stops, frameshifts, or low cov)
   - <out-prefix>.flagged.tsv                 (audit table of all flagged accessions and reasons)
-  - <out-prefix>.cohort_ledger.tsv           (complete audit ledger of all evaluated accessions)
+  - <out-prefix>.cohort_ledger.tsv           (--cohort-ledger only: the summary's
+                                              records[] as a TSV)
   - <out-prefix>.summary.json                (quantiles, cohort breakdown, multi-HSP rescue counts)
   - <out-prefix>.clean.a2m                   (A2M formatted MSA for protein language models / EVcouplings)
 
@@ -88,6 +89,9 @@ import os
 import sys
 import math
 import json
+
+from disassembler import __version__
+from disassembler import summary as summary_io
 import time
 import argparse
 import bisect
@@ -169,21 +173,14 @@ def find_internal_stops(seq: str, ref_len: int, codon_table: dict = CODON_TABLE_
     return stop_positions
 
 def compute_quantiles(values: list) -> dict:
-    """Calculates summary percentiles for a metric."""
-    if not values:
-        return {"p10": 0.0, "p25": 0.0, "p50_median": 0.0, "p75": 0.0, "p90": 0.0, "mean": 0.0}
-    s = sorted(values)
-    n = len(s)
-    def q(p):
-        idx = int(round(p * (n - 1)))
-        return round(s[max(0, min(n - 1, idx))], 4)
-    return {
-        "p10": q(0.10),
-        "p25": q(0.25),
-        "p50_median": q(0.50),
-        "p75": q(0.75),
-        "p90": q(0.90),
-        "mean": round(sum(s) / n, 4)
+    """Deprecated alias for `summary.quantiles`, kept for callers outside this module.
+
+    0.1.x named the median `p50_median` here while nothing else in the suite reported
+    quantiles at all. `summary.quantiles` is now the one implementation, under `p50`, and an
+    empty input gives None rather than a row of zeros that looks like a measurement.
+    """
+    return summary_io.quantiles(values) or {
+        "p10": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "p90": 0.0, "mean": 0.0
     }
 
 # How many malformed rows to name individually before falling back to a count.
@@ -520,6 +517,7 @@ def stream_lexicmap_to_msa(
     full_length_only: bool = False,
     max_records: int = None,
     sample_cap: int = 10,
+    write_ledger: bool = False,
     out_prefix: str = None,
     write_a2m: bool = True
 ) -> dict:
@@ -532,6 +530,15 @@ def stream_lexicmap_to_msa(
         3-5. Flagged (internal stops, low coverage, or a frameshift)
     - Writes clean MSAs, flagged audit FASTA/TSV, and complete cohort ledger.
     """
+    # Which of the three inputs this run read, for `inputs.source`. A summary that does not
+    # say what it consumed cannot be checked against anything.
+    if dataset_id:
+        src_kind, src_id = "galaxy", str(dataset_id)
+    elif file_path and file_path != "-":
+        src_kind, src_id = "file", str(file_path)
+    else:
+        src_kind, src_id = "stdin", "-"
+
     ref_name, ref_header, ref_seq = load_reference(ref_path)
     ref_len = len(ref_seq)
     ref_is_cds = (ref_len % 3 == 0)
@@ -646,11 +653,20 @@ def stream_lexicmap_to_msa(
     f_clean_fa = open(f"{out_prefix}.clean.accessions.fasta", "w", encoding="utf-8")
     f_clean_exp_fa = open(f"{out_prefix}.clean_expanded.accessions.fasta", "w", encoding="utf-8")
     f_flagged_fa = open(f"{out_prefix}.flagged.accessions.fasta", "w", encoding="utf-8")
-    f_flagged_tsv = open(f"{out_prefix}.flagged.tsv", "w", encoding="utf-8")
-    f_cohort_tsv = open(f"{out_prefix}.cohort_ledger.tsv", "w", encoding="utf-8")
-
-    f_flagged_tsv.write("accession\tcoverage\tmean_pident\tflag\tn_stops\tstop_codons\thsps_merged\tindels\n")
-    f_cohort_tsv.write("accession\tcoverage\tmean_pident\tstatus\ttier\tn_stops\tstop_codons\thsps_merged\tindels\n")
+    # `cohort_ledger.tsv` is a tabular rendering of the summary's `records[]`, which carries
+    # the same row for every accession. It is therefore **off by default** from 0.2.0 and
+    # written only under `--cohort-ledger`, for Galaxy and for spreadsheets. `flagged.tsv` is
+    # gone outright: it was a strict subset of this ledger, the rows whose status is not
+    # clean. Filter `records[]` (or the ledger) on `status` instead of either file.
+    f_cohort_tsv = None
+    if write_ledger:
+        f_cohort_tsv = open(f"{out_prefix}.cohort_ledger.tsv", "w", encoding="utf-8")
+        f_cohort_tsv.write("accession\tcoverage\tmean_pident\tstatus\ttier\tn_stops"
+                           "\tstop_codons\thsps_merged\tindels\n")
+    # One record per accession, appended as the stream runs so the summary costs no more
+    # memory than the stage already uses. Spliced into records[] at the end.
+    records = summary_io.Records(out_prefix)
+    emit_record = records.add
 
     # Tracking & State. A clean haplotype is keyed by its row AND its trusted indels: an
     # insertion has no column in the row, so two accessions that differ only by one would
@@ -787,23 +803,38 @@ def stream_lexicmap_to_msa(
             tier = 4
             count_flagged_low_cov += 1
             f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=LOW_COVERAGE{indel_tag}\n{merged_seq}\n")
-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tLOW_COVERAGE\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
 
         elif not frame_ok:
             status = "FLAGGED_FRAMESHIFT"
             tier = 5
             count_flagged_frameshift += 1
             f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=FRAMESHIFT{indel_tag}\n{merged_seq}\n")
-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tFRAMESHIFT\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
 
         else:  # covered, in frame, so `stops_ok` is false by elimination
             status = "FLAGGED_PREMATURE_STOPS"
             tier = 3
             count_flagged_stops += 1
             f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag=PREMATURE_STOPS stops={n_stops} codons={stop_str}{indel_tag}\n{merged_seq}\n")
-            f_flagged_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\tPREMATURE_STOPS\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
 
-        f_cohort_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\t{status}\t{tier}\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
+        if f_cohort_tsv is not None:
+            f_cohort_tsv.write(f"{acc}\t{cov:.4f}\t{mean_pid:.2f}\t{status}\t{tier}"
+                               f"\t{n_stops}\t{stop_str}\t{len(hsps)}\t{indel_str}\n")
+        # The same row, into the summary's records[]. This is the per-accession layer the
+        # walker has always had in its own summary and this pathway kept in a side file, so
+        # a consumer needed two parsers to ask one question (docs/summaries.md).
+        emit_record({
+            "acc": acc,
+            "status": status,
+            "tier": tier,
+            "coverage": round(cov, 4),
+            "mean_pident": round(mean_pid, 2),
+            "hsps_merged": len(hsps),
+            "n_stops": n_stops,
+            "stop_codons": stop_str,
+            "indels": indel_str,
+            "seq_sha256": summary_io.seq_sha256(merged_seq),
+            "length": len(merged_seq.replace("-", "")),
+        })
 
     try:
         while True:
@@ -926,16 +957,21 @@ def stream_lexicmap_to_msa(
         f_clean_fa.close()
         f_clean_exp_fa.close()
         f_flagged_fa.close()
-        f_flagged_tsv.close()
-        f_cohort_tsv.close()
+        if f_cohort_tsv is not None:
+            f_cohort_tsv.close()
+        records.close()
 
     total_time = time.time() - start_time
 
     # Distributions & Diagnostics
+    # One quantile helper for the whole suite, so `p50` means `p50` on both pathways. The
+    # printed report reads every key, so an empty cohort takes the all-zero row rather than
+    # the None that `summary.quantiles` returns; `cohort` in the summary keeps the None,
+    # which is the honest answer when nothing was measured.
     cov_stats = compute_quantiles(all_covs)
     pid_stats = compute_quantiles(all_pids)
-    med_cov = cov_stats["p50_median"]
-    med_pid = pid_stats["p50_median"]
+    med_cov = cov_stats["p50"]
+    med_pid = pid_stats["p50"]
     stop_rate_ge_50 = (cov_ge_50_stops / cov_ge_50_count * 100.0) if cov_ge_50_count > 0 else 0.0
 
     is_divergent = (med_pid < 85.0 or med_cov < 0.60)
@@ -1134,46 +1170,91 @@ def stream_lexicmap_to_msa(
                 })
 
     # Summary JSON
+    # The shared contract (docs/summaries.md). Until 0.2.0 this file carried cohort
+    # statistics and no provenance at all: not this tool's version, not the input it read,
+    # and not one of the eight flags that change its answer, so two summaries from different
+    # thresholds were indistinguishable on disk.
+    n_flagged = count_flagged_stops + count_flagged_low_cov + count_flagged_frameshift
+    n_clean = count_clean_full + count_clean_partial
     summary_data = {
-        "status": "ok",
-        "reference_name": ref_name,
-        "reference_length_bp": ref_len,
-        "is_cds": ref_is_cds,
-        "regime": regime,
-        "regime_warning": warning_msg,
-        "total_streamed_rows": total_rows,
-        "total_accessions_evaluated": total_accessions,
-        "cohort_breakdown": {
+        "schema": summary_io.SCHEMA,
+        "tool": summary_io.tool("lexicmap", __version__),
+        "inputs": {
+            "references": [
+                {"id": ref_name, "length": ref_len, "sha256": summary_io.seq_sha256(ref_seq)}
+            ],
+            "source": summary_io.source(src_kind, src_id, total_accessions),
+        },
+        "settings": {
+            "min_coverage": min_coverage,
+            "min_coverage_partial": min_coverage_partial,
+            "min_pident": min_pident,
+            "max_internal_stops": max_internal_stops,
+            "allow_frameshifts": allow_frameshifts,
+            "require_full_length": full_length_only,
+            "max_records": max_records,
+            "samples_per_haplotype": sample_cap,
+            "is_cds": ref_is_cds,
+        },
+        "run": summary_io.run_block(
+            status=summary_io.status_of(total_accessions, n_clean),
+            started=start_time,
+            wall_seconds=total_time,
+            n_records=total_accessions,
+            n_ok=n_clean,
+        ),
+        # Every row and every accession the run threw away. All three row counters existed
+        # before 0.2.0 and were printed but never recorded, so a run that discarded most of
+        # its input and a clean one produced the same summary.
+        "discards": {
+            "rows": {
+                "malformed": n_malformed,
+                "other_query": n_other_query,
+                "qlen_mismatch": n_qlen_mismatch,
+            },
+            "accessions": {
+                "flagged_premature_stops": count_flagged_stops,
+                "flagged_low_coverage": count_flagged_low_cov,
+                "flagged_frameshift": count_flagged_frameshift,
+            },
+        },
+        "cohort": {
+            "regime": regime,
+            "regime_warning": warning_msg,
+            "total_streamed_rows": total_rows,
             "clean_full_length": count_clean_full,
             "clean_partial": count_clean_partial,
-            "combined_clean_cohort": count_clean_full + count_clean_partial,
-            "flagged_premature_stops": count_flagged_stops,
-            "flagged_low_coverage": count_flagged_low_cov,
-            "flagged_frameshift": count_flagged_frameshift
-        },
-        "recovery_metrics": {
+            "combined_clean_cohort": n_clean,
+            "flagged": n_flagged,
             "multi_hsp_rescued_accessions": total_rescued_multihsp,
             "single_hsp_full_length_accessions": total_single_hsp_full,
             "clean_full_length_with_indels": count_clean_full_with_indels,
-            "premature_stop_rate_pct_at_50cov": round(stop_rate_ge_50, 2)
+            "premature_stop_rate_pct_at_50cov": round(stop_rate_ge_50, 2),
+            "clean_unique_haplotypes": len(sorted_haplotypes),
+            "shannon_entropy_bits": round(shannon_entropy, 4),
+            "wildtype_count": clean_full_haps.get((ref_seq, ()), 0),
+            "wildtype_fraction": (
+                round(clean_full_haps.get((ref_seq, ()), 0) / count_clean_full, 6)
+                if count_clean_full > 0 else 0
+            ),
+            "cov": summary_io.quantiles(all_covs),
+            "pident": summary_io.quantiles(all_pids),
+            "top_haplotypes": top_preview,
         },
-        "coverage_quantiles": cov_stats,
-        "pident_quantiles": pid_stats,
-        "clean_unique_haplotypes": len(sorted_haplotypes),
-        "shannon_entropy_bits": round(shannon_entropy, 4),
-        "wildtype_count": clean_full_haps.get((ref_seq, ()), 0),
-        "wildtype_fraction": round(clean_full_haps.get((ref_seq, ()), 0) / count_clean_full, 6) if count_clean_full > 0 else 0,
-        "top_10_haplotypes": top_preview,
-        "runtime_seconds": round(total_time, 2)
     }
-    summary_json_path.write_text(json.dumps(summary_data, indent=2))
+    records.close()
+    summary_io.write(summary_json_path, records_file=records.path,
+                     **{k: v for k, v in summary_data.items() if k != "schema"})
+    records.cleanup()
+
 
     print(f"     [✓] Clean MSA FASTA       : {msa_clean_fasta} ({len(sorted_haplotypes) + 1} sequences)")
     print(f"     [✓] Clean Full Accessions : {out_prefix}.clean.accessions.fasta ({count_clean_full:,} accessions)")
     print(f"     [✓] Clean Expanded (>=50%): {out_prefix}.clean_expanded.accessions.fasta ({count_clean_full + count_clean_partial:,} accessions)")
     print(f"     [✓] Flagged Accessions    : {out_prefix}.flagged.accessions.fasta ({count_flagged_stops + count_flagged_low_cov + count_flagged_frameshift:,} accessions)")
-    print(f"     [✓] Flagged Audit Table   : {out_prefix}.flagged.tsv")
-    print(f"     [✓] Complete Cohort Ledger: {out_prefix}.cohort_ledger.tsv ({total_accessions:,} rows)")
+    if write_ledger:
+        print(f"     [✓] Complete Cohort Ledger: {out_prefix}.cohort_ledger.tsv "
+              f"({total_accessions:,} rows)")
     print(f"     [✓] Summary JSON          : {summary_json_path}")
 
     # Display Top Table
@@ -1261,6 +1342,11 @@ def add_parser(subparsers):
     out.add_argument("--out-dir", dest="out_dir", type=str, default=None,
                      help="Output directory, created if needed: outputs land at "
                           "<dir>/<ref_name>.*.")
+    parser.add_argument("--cohort-ledger", action="store_true",
+                        help="Also write <prefix>.cohort_ledger.tsv, one row per evaluated "
+                             "accession. It is a tabular rendering of the summary's "
+                             "records[], which carries the same rows, so it is off "
+                             "by default; pass this for Galaxy or a spreadsheet.")
     parser.add_argument("--no-a2m", action="store_true",
                         help="Skip writing the .a2m formatted MSA files "
                              "(<prefix>.clean.a2m and the .a2m compat alias).")
@@ -1273,6 +1359,46 @@ def add_parser(subparsers):
 
 
 EX_TEMPFAIL = 75  # sysexits.h: temporary failure, try again later
+
+
+def _write_failed_summary(out_prefix: str, args, started: float, error: str) -> None:
+    """A summary even when the run failed (`docs/summaries.md` rule 4).
+
+    Until 0.2.0 an input problem raised past the writer, so the only signal was the file's
+    absence: a caller could not tell a crash from a run that had not started, and nothing on
+    disk said what had failed. The blocks it can still fill are filled.
+    """
+    if args.dataset:
+        src_kind, src_id = "galaxy", str(args.dataset)
+    elif args.file and args.file != "-":
+        src_kind, src_id = "file", str(args.file)
+    else:
+        src_kind, src_id = "stdin", "-"
+    summary_io.discard_records(out_prefix)
+    try:
+        summary_io.write(
+            f"{out_prefix}.summary.json",
+            tool=summary_io.tool("lexicmap", __version__),
+            inputs={"references": None, "source": summary_io.source(src_kind, src_id, 0)},
+            settings={
+                "min_coverage": args.min_cov,
+                "min_coverage_partial": args.min_cov_partial,
+                "min_pident": args.min_pident,
+                "max_internal_stops": args.max_internal_stops,
+                "allow_frameshifts": args.allow_frameshift_alts,
+                "require_full_length": args.require_full_length,
+                "max_records": args.max_records,
+                "samples_per_haplotype": args.samples_per_haplotype,
+            },
+            run=summary_io.run_block("failed", started, time.time() - started, 0, 0,
+                                     error=error),
+            discards={"rows": {}, "accessions": {}},
+            records=[],
+        )
+    except OSError:
+        # The output directory itself may be the thing that failed. The caller already
+        # printed the real error; losing the summary too must not change the exit code.
+        pass
 
 
 def run(args) -> int:
@@ -1295,6 +1421,8 @@ def run(args) -> int:
             print(f"lexicmap: {key_err}", file=sys.stderr)
             return 1
 
+    out_prefix = (os.path.join(args.out_dir, "") if args.out_dir else args.out_prefix)
+    started = time.time()
     try:
         summary = stream_lexicmap_to_msa(
             ref_path=args.ref,
@@ -1311,25 +1439,29 @@ def run(args) -> int:
             full_length_only=args.require_full_length,
             max_records=args.max_records,
             sample_cap=args.samples_per_haplotype,
-            out_prefix=(os.path.join(args.out_dir, "") if args.out_dir
-                        else args.out_prefix),
+            out_prefix=out_prefix,
             write_a2m=not args.no_a2m,
+            write_ledger=args.cohort_ledger,
         )
     except DatasetNotReady as e:
+        # Deliberately no summary here. EX_TEMPFAIL says the input is not ready yet and the
+        # caller should retry; no run was attempted, so there is nothing to summarise, and
+        # creating the output directory would make an unstarted run look like a failed one.
+        # This is the one exception to rule 4 in docs/summaries.md.
         print(f"lexicmap: {e}", file=sys.stderr)
         return EX_TEMPFAIL
     # Input problems (a missing or empty file, a bad table, an unreadable Galaxy dataset, a
     # missing API key) end in one line naming the cause, not a traceback.
     except (ValueError, OSError, RuntimeError) as e:
         print(f"lexicmap: {e}", file=sys.stderr)
+        _write_failed_summary(out_prefix, args, started, str(e))
         return 1
 
     # Empty-cohort hard-fail: a wrapping workflow should treat "no clean accessions
     # streamed" as failure, not as a good run with an empty output. Mirrors the
     # walker's --allow-empty escape hatch.
-    if isinstance(summary, dict) and summary.get("status") == "ok":
-        breakdown = summary.get("cohort_breakdown", {})
-        n_clean = int(breakdown.get("combined_clean_cohort", 0))
+    if isinstance(summary, dict) and summary.get("run", {}).get("status") != "failed":
+        n_clean = int(summary.get("cohort", {}).get("combined_clean_cohort", 0))
         if n_clean == 0 and not args.allow_empty:
             print(f"lexicmap: clean cohort is empty (0 full-length + 0 partial). "
                   f"Exiting non-zero. Pass --allow-empty to accept this as a good "

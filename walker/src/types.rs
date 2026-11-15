@@ -457,6 +457,32 @@ pub struct Timing {
     pub total: f64,
 }
 
+/// What `stages::variants` considered and why it refused, for one accession.
+///
+/// Until 0.2.0 every one of these numbers existed only as an `eprintln!`, so a run that
+/// recovered nothing because every candidate was refused and a run with no candidates at all
+/// produced identical summaries. `docs/summaries.md` rule 3: everything printed is recorded.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VariantStats {
+    /// Depth and floor the gates were applied at.
+    pub depth: f32,
+    pub floor: f32,
+    /// Forks the walked route passes through, and how many had exactly one viable alternative.
+    pub forks: usize,
+    pub biallelic: usize,
+    /// Alternatives actually emitted.
+    pub recovered: usize,
+    /// Of those, how many change length.
+    pub indels: usize,
+    // Refusals, in the order the stage applies them.
+    pub no_rejoin: usize,
+    pub not_substitution: usize,
+    pub over_indel_cap: usize,
+    pub frameshifting: usize,
+    pub window_not_shiftable: usize,
+    pub identical: usize,
+}
+
 /// Everything one accession produced. This is what crosses back to the collector.
 pub struct AccessionResult {
     /// Position of this accession in the input list, 0-based.
@@ -501,6 +527,14 @@ pub struct AccessionResult {
     /// What the depth-based prune did. `None` when it did not run: `--prune-frac 0`, or no
     /// first-pass haplotype to measure the depth on. Until 0.1.1 this too was stderr only.
     pub prune: Option<PruneReport>,
+    /// Sites where `variants::prefer_majority` swapped the route onto the majority allele.
+    ///
+    /// WV-07. The stage prints this, and prints a WARNING above 11, while `summary.json` said
+    /// only `pident_inherited: true`, which cannot tell 1 correction from 27. A primary that
+    /// was rerouted through a divergent segment looked identical to one that was not.
+    pub majority_corrections: usize,
+    /// What the alt search considered and refused. See [`VariantStats`].
+    pub variants: VariantStats,
 }
 
 /// How the second, pruned alignment pass ended for one accession.
@@ -575,6 +609,8 @@ impl AccessionResult {
             subgraph_fraction: None,
             provisional: false,
             prune: None,
+            majority_corrections: 0,
+            variants: VariantStats::default(),
         }
     }
 }

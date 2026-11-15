@@ -1,7 +1,7 @@
 //! Everything that leaves the pipeline.
 //!
 //! IN   Summary
-//! OUT  reconstructed.fasta, bubbles.json, <query>_walker_summary.json
+//! OUT  reconstructed.fasta, bubbles.json, <query>.summary.json
 //!
 //! `reconstructed.fasta` is consumed by `disassembler msa`, which feeds MAFFT and FastTree,
 //! so its record format is a fixed contract: downstream parsers read it, and the
@@ -14,9 +14,10 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::pipeline::Summary;
-use crate::types::{AccessionResult, Outcome, Query, Strand};
+use crate::types::{AccessionResult, Outcome, Query, Strand, Timing};
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn outcome_str(o: Outcome) -> &'static str {
     match o {
@@ -196,24 +197,149 @@ pub fn write_bubbles(summary: &Summary, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_run_info(w: &mut impl Write, run: &RunInfo) -> Result<()> {
+/// Lowercase hex sha256 of a sequence, uppercased first.
+///
+/// This is how a summary names a sequence (`docs/summaries.md`). It answers the questions the
+/// old `seq` field was used for, equality between runs, counting distinct primaries, and
+/// joining a record to its FASTA entry, without the summary carrying a second copy of
+/// `reconstructed.fasta`.
+fn seq_sha256(seq: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let upper: Vec<u8> = seq.iter().map(|b| b.to_ascii_uppercase()).collect();
+    let digest = Sha256::digest(&upper);
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ`, second resolution, UTC.
+///
+/// Written out rather than pulled in: a date crate would be the walker's only dependency that
+/// is not doing I/O, and this is 12 lines of arithmetic (Howard Hinnant's `civil_from_days`).
+fn iso8601(t: SystemTime) -> String {
+    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, tod) = ((secs / 86_400) as i64, secs % 86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+/// `{"p10": .., "p25": .., "p50": .., "p75": .., "p90": .., "mean": ..}` on one line, or
+/// `null` when there is nothing to describe. The same five quantiles and the same key names
+/// every stage uses, so two summaries can be compared without a translation table.
+fn quantiles(mut v: Vec<f64>) -> String {
+    if v.is_empty() {
+        return "null".to_string();
+    }
+    v.sort_by(f64::total_cmp);
+    let at = |q: f64| {
+        let i = ((v.len() as f64 - 1.0) * q).round() as usize;
+        v[i.min(v.len() - 1)]
+    };
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    format!(
+        "{{\"p10\": {:.4}, \"p25\": {:.4}, \"p50\": {:.4}, \"p75\": {:.4}, \"p90\": {:.4}, \
+         \"mean\": {:.4}}}",
+        at(0.10),
+        at(0.25),
+        at(0.50),
+        at(0.75),
+        at(0.90),
+        mean
+    )
+}
+
+/// What produced a summary, and what it consumed.
+///
+/// 0.1.1 changes primaries (`--primary-metric matched`, the header fix, the prune coverage
+/// rule), so a summary has to say which walker and which settings wrote it; until 0.1.1 one
+/// on disk could not. 0.2.0 adds what it read, how long it took, and which of the requested
+/// accessions it never reached.
+pub struct RunInfo<'a> {
+    /// GraphAligner's own `--version` line, and the binary that produced it. The version alone
+    /// does not say which of several installed copies ran.
+    pub graphaligner: &'a str,
+    pub graphaligner_path: &'a str,
+    pub cfg: &'a Config,
+    pub queries: &'a [Query],
+    pub started: SystemTime,
+    pub wall_seconds: f64,
+    /// Accessions asked for, before any were skipped. `n_requested - n_records` is itself a
+    /// discard and is reported as one.
+    pub n_requested: usize,
+}
+
+fn write_tool(w: &mut impl Write, run: &RunInfo) -> Result<()> {
+    writeln!(w, "  \"tool\": {{")?;
+    writeln!(w, "    \"name\": \"logan-walker\",")?;
+    writeln!(w, "    \"version\": \"{}\",", env!("CARGO_PKG_VERSION"))?;
+    // Set by `disassembler walker`; absent when the binary is run directly.
+    match std::env::var("DISASSEMBLER_VERSION") {
+        Ok(v) if !v.is_empty() => writeln!(w, "    \"disassembler\": \"{}\",", esc(&v))?,
+        _ => writeln!(w, "    \"disassembler\": null,")?,
+    }
+    writeln!(
+        w,
+        "    \"external\": [{{\"name\": \"GraphAligner\", \"version\": \"{}\", \"path\": \"{}\"}}]",
+        esc(run.graphaligner),
+        esc(run.graphaligner_path)
+    )?;
+    writeln!(w, "  }},")?;
+    Ok(())
+}
+
+fn write_inputs(w: &mut impl Write, run: &RunInfo) -> Result<()> {
     let c = run.cfg;
-    writeln!(w, "  \"logan_walker\": \"{}\",", env!("CARGO_PKG_VERSION"))?;
-    writeln!(w, "  \"graphaligner\": \"{}\",", esc(run.graphaligner))?;
-    writeln!(w, "  \"references\": [")?;
+    writeln!(w, "  \"inputs\": {{")?;
+    writeln!(w, "    \"references\": [")?;
     for (i, q) in run.queries.iter().enumerate() {
         writeln!(
             w,
-            "    {{\"id\": \"{}\", \"length\": {}}}{}",
+            "      {{\"id\": \"{}\", \"length\": {}, \"sha256\": \"{}\"}}{}",
             esc(&q.record_id),
             q.seq.len(),
+            seq_sha256(&q.seq),
             if i + 1 == run.queries.len() { "" } else { "," }
         )?;
     }
-    writeln!(w, "  ],")?;
+    writeln!(w, "    ],")?;
+    // A cached run and a streamed one can produce the same numbers from different bytes, so
+    // the summary says which it was.
+    let (kind, id) = match (&c.unitigs_cache, c.offline) {
+        (Some(p), true) => ("cache".to_string(), p.display().to_string()),
+        (Some(p), false) => ("cache+s3".to_string(), p.display().to_string()),
+        (None, _) => ("s3".to_string(), "https://logan-pub.s3.amazonaws.com/u/".to_string()),
+    };
+    writeln!(
+        w,
+        "    \"source\": {{\"kind\": \"{}\", \"id\": \"{}\", \"n_requested\": {}}}",
+        kind,
+        esc(&id),
+        run.n_requested
+    )?;
+    writeln!(w, "  }},")?;
+    Ok(())
+}
+
+fn write_settings(w: &mut impl Write, run: &RunInfo) -> Result<()> {
+    let c = run.cfg;
     // Everything that changes which accessions are processed or what they produce. Workers,
     // timeouts and paths change neither, and are left out.
-    let settings: [(&str, String); 19] = [
+    let settings: [(&str, String); 20] = [
         ("k", c.k.to_string()),
         ("graph_k", c.graph_k.to_string()),
         ("min_shared_kmers", c.min_shared_kmers.to_string()),
@@ -233,6 +359,7 @@ fn write_run_info(w: &mut impl Write, run: &RunInfo) -> Result<()> {
         ("max_alt_indel", c.max_alt_indel.to_string()),
         ("allow_frameshift_alts", c.allow_frameshift_alts.to_string()),
         ("graphaligner_threads", c.graphaligner_threads.to_string()),
+        ("summary_seqs", c.summary_seqs.to_string()),
     ];
     writeln!(w, "  \"settings\": {{")?;
     for (i, (k, v)) in settings.iter().enumerate() {
@@ -242,7 +369,148 @@ fn write_run_info(w: &mut impl Write, run: &RunInfo) -> Result<()> {
     Ok(())
 }
 
-fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<()> {
+fn write_run_block(w: &mut impl Write, s: &Summary, run: &RunInfo) -> Result<()> {
+    let n = s.results.len();
+    let ok = s.success;
+    let status = if n > 0 && ok == n {
+        "ok"
+    } else if ok == 0 {
+        "failed"
+    } else {
+        "partial"
+    };
+    let sum = |f: fn(&Timing) -> f64| s.results.iter().map(|r| f(&r.timing)).sum::<f64>();
+    writeln!(w, "  \"run\": {{")?;
+    writeln!(w, "    \"status\": \"{status}\",")?;
+    writeln!(w, "    \"exit_code\": {},", i32::from(status == "failed"))?;
+    writeln!(w, "    \"started\": \"{}\",", iso8601(run.started))?;
+    writeln!(w, "    \"wall_seconds\": {:.3},", run.wall_seconds)?;
+    writeln!(
+        w,
+        "    \"stage_seconds\": {{\"stream\": {:.3}, \"parse\": {:.3}, \"anchor\": {:.3}, \
+         \"extract\": {:.3}, \"align\": {:.3}, \"stitch\": {:.3}, \"phase\": {:.3}}},",
+        sum(|t| t.stream),
+        sum(|t| t.parse),
+        sum(|t| t.anchor),
+        sum(|t| t.extract),
+        sum(|t| t.align),
+        sum(|t| t.stitch),
+        sum(|t| t.phase)
+    )?;
+    writeln!(w, "    \"n_records\": {n},")?;
+    writeln!(w, "    \"n_ok\": {ok}")?;
+    writeln!(w, "  }},")?;
+    Ok(())
+}
+
+/// Every rejection the run made, counts only.
+///
+/// Two groups because there are two things being discarded: whole accessions, and candidate
+/// alleles within an accession. Every key is always written, including the zeroes, so a
+/// consumer can tell "this did not happen" from "this version did not measure it".
+fn write_discards(w: &mut impl Write, s: &Summary, run: &RunInfo) -> Result<()> {
+    let count = |o: Outcome| s.results.iter().filter(|r| r.outcome == o).count();
+    let v = |f: fn(&crate::types::VariantStats) -> usize| {
+        s.results.iter().map(|r| f(&r.variants)).sum::<usize>()
+    };
+    writeln!(w, "  \"discards\": {{")?;
+    writeln!(
+        w,
+        "    \"accessions\": {{\"never_reached\": {}, \"no_anchors\": {}, \"no_path\": {}, \
+         \"no_logan_data\": {}, \"too_large\": {}, \"error\": {}}},",
+        run.n_requested.saturating_sub(s.results.len()),
+        count(Outcome::NoAnchors),
+        count(Outcome::NoPath),
+        count(Outcome::NoLoganData),
+        count(Outcome::TooLarge),
+        count(Outcome::Failed)
+    )?;
+    writeln!(
+        w,
+        "    \"alleles\": {{\"no_rejoin\": {}, \"not_substitution\": {}, \"over_indel_cap\": {}, \
+         \"frameshifting\": {}, \"window_not_shiftable\": {}, \"identical\": {}}}",
+        v(|x| x.no_rejoin),
+        v(|x| x.not_substitution),
+        v(|x| x.over_indel_cap),
+        v(|x| x.frameshifting),
+        v(|x| x.window_not_shiftable),
+        v(|x| x.identical)
+    )?;
+    writeln!(w, "  }},")?;
+    Ok(())
+}
+
+/// What the run produced, as a population rather than a list.
+///
+/// None of this was in a walker summary before 0.2.0: every population-level number had to be
+/// computed by the consumer, while the LexicMap pathway reported its own. `distinct_primaries`
+/// is the one that matters most for a cohort, and it is why `seq_sha256` is a record field.
+fn write_cohort(w: &mut impl Write, s: &Summary) -> Result<()> {
+    let mut hashes: Vec<String> = Vec::new();
+    let (mut covs, mut pidents) = (Vec::new(), Vec::new());
+    for r in &s.results {
+        if let Some(h) = r.haplotypes.first() {
+            hashes.push(seq_sha256(&h.seq));
+            covs.push(h.cov);
+            pidents.push(h.pident);
+        }
+    }
+    hashes.sort();
+    let distinct = {
+        let mut d = hashes.clone();
+        d.dedup();
+        d.len()
+    };
+    let singletons = {
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < hashes.len() {
+            let j = hashes[i..].partition_point(|x| *x == hashes[i]) + i;
+            if j - i == 1 {
+                n += 1;
+            }
+            i = j;
+        }
+        n
+    };
+    writeln!(w, "  \"cohort\": {{")?;
+    writeln!(w, "    \"reconstructed\": {},", hashes.len())?;
+    writeln!(
+        w,
+        "    \"provisional\": {},",
+        s.results.iter().filter(|r| r.provisional).count()
+    )?;
+    writeln!(
+        w,
+        "    \"majority_corrected\": {},",
+        s.results.iter().filter(|r| r.majority_corrections > 0).count()
+    )?;
+    writeln!(
+        w,
+        "    \"majority_corrections\": {},",
+        s.results.iter().map(|r| r.majority_corrections).sum::<usize>()
+    )?;
+    writeln!(w, "    \"distinct_primaries\": {distinct},")?;
+    writeln!(w, "    \"singleton_primaries\": {singletons},")?;
+    writeln!(
+        w,
+        "    \"alts_recovered\": {},",
+        s.results.iter().map(|r| r.alts.len()).sum::<usize>()
+    )?;
+    writeln!(
+        w,
+        "    \"bubbles\": {},",
+        s.results.iter().map(|r| r.bubbles.len()).sum::<usize>()
+    )?;
+    writeln!(w, "    \"cov\": {},", quantiles(covs))?;
+    writeln!(w, "    \"pident\": {}", quantiles(pidents))?;
+    writeln!(w, "  }},")?;
+    Ok(())
+}
+
+/// One accession. Sub-objects go on one line each, and an empty one is omitted rather than
+/// written as null, which keeps a record near the budget in `docs/summaries.md`.
+fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: bool) -> Result<()> {
     writeln!(w, "    {{")?;
     writeln!(w, "      \"acc\": \"{}\",", esc(&r.accession))?;
     writeln!(w, "      \"status\": \"{}\",", outcome_str(r.outcome))?;
@@ -260,127 +528,113 @@ fn write_result(w: &mut impl Write, r: &AccessionResult, last: bool) -> Result<(
         writeln!(w, "      \"reconstructed\": [")?;
         for (h_idx, h) in r.haplotypes.iter().enumerate() {
             let last_h = h_idx + 1 == r.haplotypes.len();
-            writeln!(w, "        {{")?;
-            writeln!(w, "          \"haplotype_id\": \"{}\",", esc(&h.id))?;
-            writeln!(w, "          \"seq\": \"{}\",", String::from_utf8_lossy(&h.seq))?;
-            writeln!(w, "          \"cov\": {},", h.cov)?;
-            writeln!(w, "          \"pident\": {},", h.pident)?;
-            writeln!(w, "          \"pident_inherited\": {},", h.pident_inherited)?;
-            writeln!(w, "          \"length\": {},", h.seq.len())?;
-            writeln!(w, "          \"nodes\": {},", h.nodes)?;
-            writeln!(w, "          \"mean_ka\": {:.1},", h.mean_ka)?;
-            // Emit `anchor_used` only when set. Absent field ≡ single-anchor legacy JSON.
-            if let Some(rid) = &h.anchor_used {
-                writeln!(w, "          \"vaf\": {:.2},", h.vaf)?;
-                writeln!(w, "          \"anchor_used\": \"{}\"", esc(rid))?;
-            } else {
-                writeln!(w, "          \"vaf\": {:.2}", h.vaf)?;
+            write!(w, "        {{\"haplotype_id\": \"{}\"", esc(&h.id))?;
+            write!(w, ", \"seq_sha256\": \"{}\"", seq_sha256(&h.seq))?;
+            write!(w, ", \"length\": {}", h.seq.len())?;
+            // 0.1.x wrote the sequence here unconditionally. Opt-in from 0.2.0.
+            if cfg.summary_seqs {
+                write!(w, ", \"seq\": \"{}\"", String::from_utf8_lossy(&h.seq))?;
             }
-            writeln!(w, "        }}{}", if last_h { "" } else { "," })?;
+            // Four decimals, as everywhere else in the summary. 0.1.x wrote `pident` at full
+            // f64 precision, 17 digits of it, which is noise in a diff and is finer than the
+            // alignment it came from.
+            write!(w, ", \"cov\": {:.4}", h.cov)?;
+            write!(w, ", \"pident\": {:.4}", h.pident)?;
+            write!(w, ", \"pident_inherited\": {}", h.pident_inherited)?;
+            write!(w, ", \"nodes\": {}", h.nodes)?;
+            write!(w, ", \"mean_ka\": {:.1}", h.mean_ka)?;
+            write!(w, ", \"vaf\": {:.2}", h.vaf)?;
+            // Emit `anchor_used` only when set. Absent field means single-anchor.
+            if let Some(rid) = &h.anchor_used {
+                write!(w, ", \"anchor_used\": \"{}\"", esc(rid))?;
+            }
+            writeln!(w, "}}{}", if last_h { "" } else { "," })?;
         }
         writeln!(w, "      ],")?;
     }
+    writeln!(w, "      \"alts\": {},", r.alts.len())?;
     writeln!(w, "      \"bubbles\": {},", r.bubbles.len())?;
-    // Per-reference candidate snapshot, multi-anchor only. Empty vec ≡ single-anchor
-    // legacy JSON, so this field never appears there and existing consumers stay unmoved.
+    // WV-07. The stage prints this and warns above 11; until 0.2.0 the summary said only
+    // `pident_inherited`, which cannot tell 1 correction from 27.
+    writeln!(w, "      \"majority_corrections\": {},", r.majority_corrections)?;
+    let v = &r.variants;
+    if v.forks > 0 || v.biallelic > 0 || v.recovered > 0 {
+        writeln!(
+            w,
+            "      \"variants\": {{\"depth\": {:.1}, \"floor\": {:.1}, \"forks\": {}, \
+             \"biallelic\": {}, \"recovered\": {}, \"indels\": {}, \"no_rejoin\": {}, \
+             \"not_substitution\": {}, \"over_indel_cap\": {}, \"frameshifting\": {}, \
+             \"window_not_shiftable\": {}, \"identical\": {}}},",
+            v.depth, v.floor, v.forks, v.biallelic, v.recovered, v.indels, v.no_rejoin,
+            v.not_substitution, v.over_indel_cap, v.frameshifting, v.window_not_shiftable,
+            v.identical
+        )?;
+    }
+    // Per-reference candidate snapshot, multi-anchor only. Omitted in single-anchor runs.
     if !r.candidates.is_empty() {
         writeln!(w, "      \"candidates\": [")?;
         let n = r.candidates.len();
         for (i, c) in r.candidates.iter().enumerate() {
-            let last = i + 1 == n;
-            write!(w, "        {{")?;
-            write!(w, "\"record_id\": \"{}\"", esc(&c.record_id))?;
-            write!(w, ", \"pool_index\": {}", c.pool_index)?;
-            match c.cov {
-                Some(v) => write!(w, ", \"cov\": {v}")?,
-                None => write!(w, ", \"cov\": null")?,
-            }
-            match c.pident {
-                Some(v) => write!(w, ", \"pident\": {v}")?,
-                None => write!(w, ", \"pident\": null")?,
-            }
-            match c.length {
-                Some(v) => write!(w, ", \"length\": {v}")?,
-                None => write!(w, ", \"length\": null")?,
-            }
-            match c.nodes {
-                Some(v) => write!(w, ", \"nodes\": {v}")?,
-                None => write!(w, ", \"nodes\": null")?,
-            }
-            match c.path_len {
-                Some(v) => write!(w, ", \"path_len\": {v}")?,
-                None => write!(w, ", \"path_len\": null")?,
-            }
-            match c.num_matches {
-                Some(v) => write!(w, ", \"num_matches\": {v}")?,
-                None => write!(w, ", \"num_matches\": null")?,
-            }
-            match c.aln_len {
-                Some(v) => write!(w, ", \"aln_len\": {v}")?,
-                None => write!(w, ", \"aln_len\": null")?,
-            }
-            write!(w, ", \"selected\": {}", c.selected)?;
-            writeln!(w, "}}{}", if last { "" } else { "," })?;
+            let num = |x: Option<f64>| x.map_or("null".to_string(), |v| v.to_string());
+            let int = |x: Option<usize>| x.map_or("null".to_string(), |v| v.to_string());
+            writeln!(
+                w,
+                "        {{\"record_id\": \"{}\", \"pool_index\": {}, \"cov\": {}, \
+                 \"pident\": {}, \"length\": {}, \"nodes\": {}, \"path_len\": {}, \
+                 \"num_matches\": {}, \"aln_len\": {}, \"selected\": {}}}{}",
+                esc(&c.record_id),
+                c.pool_index,
+                num(c.cov),
+                num(c.pident),
+                int(c.length),
+                int(c.nodes),
+                int(c.path_len),
+                int(c.num_matches),
+                int(c.aln_len),
+                c.selected,
+                if i + 1 == n { "" } else { "," }
+            )?;
         }
         writeln!(w, "      ],")?;
     }
-    match &r.prune {
-        None => writeln!(w, "      \"prune\": null,")?,
-        Some(p) => {
-            let span = |s: Option<(usize, usize)>| match s {
-                Some((a, b)) => format!("[{a}, {b}]"),
-                None => "null".to_string(),
-            };
-            writeln!(
-                w,
-                "      \"prune\": {{\"outcome\": \"{}\", \"depth\": {:.1}, \"floor\": {:.1}, \
-                 \"unitigs\": {}, \"unitigs_kept\": {}, \"unpruned_span\": {}, \
-                 \"pruned_span\": {}}},",
-                p.result.as_str(),
-                p.depth,
-                p.floor,
-                p.unitigs,
-                p.unitigs_kept,
-                span(Some(p.unpruned_span)),
-                span(p.pruned_span)
-            )?;
-        }
+    if let Some(p) = &r.prune {
+        let span = |s: Option<(usize, usize)>| match s {
+            Some((a, b)) => format!("[{a}, {b}]"),
+            None => "null".to_string(),
+        };
+        writeln!(
+            w,
+            "      \"prune\": {{\"outcome\": \"{}\", \"depth\": {:.1}, \"floor\": {:.1}, \
+             \"unitigs\": {}, \"unitigs_kept\": {}, \"unpruned_span\": {}, \
+             \"pruned_span\": {}}},",
+            p.result.as_str(),
+            p.depth,
+            p.floor,
+            p.unitigs,
+            p.unitigs_kept,
+            span(Some(p.unpruned_span)),
+            span(p.pruned_span)
+        )?;
     }
     if let Some(e) = &r.error {
         writeln!(w, "      \"error\": \"{}\",", esc(e))?;
     }
-    writeln!(w, "      \"timing\": {{")?;
     let t = &r.timing;
-    writeln!(w, "        \"stream\": {:.3},", t.stream)?;
-    writeln!(w, "        \"parse\": {:.3},", t.parse)?;
-    writeln!(w, "        \"anchor\": {:.3},", t.anchor)?;
-    writeln!(w, "        \"extract\": {:.3},", t.extract)?;
-    writeln!(w, "        \"align\": {:.3},", t.align)?;
-    writeln!(w, "        \"stitch\": {:.3},", t.stitch)?;
-    writeln!(w, "        \"phase\": {:.3},", t.phase)?;
-    writeln!(w, "        \"total\": {:.3}", t.total)?;
-    writeln!(w, "      }}")?;
+    writeln!(
+        w,
+        "      \"timing\": {{\"stream\": {:.3}, \"parse\": {:.3}, \"anchor\": {:.3}, \
+         \"extract\": {:.3}, \"align\": {:.3}, \"stitch\": {:.3}, \"phase\": {:.3}, \
+         \"total\": {:.3}}}",
+        t.stream, t.parse, t.anchor, t.extract, t.align, t.stitch, t.phase, t.total
+    )?;
     writeln!(w, "    }}{}", if last { "" } else { "," })?;
     Ok(())
 }
 
-/// What produced a summary: the versions, the references, and the settings that change
-/// results.
+/// The summary contract in `docs/summaries.md`, as the walker implements it.
 ///
-/// 0.1.1 changes primaries (`--primary-metric matched`, the header fix, the prune coverage
-/// rule), so a summary has to say which walker and which settings wrote it; until 0.1.1 one
-/// on disk could not.
-pub struct RunInfo<'a> {
-    /// GraphAligner's own `--version` line.
-    pub graphaligner: &'a str,
-    pub cfg: &'a Config,
-    pub queries: &'a [Query],
-}
-
-/// Provenance, then per-accession counts, decisions and stage timings.
-///
-/// The top-level shape and the per-result field names are kept stable, so summaries can be
-/// diffed directly. Fields are only ever added.
+/// Seven blocks in a fixed order: `schema`, `tool`, `inputs`, `settings`, `run`, `discards`,
+/// `cohort`, `records`. Within a schema version, fields are only ever added.
 pub fn write_summary(summary: &Summary, run: &RunInfo, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -389,25 +643,16 @@ pub fn write_summary(summary: &Summary, run: &RunInfo, path: &Path) -> Result<()
     }
     let mut w = BufWriter::new(std::fs::File::create(path)?);
     writeln!(w, "{{")?;
-    write_run_info(&mut w, run)?;
-    writeln!(w, "  \"total\": {},", summary.total)?;
-    writeln!(w, "  \"success\": {},", summary.success)?;
-    writeln!(w, "  \"results\": [")?;
+    writeln!(w, "  \"schema\": 1,")?;
+    write_tool(&mut w, run)?;
+    write_inputs(&mut w, run)?;
+    write_settings(&mut w, run)?;
+    write_run_block(&mut w, summary, run)?;
+    write_discards(&mut w, summary, run)?;
+    write_cohort(&mut w, summary)?;
+    writeln!(w, "  \"records\": [")?;
     for (i, r) in summary.results.iter().enumerate() {
-        write_result(&mut w, r, i + 1 == summary.results.len())?;
-    }
-    writeln!(w, "  ],")?;
-    writeln!(w, "  \"bubble_events\": [")?;
-    let with_bubbles: Vec<&AccessionResult> =
-        summary.results.iter().filter(|r| !r.bubbles.is_empty()).collect();
-    for (i, r) in with_bubbles.iter().enumerate() {
-        writeln!(
-            w,
-            "    {{\"acc\": \"{}\", \"bubbles\": {}}}{}",
-            esc(&r.accession),
-            r.bubbles.len(),
-            if i + 1 < with_bubbles.len() { "," } else { "" }
-        )?;
+        write_result(&mut w, run.cfg, r, i + 1 == summary.results.len())?;
     }
     writeln!(w, "  ]")?;
     writeln!(w, "}}")?;
@@ -1016,6 +1261,8 @@ mod vcf_tests {
             error: None,
             anchor_used: None,
             candidates: Vec::new(),
+            majority_corrections: 0,
+            variants: crate::types::VariantStats::default(),
             subgraph_fraction: None,
             provisional: false,
             prune: None,
@@ -1169,6 +1416,8 @@ mod identity_label_tests {
                 error: None,
                 anchor_used: None,
                 candidates: Vec::new(),
+                majority_corrections: 0,
+                variants: crate::types::VariantStats::default(),
                 subgraph_fraction: None,
                 provisional: false,
                 prune: None,
@@ -1183,8 +1432,17 @@ mod identity_label_tests {
             name: "gene".into(), record_id: "gene".into(), seq: b"ACGT".to_vec(),
             path: std::path::PathBuf::from("gene.fa"), n_records: 1,
         }];
-        let run = super::RunInfo { graphaligner: "GraphAligner bioconda 1.0.17b-0", cfg: &cfg,
-                                   queries: &queries };
+        // A fixed clock so the volatile fields (`run.started`, the timings) are stable and
+        // the rest of the file is byte-comparable, the property `docs/summaries.md` promises.
+        let run = super::RunInfo {
+            graphaligner: "GraphAligner bioconda 1.0.17b-0",
+            graphaligner_path: "/opt/conda/bin/GraphAligner",
+            cfg: &cfg,
+            queries: &queries,
+            started: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_200_000),
+            wall_seconds: 1.5,
+            n_requested: 1,
+        };
         super::write_summary(s, &run, p)
     }
 
@@ -1206,13 +1464,35 @@ mod identity_label_tests {
         let out = std::fs::read_to_string(&p).unwrap();
         std::fs::remove_file(&p).ok();
         for want in [
-            concat!("\"logan_walker\": \"", env!("CARGO_PKG_VERSION"), "\""),
-            "\"graphaligner\": \"GraphAligner bioconda 1.0.17b-0\"",
-            "{\"id\": \"gene\", \"length\": 4}",
+            // The contract's block order and the provenance in them.
+            "\"schema\": 1",
+            "\"name\": \"logan-walker\"",
+            concat!("\"version\": \"", env!("CARGO_PKG_VERSION"), "\""),
+            "\"name\": \"GraphAligner\", \"version\": \"GraphAligner bioconda 1.0.17b-0\", \
+             \"path\": \"/opt/conda/bin/GraphAligner\"",
+            // A reference is identified by hash, not by the path it was read from.
+            "{\"id\": \"gene\", \"length\": 4, \"sha256\": \"1dff3e84fe7877e0673b69bbddcf4012\
+             4e396e3f9943dd890c91b6a09adb9af0\"}",
+            "\"kind\": \"s3\", \"id\": \"https://logan-pub.s3.amazonaws.com/u/\", \
+             \"n_requested\": 1",
             "\"primary_metric\": \"matched\"",
             "\"prune_frac\": 0.01",
             "\"min_abund\": 5.0",
             "\"max_size_mb\": 1024",
+            "\"summary_seqs\": false",
+            // The run block, with the clock the test pinned.
+            "\"status\": \"ok\"",
+            "\"started\": \"2025-11-15T09:46:40Z\"",
+            "\"n_records\": 1",
+            "\"n_ok\": 1",
+            // Every discard key is present even at zero, so "did not happen" is readable.
+            "\"accessions\": {\"never_reached\": 0, \"no_anchors\": 0, \"no_path\": 0, \
+             \"no_logan_data\": 0, \"too_large\": 0, \"error\": 0}",
+            "\"alleles\": {\"no_rejoin\": 0, \"not_substitution\": 0, \"over_indel_cap\": 0, \
+             \"frameshifting\": 0, \"window_not_shiftable\": 0, \"identical\": 0}",
+            "\"distinct_primaries\": 1",
+            "\"majority_corrections\": 0",
+            // Per-accession decisions that used to reach only stderr.
             "\"subgraph_fraction\": 0.161189",
             "\"provisional\": true",
             "\"prune\": {\"outcome\": \"refused_shorter_span\", \"depth\": 1700.0, \"floor\": 17.0, \
@@ -1221,6 +1501,10 @@ mod identity_label_tests {
         ] {
             assert!(out.contains(want), "missing {want}: {out}");
         }
+        // The sequence is named, not carried: 0.1.x wrote it here unconditionally and it was
+        // half the file. `docs/summaries.md`.
+        assert!(!out.contains("\"seq\":"), "the literal sequence must be opt-in: {out}");
+        assert!(out.contains("\"seq_sha256\":"), "{out}");
     }
 
     fn alt_of(h: Haplotype) -> AltHaplotype {

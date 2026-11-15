@@ -105,7 +105,7 @@ must now span as much of the reference as the unpruned one (see `--prune-frac` b
 | `-f` (default `reconstructed_haplotypes.fasta`) | always | one primary per reconstructed accession, `>ACC_primary cov=… pident=… nodes=…` (plus `anchor=` in multi-anchor mode) |
 | `<out-dir>/alt_haplotypes.fasta` | unless `--no-emit-alts` | intra-host alternatives, `>ACC_altN …` with their VAF and fork, at most 32 per accession |
 | `<out-dir>/bubbles.json` | always | bubbles in the local subgraph |
-| `<out-dir>/<query stem>_walker_summary.json` | always | versions, references and settings, then per-accession status, metrics, candidates and decisions (below) |
+| `<out-dir>/<query stem>.summary.json` | always | the run's provenance, settings, totals, discards and cohort statistics, then one record per accession (below) |
 | `<out-dir>/<ACC>.vcf` | `--emit-vcf` | intra-host SNVs of one accession, written only when it has at least one (a VCF an earlier run left for an accession with none is removed) |
 | `<out-dir>/snvs.tsv` | `--emit-snv-table` | one row per (accession, site, allele) across the run |
 
@@ -113,10 +113,32 @@ must now span as much of the reference as the unpruned one (see `--prune-frac` b
 alignment. When a haplotype's identity was inherited from the route before an allele was spliced
 in, the header says `inherited_pident=` instead.
 
-The summary JSON starts with what produced it: `logan_walker` and `graphaligner` (versions),
-`references` (each record's id and length), and `settings` (every option that changes which
-accessions are processed or what they produce). Each accession then records two decisions that
-earlier versions only printed:
+The summary JSON follows the contract in [`summaries.md`](summaries.md), which every stage of
+the suite shares. Eight blocks in a fixed order: `schema`, `tool` (this walker, the
+`disassembler` that invoked it if any, and GraphAligner's version and path), `inputs` (each
+reference's id, length and sha256, and whether the unitigs came from S3 or a cache),
+`settings` (every option that changes which accessions are processed or what they produce),
+`run` (status, wall clock, per-stage seconds, totals), `discards`, `cohort` and `records`.
+
+`discards` counts everything the run rejected, in two groups: `accessions` (`never_reached`,
+which covers duplicates dropped from the list, plus `no_anchors`, `no_path`, `no_logan_data`,
+`too_large` and `error`) and `alleles` (`no_rejoin`, `not_substitution`, `over_indel_cap`,
+`frameshifting`, `window_not_shiftable`, `identical`). Every key is written even at zero, so a
+reader can tell "this did not happen" from "this version did not measure it". Before 0.2.0
+every one of these numbers existed only as a line on stderr.
+
+`cohort` describes the run as a population rather than a list: how many accessions were
+reconstructed, how many are provisional, how many were majority-corrected and at how many
+sites in total, how many **distinct** primaries there are and how many of those are
+singletons, the alts and bubbles recovered, and cov and pident quantiles.
+
+Each record names its haplotype by `seq_sha256` and `length` rather than carrying the
+sequence, which is already in the FASTA. `--summary-seqs` restores the literal `seq` field that
+0.1.x wrote unconditionally; it was between 50% and 71% of the file on real runs. A record also
+carries `majority_corrections`, the number of sites where the route was moved onto the majority
+allele, and `variants`, what the alt search considered and refused.
+
+Each accession also records two decisions that earlier versions only printed:
 
 - `subgraph_fraction` is the extracted neighbourhood's share of the graph's unitigs, reported
   for information. `provisional` is true when the neighbourhood holds more than 3 unitigs per

@@ -18,11 +18,15 @@ import re
 import shutil
 import statistics
 import subprocess
+import time
 import sys
 from pathlib import Path
 
 from disassembler.textio import open_text
 from disassembler.validators import fraction, positive_int
+
+from disassembler import __version__
+from disassembler import summary as summary_io
 
 def find_bin(name: str, *aliases: str) -> str:
     """Resolve a tool on PATH.
@@ -172,7 +176,67 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=run)
 
 
+def _write_summary(args, state, status: str) -> None:
+    """The summary, whatever happened (`docs/summaries.md`).
+
+    This stage produced no machine-readable output at all before 0.2.0, which is awkward for
+    the one stage that can fail on a tool version: MAFFT 7.525 mishandles `--addfragments`,
+    and the only trace of how many rows survived the coverage gate, how many were reverse
+    complemented and how many could not be oriented was three lines on stdout.
+    """
+    try:
+        summary_io.write(
+            Path(args.out_aln).with_suffix(".summary.json"),
+            tool=summary_io.tool("msa", __version__, external=[
+                {"name": "mafft", "version": state.get("mafft"), "path": state.get("mafft_bin")},
+                {"name": "fasttree", "version": None, "path": state.get("fasttree_bin")},
+            ]),
+            inputs={
+                "references": ([{"id": state["ref_id"], "length": state["ref_len"],
+                                 "sha256": state["ref_sha256"]}]
+                               if state.get("ref_id") else None),
+                "source": summary_io.source("file", str(args.input), state["n_in"]),
+            },
+            settings={"msa_min_cov": args.msa_min_cov, "min_identity": args.min_identity,
+                      "mafft_threads": getattr(args, "mafft_threads", None)},
+            run=summary_io.run_block(status, state["started"], time.time() - state["started"],
+                                     n_records=state["taxa"], n_ok=state["taxa"],
+                                     error=state.get("error")),
+            # Rows lost between the input and the alignment. `below_coverage` is the gate;
+            # `unoriented` could not be placed on either strand.
+            discards={"rows": {
+                "below_coverage": max(0, state["n_in"] - state["retained"]),
+                "unoriented": state.get("unoriented", 0),
+                "lost_in_alignment": max(0, state["retained"] - state["taxa"]),
+            }},
+            cohort={"n_in": state["n_in"], "retained": state["retained"],
+                    "taxa": state["taxa"], "reverse_complemented": state.get("flipped", 0),
+                    "reference_length": state["ref_len"]},
+            records=state.get("records", []),
+        )
+    except OSError:
+        # The alignment's own directory may be what failed; the caller already said so.
+        pass
+
+
 def run(args) -> int:
+    """Align and build the tree, then write a summary on every path."""
+    state = {"started": time.time(), "n_in": 0, "retained": 0, "flipped": 0, "unoriented": 0,
+             "ref_id": None, "ref_len": 0, "ref_sha256": None, "taxa": 0, "error": None,
+             "records": []}
+    try:
+        rc = _run(args, state)
+    except BaseException as e:
+        state["error"] = f"{type(e).__name__}: {e}"
+        _write_summary(args, state, "failed")
+        raise
+    if rc != 0 and state["error"] is None:
+        state["error"] = f"exited {rc}; see stderr"
+    _write_summary(args, state, "ok" if rc == 0 else "failed")
+    return rc
+
+
+def _run(args, state) -> int:
     from Bio import SeqIO  # imported lazily so `disassembler --help` does not need biopython
 
     ref_p = Path(args.ref)
@@ -185,6 +249,7 @@ def run(args) -> int:
     try:
         mafft_bin = find_bin("mafft")
         fasttree_bin = find_bin("fasttree", "FastTree")
+        state["mafft_bin"], state["fasttree_bin"] = str(mafft_bin), str(fasttree_bin)
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -203,6 +268,10 @@ def run(args) -> int:
         return 1
     ref_rec = ref_records[0]
     ref_len = len(ref_rec.seq)
+    state["ref_id"] = ref_rec.id
+    state["ref_len"] = ref_len
+    state["ref_sha256"] = summary_io.seq_sha256(str(ref_rec.seq))
+    state["n_in"] = len(input_records)
     if len(ref_records) > 1:
         print(f"[warn] {ref_p}: {len(ref_records)} records; aligning against the first "
               f"({ref_rec.id}, {ref_len} nt). The MSA takes one reference: pass a "
@@ -251,7 +320,9 @@ def run(args) -> int:
                 fh.write(f">{clean_id}\n{seq}\n")
                 retained += 1
 
+        state["retained"] = retained
         if retained == 0:
+            state["error"] = "no sequences passed quality/coverage filtering"
             print("Error: no sequences passed quality/coverage filtering", file=sys.stderr)
             return 1
 
@@ -327,6 +398,13 @@ def run(args) -> int:
     finally:
         Path(tmp_tree).unlink(missing_ok=True)
 
+    state["taxa"] = len(aligned_recs)
+    state["flipped"] = flipped
+    state["records"] = [
+        {"id": r.id, "length": len(r.seq),
+         "seq_sha256": summary_io.seq_sha256(str(r.seq))}
+        for r in aligned_recs
+    ]
     print(
         f"\n[✓] Codon alignment complete: {len(aligned_recs)} taxa x {ref_len} nt "
         f"({ref_len // 3} codons)"

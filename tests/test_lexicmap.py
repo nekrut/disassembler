@@ -11,6 +11,7 @@ Tests:
 """
 
 import gzip
+import json
 import sys
 import unittest
 import tempfile
@@ -60,6 +61,42 @@ class TestLexicMapStreamer(unittest.TestCase):
         self.assertFalse(single_ge_cov)
         self.assertFalse(single_full)
 
+    def test_the_cohort_ledger_is_opt_in_and_matches_the_records(self):
+        """`--cohort-ledger` renders records[] as a TSV, and the two must agree.
+
+        The ledger used to be written unconditionally, which meant every accession was on
+        disk twice once records[] existed. It is kept for Galaxy and for spreadsheets, so
+        when it is asked for it has to carry exactly the same rows.
+        """
+        tsv_path = self.dir_path / "ledger_in.tsv"
+        tsv_path.write_text(
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            "SRR001\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
+            "SRR002\t91.7\t100.0\t1\t12\tATGGCTGAATAA\tATGGTTGAATAA\n"
+        )
+        prefix = str(self.dir_path / "ledger_out")
+        lms.stream_lexicmap_to_msa(ref_path=str(self.ref_fasta), file_path=str(tsv_path),
+                                   out_prefix=prefix, write_ledger=True)
+
+        ledger_path = Path(f"{prefix}.cohort_ledger.tsv")
+        self.assertTrue(ledger_path.is_file())
+        lines = ledger_path.read_text().splitlines()
+        header = lines[0].split("\t")
+        rows = [dict(zip(header, l.split("\t"))) for l in lines[1:]]
+        records = {r["acc"]: r for r in
+                   json.loads(Path(f"{prefix}.summary.json").read_text())["records"]}
+
+        self.assertEqual(len(rows), len(records))
+        for row in rows:
+            record = records[row["accession"]]
+            self.assertEqual(row["status"], record["status"])
+            self.assertEqual(int(row["tier"]), record["tier"])
+            self.assertEqual(float(row["coverage"]), record["coverage"])
+            self.assertEqual(float(row["mean_pident"]), record["mean_pident"])
+            self.assertEqual(int(row["hsps_merged"]), record["hsps_merged"])
+            self.assertEqual(int(row["n_stops"]), record["n_stops"])
+            self.assertEqual(row["indels"], record["indels"])
+
     def test_end_to_end_streaming(self):
         tsv_content = (
             "query\tqlen\thits\tsgenome\tsseqid\tqcovGnm\tcls\thsp\tqcovHSP\talenHSP\tpident\tgaps\tqstart\tqend\tsstart\tsend\tqseq\tsseq\n"
@@ -80,19 +117,32 @@ class TestLexicMapStreamer(unittest.TestCase):
             out_prefix=out_prefix
         )
 
-        breakdown = summary["cohort_breakdown"]
+        breakdown = summary["cohort"]
         self.assertEqual(breakdown["clean_full_length"], 2)
         self.assertEqual(breakdown["clean_partial"], 1)
         self.assertEqual(breakdown["combined_clean_cohort"], 3)
-        self.assertEqual(breakdown["flagged_premature_stops"], 1)
-        self.assertEqual(breakdown["flagged_low_coverage"], 1)
+        # The flagged tiers are discards, and live with the rest of them.
+        flagged = summary["discards"]["accessions"]
+        self.assertEqual(flagged["flagged_premature_stops"], 1)
+        self.assertEqual(flagged["flagged_low_coverage"], 1)
+        self.assertEqual(breakdown["flagged"], 2)
+        # Counted but never recorded before 0.2.0.
+        self.assertEqual(summary["discards"]["rows"], {
+            "malformed": 0, "other_query": 0, "qlen_mismatch": 0})
 
-        self.assertEqual(summary["recovery_metrics"]["multi_hsp_rescued_accessions"], 1)
+        self.assertEqual(summary["cohort"]["multi_hsp_rescued_accessions"], 1)
 
         self.assertTrue(Path(f"{out_prefix}.clean.msa.fasta").exists())
         self.assertTrue(Path(f"{out_prefix}.clean.haplotypes.tsv").exists())
-        self.assertTrue(Path(f"{out_prefix}.cohort_ledger.tsv").exists())
-        self.assertTrue(Path(f"{out_prefix}.flagged.tsv").exists())
+        # Off by default: records[] already carries every one of its rows.
+        self.assertFalse(Path(f"{out_prefix}.cohort_ledger.tsv").exists())
+        # flagged.tsv was a strict subset of the ledger; records[] carries every accession
+        # with its status, so it is gone rather than duplicated a third time.
+        self.assertFalse(Path(f"{out_prefix}.flagged.tsv").exists())
+        # Read records from the file on disk: the returned dict deliberately omits them,
+        # since they are unbounded in the cohort size and stream straight to the summary.
+        on_disk = json.loads(Path(f"{out_prefix}.summary.json").read_text())
+        self.assertEqual(len(on_disk["records"]), 5)
 
         tsv_lines = Path(f"{out_prefix}.clean.haplotypes.tsv").read_text().strip().split("\n")
         header = tsv_lines[0].split("\t")
@@ -142,7 +192,7 @@ class TestLexicMapStreamer(unittest.TestCase):
                     file_path=str(path),
                     out_prefix=str(self.dir_path / path.name),
                 )
-                self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 1)
+                self.assertEqual(summary["cohort"]["clean_full_length"], 1)
 
     def test_mean_pident_excludes_gap_positions(self):
         merged, cov_bases, mean_pid, _, _ = lms.merge_accession_hsps(
@@ -174,8 +224,8 @@ class TestLexicMapStreamer(unittest.TestCase):
             ref_path=str(self.ref_fasta), file_path=str(p),
             out_prefix=str(self.dir_path / "emp"),
         )
-        self.assertEqual(summary["total_accessions_evaluated"], 0)
-        self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 0)
+        self.assertEqual(summary["run"]["n_records"], 0)
+        self.assertEqual(summary["cohort"]["clean_full_length"], 0)
 
     def test_multi_record_reference_uses_only_the_first(self):
         multi = self.dir_path / "multi.fasta"
@@ -207,11 +257,11 @@ class TestLexicMapStreamer(unittest.TestCase):
             out_prefix=str(self.dir_path / "fl_off"), full_length_only=False,
         )
 
-        self.assertEqual(on["cohort_breakdown"]["clean_full_length"], 1)
-        self.assertEqual(off["cohort_breakdown"]["clean_full_length"], 2)
+        self.assertEqual(on["cohort"]["clean_full_length"], 1)
+        self.assertEqual(off["cohort"]["clean_full_length"], 2)
         self.assertNotEqual(
-            on["cohort_breakdown"]["clean_full_length"],
-            off["cohort_breakdown"]["clean_full_length"],
+            on["cohort"]["clean_full_length"],
+            off["cohort"]["clean_full_length"],
             "fixture must discriminate, or deleting the flag's effect would leave this green",
         )
 
@@ -241,13 +291,13 @@ class TestMalformedInput(unittest.TestCase):
     def test_a_bad_numeric_field_skips_the_row_and_finishes(self):
         tsv = self.header + self.good + "SRR011\tNA\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
         summary = self._run(tsv, "na")
-        self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 1)
+        self.assertEqual(summary["cohort"]["clean_full_length"], 1)
         self.assertTrue((self.dir_path / "na.summary.json").is_file())
 
     def test_an_embedded_header_row_is_skipped(self):
         tsv = self.header + self.good + self.header.strip() + "\n" + self.good.replace("SRR010", "SRR012")
         summary = self._run(tsv, "hdr")
-        self.assertEqual(summary["total_accessions_evaluated"], 2)
+        self.assertEqual(summary["run"]["n_records"], 2)
 
     def test_every_row_malformed_is_an_error_not_an_empty_cohort(self):
         tsv = self.header + "SRR010\tNA\tNA\tNA\tNA\tATG\tATG\n"
@@ -316,7 +366,7 @@ class TestQueryColumn(unittest.TestCase):
             "geneB\tSRR010\t100.0\t50.0\t7\t12\tTTTTTT\tTTTTTT\n"
         )
         summary = self._run(tsv, "multi", min_coverage=0.5)
-        self.assertEqual(summary["total_accessions_evaluated"], 1)
+        self.assertEqual(summary["run"]["n_records"], 1)
         hap = (self.dir_path / "multi.clean.haplotypes.tsv").read_text()
         self.assertIn("ATGGCT------", hap, "only geneA's half should be tiled")
         self.assertNotIn("TTTTTT", hap, "geneB's bases must not reach geneA's grid")
@@ -329,7 +379,7 @@ class TestQueryColumn(unittest.TestCase):
             "geneB\tSRR010\t100.0\t100.0\t1\t12\tTTTTTTTTTTTT\tTTTTTTTTTTTT\n"
         )
         summary = self._run(tsv, "sorted")
-        self.assertEqual(summary["total_accessions_evaluated"], 2, "both geneA accessions")
+        self.assertEqual(summary["run"]["n_records"], 2, "both geneA accessions")
 
     def test_no_row_for_this_query_is_an_error_not_an_empty_cohort(self):
         tsv = (
@@ -346,7 +396,7 @@ class TestQueryColumn(unittest.TestCase):
             "SRR010\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
         )
         summary = self._run(tsv, "nocol")
-        self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 1)
+        self.assertEqual(summary["cohort"]["clean_full_length"], 1)
 
     def test_a_qlen_disagreement_is_refused(self):
         tsv = (
@@ -363,7 +413,7 @@ class TestQueryColumn(unittest.TestCase):
             "geneA\t12\tSRR010\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n"
         )
         summary = self._run(tsv, "qlenok")
-        self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 1)
+        self.assertEqual(summary["cohort"]["clean_full_length"], 1)
 
 
 class TestMutationClassification(unittest.TestCase):
@@ -453,12 +503,10 @@ class TestIndels(unittest.TestCase):
         prefix = str(self.dir_path / name)
         summary = lms.stream_lexicmap_to_msa(ref_path=str(self.ref), file_path=str(tsv),
                                              out_prefix=prefix, **kw)
-        ledger = {}
-        with open(f"{prefix}.cohort_ledger.tsv") as fh:
-            header = fh.readline().rstrip("\n").split("\t")
-            for line in fh:
-                row = dict(zip(header, line.rstrip("\n").split("\t")))
-                ledger[row["accession"]] = row
+        # records[] in the summary is the per-accession layer now; cohort_ledger.tsv is an
+        # opt-in rendering of these same rows (--cohort-ledger).
+        on_disk = json.loads(Path(f"{prefix}.summary.json").read_text())
+        ledger = {r["acc"]: r for r in on_disk["records"]}
         with open(f"{prefix}.clean.haplotypes.tsv") as fh:
             header = fh.readline().rstrip("\n").split("\t")
             haps = [dict(zip(header, line.rstrip("\n").split("\t"))) for line in fh]
@@ -473,7 +521,7 @@ class TestIndels(unittest.TestCase):
         qseq, sseq = _ins(29, "G")
         _, ledger, _, _ = self._run([("SRR1", 98.4, qseq, sseq)], "ins1")
         self.assertEqual(ledger["SRR1"]["status"], "FLAGGED_FRAMESHIFT")
-        self.assertEqual(ledger["SRR1"]["tier"], "5")
+        self.assertEqual(ledger["SRR1"]["tier"], 5)
         self.assertEqual(ledger["SRR1"]["indels"], "30_31insG")
 
     def test_one_nt_deletion_is_a_frameshift(self):
@@ -489,7 +537,7 @@ class TestIndels(unittest.TestCase):
         _, ledger, haps, _ = self._run([("SRR1", 100.0, qseq, sseq)], "del6",
                                        full_length_only=True)
         self.assertEqual(ledger["SRR1"]["status"], "CLEAN_FULL_LENGTH")
-        self.assertEqual(ledger["SRR1"]["coverage"], "1.0000")
+        self.assertEqual(ledger["SRR1"]["coverage"], 1.0)
         self.assertEqual(ledger["SRR1"]["indels"], "31_36del")
         self.assertEqual(haps[0]["mutation_class"], "InFrameIndel")
         self.assertIn("31_36del", haps[0]["nt_mutations"].split(","))
@@ -501,9 +549,9 @@ class TestIndels(unittest.TestCase):
             [("WT1", 100.0, CDS60, CDS60), ("INS", 100.0, qseq, sseq), ("WT2", 100.0, CDS60, CDS60)],
             "ins3")
         self.assertEqual(ledger["INS"]["status"], "CLEAN_FULL_LENGTH")
-        self.assertEqual(summary["cohort_breakdown"]["clean_full_length"], 3)
-        self.assertEqual(summary["clean_unique_haplotypes"], 2)
-        self.assertEqual(summary["wildtype_count"], 2)
+        self.assertEqual(summary["cohort"]["clean_full_length"], 3)
+        self.assertEqual(summary["cohort"]["clean_unique_haplotypes"], 2)
+        self.assertEqual(summary["cohort"]["wildtype_count"], 2)
         by_class = {h["mutation_class"]: h for h in haps}
         self.assertEqual(by_class["WT"]["count"], "2")
         self.assertEqual(by_class["InFrameIndel"]["count"], "1")
@@ -527,8 +575,8 @@ class TestIndels(unittest.TestCase):
             [("EDGE", 99.0, qseq, sseq), ("WT", 100.0, CDS60, CDS60)], "edge")
         self.assertEqual(ledger["EDGE"]["status"], "CLEAN_FULL_LENGTH")
         self.assertEqual(ledger["EDGE"]["indels"], "5_6insT(edge)")
-        self.assertEqual(summary["clean_unique_haplotypes"], 1)
-        self.assertEqual(summary["wildtype_count"], 2)
+        self.assertEqual(summary["cohort"]["clean_unique_haplotypes"], 1)
+        self.assertEqual(summary["cohort"]["wildtype_count"], 2)
 
     def test_allow_frameshift_alts_waives_only_the_frameshift_tier(self):
         qseq, sseq = _ins(29, "G")
@@ -775,10 +823,8 @@ class TestCoverageTakesPrecedence(unittest.TestCase):
             f"SRR1\t98.0\t{100.0 * (qend - qstart + 1) / len(CDS60):.1f}\t{qstart}\t{qend}\t{qseq}\t{sseq}\n")
         prefix = str(self.dir_path / name)
         lms.stream_lexicmap_to_msa(ref_path=str(self.ref), file_path=str(tsv), out_prefix=prefix)
-        with open(f"{prefix}.cohort_ledger.tsv") as fh:
-            header = fh.readline().rstrip("\n").split("\t")
-            row = dict(zip(header, fh.readline().rstrip("\n").split("\t")))
-        return row["status"]
+        on_disk = json.loads(Path(f"{prefix}.summary.json").read_text())
+        return on_disk["records"][0]["status"]
 
     def test_a_fragment_with_a_frameshift_is_a_fragment(self):
         # 20 of 60 bases tiled (0.33, under the 0.50 partial floor) with a 1-nt insertion.

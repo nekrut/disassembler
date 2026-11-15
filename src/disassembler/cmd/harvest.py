@@ -10,7 +10,7 @@ For each shard, in either mode:
   2. Merges containment scores per target across all shards.
   3. Emits `<target>.accessions.txt` (sorted by score descending) and
      `<target>.scores.json` (`{"target": ..., "scores": {accession: score}}`) per
-     target, plus `UNION.accessions.txt` and `summary.json`.
+     target, plus `UNION.accessions.txt` and `harvest.summary.json`.
 
 Stratification into a size-capped cohort is a separate subcommand (`stratify`);
 this one only harvests.
@@ -35,6 +35,9 @@ from requests.adapters import HTTPAdapter
 
 from disassembler.textio import decode_bytes, read_text
 from disassembler.validators import positive_int, validate_api_key_file
+
+from disassembler import __version__
+from disassembler import summary as summary_io
 
 ATTEMPTS = 5
 
@@ -168,7 +171,7 @@ def _merge_payload(d, per_target):
 
 
 def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target,
-                   failure_noun="shard"):
+                   failure_noun="shard", started=None, source=None):
     """Emit the per-target accession lists, union, and summary.
 
     `failure_noun` is just a label for the human-facing message so the local-files
@@ -193,8 +196,33 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
 
     union_file = out_dir / "UNION.accessions.txt"
     union_file.write_text("\n".join(sorted(all_union)) + "\n")
-    summary["_union"] = {"n": len(all_union)}
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    # The shared contract (docs/summaries.md). The old `summary.json` was a bare map of
+    # target to {n, max_score} with a `_union` pseudo-entry, and the three failure counters
+    # below reached stdout only: a harvest where most shards failed to parse produced the
+    # same file as a clean one, minus some accessions.
+    started = started if started is not None else time.time()
+    kind, ident = source or ("file", str(out_dir))
+    summary_io.write(
+        out_dir / "harvest.summary.json",
+        tool=summary_io.tool("harvest", __version__),
+        inputs={"references": None,
+                "source": summary_io.source(kind, ident, n_items)},
+        settings={},
+        run=summary_io.run_block(
+            status=summary_io.status_of(n_items, n_items - n_failed),
+            started=started,
+            wall_seconds=time.time() - started,
+            n_records=len(summary),
+            n_ok=sum(1 for v in summary.values() if v["n"] > 0),
+        ),
+        discards={f"{failure_noun}s": {"failed": n_failed, "empty": n_empty},
+                  "targets": {"unusable_name": n_bad_target}},
+        cohort={"union": len(all_union), "targets": len(summary),
+                "max_score": summary_io.quantiles(
+                    [v["max_score"] for v in summary.values()])},
+        records=[{"target": k, **v} for k, v in sorted(summary.items())],
+    )
 
     if n_failed:
         print(f"[!] {n_failed}/{n_items} {failure_noun}s failed to load; the cohort "
@@ -274,7 +302,8 @@ def harvest_local(shards_dir, out_dir):
             continue
 
     _write_outputs(per_target, out_dir, len(shard_files), n_failed, n_empty,
-                   n_bad_target, failure_noun="shard file")
+                   n_bad_target, failure_noun="shard file", started=start_t,
+                   source=("file", str(shards_dir)))
 
     if shard_files and n_failed == len(shard_files):
         raise RuntimeError(
@@ -286,6 +315,7 @@ def harvest_local(shards_dir, out_dir):
 
 def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_workers=32):
     """Walk a dataset collection via the history endpoint; fetch all shard JSONs in parallel."""
+    start_t = time.time()
     print(f"[*] Fetching collection elements for {coll_id} in history {history_id}...")
     headers = {"x-api-key": api_key}
     url = f"{base_url}/api/histories/{history_id}/contents/dataset_collections/{coll_id}"
@@ -377,7 +407,8 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
         sess.close()
 
     _write_outputs(per_target, out_dir, len(items), n_failed, n_empty, n_bad_target,
-                   failure_noun="shard")
+                   failure_noun="shard", started=start_t,
+                   source=("galaxy", f"{base_url}#collection={coll_id}"))
 
     # A run that fetched nothing has produced no cohort. Saying so is the
     # difference between a downstream stage refusing to start and one silently

@@ -53,6 +53,7 @@ use crate::error::Result;
 use crate::stages::{parse, stitch};
 use crate::types::{
     AltHaplotype, GafPath, Orient, PathStep, Query, Strand, Subgraph, UnitigGraph, UnitigId,
+    VariantStats,
 };
 use std::collections::HashMap;
 
@@ -157,7 +158,7 @@ pub fn prefer_majority(
     subgraph: &Subgraph,
     path: &GafPath,
     query: &Query,
-) -> Result<Option<GafPath>> {
+) -> Result<Option<(GafPath, usize)>> {
     if !cfg.prefer_majority {
         return Ok(None);
     }
@@ -345,7 +346,7 @@ pub fn prefer_majority(
             subgraph.accession, swaps
         );
     }
-    Ok(Some(current))
+    Ok(Some((current, swaps)))
 }
 
 /// Recover one alternative haplotype per genuinely biallelic site on the walked path.
@@ -355,14 +356,14 @@ pub fn find_alts(
     subgraph: &Subgraph,
     path: &GafPath,
     query: &Query,
-) -> Result<Vec<AltHaplotype>> {
+) -> Result<(Vec<AltHaplotype>, VariantStats)> {
     // The sites feed both alt_haplotypes.fasta and the VCF, so compute them when either is
     // wanted. Skipping the work only when neither output will use it.
     if (!cfg.emit_alts && !cfg.emit_vcf && !cfg.emit_snv_table)
         || path.steps.len() < 2
         || subgraph.nodes.is_empty()
     {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), VariantStats::default()));
     }
 
     let n = subgraph.nodes.len();
@@ -390,7 +391,9 @@ pub fn find_alts(
     let mut walk: Vec<Oriented> = Vec::with_capacity(path.steps.len());
     for step in &path.steps {
         let Some(&i) = local.get(&step.node) else {
-            return Ok(Vec::new()); // path leaves the subgraph; stitch would bail too
+            // Path leaves the subgraph; stitch would bail too. Nothing was examined, so the
+            // stats stay zero rather than claiming forks that were never looked at.
+            return Ok((Vec::new(), VariantStats::default()));
         };
         let fwd = matches!(step.orient, Orient::Forward);
         walk.push((i * 2 + usize::from(fwd)) as Oriented);
@@ -403,7 +406,7 @@ pub fn find_alts(
     }
 
     let Some(primary) = stitch::stitch(cfg, graph, path, subgraph, query)? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), VariantStats::default()));
     };
     let baseline_len = stitched_len(cfg, &path.steps, subgraph);
 
@@ -575,7 +578,23 @@ pub fn find_alts(
         rejected_large, cfg.max_alt_indel, rejected_frameshift, rejected_window,
         identical
     );
-    Ok(alts)
+    // The same numbers, for `summary.json`. They are assembled here rather than counted
+    // again by the caller so the printed line and the recorded block cannot drift apart.
+    let stats = VariantStats {
+        depth,
+        floor,
+        forks,
+        biallelic,
+        recovered: alts.len(),
+        indels,
+        no_rejoin,
+        not_substitution,
+        over_indel_cap: rejected_large,
+        frameshifting: rejected_frameshift,
+        window_not_shiftable: rejected_window,
+        identical,
+    };
+    Ok((alts, stats))
 }
 
 /// The gene's own sequencing depth: median `ka:f` over the nodes the walk uses.
@@ -743,6 +762,31 @@ mod tests {
     use crate::stages::parse;
     use crate::types::PathStep;
     use std::path::PathBuf;
+
+    // Both stages gained a second return value in 0.2.0, the counts `summary.json` now
+    // records (`docs/summaries.md` rule 3). These shims shadow the real functions so the
+    // tests below keep asserting on what they are about, the alleles and the route. A test
+    // that is about the counts calls `super::` directly.
+    fn find_alts(
+        cfg: &Config,
+        graph: &UnitigGraph,
+        subgraph: &Subgraph,
+        path: &GafPath,
+        query: &Query,
+    ) -> Result<Vec<AltHaplotype>> {
+        super::find_alts(cfg, graph, subgraph, path, query).map(|(alts, _)| alts)
+    }
+
+    fn prefer_majority(
+        cfg: &Config,
+        graph: &UnitigGraph,
+        subgraph: &Subgraph,
+        path: &GafPath,
+        query: &Query,
+    ) -> Result<Option<GafPath>> {
+        super::prefer_majority(cfg, graph, subgraph, path, query)
+            .map(|fixed| fixed.map(|(path, _)| path))
+    }
 
     /// A diamond: node 0 forks to either 1 or 2, both rejoin at 3. k=4, so overlap is 3 and
     /// each branch contributes one base. The walked path takes branch 1.

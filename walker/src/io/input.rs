@@ -47,7 +47,21 @@ pub fn read_input(path: &Path, what: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The list as it will be processed.
+///
+/// Duplicates are dropped here with a warning, so this returns fewer accessions than the file
+/// lists. Callers that have to account for every entry use
+/// [`read_accession_list_counted`].
 pub fn read_accession_list(path: &Path) -> Result<Vec<Accession>> {
+    read_accession_list_counted(path).map(|(list, _)| list)
+}
+
+/// The list, and how many entries the file held before duplicates were dropped.
+///
+/// The second value is the summary's `inputs.source.n_requested` (`docs/summaries.md`): a run
+/// that silently deduplicated part of its input has to say so, and the dedup below reports
+/// itself only as a warning on stderr.
+pub fn read_accession_list_counted(path: &Path) -> Result<(Vec<Accession>, usize)> {
     let bytes = read_input(path, "accession list")?;
     let text = String::from_utf8(bytes).map_err(|e| {
         Error::Usage(format!("cannot read accession list {}: {e}", path.display()))
@@ -81,7 +95,7 @@ pub fn read_accession_list(path: &Path) -> Result<Vec<Accession>> {
             path.display()
         );
     }
-    Ok(out)
+    Ok((out, listed))
 }
 
 /// Reject anything that cannot be an accession before it becomes a confusing 404 or,
@@ -214,7 +228,7 @@ pub fn read_query(path: &Path) -> Result<Query> {
 ///
 /// Naming: the [`Query::name`] is the file stem when a file holds a single record (matching
 /// `read_query`), and `<stem>__<record_id>` when a file holds several. That keeps the
-/// summary filename derivation (`{name}_walker_summary.json`) unambiguous across files that
+/// summary filename derivation (`{name}.summary.json`) unambiguous across files that
 /// happen to share a record id.
 pub fn read_query_set(paths: &[PathBuf]) -> Result<Vec<Query>> {
     if paths.is_empty() {

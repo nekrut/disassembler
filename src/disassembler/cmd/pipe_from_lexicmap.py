@@ -20,6 +20,7 @@ cohort's own coverage gate, so neither stage silently drops rows lexicmap admitt
 from __future__ import annotations
 
 import argparse
+import time
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from disassembler.stage import stage_args
 
 
 from disassembler.validators import (
+
     fasta_has_record,
     fraction,
     non_negative_int,
@@ -38,6 +40,7 @@ from disassembler.validators import (
     positive_int,
     validate_api_key_file,
 )
+from disassembler import summary as summary_io
 
 
 # Slack between lexicmap's coverage gate and the downstream gates derived from it. A trusted
@@ -129,6 +132,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                        help="Maximum representative accessions listed per collapsed "
                             "haplotype in <prefix>.clean.haplotypes.tsv (default: 10). "
                             "Does not affect the .accessions.fasta outputs.")
+    g_lex.add_argument("--cohort-ledger", action="store_true",
+                       help="Also write <prefix>.cohort_ledger.tsv, one row per evaluated "
+                            "accession. It is a tabular rendering of the summary's "
+                            "records[], which carries the same rows, so it is off "
+                            "by default; pass this for Galaxy or a spreadsheet.")
     g_lex.add_argument("--no-a2m", action="store_true",
                        help="Skip writing the .a2m formatted MSA files "
                             "(<prefix>.clean.a2m and the .a2m compat alias).")
@@ -203,6 +211,37 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run(args) -> int:
+    """Run the stages, then write the manifest that ties their summaries together."""
+    stages: list[dict] = []
+    started = time.time()
+    try:
+        rc = _run(args, stages)
+    except BaseException as e:
+        _write_manifest(args, stages, started, "failed", f"{type(e).__name__}: {e}")
+        raise
+    _write_manifest(args, stages, started, None if rc == 0 else "failed")
+    return rc
+
+
+def _write_manifest(args, stages, started, status=None, error=None) -> None:
+    try:
+        summary_io.manifest(
+            Path(args.out_dir) / "from-lexicmap.summary.json",
+            name="from-lexicmap",
+            settings={k: v for k, v in sorted(vars(args).items())
+                      if isinstance(v, (str, int, float, bool, type(None)))},
+            source=summary_io.source("file", str(args.out_dir), len(stages)),
+            stages=stages,
+            started=started,
+            status=status,
+            error=error,
+        )
+    except OSError:
+        # The output directory may be the thing that failed; the stage already said so.
+        pass
+
+
+def _run(args, stages) -> int:
     if not args.dataset and not args.file:
         print("from-lexicmap: must specify either -d/--dataset <GALAXY_ID> or "
               "-f/-i/--file <PATH> (or '-' for stdin).", file=sys.stderr)
@@ -285,9 +324,12 @@ def run(args) -> int:
         samples_per_haplotype=args.samples_per_haplotype,
         out_prefix=str(prefix),
         no_a2m=args.no_a2m,
+        cohort_ledger=args.cohort_ledger,
         allow_empty=args.allow_empty,
     )
-    rc = lexicmap_cmd.run(lex_ns)
+    t0 = time.time()
+    rc = summary_io.stage_entry(stages, "lexicmap", t0, lexicmap_cmd.run(lex_ns),
+                                Path(f"{prefix}.summary.json"))
     if rc != 0:
         return rc
 
@@ -339,7 +381,8 @@ def run(args) -> int:
             max_gap_frac = round(min(1.0, 1.0 - gate + GATE_MARGIN), 6)
         print(f"[from-lexicmap] 2/3 sieve: --max-gap-frac {max_gap_frac} "
               f"(cohort coverage gate {gate})", flush=True)
-        rc = sieve_cmd.sieve_run(
+        t0 = time.time()
+        rc = summary_io.stage_entry(stages, "sieve", t0, sieve_cmd.sieve_run(
             cohort, sieved,
             ref=Path(args.ref),
             min_len=args.sieve_min_len,
@@ -347,12 +390,13 @@ def run(args) -> int:
             threshold=args.sieve_threshold,
             sketch=args.sieve_sketch,
             sieve_bin=args.sieve_bin,
-        )
+        ), sieved.with_suffix(".summary.json"))
         if rc != 0:
             return rc
         msa_input = sieved
     else:
         print("[from-lexicmap] 2/3 sieve skipped (no --sieve)", flush=True)
+        summary_io.stage_entry(stages, "sieve", time.time(), 0, status="skipped")
 
     # ---- 3/3 codon MSA + FastTree -----------------------------------------
     print(f"[from-lexicmap] 3/3 codon MSA + tree: --input {msa_input} --out-aln {aln} "
@@ -369,7 +413,9 @@ def run(args) -> int:
         mafft_threads=args.mafft_threads,
         msa_min_cov=msa_min_cov,
     )
-    rc = msa_cmd.run(msa_ns)
+    t0 = time.time()
+    rc = summary_io.stage_entry(stages, "msa", t0, msa_cmd.run(msa_ns),
+                                aln.with_suffix(".summary.json"))
     if rc != 0:
         return rc
 

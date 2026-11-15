@@ -272,7 +272,10 @@ class TestSieveRun(unittest.TestCase):
         rc, n, log = self._run(self.fixture)
         self.assertEqual(rc, 0, log)
         self.assertGreater(n, 0)
-        self.assertEqual(sorted(p.name for p in self.work.iterdir()), ["in.fasta", "out.fasta"])
+        # out.summary.json joined these in 0.2.0; the shards and the deduped temporary
+        # copy must still be gone.
+        self.assertEqual(sorted(p.name for p in self.work.iterdir()),
+                         ["in.fasta", "out.fasta", "out.summary.json"])
 
     def test_duplicates_keep_the_first_copy(self):
         seq = self.fixture[0][1]

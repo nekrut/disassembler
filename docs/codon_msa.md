@@ -147,3 +147,16 @@ The intra-host SNP side of the same cohort is in [`vcf_example.md`](vcf_example.
 inflate apparent diversity, and two records from one sample are not two independent
 observations. The intra-host signal has its own outputs (`--emit-vcf`, `--emit-snv-table`); see
 [`vcf_example.md`](vcf_example.md).
+
+## Summary output
+
+`disassembler msa` writes `<out-aln stem>.summary.json` beside the alignment, in the shared
+format of [`summaries.md`](summaries.md). It is new in 0.2.0; before it this stage produced no
+machine-readable output, which was awkward for the one stage that can fail on a tool version
+(MAFFT 7.525 mishandles `--addfragments`).
+
+`discards.rows` carries `below_coverage`, `unoriented` and `lost_in_alignment`, `cohort`
+carries the rows in, the rows retained, the taxa aligned and how many were reverse
+complemented, and `records[]` names each aligned row by id, length and sequence hash. It is
+written on every path, including the failures, so a caller can tell a run that aligned nothing
+from one that never started.

@@ -5,7 +5,7 @@
 //!  ────────────────────────────           ────────────────────────────────
 //!  --accession-list  FILE                 --out-fasta  reconstructed.fasta
 //!  --accession       ACC                  bubbles.json
-//!  --query           reference CDS FASTA  <query>_walker_summary.json
+//!  --query           reference CDS FASTA  <query>.summary.json
 //! ```
 //!
 //! Everything upstream (kmindex discovery) and downstream (MAFFT, FastTree) stays in the

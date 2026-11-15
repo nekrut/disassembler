@@ -17,6 +17,7 @@ Accession-list selection after stratify:
 from __future__ import annotations
 
 import argparse
+import time
 import sys
 from pathlib import Path
 
@@ -25,12 +26,14 @@ from disassembler.cmd import pipe_reconstruct
 from disassembler.cmd import stratify as stratify_cmd
 from disassembler.stage import stage_args
 from disassembler.validators import (
+
     fraction,
     positive_float,
     positive_int,
     validate_api_key_file,
     validate_unitigs_cache,
 )
+from disassembler import summary as summary_io
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -255,6 +258,37 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def run(args) -> int:
+    """Run the stages, then write the manifest that ties their summaries together."""
+    stages: list[dict] = []
+    started = time.time()
+    try:
+        rc = _run(args, stages)
+    except BaseException as e:
+        _write_manifest(args, stages, started, "failed", f"{type(e).__name__}: {e}")
+        raise
+    _write_manifest(args, stages, started, None if rc == 0 else "failed")
+    return rc
+
+
+def _write_manifest(args, stages, started, status=None, error=None) -> None:
+    try:
+        summary_io.manifest(
+            Path(args.out_dir) / "from-kmindex.summary.json",
+            name="from-kmindex",
+            settings={k: v for k, v in sorted(vars(args).items())
+                      if isinstance(v, (str, int, float, bool, type(None)))},
+            source=summary_io.source("file", str(args.out_dir), len(stages)),
+            stages=stages,
+            started=started,
+            status=status,
+            error=error,
+        )
+    except OSError:
+        # The output directory may be the thing that failed; the stage already said so.
+        pass
+
+
+def _run(args, stages) -> int:
     # Fail fast on argument bugs BEFORE spending a Galaxy round-trip on harvest.
     # These same checks fire again inside pipe_reconstruct.run at stage 3, but
     # catching them here saves the harvest.
@@ -315,7 +349,9 @@ def run(args) -> int:
             download_workers=args.harvest_workers,
         )
         print(f"[from-kmindex] 1/3 harvest -> {cohort_dir}", flush=True)
-        rc = harvest_cmd.run(harvest_ns)
+        t0 = time.time()
+        rc = summary_io.stage_entry(stages, "harvest", t0, harvest_cmd.run(harvest_ns),
+                                    cohort_dir / "harvest.summary.json")
         if rc != 0:
             return rc
 
@@ -328,11 +364,16 @@ def run(args) -> int:
             score_bins=args.score_bins,
         )
         print(f"[from-kmindex] 2/3 stratify -> {cohort_dir}", flush=True)
-        rc = stratify_cmd.run(stratify_ns)
+        t0 = time.time()
+        rc = summary_io.stage_entry(stages, "stratify", t0, stratify_cmd.run(stratify_ns),
+                                    cohort_dir / "stratify.summary.json")
         if rc != 0:
             return rc
     else:
         print("[from-kmindex] 2/3 stratify skipped (no --score-bin)", flush=True)
+        # A skipped stage is recorded as skipped, not left out: a manifest listing two
+        # stages where the pipeline has three cannot be told from a truncated run.
+        summary_io.stage_entry(stages, "stratify", time.time(), 0, status="skipped")
 
     # ---- select accession list for --target -------------------------------
     if args.score_bins:
@@ -378,4 +419,7 @@ def run(args) -> int:
         offline=args.offline,
         walker_args=args.walker_args,
     )
-    return pipe_reconstruct.run(reconstruct_ns)
+    t0 = time.time()
+    return summary_io.stage_entry(stages, "reconstruct", t0,
+                                  pipe_reconstruct.run(reconstruct_ns),
+                                  Path(out_dir) / "reconstruct.summary.json")

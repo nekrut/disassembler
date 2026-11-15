@@ -7,6 +7,7 @@ passed straight through to logan-walker.
 from __future__ import annotations
 
 import argparse
+import time
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from disassembler.cmd import walker as walker_cmd
 from disassembler.resolve import resolve_sieve, resolve_walker
 from disassembler.stage import stage_args
 from disassembler.validators import (
+
     fasta_has_record,
     fasta_record_lengths,
     fraction,
@@ -23,6 +25,7 @@ from disassembler.validators import (
     positive_int,
     validate_unitigs_cache,
 )
+from disassembler import summary as summary_io
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -276,6 +279,37 @@ def _warn_inert_knobs(args, prefix: str = "[reconstruct]") -> None:
 
 
 def run(args) -> int:
+    """Run the stages, then write the manifest that ties their summaries together."""
+    stages: list[dict] = []
+    started = time.time()
+    try:
+        rc = _run(args, stages)
+    except BaseException as e:
+        _write_manifest(args, stages, started, "failed", f"{type(e).__name__}: {e}")
+        raise
+    _write_manifest(args, stages, started, None if rc == 0 else "failed")
+    return rc
+
+
+def _write_manifest(args, stages, started, status=None, error=None) -> None:
+    try:
+        summary_io.manifest(
+            Path(args.out_dir) / "reconstruct.summary.json",
+            name="reconstruct",
+            settings={k: v for k, v in sorted(vars(args).items())
+                      if isinstance(v, (str, int, float, bool, type(None)))},
+            source=summary_io.source("file", str(args.out_dir), len(stages)),
+            stages=stages,
+            started=started,
+            status=status,
+            error=error,
+        )
+    except OSError:
+        # The output directory may be the thing that failed; the stage already said so.
+        pass
+
+
+def _run(args, stages) -> int:
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     queries = [Path(q) for q in args.query]
@@ -385,7 +419,11 @@ def run(args) -> int:
     walker_argv += list(raw_extra)
 
     print(f"[reconstruct] 1/2 walker: {' '.join(walker_argv)}", flush=True)
-    rc = walker_cmd.run_walker(walker_argv, walker_bin=args.walker_bin)
+    t0 = time.time()
+    rc = summary_io.stage_entry(
+        stages, "walker", t0,
+        walker_cmd.run_walker(walker_argv, walker_bin=args.walker_bin),
+        out / f"{queries[0].stem}.summary.json")
     if rc != 0:
         return _die(f"logan-walker (stage 1) failed (exit {rc}); see its output above.")
 
@@ -415,13 +453,17 @@ def run(args) -> int:
             if len(references) > 1:
                 print(f"[reconstruct] sieve --min-len {min_len}: 95% of the shortest "
                       f"reference ({rid}, {length} nt).", flush=True)
-        rc = sieve_cmd.sieve_run(
-            recon, sieved,
-            min_len=min_len,
-            threshold=args.sieve_threshold,
-            sketch=args.sieve_sketch,
-            sieve_bin=args.sieve_bin,
-        )
+        t0 = time.time()
+        rc = summary_io.stage_entry(
+            stages, "sieve", t0,
+            sieve_cmd.sieve_run(
+                recon, sieved,
+                min_len=min_len,
+                threshold=args.sieve_threshold,
+                sketch=args.sieve_sketch,
+                sieve_bin=args.sieve_bin,
+            ),
+            sieved.with_suffix(".summary.json"))
         if rc != 0:
             return _die(f"sieve failed (exit {rc}); see its output above.")
         msa_input = sieved
@@ -446,7 +488,9 @@ def run(args) -> int:
         mafft_threads=args.mafft_threads,
         msa_min_cov=args.msa_min_cov,
     )
-    rc = msa_cmd.run(msa_args)
+    t0 = time.time()
+    rc = summary_io.stage_entry(stages, "msa", t0, msa_cmd.run(msa_args),
+                                aln.with_suffix(".summary.json"))
     if rc != 0:
         return _die(f"codon MSA / tree (stage 2) failed (exit {rc}); see its output above.")
 

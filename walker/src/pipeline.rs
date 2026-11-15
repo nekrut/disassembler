@@ -564,6 +564,8 @@ fn run_one(
             subgraph_fraction: None,
             provisional: false,
             prune: None,
+            majority_corrections: 0,
+            variants: crate::types::VariantStats::default(),
         });
     }
 
@@ -862,8 +864,11 @@ fn run_one(
     let mut alts: Vec<crate::types::AltHaplotype> = Vec::new();
     // Correct the consensus first, so the alternatives that follow are the minority alleles
     // relative to a corrected route rather than to a reference-biased one.
+    let mut majority_corrections = 0usize;
+    let mut variant_stats = crate::types::VariantStats::default();
     if let (Some(path), Some(_)) = (&final_path, &haplotype) {
-        if let Some(fixed) = stages::variants::prefer_majority(cfg, &graph, &subgraph, path, query)?
+        if let Some((fixed, swaps)) =
+            stages::variants::prefer_majority(cfg, &graph, &subgraph, path, query)?
         {
             if let Some(mut h) = stages::stitch::stitch(cfg, &graph, &fixed, &subgraph, query)? {
                 // The route was spliced onto the majority allele, so the GAF's identity
@@ -871,11 +876,17 @@ fn run_one(
                 h.pident_inherited = true;
                 haplotype = Some(h);
                 final_path = Some(fixed);
+                // Only count corrections that reached the output. A swap whose restitch
+                // failed left the published primary unchanged, so reporting it would
+                // overstate what happened to this record.
+                majority_corrections = swaps;
             }
         }
     }
     if let (Some(path), Some(_)) = (&final_path, &haplotype) {
-        alts = stages::variants::find_alts(cfg, &graph, &subgraph, path, query)?;
+        let (found, stats) = stages::variants::find_alts(cfg, &graph, &subgraph, path, query)?;
+        alts = found;
+        variant_stats = stats;
     }
     // Tag the primary with the winning reference when the anchor pool held more than one.
     // Single-anchor mode leaves anchor_used = None on Haplotype, alts, and AccessionResult
@@ -929,6 +940,8 @@ fn run_one(
         subgraph_fraction: Some(subgraph_fraction),
         provisional,
         prune,
+        majority_corrections,
+        variants: variant_stats,
     })
 }
 
