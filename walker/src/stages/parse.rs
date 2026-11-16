@@ -395,6 +395,7 @@ mod real_data {
             compressed_len: compressed.len(),
             compressed,
             fetch_secs: 0.0,
+            payload: crate::types::Payload::default(),
         };
 
         let t0 = std::time::Instant::now();

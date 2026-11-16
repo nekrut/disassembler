@@ -91,14 +91,28 @@ volatile fields masked by `bench/mask_summary.py`: the clock (`run.started`,
 (`tool.external[].path`, `inputs.source.id` and `kind`, since a cached CI run and a cold local
 one differ there), and the versions under test (`tool.version`, `tool.disassembler`).
 
+Also masked, from 0.2.0: each record's `payload.source`, `payload.etag`,
+`payload.last_modified` and `payload.fetched_at`. A warm cache has no HTTP response behind it,
+so the middle two are absent on a cached run and present on a cold one; the mask inserts all
+four whether or not they were there, so the two forms compare equal.
+
+`payload.bytes` and `payload.sha256` are **gated**, not masked. They are identical on every
+ingest path, because a cache file is byte-identical to the S3 object, and gating them gives the
+run a property it did not have before: it fails when Logan regenerates a gated accession. The
+`u/` objects are unversioned and mutable, and a sample of 5,000 keys on 2026-11-16 found 3.1%
+rewritten since the 2024-03 load, so this is a real event rather than a hypothetical one. A
+failure here means the fixture's inputs changed, which is a different thing from a walk
+regression and the diff says which.
+
 Everything else is gated, which is the point. Every count in `discards` and `cohort`,
 every `seq_sha256`, every setting and the block order are all compared byte for byte. Those
 numbers existed only on stderr until 0.2.0, so nothing could regress them visibly: a walk that
 started refusing every candidate allele, or silently stopped majority-correcting, produced the
 same gated outputs as one that did not.
 
-To regenerate: run the gate, then copy each `<query stem>.summary.json` to
-`default/<tag>.summary.json`.
+To regenerate: run the gate with `LOGAN_GOLDEN_WORK=<dir>` so its outputs survive, then copy
+each `<dir>/def-<tag>/<query stem>.summary.json` to `default/<tag>.summary.json`. Without that
+variable the gate works in a temp directory it deletes on exit, and there is nothing to copy.
 
 `alts.fasta` is empty for the two clonal isolates, and a **missing** VCF fixture is itself an
 assertion: those two recover no SNPs, so a VCF appearing is a real change. `SRR8209082`'s

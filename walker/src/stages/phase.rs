@@ -651,7 +651,7 @@ mod phase_real {
                 eprintln!("SKIP: no data for {acc}");
                 continue;
             };
-            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
+            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0, payload: crate::types::Payload::default() };
             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();
@@ -720,7 +720,7 @@ mod phase_diagnostic {
                 eprintln!("SKIP: no data for {acc} at {path}");
                 continue;
             };
-            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
+            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0, payload: crate::types::Payload::default() };
             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();

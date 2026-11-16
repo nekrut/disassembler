@@ -86,7 +86,20 @@ about 67 MB of it duplicate FASTA.
 
   "cohort": { },                       // population statistics; omitted where meaningless
 
-  "records": [ ]                       // one small row per unit of work
+  "records": [                       // one small row per unit of work
+    {
+      "acc": "SRR8209082",
+      "status": "success",
+      "payload": {                     // what this unit of work was built from
+        "source": "s3",                // s3 | cache | none
+        "bytes": 1861058,
+        "sha256": "...",               // of the bytes as read
+        "etag": "d2dd288b238c...",     // live fetches only
+        "last_modified": "2024-03-31T17:38:36Z",
+        "fetched_at": "2026-11-16T16:47:50Z"
+      }
+    }
+  ]
 }
 ```
 
@@ -103,6 +116,10 @@ What was consumed. `source.n_requested` is the count asked for, before any filte
 `n_requested` minus `run.n_records` is itself a discard that has to be explained in `discards`.
 Reference sequences are identified by sha256, not by file path, because a path does not travel
 between machines and a renamed or edited reference must not look identical.
+
+`source` describes the run. It cannot describe a single unit of work, because a run with a
+cache and no `--offline` reports `cache+s3` while each accession came from exactly one of the
+two. That is what `records[].payload` is for.
 
 ### `settings`
 
@@ -130,9 +147,37 @@ diversity, a top-N preview. Omitted by a stage with no population to describe.
 
 ### `records`
 
-One row per unit of work: per accession, per target, per sequence. **400 bytes is the ceiling.**
-Sub-objects are written on one line each. A record names its outputs rather than carrying them:
-a sequence appears as `seq_sha256` and `length`, never as `seq`.
+One row per unit of work: per accession, per target, per sequence. Sub-objects are written on
+one line each, and a record stays inside the per-record budget below. A record names its
+outputs rather than carrying them: a sequence appears as `seq_sha256` and `length`, never as
+`seq`.
+
+#### `records[].payload`
+
+What the unit of work was built from, as opposed to what the stage made of it. Always present,
+including as `{"source": "none"}` when no bytes were read, so that "nothing to record" and
+"this version does not record it" stay different answers. Absent members are omitted rather
+than written as null.
+
+| member | meaning |
+|---|---|
+| `source` | `s3`, `cache`, or `none` when no bytes were read |
+| `bytes` | size as read. Also set on a `too_large` skip, from `Content-Length`, where no bytes were read at all |
+| `sha256` | digest of the bytes exactly as read |
+| `etag` | the object's `ETag`, quotes stripped, when a live fetch supplied one |
+| `last_modified` | the object's `Last-Modified`, normalised to `YYYY-MM-DDTHH:MM:SSZ` |
+| `fetched_at` | when this run read the object. Absent for a cache hit, whose bytes may predate the run by any amount |
+
+`sha256` is the member that works on every path, because it comes from the bytes rather than
+from the transport: a cache hit and an `--offline` run have no response to take headers from.
+`etag` and `last_modified` are recorded in addition when they exist, because they are
+comparable with what the bucket serves today.
+
+This matters because the Logan objects at `logan-pub.s3.amazonaws.com/u/` are unversioned and
+mutable, and they do get replaced. A 5,000-key sample across five key ranges on 2026-11-16
+found 3.1% of objects rewritten since the 2024-03 bulk load, in waves dated 2025-12-10,
+2025-12-14 and 2026-02-08. Without a recorded digest, a rerun after an upstream regeneration
+produces different results with no detectable difference in any output.
 
 ## The size budget
 
@@ -143,9 +188,10 @@ a sequence appears as `seq_sha256` and `length`, never as `seq`.
 | `cohort.top_n` | bounded by `--summary-top-n`, default 10 |
 | anything O(variants), O(unitigs), O(HSPs), O(bubbles) | **not in the summary** |
 
-Measured on a real walker record (ERR2028820 against PfCRT, with the variant, prune and timing
-sub-objects all populated): **1,132 bytes**, against roughly 4.9 KB for the same record in
-0.1.1. A record that produced nothing is far smaller, because a sub-object that did not run is
+Measured on a real walker record (ERR2028820 against PfCRT, with the variant, prune, timing
+and payload sub-objects all populated): **about 1.3 KB**, against roughly 4.9 KB for the same
+record in 0.1.1. `payload` accounts for about 170 bytes of that when every member is present,
+and about 30 when the bytes came from a cache. A record that produced nothing is far smaller, because a sub-object that did not run is
 omitted rather than written as null, and in a cohort like `bench/hiv1_50.txt` most records are
 of that kind. A 20,000-accession walker run therefore lands near 23 MB against 130 MB.
 

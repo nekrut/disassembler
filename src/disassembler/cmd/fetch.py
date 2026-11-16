@@ -6,6 +6,11 @@ exits. Skip-existing is implicit: the walker's own cache wedge returns the on-di
 when present, so an already-cached accession is a fast no-op.
 
 After a `fetch`, an offline `walker --unitigs-cache DIR --offline` run hits zero network.
+
+The walker writes `fetch.summary.json` recording the size, sha256 and (for anything it
+downloaded) the S3 ETag and Last-Modified of every object. That file goes into the cache
+directory by default, beside the payloads it describes, so a filled cache is a frozen input
+that can be cited rather than a bare directory of files.
 """
 
 from __future__ import annotations
@@ -34,6 +39,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     src.add_argument("-l", "--accession-list", help="file with one accession per line")
     p.add_argument("--unitigs-cache", required=True, metavar="DIR",
                    help="Directory to write <ACC>.unitigs.fa.zst files into. Created if absent.")
+    p.add_argument("--out-dir", default=None, metavar="DIR",
+                   help="Where to write fetch.summary.json. Defaults to --unitigs-cache, so "
+                        "the manifest sits beside the payloads it describes.")
     p.add_argument("--fetch-workers", type=positive_int, default=None,
                    help="Parallel S3 fetch workers (walker default 8)")
     p.add_argument("--max-size-mb", type=positive_int, default=None,
@@ -55,7 +63,11 @@ def run(args) -> int:
     if cache_err:
         print(f"fetch: {cache_err}", file=sys.stderr)
         return 1
-    argv: list[str] = ["--fetch-only", "--unitigs-cache", args.unitigs_cache]
+    # Without an explicit -o the walker would default to ./walker_output and create a
+    # directory the user never asked for, just to hold one file about the cache.
+    out_dir = args.out_dir if args.out_dir is not None else args.unitigs_cache
+    argv: list[str] = ["--fetch-only", "--unitigs-cache", args.unitigs_cache,
+                       "-o", out_dir]
     if args.accession:
         argv += ["-a", args.accession]
     else:

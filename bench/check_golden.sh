@@ -34,8 +34,14 @@
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.."; pwd)"
 WALKER="${LOGAN_WALKER_BIN:-$ROOT/walker/target/release/logan-walker}"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# Set LOGAN_GOLDEN_WORK to keep the produced outputs: `bench/golden/README.md` tells you to
+# run the gate and then copy its summaries over the fixtures, which a wiped temp dir makes
+# impossible. A directory you name is yours to remove; one we made is removed on exit.
+if [ -n "${LOGAN_GOLDEN_WORK:-}" ]; then
+  WORK="$LOGAN_GOLDEN_WORK"; mkdir -p "$WORK"
+else
+  WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+fi
 
 if [ ! -x "$WALKER" ]; then
   echo "building walker..."; ( cd "$ROOT/walker" && cargo build --release ) || exit 1
@@ -43,9 +49,16 @@ fi
 command -v GraphAligner >/dev/null || { echo "FAIL: GraphAligner not on PATH"; exit 1; }
 
 # Optional shared store for the downloaded Logan objects: a re-run then costs no download, and
-# a transient S3 failure does not turn the gate red. Logan's `u/` objects are immutable, so a
-# cached object is never stale. The CI workflow points this at a cached directory; left unset,
-# every run downloads afresh, which is the old behaviour.
+# a transient S3 failure does not turn the gate red. The CI workflow points this at a cached
+# directory; left unset, every run downloads afresh, which is the old behaviour.
+#
+# This used to say the `u/` objects are immutable and a cached one is therefore never stale.
+# They are not. A 5,000-key sample across five key ranges on 2026-11-16 found 3.1% of them
+# rewritten since the 2024-03 bulk load, in waves dated 2025-12-10, 2025-12-14 and 2026-02-08.
+# A warm cache can therefore hold bytes the bucket no longer serves, which is a feature here
+# (the gate wants the inputs it was captured against) but is not a safe assumption anywhere
+# else. The summary's per-record `payload.sha256` is gated, so a cache that disagrees with the
+# fixture shows up as a failure rather than as a silent pass.
 CACHE_ARG=()
 if [ -n "${LOGAN_UNITIGS_CACHE:-}" ]; then
   mkdir -p "$LOGAN_UNITIGS_CACHE" || { echo "FAIL: cannot create $LOGAN_UNITIGS_CACHE"; exit 1; }

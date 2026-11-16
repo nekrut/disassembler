@@ -246,6 +246,12 @@ disassembler walker -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/r
 `fetch` skips accessions already in the cache; delete a file to refetch it. The composites take
 the same two flags.
 
+`fetch` also writes `fetch.summary.json` into `--out-dir`, listing every accession with the
+size and sha256 of the bytes that landed in the cache, plus the `ETag` and `Last-Modified` of
+each object it downloaded. That is what makes a filled cache a frozen input you can cite rather
+than a directory of files: see [Input provenance](#input-provenance). The file is written even
+when the fetch fails, so a partial cache is still accounted for.
+
 ## Options
 
 `logan-walker` needs one of `-a`/`-l` and at least one `-q` (`--fetch-only` needs no `-q`).
@@ -350,8 +356,50 @@ holding RAM until reboot.
 
 `/dev/shm` is only 64 MB in a default Docker container; point `--scratch-dir` elsewhere there.
 
+## Input provenance
+
+The Logan objects are unversioned and mutable. They live at a stable URL, `u/{ACC}/`, and the
+bucket has no versioning, so a replaced object is served under the same address with nothing in
+the response to say it changed. They do get replaced: a 5,000-key sample across five key ranges
+on 2026-11-16 found 3.1% of objects rewritten since the 2024-03 bulk load, in waves dated
+2025-12-10, 2025-12-14 and 2026-02-08.
+
+Every accession's record in the summary therefore carries a `payload` block naming the bytes it
+was built from:
+
+```json
+"payload": {"source": "s3", "bytes": 1861058,
+            "sha256": "4f2a...", "etag": "d2dd288b238c3c88b46acdcd78860dce",
+            "last_modified": "2024-03-31T17:38:36Z", "fetched_at": "2026-11-16T16:47:50Z"}
+```
+
+- `sha256` is of the compressed bytes exactly as read, which are byte-identical to the S3
+  object and to the cache file. It is the member that works on every path, because a cache hit
+  and an `--offline` run have no HTTP response to take headers from. Two runs consumed the
+  same input if and only if these match.
+- `source` says which path produced the bytes: `s3`, `cache`, or `none` when none were read.
+  A run with a cache and no `--offline` reports `cache+s3` at the run level while each
+  accession came from exactly one of the two, and this is where that is recorded.
+- `etag` is the object's own identifier. Below S3's 5 GB single-PUT limit it is the MD5 of the
+  content, which `--max-size-mb` (default 1024) keeps every ingested object well inside, so it
+  is directly comparable with what the bucket serves today. Above that limit S3 appends
+  `-<parts>` and the value is opaque.
+- `fetched_at` is absent for a cache hit, whose bytes may predate the run by any amount.
+  `run.started` is the only honest clock there.
+
+A `too_large` skip carries a `payload` too, with the size that tripped `--max-size-mb`, taken
+from `Content-Length` before any body was transferred.
+
+To check whether a cohort's inputs have moved since a run, compare each record's `etag` against
+a `HEAD` of its object. The bucket also honours conditional requests, so
+`If-None-Match: "<etag>"` returns `304` when the object is unchanged and the full body when it
+is not.
+
 ## Reproducibility
 
+- **Input bytes.** See [Input provenance](#input-provenance). Reproducing a run means
+  reproducing its inputs first, and the summary's per-accession `sha256` is what makes that
+  checkable rather than assumed.
 - **GraphAligner threads.** GraphAligner is not deterministic with more than one thread: on
   `SRR8209082`, `-t 1` scored 2691 on every run, while `-t 2` gave 2686 or 2691 and five runs
   produced two different primaries. Keep `-t 1` and get parallelism from `-w`.
@@ -425,7 +473,8 @@ Logan's unitigs are BCALM2 output from a k = 31 compacted de Bruijn graph. A hea
 - Sequences are plain uppercase `ACGT`; anything else is an error.
 
 A 404 from S3 means the accession has no Logan unitigs and is not retried; server errors are
-retried three times.
+retried three times. The objects are unversioned and mutable, so each run records what it read:
+see [Input provenance](#input-provenance).
 
 [`contigs_vs_unitigs.md`](contigs_vs_unitigs.md) explains why the walker uses unitigs rather
 than Logan's assembled contigs. The default `-k 21` comes from the simulation in

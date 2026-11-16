@@ -140,7 +140,9 @@ OFFLINE / CACHE:
                                   naming the missing accession. Requires --unitigs-cache
         --fetch-only              Fetch every accession into --unitigs-cache and exit before
                                   the compute stages. Requires --unitigs-cache; -q is not
-                                  required in this mode
+                                  required in this mode. Writes fetch.summary.json into
+                                  --out-dir recording each object's size, sha256, ETag and
+                                  Last-Modified, so the cache is a citable frozen input
 
     -h, --help                    Print this help
     -V, --version                 Print version
@@ -572,14 +574,55 @@ fn real_main(mut args: Args) -> error::Result<()> {
         gb(args.cfg.max_resident_bytes()),
     );
 
+    // The run's own clock, for `run.started` and `run.wall_seconds` in the summary. Started
+    // here rather than at process entry so it measures the work, not the argument parsing,
+    // and `n_requested` is taken before the pipeline consumes the list. Above the
+    // `--fetch-only` branch because that path writes a summary too.
+    let started = std::time::SystemTime::now();
+    let run_clock = std::time::Instant::now();
+    let n_requested = n_listed;
+
     // --fetch-only takes the short path: fill the cache and exit. No compute pool, no
-    // output files, no query. Success = every accession is in the cache after this.
+    // reconstruction, no query. Success = every accession is in the cache after this.
+    //
+    // It does write `fetch.summary.json`, because a cache with no record of where its bytes
+    // came from is not a frozen input, it is just a directory. Rule 4 of the summary contract
+    // applies here as everywhere: the summary is written even when the fetch fails.
     if args.cfg.fetch_only {
-        let (ok, negatives, errors) = pipeline::run_fetch_only(&args.cfg, accessions)?;
+        let summary = pipeline::run_fetch_only(&args.cfg, accessions)?;
+        let ok = summary.success;
+        let negatives = summary.results.iter().filter(|r| r.outcome.is_negative()).count();
+        let errors = summary.results.len() - ok - negatives;
         eprintln!(
             "[logan-walker --fetch-only] {ok} fetched, {negatives} not available \
              (no Logan data or over --max-size-mb), {errors} failed"
         );
+
+        let summary_path = args.out_dir.join("fetch.summary.json");
+        let run = io::output::RunInfo {
+            // GraphAligner never runs here, so `tool.external` stays empty rather than
+            // naming a tool that did no work.
+            graphaligner: None,
+            cfg: &args.cfg,
+            queries: &[],
+            started,
+            wall_seconds: run_clock.elapsed().as_secs_f64(),
+            n_requested,
+        };
+        let written = std::fs::create_dir_all(&args.out_dir)
+            .map_err(error::file_err("create", &args.out_dir))
+            .and_then(|()| {
+                io::output::write_summary(&summary, &run, &summary_path)
+                    .map_err(|e| e.at("write", &summary_path))
+            });
+        if let Err(e) = written {
+            // A failed write must not mask a failed fetch, and must not be swallowed when
+            // the fetch was fine.
+            eprintln!("[logan-walker] write failed: {e}");
+            check_fetch(ok, negatives, errors, args.allow_empty)?;
+            return Err(e);
+        }
+        eprintln!("[logan-walker --fetch-only] wrote {}", summary_path.display());
         return check_fetch(ok, negatives, errors, args.allow_empty);
     }
 
@@ -599,13 +642,6 @@ fn real_main(mut args: Args) -> error::Result<()> {
             )));
         }
     }
-
-    // The run's own clock, for `run.started` and `run.wall_seconds` in the summary. Started
-    // here rather than at process entry so it measures the work, not the argument parsing,
-    // and `n_requested` is taken before the pipeline consumes the list.
-    let started = std::time::SystemTime::now();
-    let run_clock = std::time::Instant::now();
-    let n_requested = n_listed;
 
     // Checked before any download. GraphAligner used to be looked up per accession, after
     // its unitigs were fetched and parsed, so a missing binary failed each one in turn.
@@ -678,9 +714,9 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // did not write is left alone (WV-16).
     io::output::remove_disabled_outputs(&args.cfg, &args.out_dir, &summary);
     let summary_path = args.out_dir.join(format!("{}.summary.json", queries[0].name));
+    let bin_display = bin.display().to_string();
     let run = io::output::RunInfo {
-        graphaligner: &version,
-        graphaligner_path: &bin.display().to_string(),
+        graphaligner: Some((&version, &bin_display)),
         cfg: &args.cfg,
         queries: &queries,
         started,

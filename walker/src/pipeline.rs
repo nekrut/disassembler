@@ -186,7 +186,7 @@ const PRUNE_SPAN_TOLERANCE: usize = 3;
 pub fn run_fetch_only(
     cfg: &Config,
     accessions: Vec<Accession>,
-) -> Result<(usize, usize, usize)> {
+) -> Result<Summary> {
     let total = accessions.len();
     let work: SharedReceiver<(usize, Accession)> = {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -198,53 +198,73 @@ pub fn run_fetch_only(
 
     let fetcher = stages::stream::Fetcher::new(cfg);
     let fetcher = &fetcher;
-    let done = Arc::new(Mutex::new((0usize, 0usize, 0usize))); // (ok, negatives, errors)
+    // Results, not counts. A fetch-only run used to report three integers to stderr and exit,
+    // so the frozen-input route (`disassembler fetch` into a cache, then `--offline`) left no
+    // record of what it had frozen: the one step whose whole purpose is reproducibility was
+    // the only one that wrote no summary.
+    let collected: Arc<Mutex<Vec<AccessionResult>>> = Arc::new(Mutex::new(Vec::new()));
 
     std::thread::scope(|scope| {
         for _ in 0..cfg.fetch_workers {
             let work = Arc::clone(&work);
-            let done = Arc::clone(&done);
+            let collected = Arc::clone(&collected);
             scope.spawn(move || loop {
                 let (index, accession) = match work.lock().unwrap().recv() {
                     Ok(a) => a,
                     Err(_) => break,
                 };
                 let t = Instant::now();
-                match fetcher.fetch(index, &accession) {
+                let fetched = fetcher.fetch(index, &accession);
+                // The lock is taken once and held across the report, which also stops two
+                // workers interleaving a line.
+                let mut out = collected.lock().unwrap();
+                let progress = out.len() + 1;
+                match fetched {
                     Ok(f) => {
-                        let mut d = done.lock().unwrap();
-                        d.0 += 1;
-                        let progress = d.0 + d.1 + d.2;
                         println!(
                             "[{progress}/{total}] {accession}: cached ({} bytes in {:.1}s)",
                             f.compressed_len,
                             t.elapsed().as_secs_f64()
                         );
+                        out.push(cached(index, accession, f.payload));
                     }
                     Err(e) => {
-                        let negative = unfetched(index, accession.clone(), e.to_string(), &e)
-                            .outcome
-                            .is_negative();
-                        let mut d = done.lock().unwrap();
-                        if negative {
-                            d.1 += 1;
-                        } else {
-                            d.2 += 1;
-                        }
-                        let progress = d.0 + d.1 + d.2;
-                        if negative {
+                        let r = unfetched(index, accession.clone(), e.to_string(), &e);
+                        if r.outcome.is_negative() {
                             eprintln!("[{progress}/{total}] {accession}: not cached: {e}");
                         } else {
                             eprintln!("[{progress}/{total}] {accession}: FETCH FAILED: {e}");
                         }
+                        out.push(r);
                     }
                 }
             });
         }
     });
 
-    let counts = *done.lock().unwrap();
-    Ok(counts)
+    let mut results = std::mem::take(&mut *collected.lock().unwrap());
+    restore_input_order(&mut results);
+    let success = results
+        .iter()
+        .filter(|r| r.outcome == Outcome::Success)
+        .count();
+    Ok(Summary {
+        total,
+        success,
+        results,
+    })
+}
+
+/// The result for an accession whose bytes are now in the cache.
+///
+/// `Outcome::Success` means the unit of work succeeded, which under `--fetch-only` is the
+/// caching, not a reconstruction. The summary says which kind of run it was: `--fetch-only`
+/// writes `inputs.references: null` and an empty `tool.external`, and `cohort.reconstructed`
+/// is 0 because nothing was attempted.
+fn cached(index: usize, accession: Accession, payload: crate::types::Payload) -> AccessionResult {
+    let mut r = AccessionResult::empty(index, accession, Outcome::Success, None);
+    r.payload = payload;
+    r
 }
 
 /// The result for an accession whose fetch did not return bytes. No Logan data and an
@@ -259,8 +279,12 @@ fn unfetched(
     match e {
         Error::NoLoganData { .. } => AccessionResult::empty(index, accession, Outcome::NoLoganData, None),
         // The bare detail: the report line already says "too_large, skipped by --max-size-mb".
-        Error::TooLarge { detail: d, .. } => {
-            AccessionResult::empty(index, accession, Outcome::TooLarge, Some(d.clone()))
+        // The payload is what makes the skip actionable: it carries the size that tripped the
+        // cap as a number, where before it survived only as prose inside `detail`.
+        Error::TooLarge { detail: d, payload, .. } => {
+            let mut r = AccessionResult::empty(index, accession, Outcome::TooLarge, Some(d.clone()));
+            r.payload = (**payload).clone();
+            r
         }
         _ => AccessionResult::failed(index, accession, detail),
     }
@@ -497,6 +521,10 @@ fn compute_worker(
         };
         let accession = fetched.accession.clone();
         let index = fetched.index;
+        // Cloned off before `run_one` consumes `fetched`, and reattached below whatever the
+        // stages do with it. Provenance has to survive a failure: a run that errored on an
+        // accession still has to be able to say which bytes it errored on.
+        let payload = fetched.payload.clone();
 
         // A stage returning `Err` is already handled below. A stage that *panics* (e.g. an
         // index out of bounds on a malformed graph) must not take the worker down with it: the
@@ -506,7 +534,7 @@ fn compute_worker(
         // channel and the whole run hangs. Catching here turns a panic into one `Failed`
         // result and keeps the worker alive.
         let panic_acc = accession.clone();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_one(cfg, queries, query_index, fetched)
                 .unwrap_or_else(|e| AccessionResult::failed(index, accession, e.to_string()))
         }))
@@ -517,6 +545,7 @@ fn compute_worker(
                 "internal error: a stage panicked".to_string(),
             )
         });
+        result.payload = payload;
         if out.send(result).is_err() {
             break;
         }
@@ -578,6 +607,9 @@ fn run_one(
         return Ok(AccessionResult {
             index,
             accession,
+            // Overwritten by `compute_worker`, which is the last holder of the fetched
+            // bytes; `run_one` never sees them as anything but a stream.
+            payload: crate::types::Payload::default(),
             outcome: Outcome::NoAnchors,
             n_unitigs,
             n_anchors: 0,
@@ -975,6 +1007,7 @@ fn run_one(
     Ok(AccessionResult {
         index,
         accession,
+        payload: crate::types::Payload::default(),
         outcome,
         alts,
         n_unitigs,
@@ -1100,7 +1133,8 @@ mod ordering_tests {
         let acc = || "SRR1".to_string();
         let cases = [
             (Error::NoLoganData { accession: acc() }, Outcome::NoLoganData),
-            (Error::TooLarge { accession: acc(), detail: "big".into() }, Outcome::TooLarge),
+            (Error::TooLarge { accession: acc(), detail: "big".into(),
+              payload: Box::new(crate::types::Payload::default()) }, Outcome::TooLarge),
             (Error::Fetch { accession: acc(), detail: "HTTP 503".into() }, Outcome::Failed),
         ];
         for (e, want) in cases {

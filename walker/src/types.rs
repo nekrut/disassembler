@@ -48,6 +48,97 @@ pub struct Query {
 }
 
 // ---------------------------------------------------------------------------
+// provenance: what was read, and where it came from
+// ---------------------------------------------------------------------------
+
+/// Lowercase hex sha256 of `bytes`.
+///
+/// One digest helper for the whole walker: `io::output` names a reconstructed sequence with
+/// it, and `stages::stream` names the compressed payload an accession was built from.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Which ingest path produced an accession's bytes.
+///
+/// This answers "where did these bytes come from", not "what was configured": a run with
+/// `--unitigs-cache` and no `--offline` reports `Cache` for the accessions that hit and `S3`
+/// for the ones it had to download, which `inputs.source` (`cache+s3`) cannot distinguish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PayloadSource {
+    /// Downloaded from the Logan bucket during this run.
+    S3,
+    /// Read from `--unitigs-cache`.
+    Cache,
+    /// No bytes were read: a 404, a transport failure, or an error before the fetch.
+    #[default]
+    None,
+}
+
+impl PayloadSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PayloadSource::S3 => "s3",
+            PayloadSource::Cache => "cache",
+            PayloadSource::None => "none",
+        }
+    }
+}
+
+/// What one accession's unitig object was, as opposed to what the walker made of it.
+///
+/// The Logan objects at `logan-pub.s3.amazonaws.com/u/{acc}/` are unversioned and mutable,
+/// and they do get replaced: a 5,000-key sample across five ranges found 3.1% of objects
+/// rewritten after the 2024-03 bulk load, in waves on 2025-12-10, 2025-12-14 and 2026-02-08.
+/// Until 0.2.0 a run recorded nothing about the bytes it consumed, so a rerun after an
+/// upstream regeneration produced different results with no detectable difference in any
+/// output. This is the record that makes those two runs tell apart.
+///
+/// `sha256` is the field that works on every path, because it is derived from the bytes
+/// rather than from the transport: a cache hit and an `--offline` run have no HTTP response
+/// to read headers from. `etag` and `last_modified` are recorded in addition when a live
+/// fetch supplied them, because they are comparable with what the bucket serves today.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Payload {
+    pub source: PayloadSource,
+    /// Compressed size. Known without reading the body when S3 sent a `Content-Length` and
+    /// the object was then refused for being over `--max-size-mb`.
+    pub bytes: Option<u64>,
+    /// sha256 of the compressed bytes exactly as read, which are byte-identical to the S3
+    /// object and to the cache file. `None` when no bytes were read.
+    pub sha256: Option<String>,
+    /// S3 `ETag`, surrounding quotes stripped. For every object below S3's 5 GB single-PUT
+    /// limit this is the MD5 of the content, so it is comparable with the live bucket; above
+    /// it the value carries a `-<parts>` suffix and is opaque. `--max-size-mb` defaults to
+    /// 1024, so in practice every object the walker ingests has the comparable form.
+    pub etag: Option<String>,
+    /// S3 `Last-Modified`, normalised to `YYYY-MM-DDTHH:MM:SSZ`. Omitted rather than stored
+    /// raw when it cannot be parsed, so the field has one format or none.
+    pub last_modified: Option<String>,
+    /// When this run read the object from S3. Not set for a cache hit, where the bytes may
+    /// predate the run by any amount and `run.started` is the only honest clock.
+    pub fetched_at: Option<String>,
+}
+
+impl Payload {
+    /// Bytes that were read, from `source`, with their digest.
+    pub fn read(source: PayloadSource, bytes: &[u8]) -> Self {
+        Self {
+            source,
+            bytes: Some(bytes.len() as u64),
+            sha256: Some(sha256_hex(bytes)),
+            ..Self::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // stage 1 output: stream
 // ---------------------------------------------------------------------------
 
@@ -69,6 +160,10 @@ pub struct FetchedUnitigs {
     /// Seconds spent downloading, recorded by the fetch worker so the compute worker can
     /// report it. Network time belongs to the accession, not to whichever thread fetched it.
     pub fetch_secs: f64,
+    /// Where these bytes came from and what they hash to. Carried through to
+    /// `AccessionResult::payload` so it reaches `summary.json` whatever the accession goes
+    /// on to do, including failing.
+    pub payload: Payload,
 }
 
 // ---------------------------------------------------------------------------
@@ -662,6 +757,10 @@ pub struct AccessionResult {
     /// That maximum has reached [`KA_CEILING`], so this accession's abundances are clipped
     /// and every VAF, the prune floor and the majority calls rest on lower bounds (WV-03).
     pub depth_saturated: bool,
+    /// What this accession was built from. Present whatever the outcome: a `too_large` skip
+    /// still records the size that got it skipped, and a reconstruction that later failed
+    /// still names the bytes it failed on.
+    pub payload: Payload,
 }
 
 /// How the second, pruned alignment pass ended for one accession.
@@ -742,6 +841,7 @@ impl AccessionResult {
             snv_sites: None,
             ka_max: 0.0,
             depth_saturated: false,
+            payload: Payload::default(),
         }
     }
 }

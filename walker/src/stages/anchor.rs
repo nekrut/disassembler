@@ -708,6 +708,7 @@ mod recall_study_anchors {
             compressed_len: compressed.len(),
             compressed,
             fetch_secs: 0.0,
+            payload: crate::types::Payload::default(),
         };
         let graph = parse::build(&fetched.accession, stream::decoder(&fetched).unwrap()).unwrap();
         let query = read_query(qpath).unwrap();

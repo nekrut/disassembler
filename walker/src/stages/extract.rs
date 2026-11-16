@@ -631,7 +631,7 @@ mod recall_study_subgraphs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => panic!("{p}: {e}"),
         };
-        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
+        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0, payload: crate::types::Payload::default() };
         let rd = stream::decoder(&f).unwrap_or_else(|e| panic!("{p}: not decodable: {e}"));
         Some(parse::build(&f.accession, rd).unwrap_or_else(|e| panic!("{p}: not parseable: {e}")))
     }
@@ -751,6 +751,7 @@ mod real_data_collect {
             compressed_len: compressed.len(),
             compressed,
             fetch_secs: 0.0,
+            payload: crate::types::Payload::default(),
         };
         let graph = {
             let rd = stream::decoder(&f).unwrap();
@@ -990,6 +991,7 @@ mod cross_check {
             compressed_len: compressed.len(),
             compressed,
             fetch_secs: 0.0,
+            payload: crate::types::Payload::default(),
         };
         let graph = {
             let rd = stream::decoder(&f).unwrap();

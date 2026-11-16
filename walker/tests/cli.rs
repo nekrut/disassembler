@@ -541,9 +541,32 @@ fn the_default_walk_reconstructs_and_writes_every_output() {
         "\"status\": \"ok\"",
         "\"reconstructed\": 1",
         "\"distinct_primaries\": 1",
+        // The accession's record names the bytes it was built from. These came from the
+        // fixture cache under --offline, which has no HTTP response to take an ETag from,
+        // so the digest is the whole of the provenance and it has to be there.
+        "\"payload\": {\"source\": \"cache\", \"bytes\": ",
     ] {
         assert!(summary.contains(needle), "summary missing {needle}:\n{summary}");
     }
+    // Threaded from the fetch stage through the compute pool onto the finished record, not
+    // recomputed by the writer: a 64-hex digest of the cached object.
+    let sha = summary
+        .split("\"payload\": {")
+        .nth(1)
+        .and_then(|s| s.split("\"sha256\": \"").nth(1))
+        .and_then(|s| s.split('"').next())
+        .unwrap_or("");
+    assert_eq!(sha.len(), 64, "payload sha256 missing or malformed:\n{summary}");
+    assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()), "not hex: {sha}");
+    let cached = std::fs::read(f.dir.join("cache").join("SRRFAKE0.unitigs.fa.zst")).unwrap();
+    assert!(
+        summary.contains(&format!("\"bytes\": {}", cached.len())),
+        "payload bytes should be the cache file's size ({}):\n{summary}",
+        cached.len()
+    );
+    // A cache hit has no response behind it, so these must be absent rather than invented.
+    assert!(!summary.contains("\"etag\""), "no ETag exists for a cache hit:\n{summary}");
+    assert!(!summary.contains("\"fetched_at\""), "cached bytes predate the run:\n{summary}");
 }
 
 /// The bubble fixture is only meaningful if its de Bruijn geometry is right, and getting the
@@ -681,6 +704,28 @@ fn fetch_only_reports_its_counts_and_exit_code() {
     // Every accession already in the cache: nothing to download, even under --offline.
     let (code, stderr) = f.code("cache", &["--fetch-only"]);
     assert_eq!(code, 0, "a full cache should satisfy --fetch-only; stderr:\n{stderr}");
+
+    // A cache with no record of where its bytes came from is not a frozen input, it is a
+    // directory. Until 0.2.0 this path wrote nothing at all.
+    let summary =
+        std::fs::read_to_string(f.dir.join("out").join("fetch.summary.json")).unwrap_or_else(
+            |e| panic!("--fetch-only must write fetch.summary.json: {e}; stderr:\n{stderr}"),
+        );
+    for needle in [
+        "\"schema\": 1",
+        "\"name\": \"logan-walker\"",
+        // Nothing was reconstructed and GraphAligner never ran, so neither is claimed.
+        "\"external\": []",
+        "\"references\": null",
+        "\"n_requested\": 2",
+        "\"acc\": \"SRRFAKE0\"",
+        "\"acc\": \"SRRFAKE1\"",
+        "\"payload\": {\"source\": \"cache\", \"bytes\": ",
+    ] {
+        assert!(summary.contains(needle), "fetch summary missing {needle}:\n{summary}");
+    }
+    assert!(!summary.contains("GraphAligner"), "no tool that did no work:\n{summary}");
+    assert_eq!(summary.matches("\"sha256\": ").count(), 2, "one digest per accession:\n{summary}");
     assert!(
         stderr.contains(
             "[logan-walker --fetch-only] 2 fetched, 0 not available \

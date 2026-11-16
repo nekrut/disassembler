@@ -10,7 +10,7 @@
     "references": [
       {"id": "hiv1_pol", "length": 2739, "sha256": "9f67a60456c9ba3de95d04886a28d98ac89d674546aa44a5444700373b95f099"}
     ],
-    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/logancache", "n_requested": 1}
+    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/golden_cache", "n_requested": 1}
   },
   "settings": {
     "k": 21,
@@ -41,9 +41,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-16T00:29:25Z",
-    "wall_seconds": 0.598,
-    "stage_seconds": {"stream": 0.001, "parse": 0.042, "anchor": 0.013, "extract": 0.012, "align": 0.502, "stitch": 0.004, "phase": 0.012},
+    "started": "2026-11-16T17:24:55Z",
+    "wall_seconds": 0.596,
+    "stage_seconds": {"stream": 0.002, "parse": 0.038, "anchor": 0.012, "extract": 0.011, "align": 0.506, "stitch": 0.004, "phase": 0.012},
     "n_records": 1,
     "n_ok": 1
   },
@@ -71,6 +71,7 @@
     {
       "acc": "SRR8209082",
       "status": "success",
+      "payload": {"source": "cache", "bytes": 1861058, "sha256": "8c52ec34f0a599f99871dc719b640fde794e0cd0dbbe0cdc6d469ecad1b8c41d"},
       "n_unitigs": 81534,
       "n_anchors": 12876,
       "subgraph_nodes": 34582,
@@ -90,7 +91,7 @@
       "minority_left": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 10, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0},
       "variants": {"depth": 16000.0, "floor": 5.0, "forks": 136, "biallelic": 1, "recovered": 1, "beyond_cap": 0, "indels": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 15000.0, "floor": 150.0, "unitigs": 34582, "unitigs_kept": 6901, "unpruned_span": [0, 2738], "pruned_span": [0, 2738]},
-      "timing": {"stream": 0.001, "parse": 0.042, "anchor": 0.013, "extract": 0.012, "align": 0.502, "stitch": 0.004, "phase": 0.012, "total": 0.588}
+      "timing": {"stream": 0.002, "parse": 0.038, "anchor": 0.012, "extract": 0.011, "align": 0.506, "stitch": 0.004, "phase": 0.012, "total": 0.585}
     }
   ]
 }

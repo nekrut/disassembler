@@ -12,7 +12,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::types::{Accession, FetchedUnitigs};
+use crate::types::{Accession, FetchedUnitigs, Payload, PayloadSource};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -87,6 +87,11 @@ impl Fetcher {
                             path.display(),
                             self.max_compressed_bytes
                         ),
+                        payload: Box::new(Payload {
+                            source: PayloadSource::Cache,
+                            bytes: Some(len),
+                            ..Payload::default()
+                        }),
                     });
                 }
                 let compressed = std::fs::read(&path).map_err(|e| Error::Fetch {
@@ -99,12 +104,18 @@ impl Fetcher {
                         detail: format!("cache file is empty: {}", path.display()),
                     });
                 }
+                // Hashed here rather than at the point of download, so the digest covers
+                // every path into the pipeline. A cache hit and an `--offline` run have no
+                // HTTP response to take an ETag from, and they are exactly the runs whose
+                // inputs are least self-evident.
+                let payload = Payload::read(PayloadSource::Cache, &compressed);
                 return Ok(FetchedUnitigs {
                     index,
                     accession: accession.clone(),
                     compressed_len: compressed.len(),
                     compressed,
                     fetch_secs: 0.0,
+                    payload,
                 });
             }
             if self.offline {
@@ -147,10 +158,11 @@ impl Fetcher {
                         accession: accession.clone(),
                     })
                 }
-                Err(FetchAttempt::TooLarge(detail)) => {
+                Err(FetchAttempt::TooLarge(detail, payload)) => {
                     return Err(Error::TooLarge {
                         accession: accession.clone(),
                         detail,
+                        payload,
                     })
                 }
                 Err(FetchAttempt::Transient(detail)) => {
@@ -185,13 +197,35 @@ impl Fetcher {
             _ => return Err(FetchAttempt::Transient(format!("HTTP {status}"))),
         }
 
+        // Provenance off the response, read before the body so it survives a refusal: a
+        // `too_large` skip can still say which object was too big, and how big.
+        //
+        // The ETag is the object's MD5 for everything below S3's 5 GB single-PUT limit, which
+        // `--max-size-mb` (default 1024) keeps the walker well inside. Above that limit S3
+        // appends `-<parts>` and the value is opaque; it is recorded either way, and the
+        // suffix is self-identifying.
+        let mut payload = Payload {
+            source: PayloadSource::S3,
+            etag: header(&resp, ureq::http::header::ETAG)
+                .map(|v| v.trim_matches('"').to_string()),
+            last_modified: header(&resp, ureq::http::header::LAST_MODIFIED)
+                .as_deref()
+                .and_then(http_date_to_iso8601),
+            fetched_at: Some(crate::io::output::iso8601(std::time::SystemTime::now())),
+            ..Payload::default()
+        };
+
         // Refuse oversized accessions before transferring them, when the server says how big.
         if let Some(len) = resp.body().content_length() {
+            payload.bytes = Some(len);
             if len > self.max_compressed_bytes {
-                return Err(FetchAttempt::TooLarge(format!(
-                    "compressed size {len} exceeds max_compressed_bytes {}",
-                    self.max_compressed_bytes
-                )));
+                return Err(FetchAttempt::TooLarge(
+                    format!(
+                        "compressed size {len} exceeds max_compressed_bytes {}",
+                        self.max_compressed_bytes
+                    ),
+                    Box::new(payload),
+                ));
             }
         }
 
@@ -208,11 +242,17 @@ impl Fetcher {
             .limit(self.max_compressed_bytes.saturating_add(1))
             .read_to_vec()
             .map_err(|e| match e {
-                ureq::Error::BodyExceedsLimit(_) => FetchAttempt::TooLarge(format!(
-                    "compressed size exceeds max_compressed_bytes {} (the server sent no \
-                     Content-Length, so this was found by downloading)",
-                    self.max_compressed_bytes
-                )),
+                ureq::Error::BodyExceedsLimit(_) => FetchAttempt::TooLarge(
+                    format!(
+                        "compressed size exceeds max_compressed_bytes {} (the server sent no \
+                         Content-Length, so this was found by downloading)",
+                        self.max_compressed_bytes
+                    ),
+                    // All that is known here is "over the cap". A Content-Length cannot
+                    // have been both present and honest, or the check above would have
+                    // fired, so its value is dropped rather than recorded as a size.
+                    Box::new(Payload { bytes: None, ..payload.clone() }),
+                ),
                 e => FetchAttempt::Transient(format!("body read failed: {e}")),
             })?;
 
@@ -220,14 +260,73 @@ impl Fetcher {
             return Err(FetchAttempt::Transient("empty body".to_string()));
         }
 
+        // Content-Length is the server's claim; this is the bytes that were actually read,
+        // and it is what every downstream stage consumed.
+        payload.bytes = Some(compressed.len() as u64);
+        payload.sha256 = Some(crate::types::sha256_hex(&compressed));
+
         Ok(FetchedUnitigs {
             index,
             accession: accession.clone(),
             compressed_len: compressed.len(),
             compressed,
             fetch_secs: 0.0,
+            payload,
         })
     }
+}
+
+/// One response header as a `String`, or `None` when it is absent or not valid ASCII.
+fn header<B>(resp: &ureq::http::Response<B>, name: ureq::http::header::HeaderName) -> Option<String> {
+    resp.headers().get(name)?.to_str().ok().map(str::to_string)
+}
+
+/// `Sun, 31 Mar 2024 17:38:36 GMT` -> `2024-03-31T17:38:36Z`.
+///
+/// RFC 9110 IMF-fixdate, which is the form S3 sends, reformatted rather than parsed into an
+/// instant: the components are already the ones `summary.json` wants, so there is no epoch
+/// arithmetic and no date crate. Obsolete RFC 850 and asctime formats are not accepted, and
+/// neither is anything else: a value that is not exactly this shape returns `None` and the
+/// field is omitted, so `last_modified` has one format or is absent. A consumer never has to
+/// sniff which it got.
+fn http_date_to_iso8601(s: &str) -> Option<String> {
+    let rest = s.trim().split_once(", ")?.1;
+    let mut it = rest.split(' ');
+    let (day, mon, year, time) = (it.next()?, it.next()?, it.next()?, it.next()?);
+    if it.next()? != "GMT" || it.next().is_some() {
+        return None;
+    }
+    if day.len() != 2 || year.len() != 4 || time.len() != 8 {
+        return None;
+    }
+    if !year.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|m| *m == mon)?
+        + 1;
+    if !time
+        .bytes()
+        .enumerate()
+        .all(|(i, b)| if i == 2 || i == 5 { b == b':' } else { b.is_ascii_digit() })
+    {
+        return None;
+    }
+    // Range-checked so the result is a timestamp rather than a plausible-looking string.
+    // 60 seconds is allowed: it is a leap second, not a malformed value.
+    let d: u8 = day.parse().ok()?;
+    let (h, mi, sec): (u8, u8, u8) = (
+        time[0..2].parse().ok()?,
+        time[3..5].parse().ok()?,
+        time[6..8].parse().ok()?,
+    );
+    if d == 0 || d > 31 || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    Some(format!("{year}-{month:02}-{day}T{time}Z"))
 }
 
 /// Whether a failed attempt is worth repeating.
@@ -239,8 +338,9 @@ enum FetchAttempt {
     /// HTTP 404: Logan has no unitigs for this accession. Not an error of the run.
     Missing,
     /// Over `--max-size-mb`, by Content-Length or, without one, by the bytes read. Skipped by
-    /// the user's cap, not an error.
-    TooLarge(String),
+    /// the user's cap, not an error. Carries what the response said about the object, so the
+    /// skip is recorded with a size and an identity rather than only a sentence.
+    TooLarge(String, Box<Payload>),
 }
 
 /// Write `bytes` to `<dir>/<ACC>.unitigs.fa.zst` via a tempfile-and-rename so a killed
@@ -311,6 +411,50 @@ pub fn decoder<'a>(fetched: &'a FetchedUnitigs) -> Result<Box<dyn Read + 'a>> {
 /// Suggested read size for the decoder returned by [`decoder`].
 pub fn recommended_chunk() -> usize {
     zstd::stream::read::Decoder::<'_, std::io::Cursor<&[u8]>>::recommended_output_size()
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::http_date_to_iso8601 as parse;
+
+    /// The form S3 actually sends, taken from a live `HEAD` of
+    /// `u/SRR8209082/SRR8209082.unitigs.fa.zst`.
+    #[test]
+    fn reformats_the_imf_fixdate_s3_sends() {
+        assert_eq!(
+            parse("Sun, 31 Mar 2024 17:38:36 GMT").as_deref(),
+            Some("2024-03-31T17:38:36Z")
+        );
+        // Single-digit month, and the leap second HTTP permits.
+        assert_eq!(parse("Wed, 01 Jan 2025 00:00:00 GMT").as_deref(), Some("2025-01-01T00:00:00Z"));
+        assert_eq!(parse("Tue, 30 Jun 2026 23:59:60 GMT").as_deref(), Some("2026-06-30T23:59:60Z"));
+    }
+
+    /// Anything else is dropped rather than stored raw, so `last_modified` has exactly one
+    /// format or is absent. A consumer never has to sniff which it got.
+    #[test]
+    fn refuses_everything_that_is_not_that_shape() {
+        for bad in [
+            "",
+            "not a date",
+            "2024-03-31T17:38:36Z",                   // already ISO: not what S3 sends
+            "Sunday, 31-Mar-24 17:38:36 GMT",         // RFC 850
+            "Sun Mar 31 17:38:36 2024",               // asctime
+            "Sun, 31 Mar 2024 17:38:36 UTC",          // wrong zone token
+            "Sun, 31 Mar 2024 17:38:36 GMT extra",    // trailing junk
+            "Sun, 31 Zzz 2024 17:38:36 GMT",          // bad month
+            "Sun, 3 Mar 2024 17:38:36 GMT",           // one-digit day
+            "Sun, 31 Mar 24 17:38:36 GMT",            // two-digit year
+            "Sun, 00 Mar 2024 17:38:36 GMT",          // day 0
+            "Sun, 32 Mar 2024 17:38:36 GMT",          // day 32
+            "Sun, 31 Mar 2024 24:00:00 GMT",          // hour 24
+            "Sun, 31 Mar 2024 17:60:00 GMT",          // minute 60
+            "Sun, 31 Mar 2024 17:38:61 GMT",          // second 61
+            "Sun, 31 Mar 2024 17-38-36 GMT",          // wrong separators
+        ] {
+            assert_eq!(parse(bad), None, "accepted {bad:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -431,10 +575,86 @@ mod size_cap_tests {
     fn a_body_over_the_cap_without_content_length_is_too_large_not_transient() {
         let url = serve_without_length(vec![b'A'; 100]);
         match fetcher(10).try_once(0, &"X".to_string(), &url) {
-            Err(FetchAttempt::TooLarge(d)) => assert!(d.contains("no Content-Length"), "{d}"),
+            Err(FetchAttempt::TooLarge(d, _)) => assert!(d.contains("no Content-Length"), "{d}"),
             Err(FetchAttempt::Transient(d)) => panic!("retried as transient: {d}"),
             Err(_) => panic!("wrong failure"),
             Ok(f) => panic!("accepted {} bytes over a 10-byte cap", f.compressed_len),
+        }
+    }
+
+    /// Serve one request with `extra` headers and a correct Content-Length, so the size
+    /// check runs on the headers rather than on the transfer.
+    fn serve_once(extra: &str, body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+            body.len()
+        );
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&body);
+        });
+        format!("http://127.0.0.1:{port}/u/X/X.unitigs.fa.zst")
+    }
+
+    /// The Logan objects are unversioned and mutable, so a run has to record which bytes it
+    /// read. Everything available from the response is captured, and the digest is taken
+    /// from the bytes themselves rather than trusted from the header.
+    #[test]
+    fn a_live_fetch_records_the_object_it_read() {
+        let body = vec![b'Z'; 32];
+        let url = serve_once(
+            "ETag: \"d2dd288b238c3c88b46acdcd78860dce\"\r\nLast-Modified: Sun, 31 Mar 2024 17:38:36 GMT\r\n",
+            body.clone(),
+        );
+        let got = fetcher(1024).try_once(0, &"X".to_string(), &url).ok().expect("fetch");
+        let p = &got.payload;
+        assert_eq!(p.source, PayloadSource::S3);
+        assert_eq!(p.bytes, Some(32));
+        assert_eq!(p.sha256.as_deref(), Some(crate::types::sha256_hex(&body).as_str()));
+        // Quotes stripped: the value is compared with other ETags, not with a header line.
+        assert_eq!(p.etag.as_deref(), Some("d2dd288b238c3c88b46acdcd78860dce"));
+        // Normalised, so two summaries sort and diff against each other.
+        assert_eq!(p.last_modified.as_deref(), Some("2024-03-31T17:38:36Z"));
+        assert!(p.fetched_at.is_some(), "a live fetch records when it read the object");
+    }
+
+    /// A response with neither header still yields a usable record: the digest is the field
+    /// that does not depend on the transport.
+    #[test]
+    fn a_response_without_those_headers_still_hashes_what_it_read() {
+        let body = vec![b'Q'; 8];
+        let got = fetcher(1024)
+            .try_once(0, &"X".to_string(), &serve_once("", body.clone()))
+            .ok()
+            .expect("fetch");
+        assert_eq!(got.payload.sha256.as_deref(), Some(crate::types::sha256_hex(&body).as_str()));
+        assert_eq!(got.payload.etag, None);
+        assert_eq!(got.payload.last_modified, None);
+    }
+
+    /// The one negative where the walker knows something about an object it did not read.
+    /// Until 0.2.0 the size survived only as prose inside the error string.
+    #[test]
+    fn a_refusal_on_content_length_records_what_was_refused() {
+        let url = serve_once("ETag: \"abc123\"\r\n", vec![b'Z'; 100]);
+        match fetcher(10).try_once(0, &"X".to_string(), &url) {
+            Err(FetchAttempt::TooLarge(_, p)) => {
+                assert_eq!(p.bytes, Some(100), "the size that tripped the cap must be a number");
+                assert_eq!(p.etag.as_deref(), Some("abc123"));
+                assert_eq!(p.source, PayloadSource::S3);
+                assert!(p.sha256.is_none(), "no bytes were read, so there is nothing to hash");
+            }
+            Err(FetchAttempt::Transient(d)) => panic!("retried as transient: {d}"),
+            Err(_) => panic!("wrong failure"),
+            Ok(_) => panic!("accepted 100 bytes over a 10-byte cap"),
         }
     }
 
@@ -506,6 +726,53 @@ mod cache_tests {
         assert_eq!(got.accession, "CACHED0001");
         assert_eq!(got.compressed_len, bytes.len());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A cache hit has no HTTP response to take an ETag from, which is exactly why the
+    /// digest is computed from the bytes: `--offline` runs are the ones whose inputs are
+    /// least self-evident, and they used to record nothing at all.
+    #[test]
+    fn a_cache_hit_records_the_bytes_it_read() {
+        let dir = tempdir("prov");
+        let bytes = zstd::encode_all(&b">CACHED0003_0\nACGT\n"[..], 3).unwrap();
+        std::fs::write(cache_path(&dir, "CACHED0003"), &bytes).unwrap();
+        let f = Fetcher::new(&Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            ..Config::default()
+        });
+        let p = f.fetch(0, &"CACHED0003".to_string()).expect("cache hit").payload;
+        assert_eq!(p.source, PayloadSource::Cache);
+        assert_eq!(p.bytes, Some(bytes.len() as u64));
+        assert_eq!(p.sha256.as_deref(), Some(crate::types::sha256_hex(&bytes).as_str()));
+        assert_eq!(p.etag, None, "there was no response to take one from");
+        assert_eq!(
+            p.fetched_at, None,
+            "cached bytes may predate the run by any amount; run.started is the honest clock"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A cached file over the cap is skipped, and the skip carries its size.
+    #[test]
+    fn a_cached_file_over_the_cap_records_its_size() {
+        let dir = tempdir("capprov");
+        let bytes = zstd::encode_all(&b">CACHED0004_0\nACGTACGT\n"[..], 3).unwrap();
+        std::fs::write(cache_path(&dir, "CACHED0004"), &bytes).unwrap();
+        let f = Fetcher::new(&Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            max_compressed_bytes: bytes.len() as u64 - 1,
+            ..Config::default()
+        });
+        match f.fetch(0, &"CACHED0004".to_string()) {
+            Err(Error::TooLarge { payload, .. }) => {
+                assert_eq!(payload.bytes, Some(bytes.len() as u64));
+                assert_eq!(payload.source, PayloadSource::Cache);
+            }
+            other => panic!("expected TooLarge, got {:?}", other.map(|f| f.compressed_len)),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -582,6 +849,7 @@ mod tests {
             compressed_len: compressed.len(),
             compressed,
             fetch_secs: 0.0,
+            payload: crate::types::Payload::default(),
         }
     }
 
@@ -711,6 +979,7 @@ mod real_data_tests {
             compressed_len: compressed.len(),
             compressed,
             fetch_secs: 0.0,
+            payload: crate::types::Payload::default(),
         };
         let mut out = Vec::new();
         decoder(&f)

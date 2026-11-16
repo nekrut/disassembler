@@ -14,7 +14,7 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::pipeline::Summary;
-use crate::types::{AccessionResult, Outcome, Query, Strand, Timing};
+use crate::types::{AccessionResult, Outcome, Payload, Query, Strand, Timing};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -353,21 +353,15 @@ fn jf(v: f64) -> String {
 /// joining a record to its FASTA entry, without the summary carrying a second copy of
 /// `reconstructed.fasta`.
 fn seq_sha256(seq: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
     let upper: Vec<u8> = seq.iter().map(|b| b.to_ascii_uppercase()).collect();
-    let digest = Sha256::digest(&upper);
-    let mut s = String::with_capacity(64);
-    for b in digest {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    crate::types::sha256_hex(&upper)
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ`, second resolution, UTC.
 ///
 /// Written out rather than pulled in: a date crate would be the walker's only dependency that
 /// is not doing I/O, and this is 12 lines of arithmetic (Howard Hinnant's `civil_from_days`).
-fn iso8601(t: SystemTime) -> String {
+pub(crate) fn iso8601(t: SystemTime) -> String {
     let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let (days, tod) = ((secs / 86_400) as i64, secs % 86_400);
     let z = days + 719_468;
@@ -430,8 +424,10 @@ fn quantiles(mut v: Vec<f64>) -> String {
 pub struct RunInfo<'a> {
     /// GraphAligner's own `--version` line, and the binary that produced it. The version alone
     /// does not say which of several installed copies ran.
-    pub graphaligner: &'a str,
-    pub graphaligner_path: &'a str,
+    ///
+    /// `None` for a stage that never runs it, which is `--fetch-only`. Naming a tool that did
+    /// no work would be a false provenance claim, so `tool.external` comes out empty instead.
+    pub graphaligner: Option<(&'a str, &'a str)>,
     pub cfg: &'a Config,
     pub queries: &'a [Query],
     pub started: SystemTime,
@@ -450,12 +446,15 @@ fn write_tool(w: &mut impl Write, run: &RunInfo) -> Result<()> {
         Ok(v) if !v.is_empty() => writeln!(w, "    \"disassembler\": \"{}\",", esc(&v))?,
         _ => writeln!(w, "    \"disassembler\": null,")?,
     }
-    writeln!(
-        w,
-        "    \"external\": [{{\"name\": \"GraphAligner\", \"version\": \"{}\", \"path\": \"{}\"}}]",
-        esc(run.graphaligner),
-        esc(run.graphaligner_path)
-    )?;
+    match run.graphaligner {
+        Some((version, path)) => writeln!(
+            w,
+            "    \"external\": [{{\"name\": \"GraphAligner\", \"version\": \"{}\", \"path\": \"{}\"}}]",
+            esc(version),
+            esc(path)
+        )?,
+        None => writeln!(w, "    \"external\": []")?,
+    }
     writeln!(w, "  }},")?;
     Ok(())
 }
@@ -463,18 +462,25 @@ fn write_tool(w: &mut impl Write, run: &RunInfo) -> Result<()> {
 fn write_inputs(w: &mut impl Write, run: &RunInfo) -> Result<()> {
     let c = run.cfg;
     writeln!(w, "  \"inputs\": {{")?;
-    writeln!(w, "    \"references\": [")?;
-    for (i, q) in run.queries.iter().enumerate() {
-        writeln!(
-            w,
-            "      {{\"id\": \"{}\", \"length\": {}, \"sha256\": \"{}\"}}{}",
-            esc(&q.record_id),
-            q.seq.len(),
-            seq_sha256(&q.seq),
-            if i + 1 == run.queries.len() { "" } else { "," }
-        )?;
+    // `null`, not `[]`, for a stage with no reference: `docs/summaries.md` reserves the empty
+    // array for "this stage takes references and was given none", which cannot happen here.
+    // `--fetch-only` is the stage that has none at all.
+    if run.queries.is_empty() {
+        writeln!(w, "    \"references\": null,")?;
+    } else {
+        writeln!(w, "    \"references\": [")?;
+        for (i, q) in run.queries.iter().enumerate() {
+            writeln!(
+                w,
+                "      {{\"id\": \"{}\", \"length\": {}, \"sha256\": \"{}\"}}{}",
+                esc(&q.record_id),
+                q.seq.len(),
+                seq_sha256(&q.seq),
+                if i + 1 == run.queries.len() { "" } else { "," }
+            )?;
+        }
+        writeln!(w, "    ],")?;
     }
-    writeln!(w, "    ],")?;
     // A cached run and a streamed one can produce the same numbers from different bytes, so
     // the summary says which it was.
     let (kind, id) = match (&c.unitigs_cache, c.offline) {
@@ -712,12 +718,41 @@ fn write_cohort(w: &mut impl Write, s: &Summary) -> Result<()> {
     Ok(())
 }
 
+/// What the accession was built from: `{"source": .., "bytes": .., "sha256": .., "etag": ..,
+/// "last_modified": .., "fetched_at": ..}` on one line, absent members omitted.
+///
+/// Always written, including `{"source": "none"}` for an accession whose bytes were never
+/// read, so that "this run did not record provenance" and "there was nothing to record" are
+/// different answers. That is the same rule `discards` follows.
+///
+/// `source` says where the bytes came from, which `inputs.source` cannot: a `cache+s3` run
+/// reports `cache` for the accessions that hit and `s3` for the ones it downloaded.
+fn write_payload(w: &mut impl Write, p: &Payload) -> Result<()> {
+    write!(w, "      \"payload\": {{\"source\": \"{}\"", p.source.as_str())?;
+    if let Some(n) = p.bytes {
+        write!(w, ", \"bytes\": {n}")?;
+    }
+    for (key, value) in [
+        ("sha256", &p.sha256),
+        ("etag", &p.etag),
+        ("last_modified", &p.last_modified),
+        ("fetched_at", &p.fetched_at),
+    ] {
+        if let Some(v) = value {
+            write!(w, ", \"{key}\": \"{}\"", esc(v))?;
+        }
+    }
+    writeln!(w, "}},")?;
+    Ok(())
+}
+
 /// One accession. Sub-objects go on one line each, and an empty one is omitted rather than
 /// written as null, which keeps a record near the budget in `docs/summaries.md`.
 fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: bool) -> Result<()> {
     writeln!(w, "    {{")?;
     writeln!(w, "      \"acc\": \"{}\",", esc(&r.accession))?;
     writeln!(w, "      \"status\": \"{}\",", outcome_str(r.outcome))?;
+    write_payload(w, &r.payload)?;
     writeln!(w, "      \"n_unitigs\": {},", r.n_unitigs)?;
     writeln!(w, "      \"n_anchors\": {},", r.n_anchors)?;
     writeln!(w, "      \"subgraph_nodes\": {},", r.subgraph_nodes)?;
@@ -1743,6 +1778,7 @@ mod vcf_tests {
         AccessionResult {
             index: 0,
             accession: "ACC".into(),
+            payload: crate::types::Payload::default(),
             outcome: Outcome::Success,
             n_unitigs: 0,
             n_anchors: 0,
@@ -2121,6 +2157,7 @@ mod identity_label_tests {
             results: vec![AccessionResult {
                 index: 0,
                 accession: "ACC".into(),
+                payload: crate::types::Payload::default(),
                 outcome: Outcome::Success,
                 n_unitigs: 0,
                 n_anchors: 0,
@@ -2156,8 +2193,10 @@ mod identity_label_tests {
         // A fixed clock so the volatile fields (`run.started`, the timings) are stable and
         // the rest of the file is byte-comparable, the property `docs/summaries.md` promises.
         let run = super::RunInfo {
-            graphaligner: "GraphAligner bioconda 1.0.17b-0",
-            graphaligner_path: "/opt/conda/bin/GraphAligner",
+            graphaligner: Some((
+                "GraphAligner bioconda 1.0.17b-0",
+                "/opt/conda/bin/GraphAligner",
+            )),
             cfg: &cfg,
             queries: &queries,
             started: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_200_000),
@@ -2175,6 +2214,14 @@ mod identity_label_tests {
         let mut s = summary(hap("ACC_primary", false), vec![]);
         s.results[0].subgraph_fraction = Some(0.161189);
         s.results[0].provisional = true;
+        s.results[0].payload = crate::types::Payload {
+            source: crate::types::PayloadSource::S3,
+            bytes: Some(1_861_058),
+            sha256: Some("a".repeat(64)),
+            etag: Some("d2dd288b238c3c88b46acdcd78860dce".into()),
+            last_modified: Some("2024-03-31T17:38:36Z".into()),
+            fetched_at: Some("2026-11-16T16:47:50Z".into()),
+        };
         s.results[0].prune = Some(PruneReport {
             result: PruneResult::RefusedShorterSpan, depth: 1700.0, floor: 17.0,
             unitigs: 4976, unitigs_kept: 1734, unpruned_span: (0, 3821),
@@ -2220,6 +2267,14 @@ mod identity_label_tests {
             "\"prune\": {\"outcome\": \"refused_shorter_span\", \"depth\": 1700.0, \"floor\": 17.0, \
              \"unitigs\": 4976, \"unitigs_kept\": 1734, \"unpruned_span\": [0, 3821], \
              \"pruned_span\": [424, 3821]}",
+            // What the accession was built from. The Logan objects are unversioned and
+            // mutable, so without this a rerun after an upstream regeneration is
+            // indistinguishable from a rerun over the same bytes.
+            "\"payload\": {\"source\": \"s3\", \"bytes\": 1861058, \"sha256\": \"aaaaaaaaaaaaaaaa\
+              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \
+              \"etag\": \"d2dd288b238c3c88b46acdcd78860dce\", \
+              \"last_modified\": \"2024-03-31T17:38:36Z\", \
+              \"fetched_at\": \"2026-11-16T16:47:50Z\"}",
         ] {
             assert!(out.contains(want), "missing {want}: {out}");
         }
@@ -2227,6 +2282,67 @@ mod identity_label_tests {
         // half the file. `docs/summaries.md`.
         assert!(!out.contains("\"seq\":"), "the literal sequence must be opt-in: {out}");
         assert!(out.contains("\"seq_sha256\":"), "{out}");
+    }
+
+    /// A record whose bytes were never read says so, rather than omitting the block. The
+    /// same rule `discards` follows: "did not happen" and "this version does not measure it"
+    /// have to be different answers.
+    #[test]
+    fn a_record_with_nothing_to_record_still_carries_a_payload_block() {
+        let mut s = summary(hap("ACC_primary", false), vec![]);
+        s.results[0].payload = crate::types::Payload::default();
+        let p = tmp("payload_none.json");
+        write_summary(&s, &p).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert!(out.contains("\"payload\": {\"source\": \"none\"},"), "{out}");
+        // Absent members are omitted, not written as null: a record is on a byte budget.
+        for absent in ["\"sha256\": null", "\"etag\": null", "\"bytes\": null"] {
+            assert!(!out.contains(absent), "{absent} should be omitted: {out}");
+        }
+    }
+
+    /// `--fetch-only` writes a summary of its own. It reconstructs nothing and never runs
+    /// GraphAligner, so it must not claim a reference or an external tool it did not use,
+    /// while still recording what it put in the cache.
+    #[test]
+    fn a_fetch_only_summary_names_no_reference_and_no_external_tool() {
+        let mut s = summary(hap("ACC_primary", false), vec![]);
+        s.results[0].haplotypes.clear();
+        s.results[0].haplotype = None;
+        s.results[0].payload = crate::types::Payload {
+            source: crate::types::PayloadSource::Cache,
+            bytes: Some(4096),
+            sha256: Some("b".repeat(64)),
+            ..crate::types::Payload::default()
+        };
+        let cfg = crate::config::Config::default();
+        let run = super::RunInfo {
+            graphaligner: None,
+            cfg: &cfg,
+            queries: &[],
+            started: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_200_000),
+            wall_seconds: 0.5,
+            n_requested: 1,
+        };
+        let p = tmp("fetch_only.json");
+        super::write_summary(&s, &run, &p).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert!(out.contains("\"references\": null,"), "{out}");
+        assert!(out.contains("\"external\": []"), "{out}");
+        assert!(!out.contains("GraphAligner"), "no tool that did no work: {out}");
+        assert!(
+            out.contains("\"payload\": {\"source\": \"cache\", \"bytes\": 4096, \"sha256\": \"bbbb"),
+            "{out}"
+        );
+        // Still a well-formed summary: every contract block, in order.
+        let mut at = 0usize;
+        for block in ["\"schema\"", "\"tool\"", "\"inputs\"", "\"settings\"", "\"run\"",
+                      "\"discards\"", "\"cohort\"", "\"records\""] {
+            let i = out[at..].find(block).unwrap_or_else(|| panic!("missing {block}: {out}"));
+            at += i + block.len();
+        }
     }
 
     fn alt_of(h: Haplotype) -> AltHaplotype {

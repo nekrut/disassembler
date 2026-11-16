@@ -717,6 +717,7 @@ mod align_real {
             compressed_len: compressed.len(),
             compressed,
             fetch_secs: 0.0,
+            payload: crate::types::Payload::default(),
         };
         let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
         let query = read_query(Path::new("../queries/pfcrt_only.fasta")).unwrap();
@@ -826,6 +827,7 @@ mod determinism {
                 compressed_len: compressed.len(),
                 compressed,
                 fetch_secs: 0.0,
+                payload: crate::types::Payload::default(),
             };
             let graph = {
                 let rd = stream::decoder(&f).unwrap();

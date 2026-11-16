@@ -1,5 +1,6 @@
 //! Error type for the walker.
 
+use crate::types::Payload;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +27,13 @@ pub enum Error {
     /// finding no anchors, not a failure of the run.
     NoLoganData { accession: String },
     /// Over `--max-size-mb`: skipped by the user's own size cap, not a failure.
-    TooLarge { accession: String, detail: String },
+    ///
+    /// Carries the provenance the refusal was decided on, because this is the one negative
+    /// where the walker knows something about the object it did not read: when S3 sent a
+    /// `Content-Length` the size is exact, and the response's `ETag` and `Last-Modified`
+    /// identify the object that was too big. Without it the size survived only as prose
+    /// inside `detail`, which a workflow cannot branch on.
+    TooLarge { accession: String, detail: String, payload: Box<Payload> },
     /// No accession was reconstructed. A per-accession failure is not fatal on its own, but
     /// a run that reconstructs nothing has produced no usable output and must not look like
     /// a success to a scheduler. `errors` of the `total` failed outright; the rest found
@@ -76,7 +83,7 @@ impl fmt::Display for Error {
             Error::NoLoganData { accession } => {
                 write!(f, "[{accession}] no Logan unitigs for this accession (HTTP 404)")
             }
-            Error::TooLarge { accession, detail } => {
+            Error::TooLarge { accession, detail, .. } => {
                 write!(f, "[{accession}] skipped, over --max-size-mb: {detail}")
             }
             Error::NothingReconstructed { total, errors: 0 } => write!(

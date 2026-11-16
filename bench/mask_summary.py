@@ -19,6 +19,20 @@ Masked, and why:
                                                      and whether the unitigs came from a
                                                      warm cache, which is a property of the
                                                      runner and not of the walk
+  records[].payload.source, .etag, .last_modified, .fetched_at
+                                                     the same runner property one level down,
+                                                     plus a clock. A warm cache has no HTTP
+                                                     response behind it, so these three are
+                                                     absent there and present on a cold run;
+                                                     they are normalised to the placeholder
+                                                     whether or not they were there, so the
+                                                     two forms compare equal
+
+`records[].payload.bytes` and `.sha256` are deliberately NOT masked. They are the same on
+every ingest path (a cache file is byte-identical to the S3 object), and gating them makes the
+golden run detect an upstream regeneration of a gated accession: the Logan objects are
+unversioned and mutable, and a changed digest under an unchanged URL is exactly the failure
+this gate should be able to see.
 
 Everything else is gated, including every count, every hash and every setting. Nothing is
 reordered: the writers emit a fixed key order and that order is part of what is checked.
@@ -54,6 +68,19 @@ def mask(doc):
             for key in ("timing", "wall_seconds"):
                 if key in record:
                     record[key] = PLACEHOLDER
+            payload = record.get("payload")
+            if isinstance(payload, dict):
+                # Rebuilt rather than patched in place: the masked members are inserted even
+                # when absent, so a warm-cache record and a cold-fetch one come out with the
+                # same keys in the same order. `sort_keys=False`, so order is part of the
+                # comparison.
+                record["payload"] = {
+                    "source": PLACEHOLDER,
+                    **{k: payload[k] for k in ("bytes", "sha256") if k in payload},
+                    "etag": PLACEHOLDER,
+                    "last_modified": PLACEHOLDER,
+                    "fetched_at": PLACEHOLDER,
+                }
     return doc
 
 
