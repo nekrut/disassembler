@@ -6,6 +6,7 @@
       {
         "fork": 192735, "fork_strand": "-",
         "merge": 317303, "merge_strand": "+",
+        "ka_saturated": false,
         "branches": [
           {"node": 192712, "strand": "-", "ka": 7.7, "vaf": 0.1426},
           {"node": 222202, "strand": "-", "ka": 46.3, "vaf": 0.8574}

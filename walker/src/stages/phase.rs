@@ -189,6 +189,11 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
                 continue;
             }
             kept.sort_by_key(|a| (a.node, a.strand));
+            // WV-03: measured over every in-bubble branch, including the ones the gates
+            // dropped, because the total these VAFs divide by was summed over all of them.
+            let ka_saturated = in_bubble
+                .iter()
+                .any(|&b| graph.abundance[unlocal(b).0 as usize] >= crate::types::KA_CEILING);
 
             let (fork_id, fork_strand) = unlocal(f);
             let (merge_id, merge_strand) = unlocal(merge);
@@ -198,6 +203,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
                 merge: merge_id,
                 merge_strand,
                 branches: kept,
+                ka_saturated,
             });
         }
     }

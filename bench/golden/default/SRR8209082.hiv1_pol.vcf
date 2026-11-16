@@ -1,10 +1,13 @@
 ##fileformat=VCFv4.2
-##source=logan-walker intra-host SNPs. Frequencies are k-mer coverage (ka:f) ratios at a graph fork, a proxy for allele frequency, not read counts. Sites are per-locus and NOT phased: two rows do not assert co-occurrence on one molecule.
+##source=logan-walker intra-host SNPs. Frequencies are k-mer coverage (ka:f) ratios at a graph fork, a proxy for allele frequency, not read counts. Sites are per-locus and NOT phased: two rows do not assert co-occurrence on one molecule, UNLESS they share a BLOCK, which means one alternative haplotype carries both. ka:f is clipped at 25000, and a row whose fork reaches it is FILTERed KaSat with an overstated AF.
 ##contig=<ID=hiv1_pol,length=2739>
-##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency, ka:f ratio at the fork">
+##INFO=<ID=AF,Number=A,Type=Float,Description="Allele frequency: this allele ka:f over the total of the fork branches that return to the route">
 ##INFO=<ID=AO,Number=A,Type=Float,Description="Alternate allele k-mer coverage (ka:f)">
 ##INFO=<ID=RO,Number=1,Type=Float,Description="Reference allele k-mer coverage (ka:f); 0 if the gene base is not observed">
 ##INFO=<ID=FORK,Number=1,Type=Integer,Description="Unitig id of the fork on the walked path">
+##INFO=<ID=BLOCK,Number=1,Type=Integer,Description="Rows sharing a BLOCK are substitutions carried by ONE alternative haplotype, so they do co-occur on a single molecule. Absent on an ordinary single-site call">
+##FILTER=<ID=PASS,Description="All filters passed">
+##FILTER=<ID=KaSat,Description="A branch of this fork is at Logan's ka:f ceiling of 25000, so the fork total is a lower bound and AF is overstated. The true depth is not recoverable from the unitig file">
 ##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype (missing: this is a frequency call, not a diploid genotype)">
 ##FORMAT=<ID=AF,Number=A,Type=Float,Description="Allele frequency">
 ##FORMAT=<ID=AO,Number=A,Type=Float,Description="Alternate allele k-mer coverage">

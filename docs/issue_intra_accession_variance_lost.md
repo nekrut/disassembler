@@ -1,7 +1,19 @@
 # Path walking selects the reference-matching minority allele
 
-**Status:** diagnosed 2026-09-11 and fixed. The fix has been on by default since 2026-09-12, when
-the competing `detour` engine was also retired.
+**Status:** diagnosed 2026-09-11, corrected in two stages, and **not fully closed**. The first
+fix has been on by default since 2026-09-12, when the competing `detour` engine was also
+retired. It was incomplete twice over, and both gaps were found by the PR #13 review:
+
+- **WV-01** (fixed 2026-11-15): the correction was discarded unless the aligner's row spanned
+  the whole stitched path, which no real row does, so with default flags it almost never ran.
+- **WV-02** (fixed 2026-11-15): a fork whose walked branch was itself below `--min-vaf` was
+  skipped as "the error-branch case" and left to `--prune-frac`. Pruning is 1% of gene depth
+  and that gate was 10% of the fork, so a branch between the two was neither pruned, nor
+  corrected, nor reported. The route now moves off such a branch when the other side holds an
+  outright majority of its fork.
+
+What remains is reported rather than silent: `minority_left` in `summary.json` counts the forks
+where `_primary` still carries the rarer allele, with the reason for each.
 
 Why the walker has these three options, what bias they correct, and what they change on real data.
 Every flag and default is in the CLI reference, [walker.md](walker.md).

@@ -25,9 +25,16 @@ zika_ns5  517  .   G    A    .     PASS    AF=0.1564;AO=4800.0;RO=25000.0;FORK=.
 ...
 ```
 
-`REF` is the query gene's base, `ALT` the minor allele, `AF` its `ka:f` frequency, `AO`/`RO` the
-two alleles' `ka:f` coverage, `FORK` the unitig id of the fork. `POS` is 1-based within the
-query CDS.
+`REF` is the query gene's base. `ALT` is **each sample allele that differs from that base**,
+and `AF` is that allele's frequency. Usually the sample's minority allele, but **the majority
+allele when the sample's consensus differs from the reference**, in which case `AF` is above
+0.5, and **both alleles when neither matches the gene base**, in which case `RO` is 0.0.
+`AO`/`RO` are the alleles' `ka:f` coverage, `FORK` the unitig id of the fork. `POS` is 1-based
+within the query CDS.
+
+This matters for cohort work: filtering or averaging these frequencies as if they were all
+minor-allele frequencies mixes in values above 0.5. Where you want the minor allele
+specifically, take `min(af, 1 - af)`.
 
 ## The cohort, at scale: the long table
 
@@ -85,7 +92,7 @@ WITH a AS (SELECT accession FROM snv WHERE pos=2225),
 SELECT (SELECT count(*) FROM a JOIN b USING(accession)) AS both;   -- 6 of 6
 ```
 
-Sites 2225 and 2525 carry a minor allele in the *same* six samples: perfect co-occurrence in
+Sites 2225 and 2525 carry a non-reference allele in the *same* six samples: perfect co-occurrence in
 this cohort, computed without ever touching the sample axis as columns.
 
 ## Small cohorts only: merge and heatmap
@@ -108,10 +115,11 @@ samples, 12 seen in two or more.
 
 ![Zika NS5 intra-host SNP frequencies across the cohort](examples/zika_ns5/zika_ns5.af_matrix.png)
 
-Each cell is a minor-allele frequency; grey means the site was not called in that sample. The
+Each cell is the frequency of the non-reference allele, which is the minor allele at these
+sites; grey means the site was not polymorphic in that sample. The
 picture is the point of the VCF: it has visible cross-sample structure. Two groups fall out.
 
-- **Sites 2225 and 2525** carry a minor allele in the *same six* samples (SRR6251963, 967, 969,
+- **Sites 2225 and 2525** carry a non-reference allele in the *same six* samples (SRR6251963, 967, 969,
   973, 979, 984) at 10-25%. Two rows that light up together across the same samples is the
   correlated-column signal that frequency-covariation phasing would run on.
 - **Sites 517, 871, 1762, 2064, 2153** cluster in SRR6251992 and 6251993 (and partly 6251973/
@@ -130,3 +138,55 @@ intra-host variation also produces the substrate for exploring cross-sample link
 - The VCF is per-site, not phased: two rows do not assert co-occurrence on one molecule. Both
   caveats are written into every file's `##` header.
 - Substitutions only; indel alleles stay in `alt_haplotypes.fasta`.
+
+## INFO after a merge
+
+`AF`, `AO`, `RO` and `FORK` are written to both INFO and FORMAT. After `bcftools merge` the
+INFO fields hold **one sample's** values, not the cohort's: in the merged example here, a site
+whose samples carry 0.1564, 0.132 and 0.1327 reports `AF=0.1327` in INFO. Read per-sample
+values from FORMAT and treat merged INFO as unreliable.
+
+## Linked substitutions share a `BLOCK`
+
+An alternative haplotype carrying more than one substitution is now called site by site, and
+those rows carry the same `BLOCK` id. That tag matters for interpretation: the `##source`
+caveat says two rows do not assert co-occurrence, and for independent rows that is right, but
+rows sharing a BLOCK came from one alternative and therefore **do** sit on one molecule. It is
+the only co-occurrence this output asserts.
+
+Until 0.2.0 such alleles were dropped from both the VCF and the SNV table entirely, with no
+message, so dense variable regions were under-reported precisely where they are most
+interesting.
+
+## The `KaSat` filter
+
+From 0.2.0 a row whose fork touches Logan's `ka:f` ceiling of 25,000 is FILTERed `KaSat`
+rather than `PASS`. The frequencies on such a row are ratios against a total that is a lower
+bound, so `AF` is overstated by an unknown amount; the true depth cannot be recovered from the
+unitig file, so the row is published with a flag rather than dropped or silently adjusted.
+
+This matters most on exactly the samples these outputs are for. Deep viral and amplicon runs
+sit at the ceiling: the Zika NS5 example in `docs/examples/` has `RO=25000.0` in all 11 of its
+rows, and 2,461 of the 2,564 NS5 reference unitigs in that run are at the ceiling.
+
+`bcftools view -f PASS` therefore drops these rows now, where in 0.1.x it kept them unmarked.
+That is the intended behaviour: a cohort frequency matrix built from saturated rows is built
+from lower bounds. To keep them, filter on `KaSat` explicitly and treat the frequencies as
+minima.
+
+### The cohort files here predate the flag
+
+`SRR6251967.zika_ns5.vcf` above was regenerated in 0.2.0 and all 11 of its rows are `KaSat`,
+at the same positions and the same frequencies as before: only the flag is new, nothing about
+the result changed.
+
+The cohort files beside it (`zika_ns5.snvs.tsv`, `zika_ns5.cohort.merged.vcf`,
+`zika_ns5.af_matrix.tsv` and the figure) were produced before the flag existed, by a separate
+`bcftools merge` step over all eight accessions. **54 of their 55 rows are at the ceiling**, so
+read every frequency in them as a lower bound. To regenerate:
+
+```bash
+disassembler walker -l accessions.txt -q queries/markers/zika_ns5.fasta \
+    -o out/zika --emit-vcf --emit-snv-table
+# then bgzip/index each VCF and `bcftools merge -m none` as the merged file's header records
+```

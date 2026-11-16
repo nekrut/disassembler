@@ -118,8 +118,8 @@ Why it works the way it does:
 - [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md): why the walker uses unitigs
   rather than Logan's contigs
 - [`docs/issue_intra_accession_variance_lost.md`](docs/issue_intra_accession_variance_lost.md):
-  the reference-matching minority allele bias, and the pruning and majority-preference defaults
-  that correct it
+  the reference-matching minority allele bias, the pruning and majority-preference defaults
+  that correct it, and what they still leave behind
 - [`docs/issue_graphaligner_end_clipping.md`](docs/issue_graphaligner_end_clipping.md): why
   GraphAligner is pinned to 1.0.17b
 - [`docs/issue_sieve_calibration.md`](docs/issue_sieve_calibration.md): the sieve calibration

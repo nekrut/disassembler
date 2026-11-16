@@ -142,9 +142,14 @@ pub fn build(accession: &Accession, reader: Box<dyn Read + '_>) -> Result<Unitig
             let mut ab = 0.0f32;
             for f in fields {
                 if f.starts_with(b"ka:f:") {
+                    // WV-15: `parse::<f32>()` accepts `inf` and `nan`, and both then flow
+                    // into every VAF, the prune floor and `summary.json`, where they are
+                    // written as bare tokens no JSON parser accepts. A negative abundance is
+                    // equally meaningless. Reject at the door.
                     ab = std::str::from_utf8(&f[5..])
                         .ok()
                         .and_then(|s| s.parse::<f32>().ok())
+                        .filter(|v| v.is_finite() && *v >= 0.0)
                         .ok_or_else(|| {
                             bad(format!(
                                 "record {id}: bad abundance {:?}",
@@ -213,6 +218,19 @@ pub fn build(accession: &Accession, reader: Box<dyn Read + '_>) -> Result<Unitig
     seq_offset.push(
         u32::try_from(total_bases).map_err(|_| bad("total sequence exceeds u32 addressing".into()))?,
     );
+
+    // WV-03. `KA_CEILING` is empirical, read off three cached accessions, not something Logan
+    // publishes in a schema. If a file ever carries a higher value the constant is wrong and
+    // every saturation flag drawn from it is wrong with it, so say so loudly rather than
+    // silently under-flagging.
+    if let Some(&over) = abundance.iter().find(|&&a| a > crate::types::KA_CEILING) {
+        eprintln!(
+            "[{accession}] WARNING: ka:f {over} exceeds the assumed ceiling of {}. \
+             `types::KA_CEILING` is measured, not declared by Logan; update it, because the \
+             `depth_saturated` and `KaSat` flags are computed against it.",
+            crate::types::KA_CEILING
+        );
+    }
 
     Ok(UnitigGraph {
         accession: accession.clone(),

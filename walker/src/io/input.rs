@@ -111,6 +111,18 @@ pub fn validate_accession(s: &str, source: &str) -> Result<()> {
     if s.is_empty() {
         return Err(Error::Usage(format!("{source}: empty accession")));
     }
+    // WV-19. The value becomes `<out_dir>/<acc>.vcf`, so a 252-character line (accessions
+    // joined without a separator) pushes the filename past NAME_MAX. `--emit-vcf` then failed
+    // the whole run with "File name too long" and wrote no snvs.tsv, no alt FASTA and no
+    // summary, although the good accessions had reconstructed; the same list without
+    // `--emit-vcf` exited 0. Rejecting it here costs nothing: the longest real SRA run
+    // accession is a dozen characters.
+    if s.len() > 64 {
+        return Err(Error::Usage(format!(
+            "{source}: accession of {} characters is not usable (at most 64)",
+            s.len()
+        )));
+    }
     if !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
         return Err(Error::Usage(format!(
             "{source}: {s:?} is not a usable accession (unexpected characters)"
@@ -644,6 +656,26 @@ mod validation_tests {
                 "{bad:?} must be refused"
             );
         }
+    }
+
+    /// WV-19. The accession becomes `<out_dir>/<acc>.vcf`, and past NAME_MAX that write
+    /// fails with "File name too long". Under `--emit-vcf` it used to take the whole run
+    /// down with it, summary included, after the other accessions had already succeeded.
+    /// 64 is far above any real run accession and far below the limit.
+    #[test]
+    fn an_accession_too_long_for_a_filename_is_refused() {
+        assert!(
+            validate_accession(&"S".repeat(64), "--accession").is_ok(),
+            "64 characters is the limit, not past it"
+        );
+        assert!(
+            validate_accession(&"S".repeat(65), "--accession").is_err(),
+            "65 characters must be refused"
+        );
+        // The shape that actually produced it: a list line with accessions run together.
+        let joined = "SRR8209082".repeat(26);
+        assert_eq!(joined.len(), 260);
+        assert!(validate_accession(&joined, "list.txt:1").is_err());
     }
 
     /// Accepting is the common case, and the SRA-shape check is only a warning, because the

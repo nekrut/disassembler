@@ -61,6 +61,28 @@ Three things worth knowing before trusting a green run:
    reasons, and `SRR12363134` has no on-path fork. So a green run here says nothing about
    `prefer_majority`; the only coverage of that path is `walker/tests/cli.rs`.
 
+### `SRR8209082` was recaptured for WV-02 (2026-11-15)
+
+Its default-flag fixtures are the only ones WV-02 changed, and they changed on purpose.
+`prefer_majority` now moves the route off a branch the aligner walked that is itself a minority
+of its fork, when the other side holds an outright majority. On this accession that is 20
+corrections, all of them rescues the pre-0.2.0 gate refused to make.
+
+The new primary was checked before the fixture was replaced, because 20 corrections is the
+shape the stage warns about:
+
+- same length, 2,738 nt, and **no new stop codon** (0 before, 0 after);
+- **10 substitutions, every one a transition**, spread across the gene;
+- **7 synonymous to 3 non-synonymous**, and all three amino-acid changes conservative
+  (R422K, I737V, I858V);
+- the corrected route's mean `ka:f` **rises from 16,987 to 17,758**, so it sits on
+  better-covered unitigs than the one it replaced.
+
+That is recovered allelic variation, not a rerouted walk. `alt_haplotypes.fasta` gains a second
+record and the VCF and SNV table each gain a row, which is the other half of WV-02: those
+alleles were previously neither corrected nor reported. `ERR2028820` and `SRR12363134` are
+byte-identical through the change; only their summaries moved, for the new fields.
+
 ### The summary is gated too (new in 0.2.0)
 
 Each default-flag accession also has a `<tag>.summary.json` fixture, compared with its

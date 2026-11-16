@@ -266,6 +266,22 @@ fn unfetched(
     }
 }
 
+/// The variant stages' config when the prune asked for a floor it never got to apply.
+///
+/// `Some(raised)` only when the prune was refused (no haplotype, a shorter span, or it would
+/// have emptied the subgraph) AND its floor is above `--min-abund`. In every other case the
+/// variant stages run under the caller's config unchanged, so applied and pruned-off runs are
+/// byte-identical to before. See the call site for what this costs when it is missing.
+fn inherited_floor_config(cfg: &Config, prune: Option<&PruneReport>) -> Option<Config> {
+    let r = prune?;
+    let refused = !matches!(
+        r.result,
+        crate::types::PruneResult::Applied | crate::types::PruneResult::NothingToRemove
+    );
+    (refused && r.floor > cfg.min_abund)
+        .then(|| Config { min_abund: r.floor, ..cfg.clone() })
+}
+
 /// Fan accessions through the two pools and collect results.
 ///
 /// `queries` is the reference pool. In today's single-anchor path it holds one [`Query`];
@@ -562,9 +578,13 @@ fn run_one(
             anchor_used: None,
             candidates: Vec::new(),
             subgraph_fraction: None,
+            snv_sites: None,
+            ka_max: 0.0,
+            depth_saturated: false,
             provisional: false,
             prune: None,
             majority_corrections: 0,
+            majority: crate::types::MajorityReport::default(),
             variants: crate::types::VariantStats::default(),
         });
     }
@@ -646,13 +666,7 @@ fn run_one(
                 record_id: c.record_id.clone(),
                 pool_index: c.pool_index,
                 pident: c.haplotype.as_ref().map(|h| h.pident).or_else(|| {
-                    c.path.as_ref().map(|p| {
-                        if p.aln_len > 0 {
-                            (p.num_matches as f64 / p.aln_len as f64) * 100.0
-                        } else {
-                            0.0
-                        }
-                    })
+                    c.path.as_ref().map(|p| p.pident())
                 }),
                 cov: c.haplotype.as_ref().map(|h| h.cov),
                 length: c.haplotype.as_ref().map(|h| h.seq.len()),
@@ -864,13 +878,35 @@ fn run_one(
     let mut alts: Vec<crate::types::AltHaplotype> = Vec::new();
     // Correct the consensus first, so the alternatives that follow are the minority alleles
     // relative to a corrected route rather than to a reference-biased one.
+    // Largest abundance anywhere in the neighbourhood, for the saturation flag.
+    let ka_max = subgraph
+        .nodes
+        .iter()
+        .map(|&id| graph.abundance[id as usize])
+        .fold(0.0f32, f32::max);
+    // WV-05. The allele floor is a flat `--min-abund` (5x) unless `--min-abund-frac` is set,
+    // which it is not by default. That is safe only because the prune is supposed to have
+    // removed sub-floor unitigs first. When the prune is REFUSED, the unpruned subgraph is
+    // what the variant stages see, and the 5x gate lets through exactly the branches the
+    // prune would have deleted: a gene at 1000x with a fork at 30x against 8x (below the 10x
+    // prune floor) published `alt1 vaf=0.211`, a PASS VCF row and an snvs.tsv row, with only
+    // `prune.outcome` in the summary to hint at it.
+    //
+    // So where the prune wanted a floor and did not get to apply it, the variant stages
+    // inherit that floor. Applied and pruned-off runs are untouched.
+    let raised_cfg = inherited_floor_config(cfg, prune.as_ref());
+    let vcfg: &Config = raised_cfg.as_ref().unwrap_or(cfg);
     let mut majority_corrections = 0usize;
+    let mut majority = crate::types::MajorityReport::default();
     let mut variant_stats = crate::types::VariantStats::default();
     if let (Some(path), Some(_)) = (&final_path, &haplotype) {
-        if let Some((fixed, swaps)) =
-            stages::variants::prefer_majority(cfg, &graph, &subgraph, path, query)?
-        {
-            if let Some(mut h) = stages::stitch::stitch(cfg, &graph, &fixed, &subgraph, query)? {
+        let (fixed, report) = stages::variants::prefer_majority(vcfg, &graph, &subgraph, path, query)?;
+        // The sites left on the minority allele are reported whether or not anything was
+        // swapped: a route with no corrections and four forks it declined to move is not the
+        // same result as a route with nothing to correct (WV-02).
+        majority = report;
+        if let Some(fixed) = fixed {
+            if let Some(mut h) = stages::stitch::stitch(vcfg, &graph, &fixed, &subgraph, query)? {
                 // The route was spliced onto the majority allele, so the GAF's identity
                 // describes the sequence we just replaced, not this one.
                 h.pident_inherited = true;
@@ -879,12 +915,12 @@ fn run_one(
                 // Only count corrections that reached the output. A swap whose restitch
                 // failed left the published primary unchanged, so reporting it would
                 // overstate what happened to this record.
-                majority_corrections = swaps;
+                majority_corrections = report.swaps;
             }
         }
     }
     if let (Some(path), Some(_)) = (&final_path, &haplotype) {
-        let (found, stats) = stages::variants::find_alts(cfg, &graph, &subgraph, path, query)?;
+        let (found, stats) = stages::variants::find_alts(vcfg, &graph, &subgraph, path, query)?;
         alts = found;
         variant_stats = stats;
     }
@@ -938,11 +974,76 @@ fn run_one(
         anchor_used: anchor_used_for_output,
         candidates: candidate_reports,
         subgraph_fraction: Some(subgraph_fraction),
+        // WV-03. Measured over the whole extracted neighbourhood rather than the walked route,
+        // because the prune floor and every fork total are drawn from it, not just the path.
+        snv_sites: None,
+        ka_max,
+        depth_saturated: ka_max >= crate::types::KA_CEILING,
         provisional,
         prune,
         majority_corrections,
+        majority,
         variants: variant_stats,
     })
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::inherited_floor_config;
+    use crate::config::Config;
+    use crate::types::{PruneReport, PruneResult};
+
+    fn rep(result: PruneResult, floor: f32) -> PruneReport {
+        PruneReport {
+            result,
+            depth: 1000.0,
+            floor,
+            unitigs: 100,
+            unitigs_kept: 90,
+            unpruned_span: (0, 100),
+            pruned_span: None,
+        }
+    }
+
+    /// WV-05. The allele floor is a flat 5x by default, which is only safe because the prune
+    /// is supposed to have removed sub-floor unitigs first. When the prune is refused, the
+    /// variant stages see the unpruned subgraph, and the 5x gate admits exactly the branches
+    /// the prune meant to delete: a gene at 1000x with a fork at 30x against 8x published
+    /// `vaf=0.211`, a PASS VCF row and an snvs.tsv row, with only `prune.outcome` to hint at
+    /// it. Where the prune wanted a floor and could not apply it, the variant stages inherit
+    /// it.
+    #[test]
+    fn a_refused_prune_hands_its_floor_to_the_variant_stages() {
+        let cfg = Config { min_abund: 5.0, ..Config::default() };
+        for refused in [
+            PruneResult::RefusedShorterSpan,
+            PruneResult::RefusedNoHaplotype,
+            PruneResult::WouldEmpty,
+        ] {
+            let raised = inherited_floor_config(&cfg, Some(&rep(refused, 10.0)))
+                .unwrap_or_else(|| panic!("{refused:?} must raise the floor"));
+            assert_eq!(raised.min_abund, 10.0);
+            // Only the floor moves; nothing else about the run changes.
+            assert_eq!(raised.min_vaf, cfg.min_vaf);
+            assert_eq!(raised.max_alts, cfg.max_alts);
+        }
+    }
+
+    /// A prune that ran, or had nothing to do, already removed what it wanted to. Those runs
+    /// must stay byte-identical, so the config is left alone.
+    #[test]
+    fn an_applied_or_unnecessary_prune_changes_nothing() {
+        let cfg = Config { min_abund: 5.0, ..Config::default() };
+        for ok in [PruneResult::Applied, PruneResult::NothingToRemove] {
+            assert!(inherited_floor_config(&cfg, Some(&rep(ok, 10.0))).is_none(), "{ok:?}");
+        }
+        // No prune at all (`--prune-frac 0`), and a floor that is already the minimum.
+        assert!(inherited_floor_config(&cfg, None).is_none());
+        assert!(
+            inherited_floor_config(&cfg, Some(&rep(PruneResult::WouldEmpty, 5.0))).is_none(),
+            "a floor equal to --min-abund is not a raise"
+        );
+    }
 }
 
 #[cfg(test)]

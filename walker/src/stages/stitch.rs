@@ -210,11 +210,7 @@ pub fn stitch(
         );
     }
 
-    let pident = if path.aln_len > 0 {
-        (path.num_matches as f64 / path.aln_len as f64) * 100.0
-    } else {
-        0.0
-    };
+    let pident = path.pident();
 
     if cov < cfg.min_cov {
         return Ok(None);

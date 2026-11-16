@@ -125,7 +125,16 @@ pub fn expand(cfg: &Config, graph: &UnitigGraph, anchors: &Anchors) -> Result<Ve
 ///
 /// Median rather than mean, so one repeat-collapsed unitig cannot drag it.
 pub fn path_depth(graph: &UnitigGraph, steps: &[PathStep]) -> f32 {
-    let mut ab: Vec<f32> = steps.iter().map(|s| graph.abundance[s.node as usize]).collect();
+    median_abundance(steps.iter().map(|s| graph.abundance[s.node as usize]).collect())
+}
+
+/// Median of a set of abundances, or 0.0 when empty.
+///
+/// WV-23. `variants` measures the same quantity over the oriented walk rather than over
+/// `PathStep`s, and had its own copy of this. Identical today, but a change to one (a NaN-safe
+/// sort, length weighting) would have made the prune floor and the allele floor measure gene
+/// depth differently, which is the kind of divergence nothing downstream would reveal.
+pub fn median_abundance(mut ab: Vec<f32>) -> f32 {
     if ab.is_empty() {
         return 0.0;
     }
@@ -155,10 +164,18 @@ pub fn path_mean_ka(graph: &UnitigGraph, steps: &[PathStep]) -> f64 {
 ///
 /// Never below `min_abund`: this can only tighten the existing floor, never loosen it.
 pub fn depth_floor(cfg: &Config, depth: f32) -> f32 {
-    if cfg.prune_frac > 0.0 {
-        (cfg.prune_frac as f32 * depth).max(cfg.min_abund)
+    relative_floor(cfg.prune_frac, depth, cfg.min_abund)
+}
+
+/// A floor at `frac` of the gene's depth, never below `min_abund`.
+///
+/// WV-23. The prune uses it with `--prune-frac` and the allele gate with `--min-abund-frac`;
+/// the two differ only in which fraction they pass, so they share the arithmetic.
+pub fn relative_floor(frac: f64, depth: f32, min_abund: f32) -> f32 {
+    if frac > 0.0 {
+        (frac as f32 * depth).max(min_abund)
     } else {
-        cfg.min_abund
+        min_abund
     }
 }
 

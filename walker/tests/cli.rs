@@ -456,7 +456,10 @@ fn the_default_walk_reconstructs_and_writes_every_output() {
     let bubbles = std::fs::read_to_string(outdir.join("bubbles.json")).unwrap();
     assert!(bubbles.contains("\"n_bubbles\": 0"), "bubbles.json: {bubbles}");
     let snvs = std::fs::read_to_string(outdir.join("snvs.tsv")).unwrap();
-    assert_eq!(snvs, "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork\n");
+    assert_eq!(
+        snvs,
+        "gene\tpos\tref\talt\taccession\taf\tka_alt\tka_ref\tfork\tka_saturated\tblock\n"
+    );
     assert!(outdir.join("alt_haplotypes.fasta").exists(), "alt_haplotypes.fasta not written");
 
     let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
@@ -550,7 +553,10 @@ fn a_fork_is_phased_and_the_majority_allele_becomes_the_primary() {
     let snvs = std::fs::read_to_string(outdir.join("snvs.tsv")).unwrap();
     assert_eq!(
         snvs.lines().nth(1).unwrap(),
-        "gene\t61\tA\tG\tSRRFAKE0\t0.6000\t60.0\t40.0\t0"
+        // Trailing 0: this fork is at 40x and 60x, nowhere near Logan's 25,000 ceiling,
+        // so its frequencies are real ratios rather than lower bounds (WV-03).
+        // Trailing empty `block`: one substitution, so it is not part of a linked block.
+        "gene\t61\tA\tG\tSRRFAKE0\t0.6000\t60.0\t40.0\t0\t0\t"
     );
 }
 

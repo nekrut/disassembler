@@ -8,7 +8,7 @@
 //!   align    GraphAligner (C++)   -> GafPath
 //!   stitch   path -> sequence     -> Haplotype
 //!   phase    forks + VAF          -> Vec<Bubble>
-//!   variants on-path forks       -> Vec<AltHaplotype>  (opt-in)
+//!   variants on-path forks       -> Vec<AltHaplotype>  (on by default)
 //! ```
 //!
 //! `phase` reads the `UnitigGraph` and `Subgraph`, not the `GafPath`, so it does not

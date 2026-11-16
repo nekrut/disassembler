@@ -32,26 +32,34 @@
     "max_alt_indel": 30,
     "allow_frameshift_alts": false,
     "graphaligner_threads": 1,
-    "summary_seqs": false
+    "rescue_minority": false,
+    "summary_seqs": false,
+    "emit_alts": true,
+    "emit_vcf": true,
+    "emit_snv_table": true
   },
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-15T20:21:37Z",
-    "wall_seconds": 0.614,
-    "stage_seconds": {"stream": 0.002, "parse": 0.043, "anchor": 0.013, "extract": 0.012, "align": 0.524, "stitch": 0.003, "phase": 0.012},
+    "started": "2026-11-16T00:29:25Z",
+    "wall_seconds": 0.598,
+    "stage_seconds": {"stream": 0.001, "parse": 0.042, "anchor": 0.013, "extract": 0.012, "align": 0.502, "stitch": 0.004, "phase": 0.012},
     "n_records": 1,
     "n_ok": 1
   },
   "discards": {
     "accessions": {"never_reached": 0, "no_anchors": 0, "no_path": 0, "no_logan_data": 0, "too_large": 0, "error": 0},
-    "alleles": {"no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0}
+    "alleles": {"beyond_max_alts": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
+    "minority_sites": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 10, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0}
   },
   "cohort": {
     "reconstructed": 1,
     "provisional": 1,
     "majority_corrected": 0,
     "majority_corrections": 0,
+    "minority_rescues": 0,
+    "accessions_with_minority_sites": 1,
+    "accessions_depth_saturated": 1,
     "distinct_primaries": 1,
     "singleton_primaries": 1,
     "alts_recovered": 1,
@@ -68,15 +76,21 @@
       "subgraph_nodes": 34582,
       "subgraph_fraction": 0.424142,
       "provisional": true,
+      "ka_max": 25000.0,
+      "depth_saturated": true,
+      "snv_sites": 1,
       "reconstructed": [
         {"haplotype_id": "SRR8209082_primary", "seq_sha256": "7fea6934df9fb529abc046bf69325ea20fd6b072ab73a9c81c32054b85859343", "length": 2738, "cov": 0.9996, "pident": 97.4808, "pident_inherited": false, "nodes": 2506, "mean_ka": 16986.7, "vaf": 1.00}
       ],
       "alts": 1,
       "bubbles": 3632,
       "majority_corrections": 0,
-      "variants": {"depth": 16000.0, "floor": 5.0, "forks": 136, "biallelic": 1, "recovered": 1, "indels": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
+      "minority_rescues": 0,
+      "hit_pass_cap": false,
+      "minority_left": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 10, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0},
+      "variants": {"depth": 16000.0, "floor": 5.0, "forks": 136, "biallelic": 1, "recovered": 1, "beyond_cap": 0, "indels": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 15000.0, "floor": 150.0, "unitigs": 34582, "unitigs_kept": 6901, "unpruned_span": [0, 2738], "pruned_span": [0, 2738]},
-      "timing": {"stream": 0.002, "parse": 0.043, "anchor": 0.013, "extract": 0.012, "align": 0.524, "stitch": 0.003, "phase": 0.012, "total": 0.608}
+      "timing": {"stream": 0.001, "parse": 0.042, "anchor": 0.013, "extract": 0.012, "align": 0.502, "stitch": 0.004, "phase": 0.012, "total": 0.588}
     }
   ]
 }

@@ -104,6 +104,16 @@ INTRA-HOST VARIANTS:
                                   summary, as 0.1.x did. Off by default: the summary carries
                                   seq_sha256 and length, and the sequence itself is already in
                                   reconstructed.fasta [default: off]
+        --rescue-minority         Also move the route off a branch the aligner walked that is
+                                  itself a minority of its fork, onto an outright majority.
+                                  OFF by default: on a 5,000-accession walker20k slice the
+                                  correction loop did not converge with it on (97,068
+                                  corrections against 470, 7.8 per net substitution). The
+                                  sites are reported either way [default: off]
+        --max-alts <N>            Most alternative alleles to emit per accession. Credible
+                                  alleles beyond it are counted and warned about, not dropped
+                                  silently, and the omitted ones are the 3' sites
+                                  [default: 32]
         --no-indel-alts           Substitution alleles only; refuse any that change length
         --allow-frameshift-alts   Also accept indel alleles whose length change is not a
                                   multiple of 3. These reframe the CDS; off by default
@@ -160,6 +170,31 @@ struct Args {
     cfg: Config,
 }
 
+/// A finite float in `[lo, hi]`, or a usage error naming the flag.
+///
+/// WV-15. These were a bare `parse()`, which accepts `inf` and `NaN`. Both then reached
+/// `summary.json` through `format!("{:?}")` as the bare tokens `inf` and `NaN`, **which no
+/// JSON parser accepts**, so the run exited 0 and left a summary that `json.load` rejects.
+/// `--min-cov NaN` also disables the coverage gate entirely, since every comparison against
+/// NaN is false, and `--min-vaf 5` was accepted although a fraction above 1 can never be met.
+fn finite_in(flag: &str, raw: &str, lo: f64, hi: f64) -> error::Result<f64> {
+    let v: f64 = raw
+        .parse()
+        .map_err(|e| error::Error::Usage(format!("{flag}: {e}")))?;
+    if !v.is_finite() {
+        return Err(error::Error::Usage(format!(
+            "{flag}: {raw:?} is not a finite number"
+        )));
+    }
+    if v < lo || v > hi {
+        let upper = if hi == f64::MAX { "".to_string() } else { format!(" and at most {hi}") };
+        return Err(error::Error::Usage(format!(
+            "{flag}: {v} is out of range (must be at least {lo}{upper})"
+        )));
+    }
+    Ok(v)
+}
+
 fn parse_args(argv: &[String]) -> error::Result<Args> {
     let mut args = Args {
         accession: None,
@@ -192,13 +227,13 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
                 args.cfg.hops = value()?.parse().map_err(|e| error::Error::Usage(format!("--hops: {e}")))?;
             }
             "--min-abund" => {
-                args.cfg.min_abund = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-abund: {e}")))?;
+                args.cfg.min_abund = finite_in("--min-abund", &value()?, 0.0, f64::MAX)? as f32;
             }
             "--min-vaf" => {
-                args.cfg.min_vaf = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-vaf: {e}")))?;
+                args.cfg.min_vaf = finite_in("--min-vaf", &value()?, 0.0, 1.0)?;
             }
             "--min-cov" => {
-                args.cfg.min_cov = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-cov: {e}")))?;
+                args.cfg.min_cov = finite_in("--min-cov", &value()?, 0.0, 1.0)?;
             }
             "--primary-metric" => {
                 let raw = value()?;
@@ -281,6 +316,19 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             }
             "--emit-snv-table" | "--no-emit-snv-table" => {
                 args.cfg.emit_snv_table = flag == "--emit-snv-table";
+                i += 1;
+                continue;
+            }
+            "--max-alts" => {
+                let raw = value()?;
+                args.cfg.max_alts = raw.parse().map_err(|_| {
+                    error::Error::Usage(format!("--max-alts needs a number, got {raw:?}"))
+                })?;
+                i += 2;
+                continue;
+            }
+            "--rescue-minority" | "--no-rescue-minority" => {
+                args.cfg.rescue_minority = flag == "--rescue-minority";
                 i += 1;
                 continue;
             }
@@ -535,6 +583,20 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // Unwrap the query set for the full pipeline. The guard above ensures it is Some here.
     let queries = queries.expect("queries is Some when not --fetch-only");
 
+    // WV-14: the id reaches CHROM and `##contig=<ID=...>` verbatim, so refuse one that
+    // cannot legally appear there rather than writing a VCF no parser will read.
+    for q in &queries {
+        let id = if q.record_id.is_empty() { &q.name } else { &q.record_id };
+        if !io::output::valid_contig_id(id) {
+            return Err(error::Error::Usage(format!(
+                "reference id {id:?} cannot be a VCF contig name. Rename the record in {}: \
+                 letters, digits and !#$%&+./:;?@^_|~- are allowed, and * = after the first \
+                 character.",
+                q.path.display()
+            )));
+        }
+    }
+
     // The run's own clock, for `run.started` and `run.wall_seconds` in the summary. Started
     // here rather than at process entry so it measures the work, not the argument parsing,
     // and `n_requested` is taken before the pipeline consumes the list.
@@ -569,30 +631,49 @@ fn real_main(mut args: Args) -> error::Result<()> {
         );
     }
 
-    let summary = pipeline::run(&args.cfg, accessions, &queries)?;
+    let mut summary = pipeline::run(&args.cfg, accessions, &queries)?;
 
     // ---- OUT of the pipeline ----------------------------------------------
+    //
+    // WV-18: every writer is attempted and the summary is ALWAYS written, with the first
+    // error returned at the end. These used to be chained with `?` and the summary came
+    // last, so one write failure after the compute (a full disk, a directory in the way)
+    // threw away the whole shard's per-accession status and timings although every accession
+    // had reconstructed. The run still exits non-zero, so the failure is not hidden.
     std::fs::create_dir_all(&args.out_dir).map_err(error::file_err("create", &args.out_dir))?;
-    io::output::write_fasta(&summary, &args.out_fasta).map_err(|e| e.at("write", &args.out_fasta))?;
+    let mut first_err: Option<error::Error> = None;
+    // Scoped so the closure's mutable borrow of `first_err` ends before it is read.
+    {
+    let mut keep = |r: error::Result<()>| {
+        if let Err(e) = r {
+            eprintln!("[logan-walker] write failed: {e}");
+            first_err.get_or_insert(e);
+        }
+    };
+    keep(io::output::write_fasta(&summary, &args.out_fasta).map_err(|e| e.at("write", &args.out_fasta)));
     let bubbles = args.out_dir.join("bubbles.json");
-    io::output::write_bubbles(&summary, &bubbles).map_err(|e| e.at("write", &bubbles))?;
+    keep(io::output::write_bubbles(&summary, &bubbles).map_err(|e| e.at("write", &bubbles)));
     // One alignment pass per accession, shared by both writers.
     if args.cfg.emit_vcf || args.cfg.emit_snv_table {
-        let sites = io::output::snv_sites_all(&summary, &queries);
+        let sites = io::output::snv_sites_all(&mut summary, &queries);
         if args.cfg.emit_vcf {
-            io::output::write_vcfs(&summary, &queries, &args.out_dir, &sites)
-                .map_err(|e| e.at("write VCFs in", &args.out_dir))?;
+            keep(io::output::write_vcfs(&summary, &queries, &args.out_dir, &sites)
+                .map_err(|e| e.at("write VCFs in", &args.out_dir)));
         }
         if args.cfg.emit_snv_table {
             let snvs = args.out_dir.join("snvs.tsv");
-            io::output::write_snv_table(&summary, &queries, &snvs, &sites)
-                .map_err(|e| e.at("write", &snvs))?;
+            keep(io::output::write_snv_table(&summary, &queries, &snvs, &sites)
+                .map_err(|e| e.at("write", &snvs)));
         }
     }
     if args.cfg.emit_alts {
         let alts = args.out_dir.join("alt_haplotypes.fasta");
-        io::output::write_alts(&summary, &alts).map_err(|e| e.at("write", &alts))?;
+        keep(io::output::write_alts(&summary, &alts).map_err(|e| e.at("write", &alts)));
     }
+    // WV-17: a rerun with a writer switched off used to leave the previous run's file beside
+    // fresh results, with nothing to show the mismatch. Remove our own leftovers; a file we
+    // did not write is left alone (WV-16).
+    io::output::remove_disabled_outputs(&args.cfg, &args.out_dir, &summary);
     let summary_path = args.out_dir.join(format!("{}.summary.json", queries[0].name));
     let run = io::output::RunInfo {
         graphaligner: &version,
@@ -603,8 +684,12 @@ fn real_main(mut args: Args) -> error::Result<()> {
         wall_seconds: run_clock.elapsed().as_secs_f64(),
         n_requested,
     };
-    io::output::write_summary(&summary, &run, &summary_path)
-        .map_err(|e| e.at("write", &summary_path))?;
+    keep(io::output::write_summary(&summary, &run, &summary_path)
+        .map_err(|e| e.at("write", &summary_path)));
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
 
     println!(
         "[logan-walker] {}/{} accessions reconstructed",
@@ -621,6 +706,35 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // accession errored. Outputs are already written above, so they stay on disk for
     // inspection.
     check_run(&summary.results, args.allow_empty)
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::finite_in;
+
+    /// WV-15. These flags were a bare `parse()`, so `inf` and `NaN` were accepted and then
+    /// written into `summary.json` as bare tokens that **no JSON parser accepts**: the run
+    /// exited 0 and left a summary `json.load` rejects. `--min-cov NaN` additionally disables
+    /// the coverage gate, since every comparison against NaN is false.
+    #[test]
+    fn non_finite_and_out_of_range_values_are_refused() {
+        for bad in ["inf", "-inf", "NaN", "nan", "infinity"] {
+            assert!(finite_in("--min-cov", bad, 0.0, 1.0).is_err(), "{bad} must be refused");
+        }
+        // A fraction above 1 can never be met, and a negative one is meaningless.
+        assert!(finite_in("--min-vaf", "5", 0.0, 1.0).is_err(), "5 is not a fraction");
+        assert!(finite_in("--min-vaf", "-0.1", 0.0, 1.0).is_err());
+        assert!(finite_in("--min-abund", "-1", 0.0, f64::MAX).is_err());
+    }
+
+    #[test]
+    fn ordinary_values_still_parse() {
+        assert_eq!(finite_in("--min-cov", "0.85", 0.0, 1.0).unwrap(), 0.85);
+        assert_eq!(finite_in("--min-vaf", "0", 0.0, 1.0).unwrap(), 0.0);
+        assert_eq!(finite_in("--min-vaf", "1", 0.0, 1.0).unwrap(), 1.0);
+        assert_eq!(finite_in("--min-abund", "5", 0.0, f64::MAX).unwrap(), 5.0);
+        assert_eq!(finite_in("--min-abund", "25000", 0.0, f64::MAX).unwrap(), 25000.0);
+    }
 }
 
 #[cfg(test)]

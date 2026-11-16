@@ -195,6 +195,12 @@ pub struct Config {
     /// older result. 25 of the 26 accessions it touched moved by 1 to 11 sites and cleanly;
     /// the one exception warns, see `stages::variants::prefer_majority`.
     ///
+    /// Since 0.2.0 this also moves the route off a branch the aligner walked that is itself a
+    /// minority of its fork, when the other side holds an outright majority (WV-02). Before
+    /// that, such a fork was skipped as "the error-branch case" and left to `--prune-frac`,
+    /// which does not reach it: pruning is 1% of gene depth, the old gate was 10% of the fork,
+    /// and a branch between the two was neither pruned nor corrected nor reported.
+    ///
     /// Pruning cannot fix these: no coverage floor separates a 35% allele from a 65% one
     /// without also deleting every genuine minority variant, so the aligner keeps choosing
     /// by resemblance to the reference. Measured over the first 68 two-allele sites of a
@@ -221,6 +227,11 @@ pub struct Config {
     /// tail at +100, +142 and -282. The tail is not an allele: it is the route being sent
     /// through a different stretch of the graph, rewriting the gene rather than editing it.
     /// 30 keeps a ten-codon indel and excludes all of that.
+    /// For `find_alts` this bounds one allele. For `prefer_majority` it bounds **the whole
+    /// correction set** on an accession as well, because the corrections compound: on the
+    /// WV-02 panel `SRR6007473` took 64 swaps that were each in frame and each inside this
+    /// cap, and its ebola GP primary grew from 2,049 nt to 3,129 against a 2,031 nt
+    /// reference. Per-swap legality does not bound the total.
     pub max_alt_indel: usize,
     /// Accept indel alleles whose length change is not a multiple of three.
     ///
@@ -251,6 +262,20 @@ pub struct Config {
     /// millions of runs would be a million-column near-empty matrix; the long form is
     /// sparse-native and concatenates across cluster shards. See `io::output::write_snv_table`.
     pub emit_snv_table: bool,
+    /// Move the route off a branch the aligner walked that is itself a minority of its fork,
+    /// when another branch holds an outright majority. **Off by default.**
+    ///
+    /// This is WV-02's action, and it is off because a 5,000-accession slice of walker20k
+    /// showed the correction loop does not converge with it on: 97,068 corrections where the
+    /// pre-0.2.0 walker made 470, a median of 64 per corrected accession (the loop's own
+    /// `max_alts * 2` backstop) on 1,399 accessions, **7.8 corrections for every net
+    /// substitution**, and a net +33 internal stop codons. Sixty-four swaps producing six
+    /// bases of change means the swaps are undoing one another.
+    ///
+    /// WV-02's *finding* stands and its reporting is unconditional: forks where `_primary`
+    /// carries the rarer allele are counted in `minority_left` whether or not they are acted
+    /// on. What is off is the acting.
+    pub rescue_minority: bool,
     /// Write the literal haplotype sequence into the summary, as 0.1.x did.
     ///
     /// Off by default from 0.2.0. The summary carries `seq_sha256` and `length` instead, which
@@ -260,7 +285,12 @@ pub struct Config {
     /// the file; at walker20k scale that is roughly 67 MB of duplicate FASTA inside a 130 MB
     /// summary. See `docs/summaries.md`.
     pub summary_seqs: bool,
-    /// Hard cap on alternative haplotypes per accession.
+    /// Cap on alternative haplotypes per accession, `--max-alts`.
+    ///
+    /// WV-06: this used to have no flag and to `break` the 5'-to-3' scan, so an accession
+    /// with more credible sites than the cap published the start of its gene and nothing
+    /// after, with the stderr counters stopping at the cap so that even they did not reveal
+    /// it. The scan now runs to the end, counts what did not fit as `beyond_cap`, and warns.
     ///
     /// Measured site counts are 4, 4 and 0 on the accessions looked at, so this is a
     /// backstop against a pathological neighbourhood rather than a tuning knob.
@@ -472,6 +502,7 @@ impl Default for Config {
             emit_alts: true,
             emit_vcf: false,
             emit_snv_table: false,
+            rescue_minority: false,
             summary_seqs: false,
             max_alts: 32,
             alt_max_detour: 100,

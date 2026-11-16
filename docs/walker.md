@@ -20,9 +20,10 @@ For each accession, given a reference CDS:
 4. **Extract** the `--hops` (default 5) neighbourhood around the anchors as a local GFA.
 5. **Align** the reference through that subgraph with `GraphAligner -x dbg`.
 6. **Stitch** the walked path into the primary haplotype. By default the walker then prunes
-   low-depth branches and re-aligns (`--prune-frac`), puts the majority allele on the primary at
-   two-allele sites (`--prefer-majority`), and writes the remaining intra-host alleles as
-   alternative haplotypes (`--emit-alts`). Why these exist is in
+   low-depth branches and re-aligns (`--prune-frac`), puts the majority allele on the primary
+   (`--prefer-majority`, at two-allele sites and, since 0.2.0, wherever the aligner walked a
+   minority branch whose other side holds an outright majority), and writes the remaining
+   intra-host alleles as alternative haplotypes (`--emit-alts`). Why these exist is in
    [`issue_intra_accession_variance_lost.md`](issue_intra_accession_variance_lost.md).
 7. **Write** the primaries, the alternatives, `bubbles.json`, a summary JSON, and optionally
    per-accession VCFs and a cohort SNV table.
@@ -107,7 +108,41 @@ must now span as much of the reference as the unpruned one (see `--prune-frac` b
 | `<out-dir>/bubbles.json` | always | bubbles in the local subgraph |
 | `<out-dir>/<query stem>.summary.json` | always | the run's provenance, settings, totals, discards and cohort statistics, then one record per accession (below) |
 | `<out-dir>/<ACC>.vcf` | `--emit-vcf` | intra-host SNVs of one accession, written only when it has at least one (a VCF an earlier run left for an accession with none is removed) |
-| `<out-dir>/snvs.tsv` | `--emit-snv-table` | one row per (accession, site, allele) across the run |
+| `<out-dir>/snvs.tsv` | `--emit-snv-table` | one row per (accession, site, allele) across the run. Rows sharing a `block` come from one alternative haplotype, so they do co-occur |
+
+Allele frequencies at a fork are computed over the branches that **return to the route**. An
+exit that leaves the locus for good, a repeat, a paralog or a contaminant sharing the fork's
+k-mer, is not an allele of the gene and is excluded from the denominator; counting it deflated
+every frequency at the site and could suppress an allele entirely. `bubbles.json` has always
+done this, so the two now agree.
+
+An alternative carrying several substitutions is called site by site rather than discarded.
+In a k=31 graph two substitutions within 30 nt share one bubble and arrive as one alternative,
+and two changes in one codon are the common case; until 0.2.0 both sites vanished from the VCF
+and the SNV table with no message. Those rows share a `BLOCK` (VCF) or `block` (TSV), which
+says they **are** on one molecule, unlike two rows that merely share a position. Past
+8 linked substitutions the alternative is a rerouted stretch of graph rather than a few linked
+changes, so it stays in `alt_haplotypes.fasta` and is counted on stderr.
+
+There is no length limit on the SNV mapping. A 20 kb cap used to drop every SNV, the VCF and
+the SNV table for any longer gene (SARS-CoV-2 ORF1ab is 21,290 nt) while the run still exited
+0, so the absence read as "no variants". The mapping is now bounded by memory instead, at
+256 MiB, which refuses the case that is actually expensive, a short but highly divergent pair,
+and says so.
+
+The summary is always written, even when another output fails: every writer is attempted and
+the first error is returned at the end. Each file appears at its final path only once it is
+complete, so an interrupted run leaves no truncated output. A rerun with a writer switched off
+removes that writer's file from the previous run rather than leaving it beside fresh results,
+and a `<ACC>.vcf` this walker did not write is never removed or overwritten.
+
+Reference record ids must be usable as VCF contig names (letters, digits and
+`!#$%&+./:;?@^_|~-`, plus `*` and `=` after the first character); a run refuses rather than
+writing a VCF no parser will read. A non-ACGT reference base is written as `N` in REF.
+
+`--min-cov` and `--min-vaf` take a finite fraction in [0, 1] and `--min-abund` a finite number
+at least 0. `inf` and `NaN` used to be accepted and then written into the summary as bare
+tokens no JSON parser reads.
 
 `cov` is the walked length over the reference length, and `pident` the identity of the
 alignment. When a haplotype's identity was inherited from the route before an allele was spliced
@@ -136,7 +171,11 @@ Each record names its haplotype by `seq_sha256` and `length` rather than carryin
 sequence, which is already in the FASTA. `--summary-seqs` restores the literal `seq` field that
 0.1.x wrote unconditionally; it was between 50% and 71% of the file on real runs. A record also
 carries `majority_corrections`, the number of sites where the route was moved onto the majority
-allele, and `variants`, what the alt search considered and refused.
+allele, `minority_rescues`, how many of those the pre-0.2.0 gate would have refused to touch
+(WV-02), and `variants`, what the alt search considered and refused. Where a fork is still on
+the rarer allele, `minority_left` says so and why: `alt_below_floor`, `not_outright_majority`,
+`no_rejoin`, `length_refused`, `window_not_shiftable`, `coverage_gate` or `identical`. The run
+totals are in `discards.minority_sites` and `cohort.accessions_with_minority_sites`.
 
 Each accession also records two decisions that earlier versions only printed:
 
@@ -201,7 +240,7 @@ Options that are on by default are turned off with a `--no-…` form.
 
 | flag | default | meaning |
 |---|---|---|
-| `-a, --accession <ACC>` | | one SRA accession |
+| `-a, --accession <ACC>` | | one SRA accession. At most 64 characters: the value becomes `<out-dir>/<ACC>.vcf`, and a longer one exceeds the filesystem's name limit |
 | `-l, --accession-list <FILE>` | | file with one accession per line, plain or gzipped; a repeated accession is processed once. Give `-a` or `-l`, not both |
 | `-q, --query <FASTA>` | | reference CDS, plain or gzipped; repeatable, and more than one record switches on multi-anchor mode |
 | `-o, --out-dir <DIR>` | `walker_output` | output directory |
@@ -230,13 +269,14 @@ Options that are on by default are turned off with a `--no-…` form.
 
 | flag | default | meaning |
 |---|---|---|
-| `--min-abund <F>` | `5.0` | minimum `ka:f` for a branch to count as an allele |
+| `--min-abund <F>` | `5.0` | minimum `ka:f` for a branch to count as an allele. When the prune is refused, the variant stages inherit the prune's floor instead, since the sub-floor branches it meant to remove are still in the graph |
 | `--min-vaf <F>` | `0.10` | minimum variant allele frequency for an alternative |
 | `--min-abund-frac <F>` | `0.0` (off) | raise the floor to this fraction of the gene's depth (median `ka:f` on the path) |
 | `--alt-max-detour <N>` | `100` | unitigs an alternative may traverse before rejoining the path |
 | `--no-indel-alts` | | substitutions only |
 | `--allow-frameshift-alts` | off | also accept indels whose length is not a multiple of 3 |
-| `--max-alt-indel <N>` | `30` | largest length change treated as an indel rather than a rerouting |
+| `--max-alts <N>` | `32` | most alternative alleles per accession. Credible alleles beyond it are counted and warned about, not dropped silently, and the ones omitted are the 3' sites |
+| `--max-alt-indel <N>` | `30` | largest length change treated as an indel rather than a rerouting. For an alternative haplotype this is per allele; for the consensus correction it is also a budget for the **whole** set of corrections on one accession |
 | `--no-emit-alts` | | do not write `alt_haplotypes.fasta` |
 | `--emit-vcf` | off | write `<out-dir>/<ACC>.vcf` |
 | `--emit-snv-table` | off | write `<out-dir>/snvs.tsv` |
@@ -352,7 +392,17 @@ Logan's unitigs are BCALM2 output from a k = 31 compacted de Bruijn graph. A hea
 ```
 
 - The unitig id is the text after the last `_`. Ids run from 0 to n-1 with no gaps.
-- `ka:f` is the unitig's mean k-mer abundance; the walker uses it as depth.
+- `ka:f` is the unitig's mean k-mer abundance; the walker uses it as depth. **It is clipped at
+  25,000.** Measured on three cached accessions: `ERR2028820` has 664 unitigs at exactly
+  25000.0 against 4 at the next value down, `SRR8209082` has 802 against 24, and
+  `SRR12363134` has one at 25000.0 whose next-highest neighbour is 14500.0. Where a branch is
+  clipped, the fork total is a lower bound and every frequency drawn from it is **overstated**:
+  a 3,000x allele beside a true 250,000x one is 1.2%, but against a clipped 25,000 it reports
+  10.7% and clears the default `--min-vaf`. The true depth is not recoverable from the file, so
+  the walker flags rather than drops: `KaSat` in the VCF FILTER column, a `ka_saturated` column
+  in `snvs.tsv`, `ka_sat=1` on the alt header, `"ka_saturated"` on each bubble, and `ka_max`
+  with `depth_saturated` per accession in the summary. `bcftools view -f PASS` now drops these
+  rows, which is the intended behaviour and a change from 0.1.x, where they passed unmarked.
 - `L:s1:t:s2` in unitig `u`'s header is the traversal from `u` on strand `s1` to `t` on strand
   `s2`. Every edge appears in both endpoints' headers, so the graph is closed under reversal.
 - Consecutive unitigs overlap by k - 1 = 30 bases, which the walker removes when it stitches a

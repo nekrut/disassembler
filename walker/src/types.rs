@@ -261,6 +261,22 @@ pub struct GafPath {
 }
 
 impl GafPath {
+    /// Percent identity of this alignment: matches over aligned length.
+    ///
+    /// WV-24. The formula was spelled out in `stitch` and again in `pipeline`, which is the
+    /// kind of duplication that survives until one of the two is changed. `aln_len == 0`
+    /// gives 0.0 rather than NaN, which would reach `summary.json` as an invalid token
+    /// (WV-15).
+    pub fn pident(&self) -> f64 {
+        if self.aln_len > 0 {
+            (self.num_matches as f64 / self.aln_len as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+}
+
+impl GafPath {
     /// Reference bases the alignment spans. Unlike the haplotype's length, an indel in the
     /// sample does not change it; an alignment that stops short does.
     pub fn query_span(&self) -> usize {
@@ -310,7 +326,10 @@ pub struct Haplotype {
     pub anchor_used: Option<String>,
 }
 
-/// A recovered second allele: the primary haplotype with exactly one substitution.
+/// A recovered second allele: the primary haplotype with exactly one allele changed.
+///
+/// A substitution in the common case, or an in-frame indel of at most `max_alt_indel` bases
+/// when `allow_indel_alts` is on, which it is by default (WV-21).
 ///
 /// The frequencies are what make it interpretable. `alt_vaf` is this allele's share of
 /// coverage at its fork, `taken_vaf` the primary's, and both cleared the same gates, so the
@@ -332,6 +351,9 @@ pub struct AltHaplotype {
     /// Bases this allele adds (positive) or removes (negative) relative to the primary.
     /// Zero for a substitution, which is the common case.
     pub length_delta: i64,
+    /// A branch of this fork sits at [`KA_CEILING`], so `taken_vaf` and `alt_vaf` are computed
+    /// against a total that is a lower bound and both are overstated (WV-03).
+    pub ka_saturated: bool,
     /// How much sequence the allele actually replaces, in bases.
     ///
     /// Reported because `max_alt_indel` bounds the *net* length change and not this, and the
@@ -375,6 +397,9 @@ pub struct Bubble {
     pub merge: UnitigId,
     pub merge_strand: Strand,
     pub branches: Vec<Branch>,
+    /// A branch of this bubble is at [`KA_CEILING`], so every `vaf` on it is computed against
+    /// a lower-bound total and is overstated (WV-03).
+    pub ka_saturated: bool,
 }
 
 /// One reference's candidate at the point `pick_primary` chose the winner.
@@ -472,6 +497,9 @@ pub struct VariantStats {
     pub biallelic: usize,
     /// Alternatives actually emitted.
     pub recovered: usize,
+    /// Credible alleles that cleared every gate but did not fit under `--max-alts`
+    /// (WV-06). Non-zero means the variant outputs are incomplete for this accession.
+    pub beyond_cap: usize,
     /// Of those, how many change length.
     pub indels: usize,
     // Refusals, in the order the stage applies them.
@@ -481,6 +509,94 @@ pub struct VariantStats {
     pub frameshifting: usize,
     pub window_not_shiftable: usize,
     pub identical: usize,
+}
+
+/// The value Logan's `ka:f` stops at.
+///
+/// WV-03. Logan caps abundance, and the published values stop at exactly this number: measured
+/// on three cached accessions, `ERR2028820` has 664 unitigs here against 4 at the next value
+/// down, `SRR8209082` has 802 against 24, and `SRR12363134` has 1 here and the next is
+/// 14,500. A distribution does not pile up on one value and empty out immediately below it;
+/// that is a clip.
+///
+/// It matters because the walker reads `ka:f` as linear depth. Where a branch is clipped the
+/// fork total is a lower bound, so the minority allele's share is OVERSTATED: a 3,000x allele
+/// beside a true 250,000x major allele is 1.2%, but against a clipped 25,000 it reports 10.7%
+/// and clears `--min-vaf`. The same values drive the prune floor, the bubble VAFs and the
+/// majority correction. The true depth cannot be recovered from the file, so every output
+/// that rests on a saturated fork is flagged rather than dropped.
+pub const KA_CEILING: f32 = 25_000.0;
+
+/// What `variants::prefer_majority` did, and what it left behind.
+///
+/// WV-02. Before 0.2.0 the stage refused a fork outright when the branch the aligner walked
+/// was itself below `min_abund` or `min_vaf`, on the reasoning that such a branch is
+/// sequencing error and belongs to `--prune-frac`. But pruning removes branches below 1% of
+/// *gene depth* while this gate is 10% of the *fork*, so a walked branch between the two was
+/// neither pruned, nor swapped, nor reported anywhere. The reference-like minority of a
+/// contaminated or mixed sample lands exactly there, and `_primary` published it with
+/// `pident=100.0` and nothing to say so.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MajorityReport {
+    /// Sites where the route was moved onto the majority allele.
+    pub swaps: usize,
+    /// Of those, sites where the branch the aligner walked was itself a minority of the fork,
+    /// so the swap was the WV-02 rescue rather than an ordinary two-allele correction.
+    pub minority_rescues: usize,
+    /// The correction loop exhausted its `max_alts * 2` pass backstop with swaps still being
+    /// applied, so this route was rewritten rather than corrected at a few sites.
+    pub hit_pass_cap: bool,
+    /// Forks still on the final route where a correction was considered and not made,
+    /// counted by reason. A non-zero total is a site where `_primary` knowingly keeps an
+    /// allele the stage looked at replacing.
+    ///
+    /// `exempt_minority` is the WV-02 category, a fork whose walked branch is itself a
+    /// minority; the others fire on ordinary two-allele sites as well. The JSON key stays
+    /// `minority_left` so the 0.2.0 schema does not churn again.
+    pub left: MinorityLeft,
+}
+
+/// Why a fork whose untaken branch is an outright majority was left alone. Counts only.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MinorityLeft {
+    /// The majority branch does not clear `min_abund`: the whole fork is noise.
+    pub alt_below_floor: usize,
+    /// No single untaken branch holds half the fork, so there is no majority to move onto.
+    /// A three-way split with the route on the smallest share lands here.
+    pub not_outright_majority: usize,
+    /// The branch the aligner walked is a minority of its fork and `--rescue-minority` is off,
+    /// which is the default. This is the restored error-branch exemption: the site is reported
+    /// but not acted on. See `Config::rescue_minority` for why.
+    pub exempt_minority: usize,
+    /// A branch of the fork is at [`KA_CEILING`], so the total the majority test divides by is
+    /// a lower bound and the test cannot be trusted. Measured on a 5,000-accession slice of
+    /// walker20k: without this guard the correction count went from 470 sites to 97,068, with
+    /// a median of 64 per corrected accession, which is the loop's own backstop.
+    pub saturated: usize,
+    /// No path back to the route within `--alt-max-detour`.
+    pub no_rejoin: usize,
+    /// The length rules refused it: indels off, over `--max-alt-indel`, or a frameshift.
+    pub length_refused: usize,
+    /// The alignment window could not be shifted onto the spliced route.
+    pub window_not_shiftable: usize,
+    /// The spliced route does not clear the coverage gate.
+    pub coverage_gate: usize,
+    /// The detour spells the same sequence, so there is nothing to correct.
+    pub identical: usize,
+}
+
+impl MinorityLeft {
+    pub fn total(&self) -> usize {
+        self.alt_below_floor
+            + self.not_outright_majority
+            + self.exempt_minority
+            + self.saturated
+            + self.no_rejoin
+            + self.length_refused
+            + self.window_not_shiftable
+            + self.coverage_gate
+            + self.identical
+    }
 }
 
 /// Everything one accession produced. This is what crosses back to the collector.
@@ -502,8 +618,8 @@ pub struct AccessionResult {
     /// Everything written to the main FASTA; holds the single primary haplotype.
     pub haplotypes: Vec<Haplotype>,
     /// Second alleles recovered at biallelic sites by `stages::variants`, written to their own
-    /// file (`alt_haplotypes.fasta`). Never combined with each other: one substitution per
-    /// record.
+    /// file (`alt_haplotypes.fasta`). Never combined with each other: one allele per record,
+    /// a substitution or an in-frame indel.
     pub alts: Vec<AltHaplotype>,
     pub bubbles: Vec<Bubble>,
     pub timing: Timing,
@@ -533,8 +649,19 @@ pub struct AccessionResult {
     /// only `pident_inherited: true`, which cannot tell 1 correction from 27. A primary that
     /// was rerouted through a divergent segment looked identical to one that was not.
     pub majority_corrections: usize,
+    /// What the majority correction did and what it left behind. See [`MajorityReport`].
+    pub majority: MajorityReport,
     /// What the alt search considered and refused. See [`VariantStats`].
     pub variants: VariantStats,
+    /// Intra-host SNV sites called for this accession, or `None` when the primary could not
+    /// be mapped to the query within the alignment budget (WV-09/WV-20). `Some(0)` and `None`
+    /// are different answers: no variants, against no attempt.
+    pub snv_sites: Option<usize>,
+    /// Largest `ka:f` anywhere in this accession's extracted neighbourhood.
+    pub ka_max: f32,
+    /// That maximum has reached [`KA_CEILING`], so this accession's abundances are clipped
+    /// and every VAF, the prune floor and the majority calls rest on lower bounds (WV-03).
+    pub depth_saturated: bool,
 }
 
 /// How the second, pruned alignment pass ended for one accession.
@@ -610,7 +737,11 @@ impl AccessionResult {
             provisional: false,
             prune: None,
             majority_corrections: 0,
+            majority: MajorityReport::default(),
             variants: VariantStats::default(),
+            snv_sites: None,
+            ka_max: 0.0,
+            depth_saturated: false,
         }
     }
 }
