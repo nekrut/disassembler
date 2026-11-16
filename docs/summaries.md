@@ -77,7 +77,9 @@ about 67 MB of it duplicate FASTA.
     "exit_code": 0,
     "started": "2026-11-15T09:12:44Z",
     "wall_seconds": 182.437,
-    "stage_seconds": { },              // the stage's own internal phases
+    "stage_seconds": { },              // the stage's own internal phases; a phase that no
+                                       // longer exists reports 0 rather than disappearing,
+                                       // so two schema-1 summaries have the same keys
     "n_records": 50,
     "n_ok": 45
   },
@@ -162,7 +164,7 @@ than written as null.
 | member | meaning |
 |---|---|
 | `source` | `s3`, `cache`, or `none` when no bytes were read |
-| `bytes` | size as read. Also set on a `too_large` skip, from `Content-Length`, where no bytes were read at all |
+| `bytes` | size as read. Also set on a `too_large` skip: from `Content-Length` when the object was refused before transfer, and from the object itself when the refusal came later, such as a parsed graph over its memory budget |
 | `sha256` | digest of the bytes exactly as read |
 | `etag` | the object's `ETag`, quotes stripped, when a live fetch supplied one |
 | `last_modified` | the object's `Last-Modified`, normalised to `YYYY-MM-DDTHH:MM:SSZ` |

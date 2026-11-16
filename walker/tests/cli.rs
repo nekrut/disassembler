@@ -122,6 +122,44 @@ impl Fixture {
         Fixture { dir }
     }
 
+    /// One accession whose unitigs compress to very little but build a graph many times that
+    /// size: 120,000 near-identical short records, each carrying four links.
+    ///
+    /// Dense in *links* specifically, because adjacency is what the first parse pass holds:
+    /// 480,000 packed edges plus the offsets are about 2.4 MB against a 156 KB file. This is
+    /// the shape `GRAPH_PEAK_PER_COMPRESSED_BYTE` does not describe. The constant was
+    /// calibrated on seven real accessions at 1.24x to 1.62x; nothing in the file format holds
+    /// it there, and before the parse budget nothing stopped a file like this from being
+    /// parsed until the allocator gave up.
+    fn dense(name: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("logan-walker-cli-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(dir.join("q.fasta"), format!(">gene\n{QUERY}\n")).unwrap();
+        let script = dir.join("ga_fast");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }\nexit 0\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut unitigs = String::with_capacity(120_000 * 40);
+        for i in 0..120_000u32 {
+            // Four links each, all to ids that exist, so nothing but the budget can refuse it.
+            unitigs.push_str(&format!(
+                ">SRRDENSE_{i} ka:f:5.0 L:+:1:+ L:+:2:+ L:-:3:- L:+:4:-\n\
+                 ACGTACGTACGTACGTACGTACGTACGTACG\n"
+            ));
+        }
+        let zst = zstd::encode_all(unitigs.as_bytes(), 3).unwrap();
+        std::fs::write(dir.join("cache").join("SRRDENSE.unitigs.fa.zst"), zst).unwrap();
+        std::fs::write(dir.join("accs.txt"), "SRRDENSE\n").unwrap();
+        Fixture { dir }
+    }
+
     /// The bubble fixture described above, served from `cache` under `--offline`, with a
     /// stand-in GraphAligner that replays a fixed GAF row walking the REFERENCE branch.
     fn bubble(name: &str) -> Self {
@@ -753,4 +791,120 @@ fn fetch_only_reports_its_counts_and_exit_code() {
     let (code, stderr) = f.code("empty_cache", &["--fetch-only", "--allow-empty"]);
     assert_eq!(code, 3, "--allow-empty must not mask an all-errored fetch; stderr:\n{stderr}");
     assert!(stderr.contains("--allow-empty does not apply to errors"), "{stderr}");
+}
+
+/// A graph that would exceed its memory budget is refused, and refused as the `too_large`
+/// NEGATIVE rather than as an error.
+///
+/// The distinction is the whole point. `--allow-empty` accepts negatives and not errors, and a
+/// scheduler reads the exit code: mapping this to `error` would turn "this accession does not
+/// fit the cap you set" into "this run broke". The compute pool used to send every error it
+/// saw through `AccessionResult::failed`, so until the pool learned the same mapping the fetch
+/// pool had, the budget refusal arrived as a failure.
+#[test]
+fn a_graph_over_its_budget_is_a_too_large_negative_not_an_error() {
+    let f = Fixture::dense("dense-budget");
+    let out = Command::new(BIN)
+        .env_remove("LOGAN_KEEP_SCRATCH")
+        .arg("--scratch-dir").arg(f.dir.join("scratch"))
+        .arg("--graphaligner").arg(f.dir.join("ga_fast"))
+        .arg("-l").arg(f.dir.join("accs.txt"))
+        .arg("-q").arg(f.dir.join("q.fasta"))
+        .arg("--unitigs-cache").arg(f.dir.join("cache"))
+        .arg("--offline")
+        .arg("-o").arg(f.dir.join("out"))
+        .arg("-f").arg(f.dir.join("out").join("r.fasta"))
+        // 1 MB cap, so the graph budget is 1.7 MB. The compressed fixture is far below the
+        // cap, so only the graph budget can refuse it.
+        .arg("--max-size-mb").arg("1")
+        .arg("--allow-empty")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The per-accession outcome line goes to stdout (`pipeline::report`), not stderr. Both are
+    // read here so the assertion does not depend on which stream a given outcome prints to.
+    let log = format!("{stderr}{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a negative under --allow-empty must exit 0; log:\n{log}"
+    );
+    assert!(log.contains("too_large"), "log:\n{log}");
+
+    let summary = std::fs::read_to_string(f.dir.join("out").join("q.summary.json")).unwrap();
+    assert!(summary.contains("\"status\": \"too_large\""), "{summary}");
+    assert!(
+        !summary.contains("\"status\": \"failed\"\n"),
+        "the record must be a negative, not a failure: {summary}"
+    );
+    assert!(summary.contains("\"too_large\": 1"), "the discard must be counted: {summary}");
+    // Refused on the way, not after building the whole graph.
+    assert!(summary.contains("budget"), "the record should say what refused it: {summary}");
+    // And the accession still names the bytes it was refused on.
+    assert!(summary.contains("\"payload\": {\"source\": \"cache\""), "{summary}");
+
+    // The same input is fine with room to build it, so the refusal is the budget, not the data.
+    let ok = Command::new(BIN)
+        .env_remove("LOGAN_KEEP_SCRATCH")
+        .arg("--scratch-dir").arg(f.dir.join("scratch2"))
+        .arg("--graphaligner").arg(f.dir.join("ga_fast"))
+        .arg("-l").arg(f.dir.join("accs.txt"))
+        .arg("-q").arg(f.dir.join("q.fasta"))
+        .arg("--unitigs-cache").arg(f.dir.join("cache"))
+        .arg("--offline")
+        .arg("-o").arg(f.dir.join("out2"))
+        .arg("-f").arg(f.dir.join("out2").join("r.fasta"))
+        .arg("--max-size-mb").arg("64")
+        .arg("--allow-empty")
+        .output()
+        .unwrap();
+    let ok_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ok.stderr),
+        String::from_utf8_lossy(&ok.stdout)
+    );
+    assert_eq!(ok.status.code(), Some(0), "log:\n{ok_log}");
+    assert!(
+        !ok_log.contains("too_large"),
+        "a 64 MB cap gives the graph room, so nothing should be refused:\n{ok_log}"
+    );
+}
+
+/// A neighbourhood over `--max-subgraph-nodes` is refused, as its own negative.
+///
+/// This is the memory term the two-pass parser cannot remove: everything after extraction is
+/// proportional to the neighbourhood, and on amplicon-like data the neighbourhood is most of
+/// the graph. It gets a status of its own rather than being folded into `too_large`, because
+/// the two mean different things to whoever reads them: one is about the file, the other about
+/// the gene, and the remedy differs.
+#[test]
+fn a_neighbourhood_over_the_cap_is_its_own_negative() {
+    let f = Fixture::matching("subgraph-cap", 1);
+    let out = f
+        .cmd_ga("ga_align", "cache", &["--max-subgraph-nodes", "1", "--allow-empty"])
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(out.status.code(), Some(0), "a negative under --allow-empty exits 0:\n{log}");
+    assert!(log.contains("subgraph_too_large"), "{log}");
+
+    let summary = std::fs::read_to_string(f.dir.join("out").join("q.summary.json")).unwrap();
+    assert!(summary.contains("\"status\": \"subgraph_too_large\""), "{summary}");
+    assert!(summary.contains("\"subgraph_too_large\": 1"), "the discard is counted: {summary}");
+    // The record still says how big it was and what it was measured against, so the next run
+    // can be given a number rather than a guess.
+    assert!(summary.contains("--max-subgraph-nodes 1"), "{summary}");
+    assert!(summary.contains("\"subgraph_nodes\": 2"), "{summary}");
+    // Not folded into the file-size skip, which is a different question.
+    assert!(summary.contains("\"too_large\": 0"), "{summary}");
+
+    // Default cap: the same accession reconstructs, so the refusal is the cap not the data.
+    let ok = f.cmd_ga("ga_align", "cache", &[]).output().unwrap();
+    assert_eq!(ok.status.code(), Some(0), "stderr:\n{}", String::from_utf8_lossy(&ok.stderr));
+    let s2 = std::fs::read_to_string(f.dir.join("out").join("q.summary.json")).unwrap();
+    assert!(s2.contains("\"status\": \"success\""), "{s2}");
 }

@@ -16,20 +16,32 @@
 //! bits are for. Dropping them is what makes bubble detection mistake one edge read twice
 //! for a reconvergence.
 //!
-//! # Why everything happens in this one pass
+//! # Two passes, not one
 //!
-//! One pass, not three (count, index, sequences): adjacency, abundance and 2-bit sequences
-//! are all extracted while the bytes stream past, so the decompressed text is never held
-//! and the file is decoded exactly once. Sequences cost 17.2 MB packed for `ERR2028820`,
-//! which is far cheaper than either holding 145 MB of text or decoding a second time later.
+//! Until 0.2.0 this was one pass that built the whole CSR, and `build` below still is. The
+//! production path is now `scan` then `collect`, because almost all of that CSR was thrown
+//! away: `extract::expand` keeps the anchor neighbourhood, which is 747 of 1,277,362 unitigs
+//! for `ERR2028820`, and everything downstream touches only those.
+//!
+//! * `scan` reads adjacency and nothing else, feeding each record's bases to a [`RecordSink`]
+//!   as they stream past. `stages::anchor::Scanner` is that sink, so anchoring costs no
+//!   storage and no second walk over 68 million bases.
+//! * `extract::expand` then finds the neighbourhood from adjacency alone.
+//! * `collect` decodes a second time and keeps sequence and abundance for those ids only,
+//!   stopping once the last one is past.
+//!
+//! The second decode is not a cost in practice: pass 1 no longer packs 2-bit sequence or
+//! stores abundance for every unitig, and one light decode measures about 0.25 s per 146 MB
+//! of text. What it buys is the per-unitig data, 21.5 of the 33.5 bytes per unitig the old
+//! graph held.
 //!
 //! No regex. The cost of parsing this format is the data structure, not the tokenizer.
 //!
-//! IN   accession, streaming zstd decoder
-//! OUT  UnitigGraph (~43 MB for 1.28M unitigs)
+//! IN   accession, streaming zstd decoder (twice)
+//! OUT  UnitigGraph holding full adjacency and the neighbourhood's sequences
 
 use crate::error::{Error, Result};
-use crate::types::{Accession, UnitigGraph};
+use crate::types::{Accession, UnitigGraph, UnitigId};
 use std::io::{BufReader, Read, BufRead};
 
 /// Target id occupies the low 30 bits of a packed edge; the two strand flags sit above it.
@@ -55,20 +67,78 @@ pub fn unpack_edge(packed: u32) -> (u32, bool, bool) {
     )
 }
 
-/// Consume the decoder and build the complete `UnitigGraph`.
+/// Receives every record as `scan` streams past it.
 ///
-/// # Structural assumptions, all enforced
+/// Monomorphised rather than a trait object: `base` is called once per base, about 68 million
+/// times for a mid-sized accession, and a virtual call there would cost more than the work it
+/// dispatches. `stages::anchor::Scanner` is the production implementation; `()` is the no-op
+/// for callers that only want adjacency.
+pub trait RecordSink {
+    /// A new record begins. Any per-record state resets here.
+    fn begin(&mut self, id: UnitigId);
+    /// One base, as its 2-bit code. Already validated as ACGT by the caller.
+    fn base(&mut self, code: u8);
+    /// The record is complete.
+    fn end(&mut self);
+}
+
+impl RecordSink for () {
+    #[inline]
+    fn begin(&mut self, _id: UnitigId) {}
+    #[inline]
+    fn base(&mut self, _code: u8) {}
+    #[inline]
+    fn end(&mut self) {}
+}
+
+/// 2-bit code for one base, or an error naming it.
 ///
-/// Verified against real Logan output (`ERR2028820`, 1,277,362 records): ids run strictly
-/// 0, 1, 2, ... with no gaps, and every sequence is on a single line. Strict ordering is
-/// what makes CSR construction trivial here: a record's `L:` tokens are all the edges
-/// incident to that unitig, so appending them in record order already produces the CSR
-/// layout, with no edge sort and no temporary edge list.
+/// Shared by all three passes so that what counts as a valid base is defined once. A stray N
+/// packed as some other nucleotide would propagate silently into the haplotype, which is why
+/// this is an error and not a substitution.
+#[inline]
+fn base_code(b: u8, record: u64) -> std::result::Result<u8, String> {
+    match b {
+        b'A' => Ok(0),
+        b'C' => Ok(1),
+        b'G' => Ok(2),
+        b'T' => Ok(3),
+        _ => Err(format!(
+            "record {record}: non-ACGT base {:?}; 2-bit packing would corrupt it",
+            b as char
+        )),
+    }
+}
+
+/// Pass 1: adjacency only, with every base handed to `sink` as it goes.
 ///
-/// These are assumptions about someone else's output format, so each is checked and
-/// produces a clear error rather than a silently wrong graph. Multi-line sequences are
-/// handled regardless, since that costs nothing.
-pub fn build(accession: &Accession, reader: Box<dyn Read + '_>) -> Result<UnitigGraph> {
+/// Adjacency stays in RAM. Use `scan_in` to let it spill to disk past
+/// [`crate::types::SPILL_ADJACENCY_AT`], which is what the pipeline does.
+///
+/// Returns a `UnitigGraph` whose `nodes`, `abundance`, `seq_2bit` and `seq_offset` are empty.
+/// That graph is enough for `extract::expand`, which needs `n_unitigs` and `edges` and nothing
+/// else; `collect` fills in the rest for the ids that survive.
+pub fn scan<S: RecordSink>(
+    accession: &Accession,
+    reader: Box<dyn Read + '_>,
+    budget_bytes: u64,
+    sink: &mut S,
+) -> Result<UnitigGraph> {
+    scan_in(accession, reader, budget_bytes, sink, None, crate::types::SPILL_ADJACENCY_AT)
+}
+
+/// As `scan`, with `spool_dir` naming where adjacency may spill once it holds more than
+/// `spill_at` bytes. `None` keeps it in RAM however large it gets, which is what `build` and
+/// most tests want. `spill_at` is a parameter rather than the constant so a test can prove
+/// the threshold is what decides, without a fixture large enough to cross the real one.
+pub fn scan_in<S: RecordSink>(
+    accession: &Accession,
+    reader: Box<dyn Read + '_>,
+    budget_bytes: u64,
+    sink: &mut S,
+    spool_dir: Option<&std::path::Path>,
+    spill_at: usize,
+) -> Result<UnitigGraph> {
     let bad = |detail: String| Error::Parse {
         accession: accession.clone(),
         detail,
@@ -76,16 +146,177 @@ pub fn build(accession: &Accession, reader: Box<dyn Read + '_>) -> Result<Unitig
 
     let mut rd = BufReader::with_capacity(1 << 18, reader);
     let mut line: Vec<u8> = Vec::with_capacity(512);
-
     let mut offsets: Vec<u32> = Vec::new();
     let mut targets: Vec<u32> = Vec::new();
-    let mut abundance: Vec<f32> = Vec::new();
-    let mut seq_2bit: Vec<u8> = Vec::new();
-    let mut seq_offset: Vec<u32> = Vec::new();
 
     let mut expected_id: u64 = 0;
-    let mut total_bases: u64 = 0;
     let mut in_record = false;
+    let mut iters: u64 = 0;
+    // The ceiling warning used to scan the stored abundances. Nothing stores them here, so the
+    // maximum is tracked as it streams past and the warning is unchanged.
+    let mut max_abundance = 0.0f32;
+    // Adjacency may end up on disk, so `offsets` cannot be indexed by `targets.len()`: the
+    // Vecs are flush buffers and get cleared. This is the only running count of edges.
+    let mut n_targets: u64 = 0;
+    let mut spool: Option<crate::types::AdjacencySpool> = None;
+    let mut spill_failed = false;
+
+    loop {
+        // Adjacency is the only thing growing, so the budget is measured over it alone. See
+        // `build` for why this exists at all.
+        iters += 1;
+        if iters % BUDGET_CHECK_EVERY == 0 && budget_bytes != u64::MAX {
+            let used = (offsets.capacity() + targets.capacity()) as u64 * size_of::<u32>() as u64;
+            if used > budget_bytes {
+                return Err(Error::TooLarge {
+                    accession: accession.clone(),
+                    detail: format!(
+                        "graph adjacency reached {used} bytes after {expected_id} unitigs, over \
+                         the {budget_bytes}-byte budget (--max-size-mb x \
+                         GRAPH_PEAK_PER_COMPRESSED_BYTE)"
+                    ),
+                    payload: Box::new(crate::types::Payload::default()),
+                });
+            }
+        }
+
+        line.clear();
+        let n = rd
+            .read_until(b'\n', &mut line)
+            .map_err(|e| bad(format!("read failed after {expected_id} records: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        if line[0] == b'>' {
+            if in_record {
+                sink.end();
+            }
+            // As in `build`: the offset is the edge count on entry to the record, counted
+            // globally because `targets` is a buffer that gets flushed and cleared.
+            let edges_before = u32::try_from(n_targets)
+                .map_err(|_| bad("edge count exceeds u32 addressing".into()))?;
+            let before = targets.len();
+            let h = header(&line, expected_id, Some(&mut targets), &bad)?;
+            n_targets += (targets.len() - before) as u64;
+            offsets.push(edges_before);
+
+            // Spill once adjacency outgrows the threshold, then keep the Vecs as small write
+            // buffers. A spill that cannot be created is a warning, not a failure: the
+            // accession simply stays in RAM, which is what it would have done before.
+            let held = (offsets.len() + targets.len()) * size_of::<u32>();
+            if spool.is_none() && !spill_failed && held > spill_at {
+                match spool_dir.map(crate::types::AdjacencySpool::create) {
+                    Some(Ok(s)) => spool = Some(s),
+                    Some(Err(e)) => {
+                        eprintln!(
+                            "[{accession}] warning: could not spill adjacency to disk ({e}); \
+                             keeping it in memory"
+                        );
+                        spill_failed = true;
+                    }
+                    None => spill_failed = true,
+                }
+            }
+            if let Some(s) = spool.as_mut() {
+                if held >= SPOOL_FLUSH_AT {
+                    s.push_offsets(&offsets).map_err(|e| bad(format!("spill offsets: {e}")))?;
+                    offsets.clear();
+                    s.push_targets(&targets).map_err(|e| bad(format!("spill targets: {e}")))?;
+                    targets.clear();
+                }
+            }
+            if h.abundance > max_abundance {
+                max_abundance = h.abundance;
+            }
+            sink.begin(h.id);
+            expected_id += 1;
+            in_record = true;
+        } else {
+            if !in_record {
+                return Err(bad("sequence data before the first header".into()));
+            }
+            for &b in &line {
+                sink.base(base_code(b, expected_id - 1).map_err(&bad)?);
+            }
+        }
+    }
+    if in_record {
+        sink.end();
+    }
+
+    if expected_id == 0 {
+        return Err(bad("no unitig records found".into()));
+    }
+    offsets.push(
+        u32::try_from(n_targets).map_err(|_| bad("edge count exceeds u32 addressing".into()))?,
+    );
+    warn_ka_ceiling(accession, max_abundance);
+
+    if let Some(s) = spool.as_mut() {
+        s.push_offsets(&offsets).map_err(|e| bad(format!("spill offsets: {e}")))?;
+        s.push_targets(&targets).map_err(|e| bad(format!("spill targets: {e}")))?;
+        offsets = Vec::new();
+        targets = Vec::new();
+    }
+
+    Ok(UnitigGraph {
+        accession: accession.clone(),
+        n_unitigs: expected_id as usize,
+        offsets,
+        targets,
+        nodes: Vec::new(),
+        abundance: Vec::new(),
+        seq_2bit: Vec::new(),
+        seq_offset: Vec::new(),
+        spool,
+    })
+}
+
+/// How much adjacency accumulates in the write buffers between flushes once spilled.
+const SPOOL_FLUSH_AT: usize = 1 << 20;
+
+/// Pass 2: fill in sequence and abundance for `wanted`, which must be sorted and unique.
+///
+/// Everything else in the file is parsed past without being stored, and the pass stops once
+/// the last wanted id has been read, so a neighbourhood near the start of a large accession
+/// costs a fraction of a decode.
+pub fn collect(
+    mut graph: UnitigGraph,
+    reader: Box<dyn Read + '_>,
+    wanted: &[UnitigId],
+    budget_bytes: u64,
+) -> Result<UnitigGraph> {
+    let accession = graph.accession.clone();
+    let bad = |detail: String| Error::Parse {
+        accession: accession.clone(),
+        detail,
+    };
+    debug_assert!(wanted.windows(2).all(|w| w[0] < w[1]), "wanted must be sorted and unique");
+
+    graph.nodes = wanted.to_vec();
+    graph.abundance = Vec::with_capacity(wanted.len());
+    graph.seq_offset = Vec::with_capacity(wanted.len() + 1);
+    graph.seq_2bit.clear();
+    if wanted.is_empty() {
+        graph.seq_offset.push(0);
+        return Ok(graph);
+    }
+    let last_wanted = *wanted.last().expect("non-empty");
+
+    let mut rd = BufReader::with_capacity(1 << 18, reader);
+    let mut line: Vec<u8> = Vec::with_capacity(512);
+    let mut expected_id: u64 = 0;
+    let mut total_bases: u64 = 0;
+    // Index into `wanted`, which advances monotonically because ids are dense and ascending.
+    let mut next = 0usize;
+    let mut keeping = false;
 
     loop {
         line.clear();
@@ -103,80 +334,406 @@ pub fn build(accession: &Accession, reader: Box<dyn Read + '_>) -> Result<Unitig
         }
 
         if line[0] == b'>' {
-            // ---- header: id, abundance, edges ----
-            let mut fields = line[1..].split(|b| b.is_ascii_whitespace()).filter(|f| !f.is_empty());
-            let name = fields
-                .next()
-                .ok_or_else(|| bad(format!("record {expected_id}: empty header")))?;
-            let id_bytes = match name.iter().rposition(|&b| b == b'_') {
-                Some(p) => &name[p + 1..],
-                None => name,
-            };
-            let id = parse_u32(id_bytes).ok_or_else(|| {
-                bad(format!(
-                    "record {expected_id}: cannot read a unitig id from {:?}",
-                    String::from_utf8_lossy(name)
-                ))
-            })?;
-            if id as u64 != expected_id {
-                return Err(bad(format!(
-                    "unitig ids are not dense and sequential: expected {expected_id}, found {id}. \
-                     CSR construction relies on record order; this file needs the fallback path."
-                )));
+            // Links were taken in pass 1 and the adjacency is already built, and a record
+            // this pass is skipping needs nothing out of its header but the id. `wanted` is
+            // ascending and ids are dense, so `wanted[next] == expected_id` decides it before
+            // anything has been parsed; `header_light` then re-establishes `id == expected_id`
+            // and the two agree by construction.
+            let want = next < wanted.len() && wanted[next] as u64 == expected_id;
+            let h = header_light(&line, expected_id, want, &bad)?;
+            expected_id += 1;
+            if want {
+                keeping = true;
+                next += 1;
+                graph.abundance.push(h.abundance);
+                graph.seq_offset.push(
+                    u32::try_from(total_bases)
+                        .map_err(|_| bad("retained sequence exceeds u32 addressing".into()))?,
+                );
+                // The same budget as pass 1, now over everything the graph holds. Pass 2 is
+                // where the neighbourhood's sequences land, and a neighbourhood can be most of
+                // the graph: on amplicon-like data `extract::expand` keeps 42% of the unitigs.
+                //
+                // Checked once per retained record rather than on a line counter. A 747-node
+                // neighbourhood is 747 records, so a counter with any useful period would
+                // never have fired and the budget would have been inert exactly where it is
+                // cheapest to enforce.
+                if budget_bytes != u64::MAX {
+                    let used = graph.resident_bytes();
+                    if used > budget_bytes {
+                        return Err(Error::TooLarge {
+                            accession: accession.clone(),
+                            detail: format!(
+                                "graph reached {used} bytes while collecting {next} of {} \
+                                 neighbourhood unitigs, over the {budget_bytes}-byte budget \
+                                 (--max-size-mb x GRAPH_PEAK_PER_COMPRESSED_BYTE)",
+                                wanted.len()
+                            ),
+                            payload: Box::new(crate::types::Payload::default()),
+                        });
+                    }
+                }
+            } else {
+                keeping = false;
+                if h.id > last_wanted {
+                    break; // everything wanted has been read
+                }
             }
-            if id > ID_MASK {
-                return Err(bad(format!(
-                    "unitig id {id} exceeds the {ID_BITS}-bit packing limit"
-                )));
+        } else if keeping {
+            for &b in &line {
+                let code = base_code(b, expected_id - 1).map_err(&bad)?;
+                if total_bases & 3 == 0 {
+                    graph.seq_2bit.push(0);
+                }
+                let at = graph.seq_2bit.len() - 1;
+                graph.seq_2bit[at] |= code << (2 * (total_bases & 3));
+                total_bases += 1;
             }
+        }
+    }
 
-            offsets.push(
-                u32::try_from(targets.len())
-                    .map_err(|_| bad("edge count exceeds u32 addressing".into()))?,
-            );
+    if next != wanted.len() {
+        return Err(bad(format!(
+            "pass 2 found {next} of {} requested unitigs; the two decodes disagree",
+            wanted.len()
+        )));
+    }
+    graph.seq_offset.push(
+        u32::try_from(total_bases)
+            .map_err(|_| bad("retained sequence exceeds u32 addressing".into()))?,
+    );
+    shrink_adjacency(&mut graph).map_err(|e| bad(format!("reading spooled adjacency: {e}")))?;
+    Ok(graph)
+}
+
+/// Rewrite the full graph's adjacency down to the neighbourhood's rows, and free the rest.
+///
+/// `extract::expand` is the last thing that needs an arbitrary unitig's neighbours. After it,
+/// `write_gfa`, `phase` and `variants` only ever ask about nodes in the neighbourhood, so
+/// holding a row per unitig is holding the one part of the graph that is still O(accession).
+/// For `ERR2028820` that is 1,277,363 offsets and 2,582,206 targets, 15.4 MB, against 747
+/// rows kept: with eight compute workers it is 15.4 MB each that no longer has to coexist.
+///
+/// Rows are kept whole, including edges that leave the neighbourhood, because `write_gfa`
+/// decides which links to drop and cannot do that from a truncated row.
+fn shrink_adjacency(graph: &mut UnitigGraph) -> std::io::Result<()> {
+    // A graph that kept every unitig and never spilled is already its own neighbourhood;
+    // rewriting it would copy 15 MB to produce the same thing.
+    if graph.spool.is_none() && graph.nodes.len() == graph.n_unitigs {
+        return Ok(());
+    }
+    let mut offsets: Vec<u32> = Vec::with_capacity(graph.nodes.len() + 1);
+    let mut targets: Vec<u32> = Vec::new();
+    let mut row: Vec<u32> = Vec::new();
+    let nodes = std::mem::take(&mut graph.nodes);
+    for &id in &nodes {
+        offsets.push(targets.len() as u32);
+        graph.edges_by_id_into(id, &mut row)?;
+        targets.extend_from_slice(&row);
+    }
+    offsets.push(targets.len() as u32);
+    graph.nodes = nodes;
+    // Assigning drops the old allocations here rather than at the end of the accession, and
+    // dropping the spool closes the two unlinked handles, which is what frees the disk.
+    graph.offsets = offsets;
+    graph.targets = targets;
+    graph.spool = None;
+    Ok(())
+}
+
+/// WV-03. `KA_CEILING` is empirical, read off three cached accessions, not something Logan
+/// publishes in a schema. If a file ever carries a higher value the constant is wrong and
+/// every saturation flag drawn from it is wrong with it, so say so loudly rather than
+/// silently under-flagging.
+fn warn_ka_ceiling(accession: &Accession, max_abundance: f32) {
+    if max_abundance > crate::types::KA_CEILING {
+        eprintln!(
+            "[{accession}] WARNING: ka:f {max_abundance} exceeds the assumed ceiling of {}. \
+             `types::KA_CEILING` is measured, not declared by Logan; update it, because the \
+             `depth_saturated` and `KaSat` flags are computed against it.",
+            crate::types::KA_CEILING
+        );
+    }
+}
+
+/// What one header line carries.
+struct Header {
+    id: u32,
+    abundance: f32,
+}
+
+/// `collect`'s header reader: the id always, the abundance only when asked, the links never.
+///
+/// `header` parses every field, because pass 1 needs every field. Pass 2 needs almost none of
+/// them: the adjacency is already built, so the links are parsed and dropped, and a record
+/// pass 2 is going to skip does not need its abundance either. On `ERR2028820` that is
+/// 1,277,362 abundances and 2,582,206 links parsed for nothing on the second decode. Measured
+/// over 20 cached copies of it at `-w 1`, dropping them took `collect` from 4.36 s to 2.97 s,
+/// and over a 48-accession cohort of 9.76 GB at `-w 8` from 94.9 s to 62.3 s, 34% either way,
+/// with pass 1 unchanged and every output byte identical.
+///
+/// **What pass 2 therefore stops validating**, and why that is safe: `header` rejects a
+/// malformed link and a non-finite, negative or unparseable `ka:f:`. Pass 1 ran those checks
+/// over the same bytes, from the same `Compressed` handle, which is either a `Vec` in memory
+/// or an open file descriptor; neither can change between the two decodes. A file that would
+/// fail them has already failed in `scan`, so `collect` can never be the pass that sees it
+/// first. The id rules are kept here, because those are what make a disagreement between the
+/// two decodes detectable at all.
+fn header_light(
+    line: &[u8],
+    expected_id: u64,
+    want_abundance: bool,
+    bad: &impl Fn(String) -> Error,
+) -> Result<Header> {
+    // Leading whitespace skipped first, so this splits the name exactly where `header`'s
+    // `split(is_ascii_whitespace).filter(non-empty)` would.
+    let rest = &line[1..];
+    let start = rest.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(rest.len());
+    let name_end = rest[start..]
+        .iter()
+        .position(|b| b.is_ascii_whitespace())
+        .map(|p| p + start)
+        .unwrap_or(rest.len());
+    let name = &rest[start..name_end];
+    let id_bytes = match name.iter().rposition(|&b| b == b'_') {
+        Some(p) => &name[p + 1..],
+        None => name,
+    };
+    let id = parse_u32(id_bytes).ok_or_else(|| {
+        bad(format!(
+            "record {expected_id}: cannot read a unitig id from {:?}",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
+    if id as u64 != expected_id {
+        return Err(bad(format!(
+            "unitig ids are not dense and sequential: expected {expected_id}, found {id}. \
+             CSR construction relies on record order; this file needs the fallback path."
+        )));
+    }
+    if !want_abundance {
+        return Ok(Header { id, abundance: 0.0 });
+    }
+    // Same default as `header`: a record with no `ka:f:` field has abundance 0.
+    let mut abundance = 0.0f32;
+    for f in rest[name_end..].split(|b| b.is_ascii_whitespace()).filter(|f| !f.is_empty()) {
+        if f.starts_with(b"ka:f:") {
+            abundance = std::str::from_utf8(&f[5..])
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(|| {
+                    bad(format!(
+                        "record {id}: bad abundance {:?}",
+                        String::from_utf8_lossy(f)
+                    ))
+                })?;
+            break;
+        }
+    }
+    Ok(Header { id, abundance })
+}
+
+/// Parse one `>` line, pushing its links into `targets` when given one.
+///
+/// Shared by `scan` and `build`, so the id rules, the abundance validation and the link
+/// packing have one definition. Two decodes of the same file that disagreed about any of them
+/// would be a silent corruption rather than an error. `collect` uses `header_light`, which
+/// shares the id rules and skips the fields pass 2 has no use for.
+fn header(
+    line: &[u8],
+    expected_id: u64,
+    targets: Option<&mut Vec<u32>>,
+    bad: &impl Fn(String) -> Error,
+) -> Result<Header> {
+    let mut fields = line[1..].split(|b| b.is_ascii_whitespace()).filter(|f| !f.is_empty());
+    let name = fields
+        .next()
+        .ok_or_else(|| bad(format!("record {expected_id}: empty header")))?;
+    let id_bytes = match name.iter().rposition(|&b| b == b'_') {
+        Some(p) => &name[p + 1..],
+        None => name,
+    };
+    let id = parse_u32(id_bytes).ok_or_else(|| {
+        bad(format!(
+            "record {expected_id}: cannot read a unitig id from {:?}",
+            String::from_utf8_lossy(name)
+        ))
+    })?;
+    if id as u64 != expected_id {
+        return Err(bad(format!(
+            "unitig ids are not dense and sequential: expected {expected_id}, found {id}. \
+             CSR construction relies on record order; this file needs the fallback path."
+        )));
+    }
+    if id > ID_MASK {
+        return Err(bad(format!(
+            "unitig id {id} exceeds the {ID_BITS}-bit packing limit"
+        )));
+    }
+
+    let mut abundance = 0.0f32;
+    let mut sink = targets;
+    for f in fields {
+        if f.starts_with(b"ka:f:") {
+            // WV-15: `parse::<f32>()` accepts `inf` and `nan`, and both then flow into every
+            // VAF, the prune floor and `summary.json`, where they are written as bare tokens
+            // no JSON parser accepts. A negative abundance is equally meaningless.
+            abundance = std::str::from_utf8(&f[5..])
+                .ok()
+                .and_then(|s| s.parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(|| {
+                    bad(format!(
+                        "record {id}: bad abundance {:?}",
+                        String::from_utf8_lossy(f)
+                    ))
+                })?;
+        } else if f.starts_with(b"L:") {
+            let mut parts = f[2..].split(|&b| b == b':');
+            let s1 = parts.next().unwrap_or(b"");
+            let tgt = parts.next().unwrap_or(b"");
+            let s2 = parts.next().unwrap_or(b"");
+            let (Some(src_fwd), Some(tid), Some(dst_fwd)) = (strand(s1), parse_u32(tgt), strand(s2))
+            else {
+                return Err(bad(format!(
+                    "record {id}: malformed link {:?}",
+                    String::from_utf8_lossy(f)
+                )));
+            };
+            if tid > ID_MASK {
+                return Err(bad(format!("record {id}: link target {tid} too large")));
+            }
+            if let Some(t) = sink.as_deref_mut() {
+                t.push(pack_edge(tid, src_fwd, dst_fwd));
+            }
+        }
+    }
+    Ok(Header { id, abundance })
+}
+
+/// Heap held by the five CSR arrays, including the slack doubling leaves behind.
+///
+/// Capacity, not length: the slack is resident and is most of what the measured
+/// `GRAPH_PEAK_PER_COMPRESSED_BYTE` of 1.7 is made of.
+fn csr_bytes(
+    offsets: &Vec<u32>,
+    targets: &Vec<u32>,
+    abundance: &Vec<f32>,
+    seq_2bit: &Vec<u8>,
+    seq_offset: &Vec<u32>,
+) -> u64 {
+    let w = size_of::<u32>() as u64;
+    offsets.capacity() as u64 * w
+        + targets.capacity() as u64 * w
+        + abundance.capacity() as u64 * size_of::<f32>() as u64
+        + seq_2bit.capacity() as u64
+        + seq_offset.capacity() as u64 * w
+}
+
+/// Consume the decoder and build the complete `UnitigGraph`.
+///
+/// # Structural assumptions, all enforced
+///
+/// Verified against real Logan output (`ERR2028820`, 1,277,362 records): ids run strictly
+/// 0, 1, 2, ... with no gaps, and every sequence is on a single line. Strict ordering is
+/// what makes CSR construction trivial here: a record's `L:` tokens are all the edges
+/// incident to that unitig, so appending them in record order already produces the CSR
+/// layout, with no edge sort and no temporary edge list.
+///
+/// These are assumptions about someone else's output format, so each is checked and
+/// produces a clear error rather than a silently wrong graph. Multi-line sequences are
+/// handled regardless, since that costs nothing.
+/// How often the CSR arrays are measured against the budget, in loop iterations.
+///
+/// Every line, header or sequence, is one iteration, so this catches both an accession with
+/// very many records and one with very few enormous ones. The arrays grow by doubling, so the
+/// footprint can at most double between two checks; the refusal therefore happens within one
+/// doubling of the budget rather than exactly at it, which is why the printed bound says
+/// "up to".
+///
+/// 4096 and not something larger: the cadence has to be short enough that the check actually
+/// runs. At 65,536 a graph of fewer than about 32,000 records was never measured at all, so
+/// the budget silently did not apply to it. The cost is six `capacity()` reads per 4096 lines.
+const BUDGET_CHECK_EVERY: u64 = 1 << 12;
+
+pub fn build(
+    accession: &Accession,
+    reader: Box<dyn Read + '_>,
+    budget_bytes: u64,
+) -> Result<UnitigGraph> {
+    let bad = |detail: String| Error::Parse {
+        accession: accession.clone(),
+        detail,
+    };
+
+    let mut rd = BufReader::with_capacity(1 << 18, reader);
+    let mut line: Vec<u8> = Vec::with_capacity(512);
+
+    let mut offsets: Vec<u32> = Vec::new();
+    let mut targets: Vec<u32> = Vec::new();
+    let mut abundance: Vec<f32> = Vec::new();
+    let mut seq_2bit: Vec<u8> = Vec::new();
+    let mut seq_offset: Vec<u32> = Vec::new();
+
+    let mut expected_id: u64 = 0;
+    let mut total_bases: u64 = 0;
+    let mut in_record = false;
+    let mut iters: u64 = 0;
+
+    loop {
+        // Enforce the memory the run told the user it would use. `GRAPH_PEAK_PER_COMPRESSED_BYTE`
+        // is a calibration from real accessions, not a property of the format: a dense enough
+        // file can build a graph many times its compressed size, and before this check the only
+        // thing standing between such a file and the OOM killer was that nobody had uploaded
+        // one. Refusing it is `too_large`, the same answer the size cap gives, because it is
+        // the same judgement: this accession does not fit the budget the user set.
+        iters += 1;
+        if iters % BUDGET_CHECK_EVERY == 0 && budget_bytes != u64::MAX {
+            let used = csr_bytes(&offsets, &targets, &abundance, &seq_2bit, &seq_offset);
+            if used > budget_bytes {
+                return Err(Error::TooLarge {
+                    accession: accession.clone(),
+                    detail: format!(
+                        "parsed graph reached {used} bytes after {expected_id} unitigs, over \
+                         the {budget_bytes}-byte budget (--max-size-mb x \
+                         GRAPH_PEAK_PER_COMPRESSED_BYTE)"
+                    ),
+                    // Filled in by the caller, which is the only place that knows where the
+                    // bytes came from.
+                    payload: Box::new(crate::types::Payload::default()),
+                });
+            }
+        }
+        line.clear();
+        let n = rd
+            .read_until(b'\n', &mut line)
+            .map_err(|e| bad(format!("read failed after {expected_id} records: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        if line[0] == b'>' {
+            // ---- header: id, abundance, edges ----
+            // Shared with `scan` and `collect`, so three decodes of the same file cannot
+            // disagree about ids, abundance or link packing.
+            // Taken before the header's links are appended: `offsets[i]` is where record
+            // `i`'s edges start, so it is the count as it stands on entry.
+            let edges_before = u32::try_from(targets.len())
+                .map_err(|_| bad("edge count exceeds u32 addressing".into()))?;
+            let h = header(&line, expected_id, Some(&mut targets), &bad)?;
+            offsets.push(edges_before);
             seq_offset.push(
                 u32::try_from(total_bases)
                     .map_err(|_| bad("total sequence exceeds u32 addressing".into()))?,
             );
-
-            let mut ab = 0.0f32;
-            for f in fields {
-                if f.starts_with(b"ka:f:") {
-                    // WV-15: `parse::<f32>()` accepts `inf` and `nan`, and both then flow
-                    // into every VAF, the prune floor and `summary.json`, where they are
-                    // written as bare tokens no JSON parser accepts. A negative abundance is
-                    // equally meaningless. Reject at the door.
-                    ab = std::str::from_utf8(&f[5..])
-                        .ok()
-                        .and_then(|s| s.parse::<f32>().ok())
-                        .filter(|v| v.is_finite() && *v >= 0.0)
-                        .ok_or_else(|| {
-                            bad(format!(
-                                "record {id}: bad abundance {:?}",
-                                String::from_utf8_lossy(f)
-                            ))
-                        })?;
-                } else if f.starts_with(b"L:") {
-                    // L:<src strand>:<target id>:<dst strand>
-                    let mut parts = f[2..].split(|&b| b == b':');
-                    let s1 = parts.next().unwrap_or(b"");
-                    let tgt = parts.next().unwrap_or(b"");
-                    let s2 = parts.next().unwrap_or(b"");
-                    let (Some(src_fwd), Some(tid), Some(dst_fwd)) =
-                        (strand(s1), parse_u32(tgt), strand(s2))
-                    else {
-                        return Err(bad(format!(
-                            "record {id}: malformed link {:?}",
-                            String::from_utf8_lossy(f)
-                        )));
-                    };
-                    if tid > ID_MASK {
-                        return Err(bad(format!("record {id}: link target {tid} too large")));
-                    }
-                    targets.push(pack_edge(tid, src_fwd, dst_fwd));
-                }
-            }
-            abundance.push(ab);
+            abundance.push(h.abundance);
             expected_id += 1;
             in_record = true;
         } else {
@@ -185,19 +742,7 @@ pub fn build(accession: &Accession, reader: Box<dyn Read + '_>) -> Result<Unitig
                 return Err(bad("sequence data before the first header".into()));
             }
             for &b in &line {
-                let code = match b {
-                    b'A' => 0u8,
-                    b'C' => 1,
-                    b'G' => 2,
-                    b'T' => 3,
-                    _ => {
-                        return Err(bad(format!(
-                            "record {}: non-ACGT base {:?}; 2-bit packing would corrupt it",
-                            expected_id - 1,
-                            b as char
-                        )))
-                    }
-                };
+                let code = base_code(b, expected_id - 1).map_err(&bad)?;
                 if total_bases & 3 == 0 {
                     seq_2bit.push(0);
                 }
@@ -219,27 +764,24 @@ pub fn build(accession: &Accession, reader: Box<dyn Read + '_>) -> Result<Unitig
         u32::try_from(total_bases).map_err(|_| bad("total sequence exceeds u32 addressing".into()))?,
     );
 
-    // WV-03. `KA_CEILING` is empirical, read off three cached accessions, not something Logan
-    // publishes in a schema. If a file ever carries a higher value the constant is wrong and
-    // every saturation flag drawn from it is wrong with it, so say so loudly rather than
-    // silently under-flagging.
-    if let Some(&over) = abundance.iter().find(|&&a| a > crate::types::KA_CEILING) {
-        eprintln!(
-            "[{accession}] WARNING: ka:f {over} exceeds the assumed ceiling of {}. \
-             `types::KA_CEILING` is measured, not declared by Logan; update it, because the \
-             `depth_saturated` and `KaSat` flags are computed against it.",
-            crate::types::KA_CEILING
-        );
-    }
+    warn_ka_ceiling(
+        accession,
+        abundance.iter().copied().fold(0.0f32, f32::max),
+    );
 
     Ok(UnitigGraph {
         accession: accession.clone(),
         n_unitigs,
         offsets,
         targets,
+        // `build` keeps everything, so the retained set is the whole graph and `slot` is the
+        // identity. The production path is `scan` + `collect`, which keeps the neighbourhood.
+        nodes: (0..n_unitigs as UnitigId).collect(),
         abundance,
         seq_2bit,
         seq_offset,
+        // `build` never spills: it is the test and fixture path, and it keeps everything.
+        spool: None,
     })
 }
 
@@ -272,7 +814,484 @@ mod tests {
     use super::*;
 
     fn build_str(s: &str) -> Result<UnitigGraph> {
-        build(&"TEST".to_string(), Box::new(std::io::Cursor::new(s.as_bytes().to_vec())))
+        build_str_budget(s, u64::MAX)
+    }
+
+    fn build_str_budget(s: &str, budget: u64) -> Result<UnitigGraph> {
+        build(&"TEST".to_string(), Box::new(std::io::Cursor::new(s.as_bytes().to_vec())), budget)
+    }
+
+    /// A graph wide enough to need more than the budget is refused, and refused as
+    /// `too_large` rather than as a parse failure.
+    ///
+    /// `GRAPH_PEAK_PER_COMPRESSED_BYTE` is a calibration from seven real accessions, not a
+    /// property of the format. Nothing enforced it, so a file dense enough to build a graph
+    /// many times its compressed size would have been parsed until the allocator or the OOM
+    /// killer stopped it, whatever the startup line had promised.
+    #[test]
+    fn a_graph_over_the_budget_is_too_large_not_a_parse_error() {
+        // Enough records that the budget check (every 1 << 16 iterations, two per record)
+        // runs several times.
+        let mut fa = String::new();
+        for i in 0..200_000u32 {
+            fa.push_str(&format!(">T_{i} ka:f:5.0\nACGTACGTAC\n"));
+        }
+        match build_str_budget(&fa, 1 << 16) {
+            Err(Error::TooLarge { detail, .. }) => {
+                assert!(detail.contains("over the"), "{detail}");
+                assert!(detail.contains("budget"), "{detail}");
+            }
+            Err(e) => panic!("wrong error kind, this must be a negative not a failure: {e}"),
+            Ok(g) => panic!("parsed {} unitigs with a 64 KiB budget", g.n_unitigs),
+        }
+        // The same input is fine when nothing is budgeted, so the refusal is the budget and
+        // not the data.
+        assert_eq!(build_str_budget(&fa, u64::MAX).expect("unbudgeted").n_unitigs, 200_000);
+    }
+
+    /// A graph with everything the format can throw at the parser: links on both strands,
+    /// sequence wrapped over several lines, a unitig shorter than any k, varied abundance,
+    /// and a record with no links at all.
+    const MIXED: &str = ">T_0 ka:f:5.5 L:+:1:+ L:-:2:-\n\
+                         ACGTACGTAC\n\
+                         GTTTACGGCA\n\
+                         >T_1 ka:f:17.25 L:-:0:+\n\
+                         TTTT\n\
+                         >T_2 ka:f:0\n\
+                         GGGGCCCCAAAATTTTGGGGCCCC\n\
+                         >T_3 ka:f:3.5 L:+:0:- L:+:1:- L:-:2:+\n\
+                         ACGT\n";
+
+    fn cursor(s: &str) -> Box<dyn Read> {
+        Box::new(std::io::Cursor::new(s.as_bytes().to_vec()))
+    }
+
+    /// Two decodes must produce exactly what one did.
+    ///
+    /// `build` and `scan` + `collect` are separate walks over the same bytes. A disagreement
+    /// between them about ids, links, abundance or packing would be a silent corruption, not
+    /// an error, and the production path uses the second while almost every test fixture uses
+    /// the first. Collecting the whole id range makes them directly comparable.
+    #[test]
+    fn scan_then_collect_everything_equals_build() {
+        let one = build_str(MIXED).expect("build");
+        let skeleton = scan(&"T".to_string(), cursor(MIXED), u64::MAX, &mut ()).expect("scan");
+        // Pass 1 holds adjacency and nothing else. That is the saving.
+        assert!(skeleton.nodes.is_empty(), "pass 1 must not retain per-unitig data");
+        assert!(skeleton.seq_2bit.is_empty());
+        assert!(skeleton.abundance.is_empty());
+        assert_eq!(skeleton.n_unitigs, one.n_unitigs);
+
+        let all: Vec<UnitigId> = (0..one.n_unitigs as UnitigId).collect();
+        let two = collect(skeleton, cursor(MIXED), &all, u64::MAX).expect("collect");
+        assert_eq!(one.n_unitigs, two.n_unitigs, "n_unitigs");
+        assert_eq!(one.offsets, two.offsets, "offsets");
+        assert_eq!(one.targets, two.targets, "targets");
+        assert_eq!(one.nodes, two.nodes, "nodes");
+        assert_eq!(one.abundance, two.abundance, "abundance");
+        assert_eq!(one.seq_offset, two.seq_offset, "seq_offset");
+        assert_eq!(one.seq_2bit, two.seq_2bit, "seq_2bit");
+    }
+
+    /// Collecting a subset yields exactly the sequences and abundances `build` has for those
+    /// ids, and nothing for the rest. This is what every downstream stage reads.
+    #[test]
+    fn collecting_a_subset_matches_the_full_graph_for_those_ids() {
+        let one = build_str(MIXED).expect("build");
+        let wanted: Vec<UnitigId> = vec![1, 3];
+        let skeleton = scan(&"T".to_string(), cursor(MIXED), u64::MAX, &mut ()).expect("scan");
+        let sub = collect(skeleton, cursor(MIXED), &wanted, u64::MAX).expect("collect");
+
+        assert_eq!(sub.n_unitigs, one.n_unitigs, "the graph is still that big");
+        // Adjacency has been narrowed to the neighbourhood's rows, which is the saving, but
+        // each row is whole: `write_gfa` decides which links leave the neighbourhood and
+        // cannot do that from a truncated row.
+        assert!(sub.targets.len() < one.targets.len(), "adjacency must have been narrowed");
+        assert_eq!(sub.offsets.len(), wanted.len() + 1);
+        for &id in &wanted {
+            assert_eq!(sub.edges(id), one.edges(id), "unitig {id} edges");
+        }
+
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for &id in &wanted {
+            one.decode_seq(id, &mut a);
+            sub.decode_seq(id, &mut b);
+            assert_eq!(a, b, "unitig {id} sequence");
+            assert_eq!(one.seq_len(id), sub.seq_len(id), "unitig {id} length");
+            assert_eq!(one.abundance_of(id), sub.abundance_of(id), "unitig {id} abundance");
+        }
+        for id in [0u32, 2] {
+            assert!(!sub.has(id), "unitig {id} was not asked for and must not be retained");
+        }
+        assert!(sub.seq_2bit.len() < one.seq_2bit.len(), "the subset must be smaller");
+    }
+
+    /// The two decodes must agree about what is in the file.
+    ///
+    /// `collect` walks the same bytes `scan` did and takes it on trust that the ids it is
+    /// asked for are there. If they are not, the graph comes back with fewer sequences than
+    /// nodes and every downstream index is off by an unknown amount, which is a silent
+    /// corruption rather than an error. The check that catches it is the only thing standing
+    /// between a disagreeing pair of decodes and a wrong haplotype.
+    #[test]
+    fn collect_refuses_when_the_two_decodes_disagree() {
+        let skeleton = scan(&"T".to_string(), cursor(MIXED), u64::MAX, &mut ()).expect("scan");
+        // Id 9 is not in this file at all, which is what a disagreement looks like from here.
+        let msg = match collect(skeleton, cursor(MIXED), &[1, 9], u64::MAX) {
+            Err(e) => e.to_string(),
+            Ok(g) => panic!("accepted a graph with {} of 2 nodes", g.nodes.len()),
+        };
+        assert!(msg.contains("found 1 of 2"), "{msg}");
+        assert!(msg.contains("decodes disagree"), "{msg}");
+    }
+
+    /// The reader pass 2 uses must parse exactly what the shared one does.
+    ///
+    /// `header_light` exists only to skip work. The moment it disagrees with `header` about an
+    /// id or an abundance, the two decodes are reading different graphs out of the same bytes,
+    /// and nothing downstream could tell. These are the shapes where two implementations of
+    /// the same rules drift apart: the name split, a name with no `_` and one with two,
+    /// whitespace after `>`, `ka:f:` before and after the links, and no `ka:f:` at all.
+    #[test]
+    fn header_light_agrees_with_header_on_every_shape() {
+        let bad = |detail: String| Error::Parse {
+            accession: "T".to_string(),
+            detail,
+        };
+        let lines: &[&str] = &[
+            ">T_7 ka:f:5.5 L:+:1:+ L:-:2:-",
+            ">7 ka:f:0.25",
+            ">  T_7  ka:f:12  L:+:3:+",
+            ">T_7 L:+:1:+ ka:f:9.75 L:-:2:-",
+            ">T_7 L:+:1:+",
+            ">SRR000_sub_7 ka:f:1e2",
+        ];
+        for line in lines {
+            let full = header(line.as_bytes(), 7, None, &bad).expect(line);
+            let light = header_light(line.as_bytes(), 7, true, &bad).expect(line);
+            assert_eq!(full.id, light.id, "id for {line}");
+            assert_eq!(full.abundance, light.abundance, "abundance for {line}");
+            // Not asking for the abundance must not change which record this is.
+            let id_only = header_light(line.as_bytes(), 7, false, &bad).expect(line);
+            assert_eq!(full.id, id_only.id, "id without the abundance for {line}");
+        }
+
+        // They must also refuse the same lines. Pass 1 would have rejected any of these
+        // first, so without this the fast reader's own validation is a guard no test can
+        // fail, and a guard like that may as well not be there.
+        for line in [
+            ">T_7 ka:f:nan",
+            ">T_7 ka:f:-1",
+            ">T_7 ka:f:x",
+            ">notanid ka:f:1",
+            // A header with no name at all: `header` calls that an empty header and
+            // `header_light` cannot read an id out of it, so they refuse it for different
+            // stated reasons. What matters is that neither invents a record 0.
+            ">",
+            ">   ",
+        ] {
+            assert!(header(line.as_bytes(), 7, None, &bad).is_err(), "header took {line}");
+            assert!(
+                header_light(line.as_bytes(), 7, true, &bad).is_err(),
+                "header_light took {line}"
+            );
+        }
+    }
+
+    /// Pass 2 kept the id rules, and they have to fire on a record it is skipping.
+    ///
+    /// Everything else `header_light` checks was dropped on purpose; this is what is left, and
+    /// it is what makes a second decode that disagrees with the first an error rather than a
+    /// wrong answer. Without it the collection below returns the two nodes it was asked for
+    /// and never mentions that the record between them was not the one `scan` saw.
+    #[test]
+    fn pass_2_refuses_a_file_whose_ids_moved_under_it() {
+        let skeleton = scan(&"T".to_string(), cursor(MIXED), u64::MAX, &mut ()).expect("scan");
+        // The same four records with the third renumbered: what a decode of changed bytes
+        // looks like from here. It is a record `collect` skips, so only `header_light`'s own
+        // check can catch it.
+        let moved = MIXED.replace(">T_2 ", ">T_9 ");
+        assert_ne!(moved, MIXED, "the fixture must actually have been renumbered");
+        let msg = match collect(skeleton, cursor(&moved), &[1, 3], u64::MAX) {
+            Err(e) => e.to_string(),
+            Ok(g) => panic!("accepted {} nodes from a renumbered file", g.nodes.len()),
+        };
+        assert!(msg.contains("not dense and sequential"), "{msg}");
+    }
+
+    /// What pass 2 stopped checking, pass 1 still checks.
+    ///
+    /// `header_light` does not look at a skipped record's `ka:f:`, nor at anybody's links. The
+    /// safety argument for that is entirely that `scan` ran first over the same bytes, so this
+    /// test holds up both halves of it: pass 1 refuses each file, and pass 2 walks past the
+    /// same record without noticing. If the first half ever stops being true, the second half
+    /// is a hole.
+    #[test]
+    fn the_fields_pass_2_skips_are_still_validated_by_pass_1() {
+        for (what, bad_record) in [
+            ("abundance", ">T_1 ka:f:nan"),
+            ("link", ">T_1 ka:f:1.0 L:?:0:+"),
+        ] {
+            let good = ">T_0 ka:f:1.0\nACGT\n>T_1 ka:f:1.0\nACGT\n".to_string();
+            let bad_fa = format!(">T_0 ka:f:1.0\nACGT\n{bad_record}\nACGT\n");
+            let msg = match scan(&"T".to_string(), cursor(&bad_fa), u64::MAX, &mut ()) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("pass 1 must refuse a bad {what}"),
+            };
+            assert!(msg.contains("bad abundance") || msg.contains("malformed link"), "{msg}");
+
+            // Pass 2 reaches that record only after pass 1 has passed the file, so it is
+            // entitled to skip it. The skeleton comes from the file's valid twin, which is the
+            // only way to get one at all.
+            let skeleton = scan(&"T".to_string(), cursor(&good), u64::MAX, &mut ()).expect("scan");
+            let g = collect(skeleton, cursor(&bad_fa), &[0], u64::MAX)
+                .unwrap_or_else(|e| panic!("pass 2 must not re-read the {what}: {e}"));
+            assert_eq!(g.nodes, vec![0], "only the wanted record is collected");
+            assert_eq!(g.abundance_of(0), 1.0, "the kept record's abundance");
+        }
+    }
+
+    /// Pass 2 is bounded too.
+    ///
+    /// The neighbourhood is where the sequences land, and it can be most of the graph: on
+    /// amplicon-like data `extract::expand` keeps 42% of the unitigs. A budget that bounded
+    /// only pass 1's adjacency would hold the printed bound right up until the point the
+    /// memory was actually spent.
+    #[test]
+    fn collect_refuses_a_neighbourhood_over_the_budget() {
+        let mut fa = String::new();
+        for i in 0..4000u32 {
+            fa.push_str(&format!(">T_{i} ka:f:5.0\nACGTACGTACGTACGTACGTACGTACGTACGT\n"));
+        }
+        let all: Vec<UnitigId> = (0..4000).collect();
+        let skeleton = scan(&"T".to_string(), cursor(&fa), u64::MAX, &mut ()).expect("scan");
+        match collect(skeleton, cursor(&fa), &all, 1 << 14) {
+            Err(Error::TooLarge { detail, .. }) => {
+                assert!(detail.contains("neighbourhood unitigs"), "{detail}");
+                assert!(detail.contains("budget"), "{detail}");
+            }
+            Err(e) => panic!("must be the too_large negative, not {e}"),
+            Ok(g) => panic!("collected {} nodes inside a 16 KiB budget", g.nodes.len()),
+        }
+        // The same collection is fine with room, so the refusal is the budget not the data.
+        let skeleton = scan(&"T".to_string(), cursor(&fa), u64::MAX, &mut ()).expect("scan");
+        assert_eq!(
+            collect(skeleton, cursor(&fa), &all, u64::MAX).expect("unbudgeted").nodes.len(),
+            4000
+        );
+    }
+
+    /// The budget check has to run often enough to fire on the graphs it exists for.
+    ///
+    /// This is the defect `BUDGET_CHECK_EVERY = 1 << 16` had: every line is one iteration, so
+    /// a graph of fewer than about 32,000 records was never measured once and the budget did
+    /// not apply to it at all. 10,000 link-dense records are about 200 KB of adjacency, which
+    /// a 64 KiB budget must refuse; at the old period the check would not have run.
+    #[test]
+    fn the_budget_fires_on_a_graph_too_small_for_a_long_period() {
+        let mut fa = String::new();
+        for i in 0..10_000u32 {
+            fa.push_str(&format!(">T_{i} ka:f:5.0 L:+:1:+ L:+:2:+ L:-:3:- L:+:4:-\nACGTACGT\n"));
+        }
+        match scan(&"T".to_string(), cursor(&fa), 1 << 16, &mut ()) {
+            Err(Error::TooLarge { detail, .. }) => assert!(detail.contains("budget"), "{detail}"),
+            Err(e) => panic!("must be the too_large negative, not {e}"),
+            Ok(g) => panic!(
+                "scanned {} unitigs ({} bytes of adjacency) inside a 64 KiB budget",
+                g.n_unitigs,
+                g.resident_bytes()
+            ),
+        }
+        // Unbudgeted, the same file parses, so the refusal is the period and not the data.
+        assert_eq!(
+            scan(&"T".to_string(), cursor(&fa), u64::MAX, &mut ()).expect("unbudgeted").n_unitigs,
+            10_000
+        );
+    }
+
+    /// Spilling adjacency to disk must change nothing but where the bytes are.
+    ///
+    /// The spool is read back with `pread` into caller buffers rather than sliced out of a
+    /// Vec, so an off-by-one in the row bounds or a mix-up between the two files would give
+    /// plausible-looking edges for the wrong unitig. Comparing against the in-memory path over
+    /// the same input is what rules that out.
+    #[test]
+    fn a_spooled_graph_has_the_same_adjacency_as_an_in_memory_one() {
+        // Rows must DIFFER from each other, in both their targets and their length. With
+        // every record carrying the same two links, reading the wrong row, or reading targets
+        // from byte 0, returns identical bytes and the comparison below proves nothing: two
+        // mutants of the row addressing survived this test before the fixture was varied.
+        let mut fa = String::new();
+        for i in 0..40_000u32 {
+            fa.push_str(&format!(">T_{i} ka:f:5.0"));
+            for j in 0..(i % 4) + 1 {
+                fa.push_str(&format!(" L:+:{}:-", (i * 7 + j * 13) % 40_000));
+            }
+            fa.push_str("\nACGTACGTACGT\n");
+        }
+        let dir = std::env::temp_dir().join(format!("logan-spool-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let plain = scan(&"T".to_string(), cursor(&fa), u64::MAX, &mut ()).expect("in memory");
+        let spooled = scan_in(&"T".to_string(), cursor(&fa), u64::MAX, &mut (), Some(&dir), 1 << 12)
+            .expect("spooled");
+        assert!(plain.spool.is_none(), "no spool dir was given");
+        assert!(spooled.spool.is_some(), "200,000 records must outgrow the spill threshold");
+        assert_eq!(plain.n_unitigs, spooled.n_unitigs);
+        // The spooled graph holds its adjacency on disk, so it costs almost nothing resident.
+        assert!(
+            spooled.resident_bytes() * 4 < plain.resident_bytes(),
+            "spooled {} bytes against {} in memory",
+            spooled.resident_bytes(),
+            plain.resident_bytes()
+        );
+
+        // Every row must agree, including the empty ones and the last.
+        // Every row, not a sample: an addressing bug that only bites some rows is still a
+        // wrong haplotype for those accessions.
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut lengths = std::collections::BTreeSet::new();
+        for id in 0..40_000u32 {
+            plain.edges_by_id_into(id, &mut a).expect("memory row");
+            spooled.edges_by_id_into(id, &mut b).expect("spooled row");
+            assert_eq!(a, b, "unitig {id} edges differ between memory and spool");
+            assert!(!a.is_empty(), "fixture should give unitig {id} edges");
+            lengths.insert(a.len());
+        }
+        // Collecting a neighbourhood must read the rows back off disk and then release the
+        // handles. Asserting this on a graph that never spilled, which is what an earlier
+        // version of this did, proves nothing: `spool` is already `None` there.
+        let wanted: Vec<UnitigId> = (0..40_000u32).step_by(997).collect();
+        let spooled2 = scan_in(&"T".to_string(), cursor(&fa), u64::MAX, &mut (), Some(&dir), 1 << 12)
+            .expect("spooled");
+        assert!(spooled2.spool.is_some(), "must have spilled before collect");
+        let collected = collect(spooled2, cursor(&fa), &wanted, u64::MAX).expect("collect");
+        assert!(
+            collected.spool.is_none(),
+            "collect must release the spool handles, or every accession leaks two fds"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        // And the rows it kept are the ones the in-memory graph has.
+        for &id in &wanted {
+            plain.edges_by_id_into(id, &mut a).expect("memory row");
+            assert_eq!(collected.edges(id), a.as_slice(), "unitig {id} after collect");
+        }
+
+        // The fixture is only a test of row addressing if the rows actually vary.
+        assert!(lengths.len() >= 4, "rows must differ in length, saw {lengths:?}");
+        assert_ne!(
+            {
+                plain.edges_by_id_into(0, &mut a).unwrap();
+                a.clone()
+            },
+            {
+                plain.edges_by_id_into(1, &mut b).unwrap();
+                b.clone()
+            },
+            "neighbouring rows must differ, or reading the wrong one is undetectable"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The spool files are unlinked at creation, so a run leaves nothing to clean up.
+    #[test]
+    fn spilling_leaves_no_files_behind() {
+        let mut fa = String::new();
+        for i in 0..200_000u32 {
+            fa.push_str(&format!(">T_{i} ka:f:5.0 L:+:1:+\nACGT\n"));
+        }
+        let dir = std::env::temp_dir().join(format!("logan-spool-unlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let g = scan_in(&"T".to_string(), cursor(&fa), u64::MAX, &mut (), Some(&dir), 1 << 12)
+                .expect("spooled");
+            assert!(g.spool.is_some());
+            // Already gone from the directory while still readable through the handle.
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "spool must be unlinked");
+            let mut row = Vec::new();
+            g.edges_by_id_into(5, &mut row).expect("still readable");
+            assert_eq!(row.len(), 1);
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A spool directory that cannot be written is a warning, not a failed accession.
+    ///
+    /// Spilling is an optimisation. Turning an unwritable temp directory into a hard failure
+    /// would make the walker refuse work it used to do, which is a worse outcome than using
+    /// the memory it used to use.
+    #[test]
+    fn an_unusable_spool_directory_falls_back_to_memory() {
+        let mut fa = String::new();
+        for i in 0..200_000u32 {
+            fa.push_str(&format!(">T_{i} ka:f:5.0 L:+:1:+\nACGT\n"));
+        }
+        // A path whose parent is a file, so `create_dir_all` cannot make it.
+        let file = std::env::temp_dir().join(format!("logan-spool-blocked-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let blocked = file.join("nope");
+        let g = scan_in(&"T".to_string(), cursor(&fa), u64::MAX, &mut (), Some(&blocked), 1 << 12)
+            .expect("must still parse");
+        assert!(g.spool.is_none(), "it must have fallen back to memory");
+        assert_eq!(g.n_unitigs, 200_000);
+        let mut row = Vec::new();
+        g.edges_by_id_into(5, &mut row).expect("readable from memory");
+        assert_eq!(row.len(), 1);
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// Asking for an id the graph does not hold is a bug in the caller, and says so.
+    #[test]
+    fn reading_an_unretained_unitig_panics_with_a_useful_message() {
+        let skeleton = scan(&"T".to_string(), cursor(MIXED), u64::MAX, &mut ()).expect("scan");
+        let sub = collect(skeleton, cursor(MIXED), &[1], u64::MAX).expect("collect");
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sub.abundance_of(2)))
+            .expect_err("must panic");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(msg.contains("not in this graph"), "unhelpful panic: {msg}");
+    }
+
+    /// Capacity, not length.
+    ///
+    /// The slack doubling leaves behind is resident memory, and it is most of what the
+    /// measured `GRAPH_PEAK_PER_COMPRESSED_BYTE` of 1.7 is made of. A budget computed from
+    /// `len` would under-count by up to half, so a graph could reach twice the budget the
+    /// startup line promised before anything refused it. The over-budget test above cannot
+    /// tell the two apart, because its budget is small enough that either measure trips.
+    #[test]
+    fn the_budget_counts_the_slack_not_only_the_data() {
+        let mut offsets: Vec<u32> = Vec::with_capacity(1024);
+        offsets.push(1);
+        let (targets, abundance, seq_offset): (Vec<u32>, Vec<f32>, Vec<u32>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let seq_2bit: Vec<u8> = Vec::new();
+        let got = csr_bytes(&offsets, &targets, &abundance, &seq_2bit, &seq_offset);
+        assert!(
+            got >= 1024 * size_of::<u32>() as u64,
+            "counted {got} bytes for a Vec holding one element in a 1024-slot allocation"
+        );
+    }
+
+    /// The budget must not refuse what fits. An ordinary small graph parses under a budget
+    /// far below the 1.7 GB the defaults imply, so the check costs normal data nothing.
+    #[test]
+    fn a_graph_inside_the_budget_is_untouched() {
+        let fa = ">T_0 ka:f:5.0\nACGTACGT\n>T_1 ka:f:6.0\nTTTTGGGG\n";
+        assert_eq!(build_str_budget(fa, 1 << 20).expect("in budget").n_unitigs, 2);
+        // And byte for byte the same graph as with no budget at all.
+        let unbudgeted = build_str(fa).expect("unbudgeted");
+        let budgeted = build_str_budget(fa, 1 << 20).expect("budgeted");
+        assert_eq!(unbudgeted.n_unitigs, budgeted.n_unitigs);
+        for id in 0..2u32 {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            unbudgeted.decode_seq(id, &mut a);
+            budgeted.decode_seq(id, &mut b);
+            assert_eq!(a, b, "unitig {id} differs under a budget");
+        }
     }
 
     #[test]
@@ -393,7 +1412,7 @@ mod real_data {
             index: 0,
             accession: "ERR2028820".to_string(),
             compressed_len: compressed.len(),
-            compressed,
+            compressed: crate::types::Compressed::Memory(compressed),
             fetch_secs: 0.0,
             payload: crate::types::Payload::default(),
         };
@@ -402,6 +1421,7 @@ mod real_data {
         let g = build(
             &fetched.accession,
             stream::decoder(&fetched).expect("decoder"),
+            u64::MAX,
         )
         .expect("build");
         let elapsed = t0.elapsed();

@@ -336,6 +336,24 @@ pub struct Config {
     ///
     /// `subgraph_fraction` is still reported per result; it is a useful number, just not a gate.
     pub subgraph_nodes_per_base_guard: f64,
+    /// Refuse an accession whose anchor neighbourhood exceeds this many unitigs.
+    ///
+    /// The memory term the two-pass parser cannot remove. Everything downstream of
+    /// `extract::expand` is proportional to the neighbourhood, at roughly 150 bytes per node
+    /// in RAM plus about 157 bytes per node of GFA on scratch, and on amplicon-like data the
+    /// neighbourhood is most of the graph rather than a corner of it: a synthetic HIV cohort
+    /// reached 1,383,280 nodes, 42% of its graph.
+    ///
+    /// The default is far above anything real measured here: `ERR2028820`/PfCRT is 747 nodes,
+    /// `SRR12363134`/ERG11 is 296, and `SRR8209082`/HIV-1 *pol* is 34,582, which is already
+    /// flagged provisional by `subgraph_nodes_per_base_guard`. At 1,000,000 the ceiling is
+    /// about 150 MB of graph per compute worker, so it bounds the run without touching any
+    /// result this repo has ever produced. 0 disables it.
+    ///
+    /// This is what `--max-size-mb` can eventually be relaxed against: the compressed size cap
+    /// exists to bound memory, and once memory is bounded by the neighbourhood instead, the
+    /// size cap is a transfer guardrail rather than a correctness skip.
+    pub max_subgraph_nodes: usize,
 
     // ---- concurrency ----
     /// Threads streaming from S3. Bandwidth saturates around 8 streams at 17.4 MB/s aggregate,
@@ -350,9 +368,20 @@ pub struct Config {
     /// `--max-size-mb`. See `peak_compressed_buffers`. Set it explicitly with `-w` once you
     /// know the machine can absorb it; the startup line prints what you chose.
     pub compute_workers: usize,
-    /// Bounded queue depth between fetch and compute. Bounding it is what stops a fast network
-    /// piling up buffers, but it is only one of three places a compressed buffer waits, and
-    /// the parsed graphs come on top: the bound on resident memory is `max_resident_bytes`.
+    /// Bounded queue depth between fetch and compute.
+    ///
+    /// **Zero, a rendezvous channel.** A positive depth buys nothing here and costs one
+    /// capped buffer per slot. A fetch worker that has bytes in hand and no compute worker
+    /// ready is already a held buffer, counted by the `fetch_workers` term of
+    /// `peak_compressed_buffers`; queueing those bytes separately just moves the same
+    /// allocation into a second place and adds a slot's worth of cap to the bound. The depth
+    /// used to be 4, which at the 1 GB default put 4 GB into the printed worst case for no
+    /// throughput: measured over 20 cached 34 MB accessions at `-w 1 --fetch-workers 8`, peak
+    /// RSS fell from 516.4 to 386.5 MiB, which is the four slots exactly, with the wall clock
+    /// unchanged at 18.0 s.
+    ///
+    /// Left configurable rather than removed, because a slow network with a fast compute pool
+    /// is the one shape where a slot could help, and the startup line prints what is in force.
     pub channel_capacity: usize,
     /// Threads handed to each GraphAligner invocation.
     ///
@@ -422,6 +451,16 @@ pub struct Config {
     /// A cache miss becomes a hard error naming the missing accession, rather than a silent
     /// download. Off by default; opt in for reproducibility runs or air-gapped hosts.
     pub offline: bool,
+    /// Where adjacency spills when it outgrows `types::SPILL_ADJACENCY_AT`.
+    ///
+    /// Resolved in `main` as `--spool-dir`, else `--unitigs-cache`, else the system temp
+    /// directory. Deliberately **not** `--scratch-dir`, which defaults to `/dev/shm`: spilling
+    /// into a tmpfs moves the bytes from one part of RAM to another and measures as a saving
+    /// while being none.
+    ///
+    /// `None` keeps adjacency in memory however large it gets, which is the old behaviour and
+    /// what every test uses.
+    pub spool_dir: Option<PathBuf>,
     /// Fetch every accession into the cache and exit before the compute stages run.
     ///
     /// Requires `unitigs_cache`. `pipeline::run_fetch_only` handles this shortcut; the compute
@@ -436,15 +475,45 @@ impl Config {
     /// **Not** `channel_capacity`, which is the number this file and `pipeline`'s module doc
     /// both used to claim. Three places hold one concurrently:
     ///
-    /// * `channel_capacity` sitting in the bounded queue;
+    /// * `channel_capacity` sitting in the bounded queue (zero by default, see the field);
     /// * one per fetch worker, held from the moment `read_to_vec` returns until the blocking
     ///   `send` into a full queue completes (`stages::stream`);
     /// * one per compute worker, because `run_one` keeps `fetched` alive through the whole
     ///   parse and drops it only once the CSR graph exists (`pipeline::run_one`).
     ///
-    /// At the defaults that is 4 + 8 + 8 = 20, five times the documented figure.
+    /// At the defaults that is 0 + 8 + 8 = 16; before the queue depth went to zero it was 20,
+    /// five times the figure this file used to document.
     pub fn peak_compressed_buffers(&self) -> usize {
-        self.channel_capacity + self.fetch_workers + self.compute_workers
+        self.peak_compressed_buffers_for(usize::MAX)
+    }
+
+    /// The same bound for a run that has only `n_accessions` of work.
+    ///
+    /// The pipeline's shape is an upper bound on a long list; it is not what a short one can
+    /// reach. A single-accession run cannot fill 16 slots, so quoting 16 GB at it overstates
+    /// the requirement by the worker count. That matters because the number is read and acted
+    /// on: the Galaxy wrapper derives its memory ask from this formula, and a user sizing a
+    /// job reads the startup line.
+    ///
+    /// `--fetch-only` never starts the compute pool, so it holds neither a queue slot nor a
+    /// parsing buffer: its ceiling is one buffer per fetch worker.
+    pub fn peak_compressed_buffers_for(&self, n_accessions: usize) -> usize {
+        let slots = if self.fetch_only {
+            self.fetch_workers
+        } else {
+            self.channel_capacity + self.fetch_workers + self.compute_workers
+        };
+        slots.min(n_accessions)
+    }
+
+    /// Parsed graphs that can be resident at once: one per compute worker, never more than
+    /// the work available, and none at all under `--fetch-only`, which does not parse.
+    pub fn peak_graphs_for(&self, n_accessions: usize) -> usize {
+        if self.fetch_only {
+            0
+        } else {
+            self.compute_workers.min(n_accessions)
+        }
     }
 
     /// Worst-case bytes resident in compressed buffers alone, if every accession is at the
@@ -455,21 +524,61 @@ impl Config {
     /// graphs (`max_graph_resident_bytes`) and any transient growth inside `read_to_vec` while
     /// the receiving `Vec` reallocates.
     pub fn max_compressed_resident_bytes(&self) -> u64 {
-        (self.peak_compressed_buffers() as u64).saturating_mul(self.max_compressed_bytes)
+        self.max_compressed_resident_bytes_for(usize::MAX)
+    }
+
+    /// As above, for a run with `n_accessions` of work.
+    pub fn max_compressed_resident_bytes_for(&self, n_accessions: usize) -> u64 {
+        (self.peak_compressed_buffers_for(n_accessions) as u64)
+            .saturating_mul(self.max_compressed_bytes)
+    }
+
+    /// The budget one parsed graph may use, which is what `stages::parse` enforces.
+    ///
+    /// `max_graph_resident_bytes` is this times the number of compute workers. Splitting it
+    /// out makes the per-accession limit the single definition both the printed bound and the
+    /// parser work from, so the promise and the enforcement cannot drift apart.
+    pub fn max_graph_bytes_per_accession(&self) -> u64 {
+        (self.max_compressed_bytes as f64 * GRAPH_PEAK_PER_COMPRESSED_BYTE) as u64
+    }
+
+    /// Resident bytes one neighbourhood costs, once adjacency has gone to disk.
+    ///
+    /// About 150 bytes per node: the retained rows, the 2-bit sequence, the offsets and the
+    /// abundance. This is what bounds a run when `spool_dir` is set and
+    /// `max_subgraph_nodes` is finite, and it does not mention `--max-size-mb` at all, which
+    /// is the point of stage 3: memory stops scaling with the file and starts scaling with the
+    /// gene.
+    pub fn max_subgraph_resident_bytes(&self) -> Option<u64> {
+        if self.spool_dir.is_none() || self.max_subgraph_nodes == 0 {
+            return None;
+        }
+        Some((self.max_subgraph_nodes as u64).saturating_mul(BYTES_PER_SUBGRAPH_NODE))
     }
 
     /// Worst-case bytes in parsed graphs: one per compute worker, each from an accession at
     /// the cap. See `GRAPH_PEAK_PER_COMPRESSED_BYTE`.
     pub fn max_graph_resident_bytes(&self) -> u64 {
+        self.max_graph_resident_bytes_for(usize::MAX)
+    }
+
+    /// As above, for a run with `n_accessions` of work.
+    pub fn max_graph_resident_bytes_for(&self, n_accessions: usize) -> u64 {
         // A float-to-integer cast saturates, so an unlimited cap stays u64::MAX.
-        (self.compute_workers as f64 * self.max_compressed_bytes as f64
+        (self.peak_graphs_for(n_accessions) as f64 * self.max_compressed_bytes as f64
             * GRAPH_PEAK_PER_COMPRESSED_BYTE) as u64
     }
 
     /// Worst-case resident bytes for the run: compressed buffers plus parsed graphs. What the
     /// startup line prints.
     pub fn max_resident_bytes(&self) -> u64 {
-        self.max_compressed_resident_bytes().saturating_add(self.max_graph_resident_bytes())
+        self.max_resident_bytes_for(usize::MAX)
+    }
+
+    /// As above, for a run with `n_accessions` of work. This is what the startup line prints.
+    pub fn max_resident_bytes_for(&self, n_accessions: usize) -> u64 {
+        self.max_compressed_resident_bytes_for(n_accessions)
+            .saturating_add(self.max_graph_resident_bytes_for(n_accessions))
     }
 }
 
@@ -482,6 +591,13 @@ impl Config {
 /// This replaces a fixed ~43 MB per worker, which was the array lengths of one 33 MB
 /// accession; the 348 MB one's graph peaked at 498 MB.
 pub const GRAPH_PEAK_PER_COMPRESSED_BYTE: f64 = 1.7;
+
+/// Resident bytes per retained neighbourhood node, once adjacency is spooled.
+///
+/// The rows, the 2-bit sequence, the offsets and the abundance. Measured as the slope of peak
+/// RSS against neighbourhood size rather than derived from the field widths, so it includes
+/// the allocator's slack.
+pub const BYTES_PER_SUBGRAPH_NODE: u64 = 150;
 
 impl Default for Config {
     fn default() -> Self {
@@ -508,9 +624,10 @@ impl Default for Config {
             alt_max_detour: 100,
             min_shared_kmers: 3,
             subgraph_nodes_per_base_guard: 3.0,
+            max_subgraph_nodes: 1_000_000,
             fetch_workers: 8,
             compute_workers: 8,
-            channel_capacity: 4,
+            channel_capacity: 0,
             graphaligner_threads: 1,
             fetch_timeout_secs: 900,
             fetch_connect_timeout_secs: 15,
@@ -519,6 +636,7 @@ impl Default for Config {
             scratch_dir: std::env::temp_dir().join("logan-walker-test"),
             graphaligner_bin: String::from("GraphAligner"),
             unitigs_cache: None,
+            spool_dir: None,
             offline: false,
             fetch_only: false,
         }
@@ -534,8 +652,8 @@ mod memory_bound_tests {
     #[test]
     fn peak_buffers_counts_all_three_holders() {
         let cfg = Config::default();
-        assert_eq!((cfg.channel_capacity, cfg.fetch_workers, cfg.compute_workers), (4, 8, 8));
-        assert_eq!(cfg.peak_compressed_buffers(), 20);
+        assert_eq!((cfg.channel_capacity, cfg.fetch_workers, cfg.compute_workers), (0, 8, 8));
+        assert_eq!(cfg.peak_compressed_buffers(), 16);
         assert_ne!(
             cfg.peak_compressed_buffers(),
             cfg.channel_capacity,
@@ -548,14 +666,14 @@ mod memory_bound_tests {
     fn worst_case_bytes_track_the_size_cap() {
         let cfg = Config::default();
         assert_eq!(cfg.max_compressed_bytes, 1024 * 1024 * 1024);
-        assert_eq!(cfg.max_compressed_resident_bytes(), 20 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.max_compressed_resident_bytes(), 16 * 1024 * 1024 * 1024);
 
         // The ERG11 panel's largest accession, a real-data case.
         let panel = 343u64 * 1024 * 1024;
         let at_panel_size = cfg.peak_compressed_buffers() as u64 * panel;
         assert!(
-            (6.5..7.2).contains(&(at_panel_size as f64 / (1024.0 * 1024.0 * 1024.0))),
-            "~6.9 GB expected, got {at_panel_size} bytes"
+            (5.2..5.8).contains(&(at_panel_size as f64 / (1024.0 * 1024.0 * 1024.0))),
+            "~5.4 GB expected, got {at_panel_size} bytes"
         );
     }
 
@@ -565,7 +683,7 @@ mod memory_bound_tests {
     fn every_term_moves_the_bound() {
         let base = Config::default().peak_compressed_buffers();
         for cfg in [
-            Config { channel_capacity: 8, ..Config::default() },
+            Config { channel_capacity: 4, ..Config::default() },
             Config { fetch_workers: 16, ..Config::default() },
             Config { compute_workers: 16, ..Config::default() },
         ] {
@@ -589,8 +707,45 @@ mod memory_bound_tests {
         let cfg = Config::default();
         let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
         assert!((gib(cfg.max_graph_resident_bytes()) - 8.0 * 1.7).abs() < 1e-6);
-        assert!((gib(cfg.max_resident_bytes()) - 33.6).abs() < 1e-6);
+        // 16 GB of buffers plus 13.6 GB of graphs. It was 33.6 until the queue depth went to 0.
+        assert!((gib(cfg.max_resident_bytes()) - 29.6).abs() < 1e-6);
         let more = Config { compute_workers: 16, ..Config::default() };
         assert!(more.max_graph_resident_bytes() > cfg.max_graph_resident_bytes());
+    }
+
+    /// The pipeline's shape is a ceiling for a long list, not a figure to quote at a short
+    /// one. A single-accession run reserving 29.6 GB is what the Galaxy wrapper used to be
+    /// told to ask for.
+    #[test]
+    fn the_bound_is_capped_by_the_work_available() {
+        let cfg = Config::default();
+        assert_eq!(cfg.peak_compressed_buffers_for(1), 1);
+        assert_eq!(cfg.peak_graphs_for(1), 1);
+        assert_eq!(cfg.peak_compressed_buffers_for(4), 4);
+        // Past the pipeline's own ceiling the accession count stops mattering.
+        assert_eq!(cfg.peak_compressed_buffers_for(16), 16);
+        assert_eq!(cfg.peak_compressed_buffers_for(10_000), 16);
+        assert_eq!(cfg.peak_graphs_for(10_000), 8);
+        // 1 x 1 GB + 1 x 1.7 GB, against 29.6 GB for a list long enough to fill the pipeline.
+        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        assert!((gib(cfg.max_resident_bytes_for(1)) - 2.7).abs() < 1e-6);
+        assert_eq!(cfg.max_resident_bytes_for(usize::MAX), cfg.max_resident_bytes());
+    }
+
+    /// `--fetch-only` never starts the compute pool, so it holds neither a queue slot nor a
+    /// parsing buffer and builds no graph. Counting those would have the mode reserve memory
+    /// for stages it does not run.
+    #[test]
+    fn fetch_only_counts_neither_the_queue_nor_the_graphs() {
+        let cfg = Config { fetch_only: true, channel_capacity: 4, ..Config::default() };
+        assert_eq!(cfg.peak_compressed_buffers_for(usize::MAX), cfg.fetch_workers);
+        assert_eq!(cfg.peak_graphs_for(usize::MAX), 0);
+        assert_eq!(cfg.max_graph_resident_bytes_for(usize::MAX), 0);
+        assert_eq!(
+            cfg.max_resident_bytes_for(usize::MAX),
+            cfg.fetch_workers as u64 * cfg.max_compressed_bytes
+        );
+        // Still capped by the list.
+        assert_eq!(cfg.peak_compressed_buffers_for(2), 2);
     }
 }

@@ -12,7 +12,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::types::{Accession, FetchedUnitigs, Payload, PayloadSource};
+use crate::types::{Accession, Compressed, FetchedUnitigs, Payload, PayloadSource};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -75,7 +75,15 @@ impl Fetcher {
         if let Some(dir) = &self.cache_dir {
             let path = cache_path(dir, accession);
             if path.exists() {
-                let len = std::fs::metadata(&path).map(|m| m.len()).map_err(|e| Error::Fetch {
+                // Opened, not read. The handle is what crosses the channel and what `decoder`
+                // streams from, so a cached accession never costs its own size in RAM. The
+                // size is taken from the handle rather than from a separate `stat`, which also
+                // closes the window between checking the size and reading the file.
+                let mut file = std::fs::File::open(&path).map_err(|e| Error::Fetch {
+                    accession: accession.clone(),
+                    detail: format!("cache read {}: {e}", path.display()),
+                })?;
+                let len = file.metadata().map(|m| m.len()).map_err(|e| Error::Fetch {
                     accession: accession.clone(),
                     detail: format!("cache read {}: {e}", path.display()),
                 })?;
@@ -94,11 +102,7 @@ impl Fetcher {
                         }),
                     });
                 }
-                let compressed = std::fs::read(&path).map_err(|e| Error::Fetch {
-                    accession: accession.clone(),
-                    detail: format!("cache read {}: {e}", path.display()),
-                })?;
-                if compressed.is_empty() {
+                if len == 0 {
                     return Err(Error::Fetch {
                         accession: accession.clone(),
                         detail: format!("cache file is empty: {}", path.display()),
@@ -107,13 +111,19 @@ impl Fetcher {
                 // Hashed here rather than at the point of download, so the digest covers
                 // every path into the pipeline. A cache hit and an `--offline` run have no
                 // HTTP response to take an ETag from, and they are exactly the runs whose
-                // inputs are least self-evident.
-                let payload = Payload::read(PayloadSource::Cache, &compressed);
+                // inputs are least self-evident. Streamed in chunks and rewound, so this
+                // costs a pass over the file, not the file.
+                let payload = Payload::read_file(PayloadSource::Cache, &mut file).map_err(|e| {
+                    Error::Fetch {
+                        accession: accession.clone(),
+                        detail: format!("cache read {}: {e}", path.display()),
+                    }
+                })?;
                 return Ok(FetchedUnitigs {
                     index,
                     accession: accession.clone(),
-                    compressed_len: compressed.len(),
-                    compressed,
+                    compressed_len: len as usize,
+                    compressed: Compressed::File(file),
                     fetch_secs: 0.0,
                     payload,
                 });
@@ -134,15 +144,33 @@ impl Fetcher {
 
         for attempt in 1..=self.attempts {
             match self.try_once(index, accession, &url) {
-                Ok(f) => {
+                Ok(mut f) => {
                     if let Some(dir) = &self.cache_dir {
-                        if let Err(e) = write_cache_atomic(dir, accession, &f.compressed) {
-                            // Cache-write failure must not lose a successful fetch. Warn and
-                            // hand the bytes back so the compute stage still runs; the next
-                            // run will just have to fetch again.
-                            eprintln!(
-                                "[{accession}] warning: could not write cache entry: {e}"
-                            );
+                        match f.compressed.as_slice() {
+                            Some(bytes) => match write_cache_atomic(dir, accession, bytes) {
+                                // Written, so the bytes exist on disk and there is no reason
+                                // to keep carrying them. Swapping the buffer for the handle
+                                // drops this accession's compressed size before it reaches
+                                // the compute worker, which is where a buffer is held
+                                // longest: for the whole parse. A reopen that fails is not
+                                // worth failing the fetch over, so the buffer simply stays.
+                                Ok(path) => match std::fs::File::open(&path) {
+                                    Ok(file) => f.compressed = Compressed::File(file),
+                                    Err(e) => eprintln!(
+                                        "[{accession}] warning: cached but could not reopen \
+                                         {}: {e}",
+                                        path.display()
+                                    ),
+                                },
+                                // Cache-write failure must not lose a successful fetch. Warn
+                                // and hand the bytes back so the compute stage still runs;
+                                // the next run will just have to fetch again.
+                                Err(e) => eprintln!(
+                                    "[{accession}] warning: could not write cache entry: {e}"
+                                ),
+                            },
+                            // Already file-backed: nothing downloaded it into memory.
+                            None => {}
                         }
                     }
                     return Ok(f);
@@ -269,7 +297,7 @@ impl Fetcher {
             index,
             accession: accession.clone(),
             compressed_len: compressed.len(),
-            compressed,
+            compressed: Compressed::Memory(compressed),
             fetch_secs: 0.0,
             payload,
         })
@@ -346,7 +374,7 @@ enum FetchAttempt {
 /// Write `bytes` to `<dir>/<ACC>.unitigs.fa.zst` via a tempfile-and-rename so a killed
 /// process cannot leave a partial file behind. A partial file that survived a crash would
 /// otherwise look valid to a subsequent `--offline` run and corrupt the analysis.
-fn write_cache_atomic(dir: &Path, accession: &str, bytes: &[u8]) -> std::io::Result<()> {
+fn write_cache_atomic(dir: &Path, accession: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let final_path = cache_path(dir, accession);
     // Tempfile in the same directory so `rename` is same-filesystem and atomic. PID + nanos
@@ -361,9 +389,11 @@ fn write_cache_atomic(dir: &Path, accession: &str, bytes: &[u8]) -> std::io::Res
     // the finally-style branch below handles that.
     let write_result = std::fs::write(&tmp, bytes);
     match write_result {
-        Ok(()) => std::fs::rename(&tmp, &final_path).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        }),
+        Ok(()) => std::fs::rename(&tmp, &final_path)
+            .inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
+            .map(|()| final_path),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
@@ -396,16 +426,31 @@ fn write_cache_atomic(dir: &Path, accession: &str, bytes: &[u8]) -> std::io::Res
 /// (`zstd::Decoder::recommended_output_size()`, ~128 KB) or wrap in a `BufReader`;
 /// byte-at-a-time reads through `dyn Read` are slow.
 pub fn decoder<'a>(fetched: &'a FetchedUnitigs) -> Result<Box<dyn Read + 'a>> {
-    // Cursor<&[u8]> is already BufRead, so `with_buffer` avoids the redundant BufReader
-    // that `Decoder::new` would insert over an in-memory slice.
-    let cursor = std::io::Cursor::new(fetched.compressed.as_slice());
-    let decoder = zstd::stream::read::Decoder::with_buffer(cursor).map_err(|e| {
-        Error::Decompress {
-            accession: fetched.accession.clone(),
-            detail: format!("could not start zstd decoder: {e}"),
+    let fail = |e: std::io::Error| Error::Decompress {
+        accession: fetched.accession.clone(),
+        detail: format!("could not start zstd decoder: {e}"),
+    };
+    match &fetched.compressed {
+        // Cursor<&[u8]> is already BufRead, so `with_buffer` avoids the redundant BufReader
+        // that `Decoder::new` would insert over an in-memory slice.
+        Compressed::Memory(v) => {
+            let cursor = std::io::Cursor::new(v.as_slice());
+            Ok(Box::new(
+                zstd::stream::read::Decoder::with_buffer(cursor).map_err(fail)?,
+            ))
         }
-    })?;
-    Ok(Box::new(decoder))
+        // `&File` is `Read`, so the file is streamed rather than loaded: this is the whole
+        // point of `Compressed::File`. Rewound first, because the handle is shared with
+        // whoever hashed it and a caller may legitimately decode twice.
+        Compressed::File(f) => {
+            let mut handle = f;
+            use std::io::{Seek, SeekFrom};
+            handle.seek(SeekFrom::Start(0)).map_err(fail)?;
+            Ok(Box::new(
+                zstd::stream::read::Decoder::new(handle).map_err(fail)?,
+            ))
+        }
+    }
 }
 
 /// Suggested read size for the decoder returned by [`decoder`].
@@ -484,7 +529,10 @@ mod network_tests {
         let got = f.fetch(0, &"SRR8209082".to_string()).expect("fetch");
         eprintln!("fetched {} compressed bytes", got.compressed_len);
         assert_eq!(got.compressed_len, 1_861_058, "unexpected compressed size");
-        assert_eq!(got.compressed_len, got.compressed.len());
+        assert_eq!(
+            got.compressed_len,
+            got.compressed.as_slice().expect("no cache was set, so this is in memory").len()
+        );
 
         // The bytes must be usable by the next stage, not merely non-empty.
         let mut out = Vec::new();
@@ -671,6 +719,15 @@ mod cache_tests {
     use super::*;
     use crate::config::Config;
 
+    /// What the next stage would actually get. A cache hit now hands on a file handle rather
+    /// than a buffer, so comparing raw bytes no longer proves anything about the handle;
+    /// decoding through `decoder` proves it is positioned at the start of the right file.
+    fn decoded(f: &FetchedUnitigs) -> Vec<u8> {
+        let mut out = Vec::new();
+        decoder(f).expect("decoder").read_to_end(&mut out).expect("decode");
+        out
+    }
+
     /// Random-ish tempdir under the system temp root; no external `tempfile` dep.
     fn tempdir(tag: &str) -> PathBuf {
         let ns = std::time::SystemTime::now()
@@ -703,7 +760,8 @@ mod cache_tests {
             Err(Error::TooLarge { detail, .. }) => assert!(detail.contains("cached file"), "{detail}"),
             other => panic!("expected TooLarge, got {:?}", other.map(|f| f.compressed_len)),
         }
-        assert_eq!(fetcher(bytes.len() as u64).fetch(0, &acc).unwrap().compressed, bytes);
+        let got = fetcher(bytes.len() as u64).fetch(0, &acc).unwrap();
+        assert_eq!(decoded(&got), b">CACHED0002_0\nACGTACGTACGT\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -722,9 +780,19 @@ mod cache_tests {
         };
         let f = Fetcher::new(&cfg);
         let got = f.fetch(0, &"CACHED0001".to_string()).expect("cache hit");
-        assert_eq!(got.compressed, bytes);
+        assert_eq!(decoded(&got), b">CACHED0001_0\nACGT\n");
         assert_eq!(got.accession, "CACHED0001");
         assert_eq!(got.compressed_len, bytes.len());
+        // The point of the change: a cached accession costs a file handle, not its own size
+        // in RAM, and it is the compute worker holding one of these for the whole parse that
+        // used to dominate the bound.
+        assert!(
+            matches!(got.compressed, Compressed::File(_)),
+            "a cache hit must not be read into memory"
+        );
+        assert!(got.compressed.as_slice().is_none());
+        // Decoding twice must work: the handle is rewound, not consumed.
+        assert_eq!(decoded(&got), decoded(&got));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -847,7 +915,7 @@ mod tests {
             index: 0,
             accession: "TEST0001".to_string(),
             compressed_len: compressed.len(),
-            compressed,
+            compressed: crate::types::Compressed::Memory(compressed),
             fetch_secs: 0.0,
             payload: crate::types::Payload::default(),
         }
@@ -977,7 +1045,7 @@ mod real_data_tests {
             index: 0,
             accession: "REAL".to_string(),
             compressed_len: compressed.len(),
-            compressed,
+            compressed: crate::types::Compressed::Memory(compressed),
             fetch_secs: 0.0,
             payload: crate::types::Payload::default(),
         };

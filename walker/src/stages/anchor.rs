@@ -252,57 +252,133 @@ pub fn index_query_set(cfg: &Config, queries: &[Query]) -> Result<QueryIndex> {
 /// Forward and reverse-complement registers roll in lockstep so each unitig is scanned
 /// once rather than twice. No ambiguity handling is needed: `parse::build` has already
 /// guaranteed every stored base is ACGT.
+/// Counts shared k-mers as a record streams past, so anchoring stores nothing.
+///
+/// This is `parse::RecordSink`, driven by `parse::scan`. Until 0.2.0 anchoring was a second
+/// walk over the whole 2-bit store after the parser had built it, which meant the sequences
+/// of every unitig had to exist in memory for it to walk. Fused into the decode, it needs
+/// none of them: 68 million bases go past once and only the anchor ids survive.
+///
+/// Forward and reverse-complement registers roll in lockstep so each unitig is scanned once
+/// rather than twice. No ambiguity handling is needed: `parse` has already guaranteed every
+/// base is ACGT before it reaches `base`.
+pub struct Scanner<'a> {
+    k: usize,
+    min_shared: u32,
+    index: &'a QueryIndex,
+    shift: u64,
+    mask: u64,
+    /// Rolling registers for the record in progress.
+    fwd: u64,
+    rev: u64,
+    /// Bases seen in this record, which is also the k-mer boundary test.
+    j: usize,
+    count: u32,
+    id: UnitigId,
+    ids: Vec<UnitigId>,
+    shared_kmers: Vec<u32>,
+    n_unitigs: usize,
+}
+
+impl<'a> Scanner<'a> {
+    pub fn new(cfg: &Config, index: &'a QueryIndex) -> Result<Self> {
+        let k = cfg.k;
+        if k != index.k {
+            return Err(Error::Usage(format!(
+                "config k={k} disagrees with the query index k={}",
+                index.k
+            )));
+        }
+        Ok(Self {
+            k,
+            min_shared: cfg.min_shared_kmers.max(1),
+            index,
+            shift: 2 * (k as u64 - 1),
+            mask: if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 },
+            fwd: 0,
+            rev: 0,
+            j: 0,
+            count: 0,
+            id: 0,
+            ids: Vec::new(),
+            shared_kmers: Vec::new(),
+            n_unitigs: 0,
+        })
+    }
+
+    /// The anchors found, and what share of the graph they are.
+    pub fn finish(self) -> Anchors {
+        let fraction_of_graph = if self.n_unitigs == 0 {
+            0.0
+        } else {
+            self.ids.len() as f64 / self.n_unitigs as f64
+        };
+        Anchors {
+            ids: self.ids,
+            shared_kmers: self.shared_kmers,
+            fraction_of_graph,
+        }
+    }
+}
+
+impl crate::stages::parse::RecordSink for Scanner<'_> {
+    #[inline]
+    fn begin(&mut self, id: UnitigId) {
+        self.id = id;
+        self.fwd = 0;
+        self.rev = 0;
+        self.j = 0;
+        self.count = 0;
+        self.n_unitigs += 1;
+    }
+
+    /// The hot loop: once per base of every unitig, roughly 68 million times for a mid-sized
+    /// accession. Monomorphised through `parse::scan`, so this inlines into the decode.
+    #[inline]
+    fn base(&mut self, code: u8) {
+        let c = code as u64;
+        self.fwd = ((self.fwd << 2) | c) & self.mask;
+        self.rev = (self.rev >> 2) | ((3 - c) << self.shift);
+        self.j += 1;
+        // A unitig shorter than k never reaches this, which is the old loop's explicit skip.
+        if self.j >= self.k && self.index.contains(self.fwd.min(self.rev)) {
+            self.count += 1;
+        }
+    }
+
+    #[inline]
+    fn end(&mut self) {
+        if self.count >= self.min_shared {
+            self.ids.push(self.id);
+            self.shared_kmers.push(self.count);
+        }
+    }
+}
+
+/// Anchors of a graph that already holds every sequence.
+///
+/// The production path does not use this: it anchors during `parse::scan` with a [`Scanner`],
+/// which is the point of the two-pass parser. Kept because a `build`-made graph is the
+/// convenient fixture for tests, and because driving the same `Scanner` here is what makes
+/// those tests evidence about the production path rather than about a second implementation.
 pub fn find(cfg: &Config, graph: &UnitigGraph, index: &QueryIndex) -> Result<Anchors> {
-    let k = cfg.k;
-    if k != index.k {
-        return Err(Error::Usage(format!(
-            "config k={k} disagrees with the query index k={}",
-            index.k
-        )));
+    use crate::stages::parse::RecordSink;
+    let mut scanner = Scanner::new(cfg, index)?;
+    let mut seq: Vec<u8> = Vec::new();
+    for id in 0..graph.n_unitigs as UnitigId {
+        scanner.begin(id);
+        graph.decode_seq(id, &mut seq);
+        for &b in &seq {
+            scanner.base(match b {
+                b'A' => 0,
+                b'C' => 1,
+                b'G' => 2,
+                _ => 3,
+            });
+        }
+        scanner.end();
     }
-    let min_shared = cfg.min_shared_kmers.max(1);
-    let shift = 2 * (k as u64 - 1);
-    let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
-
-    let mut ids: Vec<UnitigId> = Vec::new();
-    let mut shared_kmers: Vec<u32> = Vec::new();
-
-    for id in 0..graph.n_unitigs {
-        let start = graph.seq_offset[id] as usize;
-        let end = graph.seq_offset[id + 1] as usize;
-        if end - start < k {
-            continue;
-        }
-
-        let (mut fwd, mut rev) = (0u64, 0u64);
-        let mut count: u32 = 0;
-        for (j, p) in (start..end).enumerate() {
-            // Inlined 2-bit read: byte p/4, quarter p%4.
-            let code = ((graph.seq_2bit[p >> 2] >> (2 * (p & 3))) & 3) as u64;
-            fwd = ((fwd << 2) | code) & mask;
-            rev = (rev >> 2) | ((3 - code) << shift);
-            if j + 1 >= k && index.contains(fwd.min(rev)) {
-                count += 1;
-            }
-        }
-
-        if count >= min_shared {
-            ids.push(id as UnitigId);
-            shared_kmers.push(count);
-        }
-    }
-
-    let fraction_of_graph = if graph.n_unitigs == 0 {
-        0.0
-    } else {
-        ids.len() as f64 / graph.n_unitigs as f64
-    };
-
-    Ok(Anchors {
-        ids,
-        shared_kmers,
-        fraction_of_graph,
-    })
+    Ok(scanner.finish())
 }
 
 // The anchor-fraction guard that used to live here has been removed. It was calibrated on
@@ -319,7 +395,7 @@ mod find_tests {
     use std::path::PathBuf;
 
     fn graph(fa: &str) -> UnitigGraph {
-        parse::build(&"T".to_string(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
+        parse::build(&"T".to_string(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap()
     }
     fn query(seq: &str) -> Query {
         Query { name: "q".into(), record_id: "q".into(), seq: seq.as_bytes().to_vec(), path: PathBuf::from("q.fa"), n_records: 1 }
@@ -706,11 +782,11 @@ mod recall_study_anchors {
             index: 0,
             accession: "ERR2028820".to_string(),
             compressed_len: compressed.len(),
-            compressed,
+            compressed: crate::types::Compressed::Memory(compressed),
             fetch_secs: 0.0,
             payload: crate::types::Payload::default(),
         };
-        let graph = parse::build(&fetched.accession, stream::decoder(&fetched).unwrap()).unwrap();
+        let graph = parse::build(&fetched.accession, stream::decoder(&fetched).unwrap(), u64::MAX).unwrap();
         let query = read_query(qpath).unwrap();
 
         // (min_shared_kmers, anchors the study recorded)

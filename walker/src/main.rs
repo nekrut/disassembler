@@ -74,6 +74,15 @@ TUNING:
                                   reference's bases matched]. Ignored in single-anchor mode
         --min-shared-kmers <N>    Anchor threshold, validated 1..=5 [default: 3]
         --max-size-mb <N>         Maximum compressed SRA size in MB [default: 1024]
+        --spool-dir <DIR>         Where adjacency spills once it outgrows 4 MiB. Defaults to
+                                  --unitigs-cache, else the system temp directory. Not
+                                  --scratch-dir, which is /dev/shm by default: spilling into a
+                                  tmpfs is not a saving
+        --max-subgraph-nodes <N>  Refuse an accession whose anchor neighbourhood exceeds N
+                                  unitigs, as subgraph_too_large [default: 1000000; 0 = off].
+                                  Everything after extraction is proportional to the
+                                  neighbourhood, so this and not --max-size-mb is what bounds
+                                  memory once the gene is found
         --prune-frac <F>          Drop unitigs below this fraction of the gene's depth and
                                   realign, removing the aligner's reference bias. The
                                   realignment is kept only if it spans as much of the
@@ -248,6 +257,12 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             "--min-shared-kmers" => {
                 args.cfg.min_shared_kmers = value()?.parse().map_err(|e| error::Error::Usage(format!("--min-shared-kmers: {e}")))?;
             }
+            "--spool-dir" => args.cfg.spool_dir = Some(PathBuf::from(value()?)),
+            "--max-subgraph-nodes" => {
+                args.cfg.max_subgraph_nodes = value()?
+                    .parse()
+                    .map_err(|e| error::Error::Usage(format!("--max-subgraph-nodes: {e}")))?;
+            }
             "--max-size-mb" => {
                 let mb: u64 = value()?.parse().map_err(|e| error::Error::Usage(format!("--max-size-mb: {e}")))?;
                 // saturate rather than wrap: an absurd value should mean "no cap", not a tiny one.
@@ -394,9 +409,46 @@ fn default_sigpipe() {
     }
 }
 
+/// Stop glibc's dynamic mmap threshold from turning freed graph arrays into resident slack.
+///
+/// The parser's five CSR arrays grow by doubling (`stages::parse::build`). glibc services a
+/// large allocation with `mmap` only while the request is above its mmap threshold, and that
+/// threshold is *dynamic*: each time an mmapped block is freed, glibc raises it towards 32 MiB
+/// on the theory that the next allocation of that size should come from the heap instead. One
+/// accession per run therefore behaves nothing like twenty. From the second accession on, the
+/// arrays grow inside the heap arenas, freed chunks are not returned to the OS, and the steady
+/// state measured about 3.17x the compressed size rather than the 1.7x
+/// `GRAPH_PEAK_PER_COMPRESSED_BYTE` was calibrated at, which was measured one accession per
+/// run.
+///
+/// Pinning the threshold at 1 MiB makes every array above it an `mmap`/`munmap` pair, so the
+/// memory goes back to the OS when the graph is dropped. Measured over 20 cached 34 MB
+/// accessions at `-w 1 --fetch-workers 8`: peak RSS 386.5 -> 340.3 MiB, no output change.
+///
+/// glibc only. musl has no dynamic threshold and no `mallopt` tunable worth setting here, and
+/// on other platforms this is a no-op.
+///
+/// **Deliberately not unit-tested.** glibc exposes no getter for the threshold, and the only
+/// observable effect is peak RSS over a multi-accession run, which is not a thing to assert in
+/// a unit test. Removing this call changes no output and fails nothing; the evidence is the
+/// measurement above, and this comment is here so that a future reader finds the gap stated
+/// rather than assumes the guard is covered.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn pin_mmap_threshold() {
+    // Safe: `mallopt` takes two ints and touches no memory we own. A failure is not actionable
+    // (the allocator keeps its default behaviour), so the return value is deliberately ignored.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn pin_mmap_threshold() {}
+
 fn main() -> ExitCode {
     #[cfg(unix)]
     default_sigpipe();
+    pin_mmap_threshold();
     let argv: Vec<String> = std::env::args().skip(1).collect();
 
     if argv.is_empty() || argv.iter().any(|a| a == "-h" || a == "--help") {
@@ -554,25 +606,92 @@ fn real_main(mut args: Args) -> error::Result<()> {
     };
 
     // ---- the pipeline -----------------------------------------------------
+    // Adjacency spills next to the cache when there is one, because that is a directory the
+    // user has already chosen and sized for this run's data. Otherwise the system temp
+    // directory. Never the scratch directory, which is a tmpfs by default.
+    if args.cfg.spool_dir.is_none() {
+        args.cfg.spool_dir = Some(
+            args.cfg
+                .unitigs_cache
+                .clone()
+                .unwrap_or_else(std::env::temp_dir),
+        );
+    }
+    if let Some(d) = &args.cfg.spool_dir {
+        if d.starts_with("/dev/shm") {
+            eprintln!(
+                "[warn] --spool-dir {} is a tmpfs, so spilled adjacency stays in RAM and the \
+                 memory bound below does not hold",
+                d.display()
+            );
+        }
+    }
+
     // State the memory bound up front. This used to be a comment in `pipeline`, and it was
     // wrong by 5x; a number that moves with -w, --fetch-workers and --max-size-mb is worth
     // printing rather than documenting.
     let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    // What the pipeline will actually process: `n_listed` counts the list before duplicates
+    // were dropped, and a duplicate never becomes a second in-flight buffer.
+    let n = accessions.len();
+    let buffers = args.cfg.peak_compressed_buffers_for(n);
+    let graphs = args.cfg.peak_graphs_for(n);
+    // Where the slots come from. Under --fetch-only there is no queue and no compute pool, so
+    // saying "queued + fetching + parsing" there would name two things that cannot happen.
+    let shape = if args.cfg.fetch_only {
+        format!("{} fetching", args.cfg.fetch_workers)
+    } else {
+        format!(
+            "{} queued + {} fetching + {} parsing",
+            args.cfg.channel_capacity, args.cfg.fetch_workers, args.cfg.compute_workers
+        )
+    };
+    // A short list cannot fill the pipeline, and quoting the pipeline's ceiling at a
+    // one-accession run overstates it by the worker count. Compared against this mode's own
+    // ceiling: under --fetch-only there are no graphs at all, which is the mode, not the list.
+    let plural = |k: usize| if k == 1 { "" } else { "s" };
+    let capped = if buffers < args.cfg.peak_compressed_buffers()
+        || graphs < args.cfg.peak_graphs_for(usize::MAX)
+    {
+        format!(", capped by {n} accession{}", plural(n))
+    } else {
+        String::new()
+    };
+    let graph_clause = if args.cfg.fetch_only {
+        // Saying "0 parsed graphs at up to 1.7x = 0.0 GB" invites the reader to wonder what
+        // would make it non-zero. Nothing would: --fetch-only never builds one.
+        ", and no parsed graphs, because --fetch-only does not parse".to_string()
+    } else {
+        format!(
+            ", plus {graphs} parsed graph{} at up to {:.1}x their compressed size = {:.1} GB",
+            plural(graphs),
+            config::GRAPH_PEAK_PER_COMPRESSED_BYTE,
+            gb(args.cfg.max_graph_resident_bytes_for(n)),
+        )
+    };
     eprintln!(
-        "[logan-walker] memory bound: {} compressed buffers ({} queued + {} fetching + {} \
-         parsing) x {} MB cap = {:.1} GB, plus {} parsed graphs at up to {:.1}x their \
-         compressed size = {:.1} GB; {:.1} GB worst case",
-        args.cfg.peak_compressed_buffers(),
-        args.cfg.channel_capacity,
-        args.cfg.fetch_workers,
-        args.cfg.compute_workers,
+        "[logan-walker] memory bound: {buffers} compressed buffer{} ({shape}{capped}) x {} MB \
+         cap = {:.1} GB{graph_clause}; {:.1} GB worst case. Excludes GraphAligner, the \
+         scratch GFA and the output buffers.",
+        plural(buffers),
         args.cfg.max_compressed_bytes / (1024 * 1024),
-        gb(args.cfg.max_compressed_resident_bytes()),
-        args.cfg.compute_workers,
-        config::GRAPH_PEAK_PER_COMPRESSED_BYTE,
-        gb(args.cfg.max_graph_resident_bytes()),
-        gb(args.cfg.max_resident_bytes()),
+        gb(args.cfg.max_compressed_resident_bytes_for(n)),
+        gb(args.cfg.max_resident_bytes_for(n)),
     );
+    // The bound above assumes the graph is in RAM and scales with --max-size-mb. With
+    // adjacency spooled and the neighbourhood capped, neither is true, and the real ceiling is
+    // far lower and no longer mentions the file size at all. Printed as well as, not instead
+    // of, the above: the first is what the run cannot exceed, this is what it should use.
+    if let Some(per) = args.cfg.max_subgraph_resident_bytes() {
+        eprintln!(
+            "[logan-walker] with adjacency spooled to {} and --max-subgraph-nodes {}, the \
+             graphs are bounded by {graphs} x {:.2} GB = {:.2} GB regardless of accession size",
+            args.cfg.spool_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+            args.cfg.max_subgraph_nodes,
+            gb(per),
+            gb(per.saturating_mul(graphs as u64)),
+        );
+    }
 
     // The run's own clock, for `run.started` and `run.wall_seconds` in the summary. Started
     // here rather than at process entry so it measures the work, not the argument parsing,

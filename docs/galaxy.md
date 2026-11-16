@@ -38,7 +38,10 @@ decides the scatter strategy (below). The wrapper:
 - sets `--scratch-dir` inside the job directory, because the walker's default `/dev/shm` is
   shared by every job on a node and is only 64 MB inside a default Docker container;
 - sets `-w` from `GALAXY_SLOTS`, and trims `--fetch-workers` so the walker's worst-case buffer
-  memory fits `GALAXY_MEMORY_MB` when the runner sets it;
+  memory fits `GALAXY_MEMORY_MB` when the runner sets it. That worst case is a good deal
+  smaller from 0.2.0: the fetch-to-compute queue no longer holds buffers, and an accession read
+  from `--unitigs-cache` is streamed from its file handle rather than held, so the wrapper's
+  formula can be recomputed against the bound the walker now prints at startup;
 - keeps `-t` at 1, because GraphAligner is not reproducible with more threads;
 - links the reference under its dataset name, because the walker names its summary and
   multi-anchor tags after the reference file's stem.

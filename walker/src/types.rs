@@ -65,6 +65,125 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// The whole graph's adjacency, held on disk instead of in RAM.
+///
+/// Adjacency is the last part of the walker that is O(accession) rather than O(neighbourhood):
+/// 12 bytes per unitig, 15.4 MB for `ERR2028820`, and it exists from `parse::scan` until
+/// `extract::expand` has finished walking it. It is also the term that keeps `--max-size-mb`
+/// in the memory bound, because it scales with the file rather than with the gene.
+///
+/// Two unlinked temp files, read with `pread`. Unlinked at creation, so the data is reclaimed
+/// when the handles close even if the process is killed: there is no cleanup path to get
+/// wrong and nothing to sweep.
+///
+/// Spilling is opt-in per accession, past [`SPILL_ADJACENCY_AT`]. A small accession stays in
+/// RAM and never touches the disk, which keeps the common case free of a new failure mode, and
+/// a spill that cannot be created falls back to memory with a warning rather than failing the
+/// accession.
+#[derive(Debug)]
+pub struct AdjacencySpool {
+    offsets: std::fs::File,
+    targets: std::fs::File,
+    n_offsets: usize,
+    n_targets: usize,
+}
+
+/// In-memory adjacency above this spills to disk. 4 MiB is about 350,000 unitigs.
+///
+/// Low enough that any accession big enough for adjacency to matter spills, high enough that
+/// the small ones, and every test fixture, stay in RAM.
+pub const SPILL_ADJACENCY_AT: usize = 4 << 20;
+
+impl AdjacencySpool {
+    /// Two unlinked files under `dir`.
+    pub fn create(dir: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self {
+            offsets: anon_file(dir, "off")?,
+            targets: anon_file(dir, "tgt")?,
+            n_offsets: 0,
+            n_targets: 0,
+        })
+    }
+
+    pub fn push_offsets(&mut self, v: &[u32]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.offsets.write_all(as_bytes(v))?;
+        self.n_offsets += v.len();
+        Ok(())
+    }
+
+    pub fn push_targets(&mut self, v: &[u32]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.targets.write_all(as_bytes(v))?;
+        self.n_targets += v.len();
+        Ok(())
+    }
+
+    pub fn n_targets(&self) -> usize {
+        self.n_targets
+    }
+
+    /// Row `id` into `buf`, which is cleared first.
+    pub fn edges_into(&self, id: UnitigId, buf: &mut Vec<u32>) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let i = id as usize;
+        if i + 1 >= self.n_offsets {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unitig {id} is outside the spooled graph ({} rows)", self.n_offsets),
+            ));
+        }
+        let mut bounds = [0u8; 8];
+        self.offsets.read_exact_at(&mut bounds, (i * 4) as u64)?;
+        let lo = u32::from_ne_bytes([bounds[0], bounds[1], bounds[2], bounds[3]]) as usize;
+        let hi = u32::from_ne_bytes([bounds[4], bounds[5], bounds[6], bounds[7]]) as usize;
+        if hi < lo || hi > self.n_targets {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("spooled row {id} is [{lo}, {hi}) of {} targets", self.n_targets),
+            ));
+        }
+        buf.clear();
+        buf.resize(hi - lo, 0);
+        if hi > lo {
+            self.targets.read_exact_at(as_bytes_mut(buf), (lo * 4) as u64)?;
+        }
+        Ok(())
+    }
+}
+
+/// A file that is unlinked the moment it exists, so it needs no cleanup and survives no crash.
+fn anon_file(dir: &std::path::Path, tag: &str) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!(".logan-{tag}-{}-{ns}.spool", std::process::id()));
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    // From here the only reference is the handle. The bytes go back to the filesystem when it
+    // closes, including on a signal, and nothing is left behind to sweep.
+    std::fs::remove_file(&path)?;
+    Ok(f)
+}
+
+#[inline]
+fn as_bytes(v: &[u32]) -> &[u8] {
+    // Safe: u32 has no padding and no invalid bit patterns, and the slice is read-only. The
+    // spool is written and read by the same process, so native endianness is consistent.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+#[inline]
+fn as_bytes_mut(v: &mut [u32]) -> &mut [u8] {
+    // Safe: as `as_bytes`, and every byte pattern is a valid u32.
+    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, std::mem::size_of_val(v)) }
+}
+
 /// Which ingest path produced an accession's bytes.
 ///
 /// This answers "where did these bytes come from", not "what was configured": a run with
@@ -136,6 +255,69 @@ impl Payload {
             ..Self::default()
         }
     }
+
+    /// The same for a file whose contents are never held: the digest is taken in chunks and
+    /// the handle is rewound, so this costs 128 KiB of stack and one extra pass over bytes the
+    /// OS page cache is about to be asked for anyway.
+    pub fn read_file(source: PayloadSource, file: &mut std::fs::File) -> std::io::Result<Self> {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 128 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            total += n as u64;
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut hex = String::with_capacity(64);
+        for b in hasher.finalize() {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        Ok(Self {
+            source,
+            bytes: Some(total),
+            sha256: Some(hex),
+            ..Self::default()
+        })
+    }
+}
+
+/// Where one accession's compressed bytes live while the pipeline works on them.
+///
+/// Until 0.2.0 this was always a `Vec<u8>`, which made peak memory `(C + F + W) x cap`: the
+/// compressed object was resident in the queue, in the fetch worker blocked on `send`, and in
+/// the compute worker for the whole parse. 20 of the 33.6 GB the walker printed as its default
+/// worst case were these buffers, and none of it was necessary for a cache hit, where the
+/// bytes are already a file and `zstd` can stream from the handle with about 128 KB of state.
+///
+/// Measured over 20 cached 34 MB accessions at `-w 1 --fetch-workers 8`, with the queue depth
+/// and allocator changes already in: peak RSS 340.3 -> 49.9 MiB, and 516.4 -> 49.9 against
+/// 0.1.1, a 10.4x reduction with the wall clock unchanged and every output byte-identical.
+/// At `-w 8 --fetch-workers 8` the floor is the eight resident graphs: 366.9 MiB.
+#[derive(Debug)]
+pub enum Compressed {
+    /// Held in RAM. A download with no `--unitigs-cache` to spool into, and the test fixtures.
+    Memory(Vec<u8>),
+    /// An open handle to a file holding exactly the compressed object: a cache hit, or a
+    /// download that was streamed into the cache. Decoded without being read whole.
+    File(std::fs::File),
+}
+
+impl Compressed {
+    /// The bytes, when they are in memory. `None` for a file-backed payload, which is the
+    /// point: nothing may quietly read one of those into a `Vec`.
+    pub fn as_slice(&self) -> Option<&[u8]> {
+        match self {
+            Compressed::Memory(v) => Some(v.as_slice()),
+            Compressed::File(_) => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +337,8 @@ pub struct FetchedUnitigs {
     /// collector can restore input order; see `AccessionResult::index`.
     pub index: usize,
     pub accession: Accession,
-    pub compressed: Vec<u8>,
+    /// The compressed object, in RAM or as a file handle. See [`Compressed`].
+    pub compressed: Compressed,
     pub compressed_len: usize,
     /// Seconds spent downloading, recorded by the fetch worker so the compute worker can
     /// report it. Network time belongs to the accession, not to whichever thread fetched it.
@@ -192,15 +375,42 @@ pub struct FetchedUnitigs {
 pub struct UnitigGraph {
     pub accession: Accession,
     pub n_unitigs: usize,
-    /// `offsets[i]..offsets[i+1]` indexes `targets` for unitig `i`. Length `n_unitigs + 1`.
+    /// `offsets[i]..offsets[i+1]` indexes `targets`. Length `n_unitigs + 1` after
+    /// `parse::scan`, `nodes.len() + 1` after `parse::collect`.
+    ///
+    /// **Indexed by unitig id until `collect` runs, and by slot afterwards.** `scan` needs the
+    /// whole graph's adjacency because `extract::expand` walks it to find the neighbourhood;
+    /// once the neighbourhood is known, nothing downstream ever asks about a unitig outside
+    /// it, so `collect` rewrites these to the neighbourhood's rows and frees the rest. On a
+    /// 1.28M-unitig accession with a 747-node neighbourhood that is 15.4 MB returned to the
+    /// allocator while seven other compute workers are still holding theirs.
+    ///
+    /// Use `edges_by_id` before `collect` and `edges` after. A graph from `build` holds every
+    /// unitig, so for that one the two indexings coincide.
     pub offsets: Vec<u32>,
     /// Packed edge: target id in the low 30 bits, source strand in bit 30, target strand
     /// in bit 31. Use `stages::parse::{pack_edge, unpack_edge}` rather than doing it by hand.
     /// 30 bits caps an accession at 2^30 unitigs, which `parse::build` enforces.
     pub targets: Vec<u32>,
-    /// Mean k-mer coverage (`ka:f:`) per unitig.
+    /// Ids whose sequence and abundance this graph holds, ascending.
+    ///
+    /// Empty between `parse::scan` and `parse::collect`: pass 1 builds adjacency only, which
+    /// is all `stages::extract::expand` needs to find the neighbourhood. Pass 2 then decodes a
+    /// second time and keeps the per-unitig data for these ids alone.
+    ///
+    /// Sorted, so `slot` is a binary search. The subgraph is 747 nodes for `ERR2028820`
+    /// against 1,277,362 in the graph, and the only production caller that touches a sequence
+    /// is `extract::collect_seqs`, once per node, so the log factor is not on any hot path.
+    pub nodes: Vec<UnitigId>,
+    /// Mean k-mer coverage (`ka:f:`) for `nodes[i]`, parallel to `nodes`.
     pub abundance: Vec<f32>,
-    /// All unitig sequences, 2 bits per base, 4 bases per byte.
+    /// Set when the whole graph's adjacency was too large to keep in RAM and went to disk.
+    ///
+    /// Present only between `parse::scan` and `parse::collect`; `offsets` and `targets` are
+    /// empty while it is. `collect` reads the neighbourhood's rows back and drops it, so no
+    /// stage after extraction knows or cares whether the accession ever spilled.
+    pub spool: Option<AdjacencySpool>,
+    /// The sequences of `nodes`, in that order, 2 bits per base, 4 bases per byte.
     ///
     /// 2-bit packing is safe: Logan unitigs are uppercase ACGT only, because BCALM2 never
     /// emits a k-mer containing N. Verified 2026-09-10 by scanning 10 accessions spanning
@@ -212,8 +422,8 @@ pub struct UnitigGraph {
     /// loudly rather than silently corrupting a base; a stray N would otherwise be encoded
     /// as some other nucleotide and propagate into the haplotype.
     pub seq_2bit: Vec<u8>,
-    /// Base offset of unitig `i` within `seq_2bit`, in bases (not bytes). Length
-    /// `n_unitigs + 1`, so the length of unitig `i` is `seq_offset[i+1] - seq_offset[i]`.
+    /// Base offset of `nodes[i]` within `seq_2bit`, in bases (not bytes). Length
+    /// `nodes.len() + 1`, so the length of `nodes[i]` is `seq_offset[i+1] - seq_offset[i]`.
     ///
     /// Packing is contiguous across unitig boundaries, so a sequence may begin mid-byte.
     /// That saves the ~1.9 MB of padding byte-alignment would cost on a 1.28M-unitig
@@ -222,9 +432,60 @@ pub struct UnitigGraph {
 }
 
 impl UnitigGraph {
+    /// Heap this graph holds: full adjacency plus whatever `parse::collect` retained.
+    ///
+    /// Capacity, not length. The slack doubling leaves behind is resident, and it is most of
+    /// what the measured `GRAPH_PEAK_PER_COMPRESSED_BYTE` of 1.7 is made of. This is the
+    /// quantity `--max-size-mb x 1.7` bounds, and the single definition both parse passes
+    /// measure against.
+    pub fn resident_bytes(&self) -> u64 {
+        // A spooled graph's adjacency is on disk and costs no resident bytes, which is the
+        // whole point of spilling it.
+        let w = size_of::<u32>() as u64;
+        self.offsets.capacity() as u64 * w
+            + self.targets.capacity() as u64 * w
+            + self.nodes.capacity() as u64 * w
+            + self.seq_offset.capacity() as u64 * w
+            + self.abundance.capacity() as u64 * size_of::<f32>() as u64
+            + self.seq_2bit.capacity() as u64
+    }
+
+    /// Where unitig `id`'s per-unitig data sits, or `None` when this graph does not hold it.
+    ///
+    /// Absent is a normal answer, not an error: a graph holds the neighbourhood, and a caller
+    /// asking about a unitig outside it is asking about something that was deliberately not
+    /// kept. Callers that cannot sensibly continue use `expect_slot`, which names the id.
+    #[inline]
+    pub fn slot(&self, id: UnitigId) -> Option<usize> {
+        self.nodes.binary_search(&id).ok()
+    }
+
+    /// Whether this graph holds unitig `id`'s sequence and abundance.
+    #[inline]
+    pub fn has(&self, id: UnitigId) -> bool {
+        self.slot(id).is_some()
+    }
+
+    #[inline]
+    fn expect_slot(&self, id: UnitigId, what: &str) -> usize {
+        self.slot(id).unwrap_or_else(|| {
+            panic!(
+                "{what} for unitig {id}, which is not in this graph's {} retained nodes. \
+                 Only the extracted neighbourhood is kept; see UnitigGraph::nodes.",
+                self.nodes.len()
+            )
+        })
+    }
+
+    /// Mean k-mer coverage of unitig `id`.
+    #[inline]
+    pub fn abundance_of(&self, id: UnitigId) -> f32 {
+        self.abundance[self.expect_slot(id, "abundance")]
+    }
+
     /// Length of unitig `id` in bases.
     pub fn seq_len(&self, id: UnitigId) -> usize {
-        let i = id as usize;
+        let i = self.expect_slot(id, "sequence length");
         (self.seq_offset[i + 1] - self.seq_offset[i]) as usize
     }
 
@@ -232,7 +493,7 @@ impl UnitigGraph {
     /// rather than allocating per unitig.
     pub fn decode_seq(&self, id: UnitigId, out: &mut Vec<u8>) {
         const BASES: [u8; 4] = *b"ACGT";
-        let i = id as usize;
+        let i = self.expect_slot(id, "sequence");
         let (start, end) = (self.seq_offset[i] as usize, self.seq_offset[i + 1] as usize);
         out.clear();
         out.reserve(end - start);
@@ -242,18 +503,46 @@ impl UnitigGraph {
     }
 
     /// 2-bit code of base `j` of unitig `id`, without materialising the sequence.
-    /// This is the accessor the k-mer scan should use.
     #[inline]
     pub fn base_at(&self, id: UnitigId, j: usize) -> u64 {
-        let p = self.seq_offset[id as usize] as usize + j;
+        let p = self.seq_offset[self.expect_slot(id, "base")] as usize + j;
         ((self.seq_2bit[p >> 2] >> (2 * (p & 3))) & 3) as u64
     }
 
-    /// Neighbours of `id` as packed edges.
+    /// Neighbours of `id` as packed edges, for a graph whose neighbourhood has been collected.
+    ///
+    /// Includes edges that leave the neighbourhood: `extract::write_gfa` has to know which
+    /// links to drop, so the row is whole even though its targets may not be retained.
     #[inline]
     pub fn edges(&self, id: UnitigId) -> &[u32] {
-        let i = id as usize;
+        let i = self.expect_slot(id, "edges");
         &self.targets[self.offsets[i] as usize..self.offsets[i + 1] as usize]
+    }
+
+    /// Neighbours of `id` into `buf`, while the graph still holds every unitig's row.
+    ///
+    /// Valid between `parse::scan` and `parse::collect`, which is exactly the window
+    /// `extract::expand` runs in. Fills a caller-owned buffer rather than returning a slice
+    /// because the rows may be on disk; pass the same buffer back each time.
+    ///
+    /// After `collect` the arrays are indexed by slot and this would read the wrong row, so it
+    /// says so rather than returning plausible edges.
+    pub fn edges_by_id_into(&self, id: UnitigId, buf: &mut Vec<u32>) -> std::io::Result<()> {
+        debug_assert!(
+            self.nodes.is_empty() || self.nodes.len() == self.n_unitigs,
+            "edges_by_id_into after collect: the adjacency is indexed by slot now, use edges()"
+        );
+        match &self.spool {
+            Some(s) => s.edges_into(id, buf),
+            None => {
+                let i = id as usize;
+                buf.clear();
+                buf.extend_from_slice(
+                    &self.targets[self.offsets[i] as usize..self.offsets[i + 1] as usize],
+                );
+                Ok(())
+            }
+        }
     }
 }
 
@@ -549,6 +838,15 @@ pub enum Outcome {
     NoLoganData,
     /// Skipped by `--max-size-mb`.
     TooLarge,
+    /// The anchor neighbourhood is over `--max-subgraph-nodes`.
+    ///
+    /// Distinct from `TooLarge`, which is about the file. This is about the *graph*: the
+    /// accession downloaded and parsed fine, and then the gene's neighbourhood turned out to
+    /// be most of it. That is the one case the two-pass parser does not help with, because an
+    /// O(subgraph) design is O(graph) when the subgraph is the graph, and it is the memory
+    /// term left after `--max-size-mb` stops governing. Its own status, because the remedy is
+    /// different: a bigger cap or a more specific reference, not a bigger machine.
+    SubgraphTooLarge,
     Failed,
 }
 
@@ -559,7 +857,11 @@ impl Outcome {
     pub fn is_negative(self) -> bool {
         matches!(
             self,
-            Outcome::NoAnchors | Outcome::NoPath | Outcome::NoLoganData | Outcome::TooLarge
+            Outcome::NoAnchors
+                | Outcome::NoPath
+                | Outcome::NoLoganData
+                | Outcome::TooLarge
+                | Outcome::SubgraphTooLarge
         )
     }
 }
@@ -849,6 +1151,65 @@ impl AccessionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every outcome is deliberately either a negative or a failure.
+    ///
+    /// The split decides what `--allow-empty` accepts and what a scheduler is told, so a new
+    /// outcome that nobody classified would quietly land on the failure side and turn "this
+    /// accession had nothing to give" into "this run broke". Written as an exhaustive match so
+    /// that adding a variant without deciding which side it is on does not compile.
+    #[test]
+    fn every_outcome_is_classified_as_found_nothing_or_failed() {
+        for o in [
+            Outcome::Success,
+            Outcome::NoAnchors,
+            Outcome::NoPath,
+            Outcome::NoLoganData,
+            Outcome::TooLarge,
+            Outcome::SubgraphTooLarge,
+            Outcome::Failed,
+        ] {
+            let expected = match o {
+                // Nothing was found, which is a fact about the accession.
+                Outcome::NoAnchors
+                | Outcome::NoPath
+                | Outcome::NoLoganData
+                | Outcome::TooLarge
+                | Outcome::SubgraphTooLarge => true,
+                // Not negatives: one worked, the other broke.
+                Outcome::Success | Outcome::Failed => false,
+            };
+            assert_eq!(o.is_negative(), expected, "{o:?} is on the wrong side of the split");
+        }
+    }
+
+    /// `resident_bytes` counts capacity, not length.
+    ///
+    /// The slack doubling leaves behind is resident memory, and it is most of what the
+    /// measured `GRAPH_PEAK_PER_COMPRESSED_BYTE` of 1.7 is made of. Measuring `len` would
+    /// under-count by up to half, so a graph could reach twice the budget the startup line
+    /// promised before either parse pass refused it. The budget tests cannot tell the two
+    /// apart, because their budgets are small enough that either measure trips.
+    #[test]
+    fn resident_bytes_counts_the_slack_not_only_the_data() {
+        let mut g = UnitigGraph {
+            accession: "T".into(),
+            n_unitigs: 1,
+            offsets: Vec::new(),
+            targets: Vec::new(),
+            nodes: Vec::new(),
+            abundance: Vec::new(),
+            seq_2bit: Vec::with_capacity(4096),
+            seq_offset: Vec::new(),
+            spool: None,
+        };
+        g.seq_2bit.push(0);
+        assert!(
+            g.resident_bytes() >= 4096,
+            "counted {} bytes for one byte held in a 4096-byte allocation",
+            g.resident_bytes()
+        );
+    }
 
     /// TW-01. `Drop` unlinked `gfa_path` whoever built the value, and unit tests build
     /// `Subgraph` by hand with paths they never created, so as root the suite deleted

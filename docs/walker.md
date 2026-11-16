@@ -229,6 +229,10 @@ downloads it and writes it there (atomically, so a killed run never leaves a par
 `--offline` refuses the S3 fallback and turns a cache miss into an error naming the accession.
 Cached files are byte-identical to the S3 objects.
 
+A cache hit is opened, not read: the decoder streams from the file handle, so a cached
+accession costs no RAM of its own. That makes `--unitigs-cache --offline` the cheapest way to
+run, not just the fastest. See [Memory](#memory).
+
 The cache is the only thing that writes unitigs to disk, and it keeps every file it downloads:
 the 20,000-accession SARS-CoV-2 run left about 100 GB. Without it, each file is held in memory
 until it is parsed and then dropped, so a run needs RAM (see [Memory](#memory)) but almost no
@@ -312,16 +316,81 @@ Options that are on by default are turned off with a `--no-…` form.
 
 ## Memory
 
-A compressed unitig file is held in three places at once: queued in a bounded channel (4 slots,
-not a flag), held by a fetch worker waiting to hand it over (`--fetch-workers`), and held by a
-compute worker for the whole parse (`-w`). At the defaults that is up to 4 + 8 + 8 = 20 files, so
-**20 GB** at the 1 GB `--max-size-mb` cap.
+A compressed unitig file can be held by a fetch worker waiting to hand it over
+(`--fetch-workers`) and by a compute worker for the whole parse (`-w`). At the defaults that is
+up to 8 + 8 = 16 files, so **16 GB** at the 1 GB `--max-size-mb` cap.
 
-On top of that, each compute worker builds a parsed graph, which peaks at up to about 1.6 times
-the compressed size of its file. Measured one accession at a time, as peak memory minus the
-process baseline and the compressed file:
+Two things keep that figure from being reached in practice, both new in 0.2.0:
 
-| accession | compressed | graph at peak |
+- **A cached accession costs a file handle, not its own size.** A cache hit opens the file and
+  the zstd decoder streams from the handle, so the bytes are never resident. A download with
+  `--unitigs-cache` set is written to the cache and the buffer dropped for the handle, which is
+  what removes the compute worker's copy, the one held longest. Only a download with no cache
+  configured is still held in RAM. Measured over 20 cached 34 MB accessions at
+  `-w 1 --fetch-workers 8`, peak RSS fell from 516.4 MiB to **49.9 MiB**, a 10.4x reduction,
+  with the wall clock unchanged and every output byte-identical. At `-w 8 --fetch-workers 8`
+  the floor is the eight resident graphs, 366.9 MiB.
+- **The queue between fetch and compute no longer holds anything.** It was four slots deep,
+  which is four more capped buffers in the bound for no throughput: a fetch worker with bytes
+  in hand and nowhere to put them is already a held buffer. It is now a rendezvous.
+
+On top of that, each compute worker holds a parsed graph, which the walker budgets at 1.7
+times the compressed size of its file.
+
+From 0.2.0 that graph is mostly adjacency. The file is decoded **twice**: the first pass builds
+adjacency and finds the anchors as the bases stream past, and the second keeps sequence and
+abundance for the extracted neighbourhood alone. `ERR2028820` has 1,277,362 unitigs and a
+747-node neighbourhood for PfCRT, so the per-unitig data the old parser built was almost
+entirely thrown away. Over the same 20 cached accessions, peak RSS fell from 49.9 MiB to
+**24.1 MiB** at `-w 1 --fetch-workers 8`, and from 366.9 MiB to **161.4 MiB** at `-w 8`. Against
+0.1.1 that is 516.4 MiB to 24.1, about 21x.
+
+From 0.2.0 the adjacency itself leaves RAM. It is the last part of the walker that scaled with
+the *file* rather than the gene (12 bytes per unitig, 15.4 MB for `ERR2028820`), and it exists
+only from pass 1 until `extract::expand` has finished walking it. Past 4 MiB it spills to two
+files under `--spool-dir`, read back with `pread`; `parse::collect` then keeps the
+neighbourhood's rows and drops the spool. The files are unlinked the moment they are created,
+so they need no cleanup and survive no crash, and a spool directory that cannot be written is a
+warning rather than a failed accession: the run simply uses the memory it used to use.
+
+With that, peak RSS over the same 20 cached accessions is **12.9 MiB** at `-w 1
+--fetch-workers 8` and **77.8 MiB** at `-w 8`, against 516.4 MiB at 0.1.1: about **40x**, with
+no change to any output.
+
+The second decode is not free, but most of what it used to cost was work whose result was
+discarded. `parse::collect` originally called the same header reader pass 1 uses, which parses
+`ka:f:` for every record and all three components of every `L:`. Pass 2 has the adjacency
+already and skips most records, so on `ERR2028820` that was 1,277,362 abundances and 2,582,206
+links parsed per accession for nothing. It now uses `header_light`, which reads the id, takes
+the abundance only for a record it is keeping, and never looks at a link. For scale, zstd
+decompresses that accession's 146 MB of text in 0.09 s, so the header walk, not the inflate,
+was the larger half of pass 2.
+
+Measured over the same 20 cached accessions at `-w 1 --fetch-workers 8`, pass 2 costs about
+**0.15 s per accession**, down from 0.21 s, and the two-pass parser is now **1.4% slower** than
+the single-pass one it replaced (18.27 s against 18.02 s over the 20), where before the change
+it was 10.4% slower. On a 48-accession cohort spanning 18 MB to 695 MB compressed, 9.76 GB in
+all, at `-w 8`: pass 2 fell from 94.9 s to 62.3 s (**34%**), pass 1 was unchanged at 234.5 s
+against 237.2 s, and wall went from 49.6 s to 44.3 s. Every output byte was identical, and peak
+RSS did not move (83.8 MiB against 82.5 MiB), which is the point: this one is time only.
+
+Note what the remaining cost tracks: pass 2 stops once the last wanted unitig has gone
+past, so it is governed by **where the neighbourhood sits in the file**, not by how large it is.
+A neighbourhood scattered to the end costs a full second decode however few nodes it has.
+
+What pass 2 stopped validating, pass 1 still validates. A malformed link, or an abundance that
+is unparseable, negative or not finite, fails in `scan`, over the same bytes from the same
+`Compressed` handle, so `collect` can never be the pass that meets one first. The id rules stay
+in both readers, because a disagreement between the two decodes has to stay an error rather
+than becoming a wrong answer.
+
+The 1.7 budget was calibrated before that split, on the single-pass graph, measured one
+accession at a time as peak memory minus the process baseline and the compressed file. It is
+kept as the budget because it is the figure the printed bound and the parser both work from,
+and because it is now a ceiling the two-pass graph sits well under rather than a prediction of
+what it will use:
+
+| accession | compressed | single-pass graph at peak |
 |---|---|---|
 | `ERR6174245` | 4.8 MB | 1.6x |
 | `ERR2028820` | 32.4 MB | 1.25x |
@@ -329,15 +398,51 @@ process baseline and the compressed file:
 | `SRR15477033` | 289.1 MB | 1.62x |
 | `ERR9831160` | 347.6 MB | 1.43x |
 
-The walker counts each graph at 1.7 times the cap, so the default worst case is 20 GB plus
-8 x 1.7 GB, **33.6 GB**, and it prints the bound for the settings it was given at startup.
-(Before 0.1.1 it counted a fixed 43 MB per graph.)
+The walker counts each graph at 1.7 times the cap, so the default worst case is 16 GB plus
+8 x 1.7 GB, **29.6 GB**, and it prints the bound for the settings and the accession list it was
+actually given at startup. (Before 0.1.1 it counted a fixed 43 MB per graph; before 0.2.0 the
+buffer term was 20 GB, because the fetch-to-compute queue held four more.)
+
+The printed bound is capped by the work available: a run of n accessions can hold at most n
+buffers and at most min(n, `-w`) graphs, so a single-accession run prints 2.7 GB rather than
+29.6. `--fetch-only` prints one buffer per fetch worker and no graphs, because it never parses.
+
+That bound assumes the graph is in RAM and scales with `--max-size-mb`. With adjacency spooled
+and `--max-subgraph-nodes` set, neither holds, and the walker prints a second line with the
+ceiling that actually applies: about 150 bytes per retained node, so `-w 8` with the default
+1,000,000-node cap is **1.12 GB regardless of accession size**. That figure does not mention
+the file size at all, which is the point. It is also what `--max-size-mb` can eventually be
+relaxed against, since the compressed cap exists to bound memory and memory is now bounded by
+the gene instead.
+
+Spilling trades RAM for disk: up to roughly the compressed size again per in-flight accession,
+so `-w 8 --fetch-workers 8` at the 1 GB cap can want several GB of scratch under
+`--spool-dir`. It defaults to `--unitigs-cache` when set, otherwise the system temp directory,
+and deliberately not `--scratch-dir`, which is `/dev/shm` by default: spilling into a tmpfs
+moves bytes from one part of RAM to another and measures as a saving while being none. The
+walker warns if you point it there anyway.
+
+That 1.7 figure came from measuring real accessions one at a time, and two things make it hold
+over a long list rather than drift:
+
+- **The allocator keeps its promise.** glibc raises its own mmap threshold each time a large
+  block is freed, so from the second accession on the graph arrays grow inside the heap and
+  freed chunks stay resident. The walker pins the threshold at 1 MiB on glibc, which returns
+  each graph to the OS when it is dropped. Worth 46 MiB of the measurement above.
+- **The parser enforces the budget.** 1.7x is a property of the accessions measured, not of the
+  file format: a dense enough file can build a graph many times its compressed size, and
+  nothing used to stop it. Both passes measure what the graph holds and refuse the accession as
+  `too_large` once it passes `--max-size-mb` x 1.7, so neither a link-dense file in pass 1 nor a
+  neighbourhood that turns out to be most of the graph in pass 2 can exceed the printed bound.
+  The arrays grow by doubling and are measured periodically, so the refusal lands within one
+  doubling of the budget rather than exactly on it, which is why the bound says "up to".
 
 This is a worst case: it assumes every accession sits at the cap. `ERR2028820` is 33 MB, and the
 largest *C. auris* ERG11 accession tested was 343 MB. To contain a run, lower `--max-size-mb` and
 the two worker counts together, since they multiply. `-w 16 --fetch-workers 16`, for example,
-allows 36 buffers and 16 graphs. The cap applies to files read from `--unitigs-cache` too: a
-cached file over it is skipped as `too_large`, like a download.
+allows 32 buffers and 16 graphs. The cap applies to files read from `--unitigs-cache` too: a
+cached file over it is skipped as `too_large`, like a download, and so is one whose parsed graph
+would exceed the budget above.
 
 ## Scratch files
 
@@ -423,7 +528,8 @@ Each accession ends with one status, printed as it finishes and recorded in the 
 | `no_anchors` | no unitig shares enough k-mers with the reference: the gene is not there | nothing found |
 | `no_path` | anchors were found, but no alignment through the subgraph covers `--min-cov` of the reference | nothing found |
 | `no_logan_data` | Logan has no unitigs for the accession (HTTP 404) | nothing found |
-| `too_large` | over `--max-size-mb`, so skipped before downloading | nothing found |
+| `too_large` | over `--max-size-mb`, so skipped before downloading, or its parsed graph would exceed `--max-size-mb` x 1.7 | nothing found |
+| `subgraph_too_large` | the gene's neighbourhood is over `--max-subgraph-nodes` | nothing found |
 | `error` | anything else: a network or cache failure, a corrupt file, GraphAligner crashing | error |
 
 One bad accession does not stop the run, and one success is enough for it to exit 0. When none

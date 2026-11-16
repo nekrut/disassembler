@@ -87,10 +87,17 @@ pub fn expand(cfg: &Config, graph: &UnitigGraph, anchors: &Anchors) -> Result<Ve
     // Only the newly reached nodes need expanding each round. Re-scanning every node ever
     // seen gives the same closure but is quadratic in the neighbourhood size.
     let mut next: Vec<UnitigId> = Vec::new();
+    // One buffer for the whole walk: the rows may be on disk, and a fresh Vec per node would
+    // allocate once per visited unitig.
+    let mut row: Vec<u32> = Vec::new();
     for _ in 0..cfg.hops {
         next.clear();
         for &node in &frontier {
-            for &packed in graph.edges(node) {
+            graph.edges_by_id_into(node, &mut row).map_err(|e| Error::Parse {
+                accession: graph.accession.clone(),
+                detail: format!("reading adjacency for unitig {node}: {e}"),
+            })?;
+            for &packed in &row {
                 let (target, _, _) = parse::unpack_edge(packed);
                 if (target as usize) >= graph.n_unitigs {
                     return Err(Error::Parse {
@@ -125,7 +132,7 @@ pub fn expand(cfg: &Config, graph: &UnitigGraph, anchors: &Anchors) -> Result<Ve
 ///
 /// Median rather than mean, so one repeat-collapsed unitig cannot drag it.
 pub fn path_depth(graph: &UnitigGraph, steps: &[PathStep]) -> f32 {
-    median_abundance(steps.iter().map(|s| graph.abundance[s.node as usize]).collect())
+    median_abundance(steps.iter().map(|s| graph.abundance_of(s.node)).collect())
 }
 
 /// Median of a set of abundances, or 0.0 when empty.
@@ -156,7 +163,7 @@ pub fn path_mean_ka(graph: &UnitigGraph, steps: &[PathStep]) -> f64 {
     if steps.is_empty() {
         return 0.0;
     }
-    let sum: f64 = steps.iter().map(|s| graph.abundance[s.node as usize] as f64).sum();
+    let sum: f64 = steps.iter().map(|s| graph.abundance_of(s.node) as f64).sum();
     sum / steps.len() as f64
 }
 
@@ -204,7 +211,7 @@ pub fn prune_nodes(
     let mut kn = Vec::with_capacity(nodes.len());
     let mut ks = Vec::with_capacity(seqs.len());
     for (id, seq) in nodes.into_iter().zip(seqs) {
-        if survives(graph.abundance[id as usize], floor) {
+        if survives(graph.abundance_of(id), floor) {
             kn.push(id);
             ks.push(seq);
         }
@@ -425,7 +432,7 @@ mod collect_tests {
     use crate::stages::parse;
 
     fn graph(fa: &str) -> UnitigGraph {
-        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
+        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap()
     }
 
     #[test]
@@ -491,7 +498,7 @@ mod expand_tests {
     use crate::types::Anchors;
 
     fn graph(fa: &str) -> UnitigGraph {
-        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
+        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap()
     }
     fn anchors(ids: &[UnitigId], n: usize) -> Anchors {
         Anchors {
@@ -631,9 +638,9 @@ mod recall_study_subgraphs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => panic!("{p}: {e}"),
         };
-        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0, payload: crate::types::Payload::default() };
+        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed: crate::types::Compressed::Memory(compressed), fetch_secs: 0.0, payload: crate::types::Payload::default() };
         let rd = stream::decoder(&f).unwrap_or_else(|e| panic!("{p}: not decodable: {e}"));
-        Some(parse::build(&f.accession, rd).unwrap_or_else(|e| panic!("{p}: not parseable: {e}")))
+        Some(parse::build(&f.accession, rd, u64::MAX).unwrap_or_else(|e| panic!("{p}: not parseable: {e}")))
     }
 
     /// TW-12: a corrupt fixture must fail loudly, not be reported as "no data".
@@ -749,13 +756,13 @@ mod real_data_collect {
             index: 0,
             accession: "ERR2028820".into(),
             compressed_len: compressed.len(),
-            compressed,
+            compressed: crate::types::Compressed::Memory(compressed),
             fetch_secs: 0.0,
             payload: crate::types::Payload::default(),
         };
         let graph = {
             let rd = stream::decoder(&f).unwrap();
-            parse::build(&f.accession, rd).unwrap()
+            parse::build(&f.accession, rd, u64::MAX).unwrap()
         };
 
         let Ok(fh) = std::fs::File::open(&plain) else {
@@ -820,7 +827,7 @@ mod gfa_tests {
     use std::io::Read;
 
     fn graph(fa: &str) -> UnitigGraph {
-        parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
+        parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap()
     }
     /// A config and the guard that removes its scratch directory (TW-10). Bind the guard,
     /// usually as `_d`, for as long as the config is in use.
@@ -989,13 +996,13 @@ mod cross_check {
             index: 0,
             accession: "ERR2028820".into(),
             compressed_len: compressed.len(),
-            compressed,
+            compressed: crate::types::Compressed::Memory(compressed),
             fetch_secs: 0.0,
             payload: crate::types::Payload::default(),
         };
         let graph = {
             let rd = stream::decoder(&f).unwrap();
-            parse::build(&f.accession, rd).unwrap()
+            parse::build(&f.accession, rd, u64::MAX).unwrap()
         };
         let query = read_query(Path::new("../queries/pfcrt_only.fasta")).unwrap();
         let cfg = Config {
@@ -1040,7 +1047,7 @@ mod depth_tests {
     use crate::types::{Orient, PathStep};
 
     fn graph(fa: &str) -> UnitigGraph {
-        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
+        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap()
     }
     fn steps(ids: &[UnitigId]) -> Vec<PathStep> {
         ids.iter().map(|&node| PathStep { node, orient: Orient::Forward }).collect()

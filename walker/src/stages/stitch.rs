@@ -275,7 +275,7 @@ mod tests {
             .enumerate()
             .map(|(i, a)| format!(">T_{i} ka:f:{a}\nACGT\n"))
             .collect();
-        crate::stages::parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.into_bytes())))
+        crate::stages::parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.into_bytes())), u64::MAX)
             .unwrap()
     }
     /// For the cases where abundance is irrelevant; wide enough for every node id used here.
@@ -666,11 +666,11 @@ mod golden_haplotype {
             index: 0,
             accession: "ERR2028820".into(),
             compressed_len: compressed.len(),
-            compressed,
+            compressed: crate::types::Compressed::Memory(compressed),
             fetch_secs: 0.0,
             payload: crate::types::Payload::default(),
         };
-        let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
+        let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd, u64::MAX).unwrap() };
         let query = read_query(Path::new("../queries/pfcrt_only.fasta")).unwrap();
         let idx = anchor::index_query(&cfg, &query).unwrap();
         let a = anchor::find(&cfg, &graph, &idx).unwrap();

@@ -213,7 +213,7 @@ pub fn prefer_majority(
     let mut hit_cap = true;
     for _ in 0..passes {
         let Some(v) = view(graph, subgraph, &current) else { break };
-        let abund = |o: Oriented| graph.abundance[subgraph.nodes[(o as usize) / 2] as usize];
+        let abund = |o: Oriented| graph.abundance_of(subgraph.nodes[(o as usize) / 2]);
         let depth = path_depth(graph, subgraph, &v.walk);
         let floor = abundance_floor(cfg, depth);
 
@@ -567,7 +567,7 @@ pub fn find_alts(
     };
     let baseline_len = stitched_len(cfg, &path.steps, subgraph);
 
-    let abund = |o: Oriented| graph.abundance[subgraph.nodes[(o as usize) / 2] as usize];
+    let abund = |o: Oriented| graph.abundance_of(subgraph.nodes[(o as usize) / 2]);
     let depth = path_depth(graph, subgraph, &walk);
     let floor = abundance_floor(cfg, depth);
 
@@ -791,7 +791,7 @@ fn path_depth(graph: &UnitigGraph, subgraph: &Subgraph, walk: &[Oriented]) -> f3
     // rather than over `PathStep`s. Only the projection differs, so only it lives here.
     crate::stages::extract::median_abundance(
         walk.iter()
-            .map(|&o| graph.abundance[subgraph.nodes[(o as usize) / 2] as usize])
+            .map(|&o| graph.abundance_of(subgraph.nodes[(o as usize) / 2]))
             .collect(),
     )
 }
@@ -1009,7 +1009,7 @@ mod tests {
              >T_3 ka:f:{main}  L:-:1:-  L:-:2:-\nGTAG\n",
             main = 100.0, taken = taken, alt = alt
         );
-        parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.into_bytes()))).unwrap()
+        parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.into_bytes())), u64::MAX).unwrap()
     }
 
     fn subgraph_of(g: &UnitigGraph) -> Subgraph {
@@ -1182,7 +1182,7 @@ mod tests {
              >T_6 ka:f:100.0  L:-:4:-  L:-:5:-\nACGT\n",
             ins = ins
         );
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.into_bytes())))
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.into_bytes())), u64::MAX)
             .unwrap();
         let s = subgraph_of(&g);
         let walk = GafPath {
@@ -1275,7 +1275,7 @@ mod tests {
                   >T_2 ka:f:47.0   L:-:0:-  L:+:4:+\nCGTC\n\
                   >T_3 ka:f:47.0   L:-:0:-  L:+:4:+\nCGTG\n\
                   >T_4 ka:f:100.0  L:-:1:-  L:-:2:-  L:-:3:-\nGTAG\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())))
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX)
             .unwrap();
         let s = subgraph_of(&g);
         let walk = GafPath {
@@ -1307,7 +1307,7 @@ mod tests {
                   >T_1 ka:f:40.0   L:-:0:-  L:+:3:+\nCGTA\n\
                   >T_2 ka:f:60.0   L:-:0:-  L:+:3:+\nCGTCAAA\n\
                   >T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nGTAG\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap();
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap();
         let s = subgraph_of(&g);
         let fixed = prefer_majority(&maj(true), &g, &s, &walked(), &q("ACGTAG"))
             .unwrap()
@@ -1323,7 +1323,7 @@ mod tests {
                   >T_1 ka:f:40.0   L:-:0:-  L:+:3:+\nCGTA\n\
                   >T_2 ka:f:60.0   L:-:0:-  L:+:3:+\nCGTCA\n\
                   >T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nGTAG\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap();
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap();
         let s = subgraph_of(&g);
         assert!(prefer_majority(&maj(true), &g, &s, &walked(), &q("ACGTAG")).unwrap().is_none());
         let c = Config { allow_indel_alts: false, ..maj(true) };
@@ -1399,7 +1399,7 @@ mod tests {
                   >T_1 ka:f:60.0   L:-:0:-  L:+:3:+\nCGTA\n\
                   >T_2 ka:f:40.0   L:-:0:-  L:+:3:+\nCGTCAAA\n\
                   >T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nGTAG\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap();
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap();
         let s = subgraph_of(&g);
         let query = q("ACGTAG");
         let primary = stitch::stitch(&cfg(true), &g, &walked(), &s, &query).unwrap().unwrap();
@@ -1421,7 +1421,7 @@ mod tests {
                   >T_1 ka:f:60.0   L:-:0:-  L:+:3:+\nCGTA\n\
                   >T_2 ka:f:40.0   L:-:0:-  L:+:3:+\nCGTCAAA\n\
                   >T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nGTAG\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap();
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap();
         let s = subgraph_of(&g);
         let c = Config { allow_indel_alts: false, ..cfg(true) };
         assert!(find_alts(&c, &g, &s, &walked(), &q("ACGTAG")).unwrap().is_empty());
@@ -1436,7 +1436,7 @@ mod tests {
                   >T_1 ka:f:60.0   L:-:0:-  L:+:3:+\nCGTA\n\
                   >T_2 ka:f:40.0   L:-:0:-  L:+:3:+\nCGTCA\n\
                   >T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nGTAG\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap();
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap();
         let s = subgraph_of(&g);
         assert!(
             find_alts(&cfg(true), &g, &s, &walked(), &q("ACGTAG")).unwrap().is_empty(),
@@ -1459,7 +1459,7 @@ mod tests {
              >T_2 ka:f:40.0   L:-:0:-  L:+:3:+\n{long}\n\
              >T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nGTAG\n"
         );
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.into_bytes()))).unwrap();
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.into_bytes())), u64::MAX).unwrap();
         let s = subgraph_of(&g);
         let c = Config { allow_frameshift_alts: true, ..cfg(true) };
         assert!(
@@ -1563,7 +1563,7 @@ mod tests {
                   >T_2 ka:f:20.0   L:-:0:-  L:+:4:+\nCGTC\n\
                   >T_3 ka:f:400.0  L:-:0:-\nCGTG\n\
                   >T_4 ka:f:80.0   L:-:1:-  L:-:2:-\nGTAG\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())))
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX)
             .unwrap();
         let s = subgraph_of(&g);
         let walk = GafPath {
@@ -1594,7 +1594,7 @@ mod tests {
                   >T_2 ka:f:80.0   L:-:0:-  L:+:4:+\nCGTC\n\
                   >T_3 ka:f:400.0  L:-:0:-\nCGTG\n\
                   >T_4 ka:f:80.0   L:-:1:-  L:-:2:-\nGTAG\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())))
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX)
             .unwrap();
         let s = subgraph_of(&g);
         let walk = GafPath {
@@ -1694,7 +1694,7 @@ mod tests {
                   >T_1 ka:f:40.0   L:-:0:-  L:+:3:+\nCGTA\n\
                   >T_2 ka:f:60.0   L:-:0:-  L:+:3:+\nCGTCAAA\n\
                   >T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nGTAG\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())))
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX)
             .unwrap();
         let s = subgraph_of(&g);
         let c = maj(true);
@@ -1736,7 +1736,7 @@ mod tests {
                   >T_2 ka:f:45.0   L:-:0:-  L:+:3:+\nCGTCA\n\
                   >T_3 ka:f:100.0  L:-:1:-  L:-:2:-  L:-:4:-\nGTAG\n\
                   >T_4 ka:f:30.0   L:-:0:-  L:+:3:+\nCGTC\n";
-        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())))
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX)
             .unwrap();
         let s = subgraph_of(&g);
         let c = maj(true);

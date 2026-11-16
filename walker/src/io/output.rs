@@ -26,6 +26,7 @@ fn outcome_str(o: Outcome) -> &'static str {
         Outcome::NoPath => "no_path",
         Outcome::NoLoganData => "no_logan_data",
         Outcome::TooLarge => "too_large",
+        Outcome::SubgraphTooLarge => "subgraph_too_large",
         Outcome::Failed => "error",
     }
 }
@@ -587,12 +588,14 @@ fn write_discards(w: &mut impl Write, s: &Summary, run: &RunInfo) -> Result<()> 
     writeln!(
         w,
         "    \"accessions\": {{\"never_reached\": {}, \"no_anchors\": {}, \"no_path\": {}, \
-         \"no_logan_data\": {}, \"too_large\": {}, \"error\": {}}},",
+         \"no_logan_data\": {}, \"too_large\": {}, \"subgraph_too_large\": {}, \
+         \"error\": {}}},",
         run.n_requested.saturating_sub(s.results.len()),
         count(Outcome::NoAnchors),
         count(Outcome::NoPath),
         count(Outcome::NoLoganData),
         count(Outcome::TooLarge),
+        count(Outcome::SubgraphTooLarge),
         count(Outcome::Failed)
     )?;
     writeln!(
@@ -2255,7 +2258,8 @@ mod identity_label_tests {
             "\"n_ok\": 1",
             // Every discard key is present even at zero, so "did not happen" is readable.
             "\"accessions\": {\"never_reached\": 0, \"no_anchors\": 0, \"no_path\": 0, \
-             \"no_logan_data\": 0, \"too_large\": 0, \"error\": 0}",
+             \"no_logan_data\": 0, \"too_large\": 0, \"subgraph_too_large\": 0, \
+             \"error\": 0}",
             "\"alleles\": {\"beyond_max_alts\": 0, \
              \"no_rejoin\": 0, \"not_substitution\": 0, \"over_indel_cap\": 0, \
              \"frameshifting\": 0, \"window_not_shiftable\": 0, \"identical\": 0}",

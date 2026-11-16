@@ -715,11 +715,11 @@ mod align_real {
             index: 0,
             accession: "ERR2028820".into(),
             compressed_len: compressed.len(),
-            compressed,
+            compressed: crate::types::Compressed::Memory(compressed),
             fetch_secs: 0.0,
             payload: crate::types::Payload::default(),
         };
-        let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
+        let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd, u64::MAX).unwrap() };
         let query = read_query(Path::new("../queries/pfcrt_only.fasta")).unwrap();
         let idx = anchor::index_query(&cfg, &query).unwrap();
         let a = anchor::find(&cfg, &graph, &idx).unwrap();
@@ -825,13 +825,13 @@ mod determinism {
                 index: 0,
                 accession: acc.into(),
                 compressed_len: compressed.len(),
-                compressed,
+                compressed: crate::types::Compressed::Memory(compressed),
                 fetch_secs: 0.0,
                 payload: crate::types::Payload::default(),
             };
             let graph = {
                 let rd = stream::decoder(&f).unwrap();
-                parse::build(&f.accession, rd).unwrap()
+                parse::build(&f.accession, rd, u64::MAX).unwrap()
             };
             let query = read_query(Path::new(qpath)).unwrap();
             let idx = anchor::index_query(&cfg, &query).unwrap();

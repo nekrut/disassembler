@@ -41,14 +41,14 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-16T17:24:53Z",
-    "wall_seconds": 0.918,
-    "stage_seconds": {"stream": 0.029, "parse": 0.578, "anchor": 0.261, "extract": 0.000, "align": 0.044, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-16T19:15:52Z",
+    "wall_seconds": 1.018,
+    "stage_seconds": {"stream": 0.017, "parse": 0.739, "anchor": 0.000, "extract": 0.216, "align": 0.043, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
   "discards": {
-    "accessions": {"never_reached": 0, "no_anchors": 0, "no_path": 0, "no_logan_data": 0, "too_large": 0, "error": 0},
+    "accessions": {"never_reached": 0, "no_anchors": 0, "no_path": 0, "no_logan_data": 0, "too_large": 0, "subgraph_too_large": 0, "error": 0},
     "alleles": {"beyond_max_alts": 0, "no_rejoin": 1, "not_substitution": 0, "over_indel_cap": 2, "frameshifting": 1, "window_not_shiftable": 0, "identical": 0},
     "minority_sites": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 0, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0}
   },
@@ -90,7 +90,7 @@
       "hit_pass_cap": false,
       "variants": {"depth": 180.0, "floor": 5.0, "forks": 11, "biallelic": 4, "recovered": 0, "beyond_cap": 0, "indels": 0, "no_rejoin": 1, "not_substitution": 0, "over_indel_cap": 2, "frameshifting": 1, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 180.0, "floor": 5.0, "unitigs": 747, "unitigs_kept": 479, "unpruned_span": [0, 1275], "pruned_span": [0, 1275]},
-      "timing": {"stream": 0.029, "parse": 0.578, "anchor": 0.261, "extract": 0.000, "align": 0.044, "stitch": 0.000, "phase": 0.000, "total": 0.885}
+      "timing": {"stream": 0.017, "parse": 0.739, "anchor": 0.000, "extract": 0.216, "align": 0.043, "stitch": 0.000, "phase": 0.000, "total": 0.999}
     }
   ]
 }

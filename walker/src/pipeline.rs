@@ -29,7 +29,7 @@
 //!  │   └───┬────┘ └───┬────┘        └───┬────┘                            │
 //!  │       │          │                 │                                 │
 //!  │       │   per accession, in order:                                   │
-//!  │       │     stages::parse    -> UnitigGraph (CSR, ~1.5x compressed)  │
+//!  │       │     stages::parse    -> UnitigGraph (CSR, up to 1.7x compr.) │
 //!  │       │     stages::anchor   -> Anchors                              │
 //!  │       │     stages::extract  -> Subgraph + GFA on tmpfs              │
 //!  │       │     stages::align    -> GraphAligner subprocess -> GafPath   │
@@ -61,24 +61,35 @@
 //! three places at once, not one:
 //!
 //! ```text
-//!   cfg.channel_capacity     queued in the bounded channel             4
+//!   cfg.channel_capacity     queued in the bounded channel             0
 //! + cfg.fetch_workers        held by a worker blocked in send(),       8
 //!                            after read_to_vec has already returned
 //! + cfg.compute_workers      held by run_one for the whole parse,      8
 //!                            dropped only once the CSR graph exists
 //!                            -----------------------------------------
-//!                            peak concurrent buffers                  20
+//!                            peak concurrent buffers                  16
+//!
+//!   capped by the accession count: a run of n accessions cannot hold
+//!   more than n buffers or more than min(n, W) graphs, and --fetch-only
+//!   holds F buffers and no graphs at all
 //! ```
 //!
-//! `Config::peak_compressed_buffers` computes that and
-//! `Config::max_compressed_resident_bytes` multiplies it by `--max-size-mb`: at the 1 GB
-//! default cap, **about 20 GB** in compressed buffers, not 4 GB.
+//! `Config::peak_compressed_buffers_for` computes that and
+//! `Config::max_compressed_resident_bytes_for` multiplies it by `--max-size-mb`: at the 1 GB
+//! default cap, **about 16 GB** in compressed buffers. It was 20 GB until the queue depth
+//! went to 0, which is the whole of what a positive depth was costing.
 //!
-//! On top of that sits one `UnitigGraph` per compute worker, which peaks at up to ~1.6x the
+//! On top of that sits one `UnitigGraph` per compute worker, which peaks at up to 1.7x the
 //! compressed size of its accession (`Config::GRAPH_PEAK_PER_COMPRESSED_BYTE`; it was taken
 //! to be a fixed ~43 MB), and whatever `read_to_vec` transiently allocates while its `Vec`
-//! grows. `Config::max_resident_bytes` adds the graphs: **about 34 GB** at the defaults. The
-//! binary prints it at startup, so it is visible before the run rather than after the OOM.
+//! grows. `Config::max_resident_bytes_for` adds the graphs: **about 29.6 GB** at the
+//! defaults. The binary prints it at startup for the run it was actually given, so it is
+//! visible before the run rather than after the OOM.
+//!
+//! That 1.7x is a calibration, not an enforced bound, and it was measured one accession per
+//! run. Across many accessions glibc's dynamic mmap threshold rises as freed graph arrays are
+//! returned, so later arrays grow inside the heap and the steady state drifts well above it.
+//! `main::pin_mmap_threshold` pins the threshold at 1 MiB to stop that.
 //!
 //! The bound is worst case, not typical: it assumes every accession sits at the cap, while
 //! `ERR2028820` is 33 MB and the largest of the ERG11 panel is 343 MB. But the cap is what
@@ -229,7 +240,7 @@ pub fn run_fetch_only(
                         out.push(cached(index, accession, f.payload));
                     }
                     Err(e) => {
-                        let r = unfetched(index, accession.clone(), e.to_string(), &e);
+                        let r = result_for_error(index, accession.clone(), e.to_string(), &e);
                         if r.outcome.is_negative() {
                             eprintln!("[{progress}/{total}] {accession}: not cached: {e}");
                         } else {
@@ -267,9 +278,15 @@ fn cached(index: usize, accession: Accession, payload: crate::types::Payload) ->
     r
 }
 
-/// The result for an accession whose fetch did not return bytes. No Logan data and an
-/// accession over the size cap are negatives; anything else is an error.
-fn unfetched(
+/// Turn a per-accession error into its result, with the right outcome.
+///
+/// Shared by both pools, because both can produce the same negatives. The fetch pool raises
+/// `TooLarge` from a `Content-Length` or a cached file's size; the compute pool raises it from
+/// `stages::parse`, when a graph exceeds the per-accession budget the startup line promised.
+/// Routing the second through `AccessionResult::failed` would have reported "this run broke"
+/// for what is really "this accession does not fit the cap you set", and `--allow-empty`
+/// treats the two differently.
+fn result_for_error(
     index: usize,
     accession: Accession,
     detail: String,
@@ -461,6 +478,11 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
             "[{done}/{total}] {}: no_logan_data (no Logan unitigs for this accession)",
             r.accession
         ),
+        Outcome::SubgraphTooLarge => println!(
+            "[{done}/{total}] {}: subgraph_too_large{}",
+            r.accession,
+            r.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default()
+        ),
         Outcome::TooLarge => println!(
             "[{done}/{total}] {}: too_large, skipped by --max-size-mb ({})",
             r.accession,
@@ -496,7 +518,7 @@ fn fetch_worker(
                 }
             }
             Err(e) => {
-                let result = unfetched(index, accession, e.to_string(), &e);
+                let result = result_for_error(index, accession, e.to_string(), &e);
                 if result.outcome == Outcome::Failed {
                     eprintln!("{e}");
                 }
@@ -536,7 +558,7 @@ fn compute_worker(
         let panic_acc = accession.clone();
         let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_one(cfg, queries, query_index, fetched)
-                .unwrap_or_else(|e| AccessionResult::failed(index, accession, e.to_string()))
+                .unwrap_or_else(|e| result_for_error(index, accession, e.to_string(), &e))
         }))
         .unwrap_or_else(|_| {
             AccessionResult::failed(
@@ -560,7 +582,7 @@ fn compute_worker(
 /// `parse::build` consumes the compressed bytes as a stream and returns everything the rest
 /// of the pipeline needs, so the decompressed text (145 MB for `ERR2028820`, ~1.44 GB for the
 /// largest ERG11 accessions) is never held. After the scope below closes, resident state per
-/// worker is one `UnitigGraph`: ~43 MB of arrays for `ERR2028820`, up to ~1.6x the
+/// worker is one `UnitigGraph`: ~43 MB of arrays for `ERR2028820`, up to 1.7x the
 /// compressed size at peak in general (`Config::GRAPH_PEAK_PER_COMPRESSED_BYTE`).
 ///
 /// Peak is therefore roughly `compressed + graph`: measured at 80 MB for the whole process
@@ -584,21 +606,30 @@ fn run_one(
     let fetch_secs = fetched.fetch_secs;
     let mut timing = Timing::default();
 
-    // Single streaming decode. `fetched` is dropped at the end of this scope; nothing
-    // downstream needs the raw file again.
+    // Pass 1 of 2. Adjacency only, with anchoring fused into the decode: `Scanner` sees each
+    // base as it streams past, so neither the sequences nor a second walk over them exists.
+    // `fetched` stays alive until pass 2, which is why it is not dropped here.
     let t = Instant::now();
-    let graph = {
-        let reader = stages::stream::decoder(&fetched)?;
-        stages::parse::build(&fetched.accession, reader)?
-    };
-    drop(fetched);
+    let mut scanner = stages::anchor::Scanner::new(cfg, query_index)?;
+    let mut graph = stages::parse::scan_in(
+        &fetched.accession,
+        stages::stream::decoder(&fetched)?,
+        // The budget the startup line promised: one graph per compute worker at
+        // GRAPH_PEAK_PER_COMPRESSED_BYTE times the size cap. Without it that line is a
+        // calibration from real accessions rather than a limit anything enforces.
+        cfg.max_graph_bytes_per_accession(),
+        &mut scanner,
+        cfg.spool_dir.as_deref(),
+        crate::types::SPILL_ADJACENCY_AT,
+    )?;
     timing.stream = fetch_secs;
+    // `parse` now covers the anchoring too, and `anchor` is no longer a pass of its own. The
+    // key stays in the contract rather than being dropped, because removing it would make two
+    // schema-1 summaries disagree about which keys exist.
     timing.parse = t.elapsed().as_secs_f64();
+    timing.anchor = 0.0;
     let n_unitigs = graph.n_unitigs;
-
-    let t = Instant::now();
-    let anchors = stages::anchor::find(cfg, &graph, query_index)?;
-    timing.anchor = t.elapsed().as_secs_f64();
+    let anchors = scanner.finish();
 
     // No anchors means the gene is not present in this accession. A legitimate outcome,
     // not a failure, and there is nothing to expand from.
@@ -637,6 +668,42 @@ fn run_one(
     let t = Instant::now();
     let nodes = stages::extract::expand(cfg, &graph, &anchors)?;
     let subgraph_fraction = stages::extract::subgraph_fraction(&graph, &nodes);
+    // The memory term the two-pass parser cannot remove. Everything from here on is
+    // proportional to the neighbourhood, so this is where an accession whose gene turns out
+    // to be most of its graph has to be refused rather than attempted. Checked before
+    // `collect`, which is the first thing that would allocate against it.
+    if cfg.max_subgraph_nodes > 0 && nodes.len() > cfg.max_subgraph_nodes {
+        timing.extract = t.elapsed().as_secs_f64();
+        timing.total = t_start.elapsed().as_secs_f64();
+        let mut r = AccessionResult::empty(
+            index,
+            accession,
+            Outcome::SubgraphTooLarge,
+            Some(format!(
+                "neighbourhood is {} unitigs of {n_unitigs} ({:.1}% of the graph), over \
+                 --max-subgraph-nodes {}",
+                nodes.len(),
+                subgraph_fraction * 100.0,
+                cfg.max_subgraph_nodes
+            )),
+        );
+        r.n_unitigs = n_unitigs;
+        r.n_anchors = anchors.ids.len();
+        r.subgraph_nodes = nodes.len();
+        r.subgraph_fraction = Some(subgraph_fraction);
+        r.timing = timing;
+        return Ok(r);
+    }
+    // Pass 2 of 2: sequence and abundance for the neighbourhood alone. This is where the
+    // graph stops being O(accession) and becomes O(subgraph), and it is the last thing the
+    // compressed bytes are needed for.
+    graph = stages::parse::collect(
+        graph,
+        stages::stream::decoder(&fetched)?,
+        &nodes,
+        cfg.max_graph_bytes_per_accession(),
+    )?;
+    drop(fetched);
     // In multi-anchor mode the pool's references are the same gene at slightly different
     // lengths, and the guard runs before one of them has won, so the longest stands for the
     // gene. It is also the most forgiving choice: the largest denominator flags the fewest.
@@ -806,7 +873,7 @@ fn run_one(
             let surviving = subgraph
                 .nodes
                 .iter()
-                .filter(|&&id| stages::extract::survives(graph.abundance[id as usize], floor))
+                .filter(|&&id| stages::extract::survives(graph.abundance_of(id), floor))
                 .count();
 
             let unpruned_span = (path.query_start, path.query_end);
@@ -867,7 +934,7 @@ fn run_one(
                             graph.accession, depth, floor, before - dropped, before,
                             stages::extract::path_depth(&graph, &p.steps).min(
                                 p.steps.iter()
-                                    .map(|s| graph.abundance[s.node as usize])
+                                    .map(|s| graph.abundance_of(s.node))
                                     .fold(f32::INFINITY, f32::min)
                             )
                         );
@@ -928,7 +995,7 @@ fn run_one(
     let ka_max = subgraph
         .nodes
         .iter()
-        .map(|&id| graph.abundance[id as usize])
+        .map(|&id| graph.abundance_of(id))
         .fold(0.0f32, f32::max);
     // WV-05. The allele floor is a flat `--min-abund` (5x) unless `--min-abund-frac` is set,
     // which it is not by default. That is safe only because the prune is supposed to have
@@ -1138,7 +1205,7 @@ mod ordering_tests {
             (Error::Fetch { accession: acc(), detail: "HTTP 503".into() }, Outcome::Failed),
         ];
         for (e, want) in cases {
-            let r = super::unfetched(7, acc(), e.to_string(), &e);
+            let r = super::result_for_error(7, acc(), e.to_string(), &e);
             assert_eq!((r.index, r.outcome), (7, want), "{e}");
         }
     }
@@ -1161,7 +1228,7 @@ mod prune_outcome_tests {
     use crate::types::UnitigGraph;
 
     fn graph(fa: &str) -> UnitigGraph {
-        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
+        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap()
     }
 
     /// The three cases must stay distinct. Folding `WouldEmpty` back into
@@ -1236,7 +1303,7 @@ mod prune_outcome_tests {
         let nodes = vec![0u32, 1, 2];
         let surviving = nodes
             .iter()
-            .filter(|&&id| g.abundance[id as usize] >= floor)
+            .filter(|&&id| g.abundance_of(id) >= floor)
             .count();
         assert_eq!(surviving, 0);
         assert_eq!(prune_outcome(surviving, nodes.len()), PruneOutcome::WouldEmpty);

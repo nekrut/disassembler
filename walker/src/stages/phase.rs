@@ -170,7 +170,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
             // the total.
             let total: f64 = in_bubble
                 .iter()
-                .map(|&b| graph.abundance[unlocal(b).0 as usize] as f64)
+                .map(|&b| graph.abundance_of(unlocal(b).0) as f64)
                 .sum();
             if total <= 0.0 {
                 continue;
@@ -179,7 +179,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
             let mut kept: Vec<Branch> = Vec::new();
             for &b in &in_bubble {
                 let (node, strand) = unlocal(b);
-                let ab = graph.abundance[node as usize];
+                let ab = graph.abundance_of(node);
                 let vaf = ab as f64 / total;
                 if extract::survives(ab, cfg.min_abund) && vaf >= cfg.min_vaf {
                     kept.push(Branch { node, strand, abundance: ab, vaf });
@@ -193,7 +193,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
             // dropped, because the total these VAFs divide by was summed over all of them.
             let ka_saturated = in_bubble
                 .iter()
-                .any(|&b| graph.abundance[unlocal(b).0 as usize] >= crate::types::KA_CEILING);
+                .any(|&b| graph.abundance_of(unlocal(b).0) >= crate::types::KA_CEILING);
 
             let (fork_id, fork_strand) = unlocal(f);
             let (merge_id, merge_strand) = unlocal(merge);
@@ -222,7 +222,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn build(fa: &str) -> UnitigGraph {
-        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
+        parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap()
     }
     /// A config and the guard that removes its scratch directory (TW-10). Every test binds
     /// the guard as `_d`; dropping it early would delete the GFA the test is still reading.
@@ -651,8 +651,8 @@ mod phase_real {
                 eprintln!("SKIP: no data for {acc}");
                 continue;
             };
-            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0, payload: crate::types::Payload::default() };
-            let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
+            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed: crate::types::Compressed::Memory(compressed), fetch_secs: 0.0, payload: crate::types::Payload::default() };
+            let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd, u64::MAX).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();
             cfg.scratch_dir = std::env::temp_dir().join(format!("logan_phase_real_{}", std::process::id()));
@@ -720,8 +720,8 @@ mod phase_diagnostic {
                 eprintln!("SKIP: no data for {acc} at {path}");
                 continue;
             };
-            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0, payload: crate::types::Payload::default() };
-            let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
+            let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed: crate::types::Compressed::Memory(compressed), fetch_secs: 0.0, payload: crate::types::Payload::default() };
+            let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd, u64::MAX).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();
             cfg.scratch_dir = std::env::temp_dir().join(format!("logan_diag_{}", std::process::id()));
