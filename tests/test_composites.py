@@ -43,6 +43,11 @@ class _Stubs(unittest.TestCase):
         self.walker = self.work / "fake_walker.sh"
         self.walker.write_text(
             "#!/usr/bin/env bash\n"
+            # PK-01: the composites check the walker's version before running it, because
+            # the published 0.1.1 container pairs this package with walker 0.1.0. A stub
+            # that cannot answer --version is, as far as that check is concerned, exactly
+            # the broken install it exists to catch.
+            'if [ "$1" = --version ]; then echo "logan-walker 0.1.1"; exit 0; fi\n'
             'echo "$@" > "$(dirname "$0")/walker_argv.txt"\n'
             "fasta=''; q=''; acc=''; list=''\n"
             'while [ $# -gt 0 ]; do case "$1" in\n'

@@ -68,6 +68,20 @@ Before enabling a platform, check that it actually solves:
   `-c bioconda -c conda-forge` with flexible priority gets 7.525. From 0.2.0 `msa` runs
   `mafft --version` before any work and refuses 7.525 by name, so an environment that
   resolves it fails with one line instead of a raw `MAFFT failed:` log after the walk.
+- **logan-walker >= 0.1.1 is enforced at run time**, not only by the recipe. From 0.2.0 the
+  package runs `logan-walker --version` before using it and refuses anything older, in the
+  `walker` passthrough and in the composites' preflight. A recipe floor only constrains the
+  build: this also catches a stale conda environment, a `--walker-bin` pointed at an old
+  build, and a hand-built binary on PATH. Raise `MIN_WALKER_VERSION` in
+  `src/disassembler/resolve.py` and the recipe floor together.
+
+  **Known bad build: `disassembler:0.1.1--pyhdfd78af_0` ships logan-walker 0.1.0.** The image
+  was built on 2026-11-02 and walker 0.1.1 reached the channel on 2026-11-05, and the recipe
+  floor was `>=0.1.0,<0.2`, so the solver was free to take 0.1.0. Anything run from that image
+  picks the multi-anchor primary by `cov` rather than `matched` and has no prune-span guard,
+  and the 0.1.0 summary JSON has no `settings` block, so nothing in the outputs reveals it.
+  Use `_1` or later. The run-time check above now refuses it outright.
+
 - **kmer-diversity-sieve 0.1.0** is upstream commit `70022da`, because upstream has no tagged
   releases. The recipe overrides the Makefile's `-march=native`, so the binary runs on any
   x86-64 machine; the portable build gave byte-identical output on the test fixture.

@@ -173,13 +173,24 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
     all_union = set()
     summary = {}
     for target, acc_dict in sorted(per_target.items()):
-        accs = sorted(acc_dict, key=lambda a: -acc_dict[a])
+        # PH-01: by score, highest first, **ties broken by accession**. Python's sort is
+        # stable, so sorting on the score alone left tied accessions in dict insertion
+        # order, which is shard ARRIVAL order: `as_completed` in API mode, file-name order
+        # under --shards-dir. kmindex scores tie in bulk (274,808 accessions score exactly
+        # 1.0 in the SARS-CoV-2 spike harvest), so two runs of the documented route produced
+        # different `.accessions.txt`, `.scores.json` and cohorts, and nothing in any output
+        # said the cohort had changed. Two sorts rather than a tuple key: the same order
+        # without a tuple per accession, which matters at 1-2 M of them.
+        accs = sorted(acc_dict)
+        accs.sort(key=lambda a: -acc_dict[a])
         all_union.update(accs)
         acc_file = out_dir / f"{target}.accessions.txt"
         score_file = out_dir / f"{target}.scores.json"
         acc_file.write_text("\n".join(accs) + "\n")
         # The target goes inside, so stratify never has to read it off the file name.
-        score_file.write_text(json.dumps({"target": target, "scores": acc_dict}, indent=2))
+        # Written in the same order, so the two files agree and both are byte-stable.
+        score_file.write_text(json.dumps(
+            {"target": target, "scores": {a: acc_dict[a] for a in accs}}, indent=2))
         summary[target] = {
             "n": len(accs),
             "max_score": max(acc_dict.values()) if acc_dict else 0.0,

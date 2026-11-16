@@ -26,7 +26,7 @@ import os
 import subprocess
 import sys
 
-from disassembler.resolve import resolve_walker, not_found_message, EX_TOOL_NOT_FOUND
+from disassembler.resolve import resolve_walker, not_found_message, EX_TOOL_NOT_FOUND, walker_version_error
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -49,6 +49,14 @@ def _resolved_or_report(walker_bin: str | None) -> str | None:
     resolved = resolve_walker(walker_bin)
     if not resolved:
         print(not_found_message("walker", "walker"), file=sys.stderr)
+        return None
+    # PK-01: a binary that exists is not enough. The published 0.1.1 container pairs this
+    # package with logan-walker 0.1.0, whose multi-anchor primary is chosen by `cov` instead
+    # of `matched` and which has no prune-span guard, and nothing in the outputs says so.
+    err = walker_version_error(resolved)
+    if err:
+        print(f"walker: {err}", file=sys.stderr)
+        return None
     return resolved
 
 

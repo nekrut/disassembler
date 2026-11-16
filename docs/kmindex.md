@@ -129,3 +129,17 @@ A popular gene can return millions of candidates: a SARS-CoV-2 spike search retu
 5.1 million accessions. Walking all of them is not practical, so harvest, stratify (or
 otherwise subset) the list, and walk the subset. On Galaxy the walker is scattered over the list
 in shards; see [`galaxy.md`](galaxy.md#scatter).
+
+
+## Ordering (0.2.0)
+
+Accession lists, score files and cohorts are ordered **by score, highest first, with ties
+broken by accession**. Before 0.2.0 only the score was used, and Python's sort is stable, so
+tied accessions kept the order their shards arrived in: `as_completed` order over the download
+workers in API mode, file-name order under `--shards-dir`. kmindex scores tie in bulk (274,808
+accessions score exactly 1.0 in the SARS-CoV-2 spike harvest), so two runs of the documented
+route produced different `<target>.accessions.txt`, `<target>.scores.json`, `<target>.bins.txt`
+and cohorts, the two modes disagreed with each other, and nothing in any output showed that
+the cohort had changed. `--download-workers 1` was the only stable setting.
+
+Cohorts produced before 0.2.0 are not reproduced by the new order, and are not regenerated.

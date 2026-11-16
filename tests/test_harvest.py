@@ -380,5 +380,90 @@ class TestSafeTargetName(unittest.TestCase):
         self.assertEqual(hk.safe_target_name("candida_auris_erg11"), "candida_auris_erg11")
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestTiedScoresAreDeterministic(unittest.TestCase):
+    """PH-01: equal scores must not be ordered by the order the shards arrived in.
+
+    `sorted(acc_dict, key=lambda a: -acc_dict[a])` is stable, so tied accessions kept dict
+    insertion order, which is `as_completed` order in Galaxy API mode and file-name order
+    under `--shards-dir`. kmindex scores tie in bulk: 274,808 accessions score exactly 1.0 in
+    the SARS-CoV-2 spike harvest. Two runs of the documented route therefore produced
+    different `.accessions.txt`, `.scores.json` and cohorts, and the two modes disagreed with
+    each other, while `docs/kmindex.md` said they produce identical output. Nothing in any
+    output revealed that the cohort had changed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def scores():
+        """Twelve accessions, eight of them tied at 1.0, named so that arrival order and
+        accession order disagree."""
+        tied = {f"SRR{i:03d}": 1.0 for i in (7, 1, 9, 3, 11, 5, 2, 8)}
+        rest = {"SRR004": 0.9, "SRR006": 0.5, "SRR010": 0.5, "SRR012": 0.1}
+        return tied, rest
+
+    def write_outputs(self, order):
+        """Run `_write_outputs` with the accession dict built in `order`."""
+        out = self.dir / "_".join(order[:2])
+        out.mkdir()
+        tied, rest = self.scores()
+        both = {**tied, **rest}
+        acc_dict = {a: both[a] for a in order}
+        from disassembler.cmd import harvest as hv
+        hv._write_outputs({"t": acc_dict}, out, len(acc_dict), 0, 0, 0)
+        return out
+
+    def test_two_arrival_orders_give_the_same_files(self):
+        tied, rest = self.scores()
+        forward = list(tied) + list(rest)
+        backward = list(reversed(forward))
+        a = self.write_outputs(forward)
+        b = self.write_outputs(backward)
+        for name in ("t.accessions.txt", "t.scores.json"):
+            with self.subTest(file=name):
+                self.assertEqual((a / name).read_text(), (b / name).read_text(),
+                                 f"{name} depends on the order the shards arrived in")
+
+    def test_ties_are_ordered_by_accession(self):
+        tied, rest = self.scores()
+        out = self.write_outputs(list(tied) + list(rest))
+        accs = (out / "t.accessions.txt").read_text().split()
+        top = accs[:len(tied)]
+        self.assertEqual(top, sorted(tied), "tied accessions are not in accession order")
+        self.assertEqual([a for a in accs if a not in tied][0], "SRR004",
+                         "the score order itself must be unchanged")
+
+    def test_the_scores_file_is_written_in_the_same_order(self):
+        tied, rest = self.scores()
+        out = self.write_outputs(list(tied) + list(rest))
+        accs = (out / "t.accessions.txt").read_text().split()
+        written = list(json.loads((out / "t.scores.json").read_text())["scores"])
+        self.assertEqual(accs, written, "the two files disagree about the order")
+
+    def test_the_cohort_does_not_move_with_arrival_order(self):
+        # `stratify` picks by rank inside each bin, so the tie order reaches the cohort.
+        tied, rest = self.scores()
+        both = {**tied, **rest}
+        forward = {a: both[a] for a in list(tied) + list(rest)}
+        backward = {a: both[a] for a in reversed(list(tied) + list(rest))}
+        bins = [(0.9, 1.0, 4)]
+        from disassembler.cmd import stratify as st
+        picks_f, _ = st.sample_bins_from_scores(forward, bins)
+        picks_b, _ = st.sample_bins_from_scores(backward, bins)
+        self.assertEqual(picks_f, picks_b, "the cohort depends on shard arrival order")
+        # Which four, exactly: `stratified_sample` spreads its picks evenly across the
+        # ranked candidates rather than taking the top n, so the point is not that the
+        # first four win but that the ranking they are drawn from is now the accessions'
+        # own order and not the shards'.
+        chosen = [a for a, _s in picks_f]
+        self.assertEqual(len(chosen), 4)
+        self.assertEqual(chosen, sorted(chosen), "picks come back in a stable order")
+        self.assertTrue(set(chosen) <= set(tied))
+
+
+

@@ -126,7 +126,9 @@ def sample_bins_from_scores(scores, bins):
     for lo, hi, n in bins:
         in_range = sorted(
             ((a, s) for a, s in nonzero.items() if in_bin(s, lo, hi)),
-            key=lambda x: -x[1],
+            # PH-01: ties by accession, so which tied accession enters a bin is not
+            # decided by the order the shards happened to arrive in.
+            key=lambda x: (-x[1], x[0]),
         )
         selected = stratified_sample(in_range, n)
         per_bin.append({
@@ -138,7 +140,7 @@ def sample_bins_from_scores(scores, bins):
             "accessions": [{"acc": a, "score": s} for a, s in selected],
         })
         picks.extend(selected)
-    picks.sort(key=lambda x: -x[1])
+    picks.sort(key=lambda x: (-x[1], x[0]))   # PH-01
     return picks, per_bin
 
 

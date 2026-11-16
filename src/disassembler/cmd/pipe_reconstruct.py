@@ -14,7 +14,7 @@ from pathlib import Path
 from disassembler.cmd import msa as msa_cmd
 from disassembler.cmd import sieve as sieve_cmd
 from disassembler.cmd import walker as walker_cmd
-from disassembler.resolve import resolve_sieve, resolve_walker, not_found_message, EX_TOOL_NOT_FOUND
+from disassembler.resolve import resolve_sieve, resolve_walker, not_found_message, EX_TOOL_NOT_FOUND, walker_version_error
 from disassembler.stage import stage_args
 from disassembler.validators import (
 
@@ -353,9 +353,14 @@ def _run(args, stages) -> int:
     if scrub_err:
         return _die(scrub_err)
 
-    if not resolve_walker(args.walker_bin):
+    _walker = resolve_walker(args.walker_bin)
+    if not _walker:
         # PL-27: the same message the `walker` stage prints, and the same exit code.
         return _die(not_found_message("walker", "reconstruct"), EX_TOOL_NOT_FOUND)
+    # PK-01: refuse an old walker in the preflight, before the fetch and the walk.
+    _ver_err = walker_version_error(_walker)
+    if _ver_err:
+        return _die(_ver_err)
 
     _warn_inert_knobs(args)
 

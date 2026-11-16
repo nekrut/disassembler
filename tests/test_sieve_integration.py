@@ -73,6 +73,8 @@ class TestReconstructSieveSeam(unittest.TestCase):
         self.fake_walker = self.work / "fake_walker.sh"
         self.fake_walker.write_text(
             "#!/usr/bin/env bash\n"
+            # PK-01: the composite checks the walker's version before running it.
+            'if [ "$1" = --version ]; then echo "logan-walker 0.1.1"; exit 0; fi\n'
             "out=''; fasta=''\n"
             'while [ $# -gt 0 ]; do case "$1" in\n'
             '  -o) out="$2"; shift 2;; -f) fasta="$2"; shift 2;; *) shift;; esac; done\n'

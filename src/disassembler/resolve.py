@@ -20,7 +20,9 @@ X_OK)` is the same check `shutil.which` uses on PATH entries.
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -101,3 +103,36 @@ def not_found_message(tool: str, prog: str = "disassembler") -> str:
         f"${t['env']}, then on PATH, then in this checkout. Build it "
         f"(`{t['build']}`) or install it (`{t['conda']}`)."
     )
+
+
+# PK-01. The published biocontainer `disassembler:0.1.1--pyhdfd78af_0` carries disassembler
+# 0.1.1 beside **logan-walker 0.1.0**: the recipe floor was `>=0.1.0,<0.2` and the image was
+# built three days before walker 0.1.1 reached the channel. Everything run from that image
+# behaves like 0.1.0, which picks the multi-anchor primary by `cov` rather than `matched` (62%
+# of a 20,000-accession SARS-CoV-2 run tagged XBB.1.5, one of the shortest references, against
+# 43% Delta, the cohort's real mix) and has no prune-span guard. The 0.1.0 summary JSON has no
+# `settings` block, so nothing in a user's outputs reveals which walker produced them.
+#
+# A recipe floor only constrains the build. This is the stronger guard: it also catches a stale
+# conda environment, an `--walker-bin` pointed at an old build, and a hand-built binary on PATH.
+MIN_WALKER_VERSION = (0, 1, 1)
+_WALKER_VER = re.compile(r"^logan-walker (\d+)\.(\d+)\.(\d+)")
+
+
+def walker_version_error(path: str) -> str | None:
+    """None if `path` is a new enough `logan-walker`, else a message naming what is wrong."""
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"{path}: cannot run --version ({e})"
+    m = _WALKER_VER.match(out)
+    if not m:
+        return f"{path}: unrecognised --version output {out!r}"
+    if tuple(map(int, m.groups())) < MIN_WALKER_VERSION:
+        need = ".".join(map(str, MIN_WALKER_VERSION))
+        return (f"{path} is logan-walker {'.'.join(m.groups())}; this disassembler needs "
+                f"logan-walker >= {need}. The biocontainer "
+                f"disassembler:0.1.1--pyhdfd78af_0 ships 0.1.0: use a later build, or "
+                f"`conda install 'logan-walker>={need}'`.")
+    return None
