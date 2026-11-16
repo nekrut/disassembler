@@ -22,34 +22,71 @@ as `qcovHSP >= 80%`, even though together they cover all of it.
 
 1. **Tiles HSPs onto the reference.** Rows are grouped by accession (`sgenome`), and every HSP
    at or above `--min-pident` is projected onto reference positions `1..L` using its `qstart`
-   and aligned `qseq`/`sseq`. Where HSPs overlap, the base from the HSP with the higher percent
-   identity wins. Reference positions that no HSP covers are written as `-`.
+   and aligned `qseq`/`sseq`. Where HSPs overlap, each position is decided on its own, by
+   depth: the base comes from the HSP the position lies furthest inside, measured to the nearer
+   of that HSP's two ends, with percent identity only as a tiebreak. Where two HSPs place
+   different bases at a position at least 10 bases inside both, the position is recorded as a
+   **conflict** and the accession is flagged (tier 6). Reference positions that no HSP covers
+   are written as `-`.
+
+   Through 0.1.1 the rule was whole-HSP: the HSP with the higher identity *to the reference*
+   won every position it touched. Logan leaves an unpopped SNP bubble as two separate contigs,
+   both of which clear LexicMap's default `-l 50 -i 70`, and the reference branch is 100%
+   identical while the alternative one is not, so the reference branch overrode the real
+   variant regardless of which allele the sample carries. A deletion on the losing HSP was then
+   dropped as "not owned", so a premature stop or frameshift disappeared with it and the
+   accession came out `CLEAN_FULL_LENGTH` wild type with nothing in any column saying so. Depth
+   is the right tiebreak because a bubble branch is short: every one of its positions is near
+   one of its ends, while the same positions sit deep inside the contig that spans the gene.
 2. **Reads the indels.** A run of `-` in `qseq` is an insertion in the sample, and a run of `-`
    in `sseq` a deletion. A deletion stays in the row as `-` and counts as covered; an insertion
    has no position on the grid, so it is recorded instead (see [Outputs](#outputs)). An indel
-   counts only where its own HSP supplied the row, and one within 10 aligned bases of either end
-   of its HSP is reported as `(edge)` but not trusted: aligners can close an alignment with a
-   forced gap there. Indels LexicMap did not align through (a contig break, or an insertion too
-   long to bridge) split the alignment into separate HSPs and cannot be seen.
+   counts only where its own HSP supplied the row, and one within 10 aligned bases of the end
+   of **every** HSP that carries it is reported as `(edge)` but not trusted: aligners can close
+   an alignment with a forced gap there. Adjacent Logan contigs overlap by k-1 = 30 nt, so an
+   indel can sit at one contig's end and deep inside the next; judged from the first contig
+   alone a real frameshift was marked `(edge)` and the frame rule then ignored it. An edge
+   deletion also never hides a base another HSP supplied: its `-` is replaced by that base and
+   the indel is dropped, because an alignment artefact is not a statement about the sample.
+   Indels LexicMap did not align through (a contig break, or an insertion too long to bridge)
+   split the alignment into separate HSPs and cannot be seen.
 3. **Checks the reading frame.** The trusted indels are walked in reference order, tracking how
    far out of frame the sample is (their net length, mod 3). A **frameshift** is a stretch that
-   stays out of frame for at least 30 reference bases, or to the end of the gene. Indels that
+   stays out of frame for at least 30 reference bases, or to the end of the gene; a
+   deletion's own bases do not count towards that span, because the sample does not have them
+   and the frame shifts only after them. Indels that
    restore the frame sooner (for example +1 and then -1 five bases later, a common way for an
    aligner to write a divergent stretch) are treated like an in-frame indel. For the stop scan,
    every indel that is not part of a frameshift is applied to the tiled sequence (deletions
    removed, insertions put back), which is then translated with genetic code 11 and its coding
-   body (everything before the final stop codon) scanned for premature stops, so a stop formed
-   across an indel, or inside a briefly shifted stretch, is found. Positions are reported as
-   reference codon numbers.
+   body scanned for premature stops, so a stop formed across an indel, or inside a briefly
+   shifted stretch, is found. Positions are reported as reference codon numbers.
+
+   The genetic code is `--genetic-code` (default 11, bacterial and plant plastid). The shipped
+   `queries/markers/candida_auris_erg11.fasta` is from a CTG-clade yeast and needs
+   `--genetic-code 12`, where CTG is Ser and not Leu. The coding body is everything before the
+   final stop codon **when the reference ends in one**; six shipped references are polyprotein
+   segments that end in a sense codon (`dengue_1_ns5` to `dengue_4_ns5`, `westnile_ns5`,
+   `zika_ns5`), and for those the last codon is scanned like any other.
+
+   **The reference is checked before anything else runs.** A reference with its own in-frame
+   stop under the selected code is refused, naming the codons: its stops would otherwise be
+   counted against every sample, so even perfect matches were flagged and the run ended
+   reporting an empty clean cohort, which names the wrong cause. A reference whose length is
+   not a multiple of 3 is treated as non-coding, with a warning; pass `--non-coding` for a
+   non-coding target whose length happens to be one, which is one target in three. **Both the
+   stop rule and the frame rule apply only to a coding reference**, so for an rRNA, ITS or UTR
+   marker an indel allele reaches the clean cohort as `NonCoding_Variant`.
 4. **Sorts accessions into tiers** (`status` and `tier` columns of the ledger):
 
    | tier | status | rule |
    |---|---|---|
-   | 1 | `CLEAN_FULL_LENGTH` | coverage at least `--min-cov` (100% under `--require-full-length`), at most `--max-internal-stops` premature stops, no frameshift |
-   | 2 | `CLEAN_PARTIAL` | coverage at least `--min-cov-partial`, same stop and frameshift rules |
+   | 1 | `CLEAN_FULL_LENGTH` | coverage at least `--min-cov` (100% under `--require-full-length`), at most `--max-internal-stops` premature stops, no frameshift, no conflicting HSPs |
+   | 2 | `CLEAN_PARTIAL` | coverage at least `--min-cov-partial`, same stop, frameshift and conflict rules |
    | 4 | `LOW_COVERAGE_FRAGMENT` | coverage below `--min-cov-partial` |
    | 5 | `FLAGGED_FRAMESHIFT` | covered, but out of frame for 30 or more bases; the indels are listed in the `indels` column |
    | 3 | `FLAGGED_PREMATURE_STOPS` | covered and in frame, but more than `--max-internal-stops` premature stops, with their codon positions |
+   | 6 | `FLAGGED_MIXED_HSPS` | covered, in frame and without premature stops, but the accession's own HSPs disagree about at least one base; the positions are in the `conflict_sites` column |
 
    The rules are applied in that order, so coverage decides first: an accession with too little
    of the gene tiled is a fragment whatever its frame and stop codons look like, and the two
@@ -57,13 +94,19 @@ as `qcovHSP >= 80%`, even though together they cover all of it.
    and stop rules came first, which made both flagged tiers mostly fragments: on the
    SARS-CoV-2 strict pass, 61,897 of the 64,034 accessions reported as frameshifted were
    fragments at a median coverage of 0.18, where a real shift cannot be told from a gap in the
-   tiling. `--allow-frameshift-alts` waives the frameshift rule; the stop rule still applies. Frameshifts are common in practice and mostly not biology: hits from
+   tiling. The conflict rule is judged last, so an accession with both a premature stop and
+   conflicting HSPs is reported as the stop. `--allow-frameshift-alts` waives the frameshift
+   rule and `--allow-mixed` the conflict rule, each waiving only its own tier; the stop rule
+   still applies. Frameshifts are common in practice and mostly not biology: hits from
    divergent relatives, 1-nt deletions in homopolymers in Nanopore and PacBio runs, and, more
    rarely, real frameshift alleles. `flagged.tsv` lists them with their positions. The frame is
    judged against the reference, so a reference that is itself a pseudogene makes every intact
    sample look frameshifted; use an intact allele as the reference.
 5. **Collapses haplotypes.** Tier 1 sequences are collapsed into unique haplotypes as they
-   stream (memory grows with the number of distinct haplotypes, not the number of rows). For
+   stream. Memory grows with the number of distinct haplotypes and, far more slowly, with the
+   number of accessions: roughly 100 bytes each for the contiguity check, plus one sequence
+   per distinct clean haplotype. It does **not** grow with the number of rows, which is the
+   unbounded quantity. For
    each haplotype it records the count and frequency, nucleotide (`198G>A`) and amino acid
    (`V66V`, `I61V`) changes against the reference, its indels (`685_686insT`, `2316_2321del`), a
    mutation class (`WT`, `WT_partial`, `Synonymous`, `Missense`, `Nonsense`, `InFrameIndel`,
@@ -72,10 +115,34 @@ as `qcovHSP >= 80%`, even though together they cover all of it.
    accessions. A haplotype is its row plus its trusted indels, so an accession that differs
    from the wild type only by an insertion is its own haplotype even though its row is
    identical. It also reports the Shannon entropy of the haplotype distribution.
+
+   Amino-acid changes are read from the sample's own sequence, not from the reference grid, so
+   a trusted in-frame indel is described: `P11del`, `K10_P11insA`, `R101_E105delinsKRVQQ`.
+   Each cluster of nearby indels is described on its own, so two indels in different parts of
+   the gene are two changes rather than one long `delins`. 3' shifting in a repeat is not
+   applied, so a call inside a homopolymer can differ from what another tool prints. An `N` or
+   other ambiguity code is missing information rather than a change and is not reported as
+   one.
+
+   **Without `--require-full-length` these counts depend on coverage.** A haplotype is the
+   whole reference-length row, which carries `-` at every untiled position, and with the
+   default `--min-cov 0.80` a tier 1 row can be a fifth `-`, so two accessions that agree
+   wherever both are covered but whose contigs stop in different places are two haplotypes.
+   `clean_unique_haplotypes`, `shannon_entropy_bits` and `wildtype_fraction` therefore measure
+   assembly fragmentation as well as sequence diversity, and track sequencing depth. From
+   0.2.0 the summary carries coverage-independent figures beside them (the `*_full_coverage`
+   and `*_folded` fields below); the original fields are unchanged, so runs already done stay
+   comparable.
 6. **Diagnoses the regime.** Coverage and identity quantiles (p10, median, p90) and stop-codon
-   rates go into the summary. If the median identity is below 85% or the median coverage below
-   0.60, the target is called **divergent**: reference-guided projection fragments there, and
-   the log recommends the walker route instead.
+   rates go into the summary. Quantiles are interpolated linearly between the two neighbouring
+   values (numpy's "linear"), so an even cohort's median sits between its two middle values
+   rather than being one of them. If the median identity is below 85% or the median coverage
+   below 0.60, the target is called **divergent**: reference-guided projection fragments there,
+   and the log recommends the walker route instead.
+
+   A search that found nothing is `no_data`, with null quantiles and no warning, rather than
+   `divergent` with an invented median of 0.0%. A cohort whose HSPs all fell below
+   `--min-pident` is divergent and says so in those words.
 
 ## Input
 
@@ -86,9 +153,14 @@ columns* in Galaxy) so that `qseq` and `sseq` are present. It can come from:
 - standard input (`-f -`);
 - a Galaxy dataset streamed over the API (`-d <dataset id>`, with `--base-url`). The API key
   comes from `--api-key`, then `--api-key-file`, then `$GALAXY_API_KEY`, then `/tmp/gxy.txt`.
-  Only a dataset in state `ok` is read. One still being produced (`queued`, `running`, `new`,
-  `paused` and the like) exits 75 (`EX_TEMPFAIL`), so a script can try again later; one in
-  any other state (`error`, for example) exits 1.
+  Only a dataset in state `ok` is read. One still being produced (`new`, `upload`, `queued`,
+  `running`, `setting_metadata`: Galaxy's own non-ready states) exits 75 (`EX_TEMPFAIL`), so a
+  script can try again later. A `deferred` or `paused` dataset exits 1 instead, naming what to
+  do: neither becomes `ok` on its own, so retrying on 75 would loop until the caller's own
+  limit. Any other state (`error`, for example) exits 1.
+
+  A download that ends before the size the server declared exits 1; rerun it. So does a
+  truncated or corrupt gzip, naming the file.
 
 Any of them can be plain or gzip-compressed; gzip is detected from the content, not the name.
 A zstd-compressed table is refused with a message, so decompress it first
@@ -132,9 +204,9 @@ that did not exist yet was taken as a prefix.) `from-lexicmap -o DIR` writes the
 | `<prefix>.clean_expanded.accessions.fasta` | tiers 1 and 2 together |
 | `<prefix>.clean.msa.fasta` | one row per collapsed tier 1 haplotype, with rank, count and frequency |
 | `<prefix>.clean.haplotypes.tsv` | the haplotype catalogue: changes, class, representative accessions |
-| `<prefix>.clean.a2m` | the reference plus the collapsed haplotypes in A2M format, for protein language models and EVcouplings (`--no-a2m` skips it) |
-| `<prefix>.flagged.accessions.fasta` | tiers 3, 4 and 5 |
-| `<prefix>.cohort_ledger.tsv` | **`--cohort-ledger` only.** Every accession: coverage, identity, status, tier, stops, HSPs merged, indels. A tabular rendering of the summary's `records[]` |
+| `<prefix>.clean.a2m` | the reference plus the collapsed haplotypes in A2M format, **nucleotide, not protein**: translate it before using it with a protein MSA model or EVcouplings, which would otherwise accept a 4-letter "protein" of three times the real length and score it (`--no-a2m` skips it) |
+| `<prefix>.flagged.accessions.fasta` | tiers 3, 4, 5 and 6 |
+| `<prefix>.cohort_ledger.tsv` | **`--cohort-ledger` only.** Every accession: coverage, identity, status, tier, stops, HSPs merged, indels, conflict sites. A tabular rendering of the summary's `records[]` |
 | `<prefix>.summary.json` | the run: provenance, settings, discards, cohort statistics, and one record per accession |
 
 `<prefix>.cohort_ledger.tsv` is **off by default** from 0.2.0, because the summary's
@@ -142,7 +214,7 @@ that did not exist yet was taken as a prefix.) `from-lexicmap -o DIR` writes the
 twice. Pass `--cohort-ledger` when something downstream wants tabular, such as a Galaxy
 dataset or a spreadsheet; `disassembler from-lexicmap` takes the same flag and forwards it.
 
-`<prefix>.flagged.tsv` was removed in 0.2.0. It held tiers 3, 4 and 5 with the same columns as
+`<prefix>.flagged.tsv` was removed in 0.2.0. It held the flagged tiers with the same columns as
 the ledger, so once every accession is in the summary's `records[]` with its status it was the
 same rows written a third time. Filter `records[]` or the ledger on `status` instead.
 
@@ -156,8 +228,39 @@ printed but never recorded. A summary is now written even when the run fails, so
 the file is no longer the only signal; the one exception is a Galaxy dataset that is not ready
 yet, which exits `EX_TEMPFAIL` without producing anything, because no run was attempted.
 
+`cohort` also carries, from 0.2.0, figures that do not move when an accession's contigs stop
+short:
+
+| field | meaning |
+|---|---|
+| `full_coverage_rows` | tier 1 rows covering the whole reference (bases placed, plus the reference bases a trusted deletion removes) |
+| `clean_unique_haplotypes_full_coverage` | distinct haplotypes among those rows |
+| `shannon_entropy_bits_full_coverage` | entropy over those rows |
+| `partial_rows_folded` | rows that stop short and match exactly one full-coverage haplotype at every position they do cover, carrying the same trusted indels |
+| `partial_rows_unresolved` | rows that match none, or more than one: never guessed, and left out of the folded figures |
+| `clean_unique_haplotypes_folded` | distinct haplotypes after folding |
+| `shannon_entropy_bits_folded` | entropy after folding |
+| `wildtype_compatible_count` / `wildtype_fraction_folded` | wild-type rows after folding, and their share |
+
+A partial row is never folded on its variants alone, because a row whose variant lies in its
+own uncovered region would then be called wild type.
+
+`records[]` gains `n_conflicts` and `conflict_sites` (the first 10 positions, 1-based; the
+count is always exact).
+
 `<prefix>.msa.fasta`, `<prefix>.haplotypes.tsv` and `<prefix>.a2m` are compatibility copies of
 the `clean.*` files.
+
+**The outputs appear together or not at all.** Each is written to `<name>.part` and renamed in
+only once the run has finished, and anything an earlier run left under a name this run did not
+write is removed, so a `--no-a2m` rerun cannot leave the previous run's A2M beside a new MSA.
+`summary.json` is the exception: a failed run still writes one, saying so, which is how a
+reader is meant to tell.
+
+Whitespace inside a sequence line of the reference FASTA is ignored, and nothing may precede
+the first `>` header. Path separators in the record id become `_` when the id is used to name
+output files; the id itself is unchanged, since it has to keep matching the search's query
+column.
 
 Every row in the FASTA outputs is on the reference grid, so the files are already
 column-aligned. Under `--require-full-length`, the only `-` in a tier 1 row are in-frame
@@ -200,14 +303,17 @@ and also removes an earlier run's MSA and tree.
 | `--out-dir <DIR>` | | output directory, created if needed; exclusive with `-o` |
 | `--base-url <URL>` | `https://usegalaxy.org` | Galaxy server for `-d` |
 | `--api-key <KEY>` / `--api-key-file <PATH>` | | Galaxy API key, literal or from a file |
-| `--min-cov <F>` | `0.80` | tier 1 coverage gate |
+| `--min-cov <F>` | `0.80` | tier 1 coverage gate; ignored under `--require-full-length` |
 | `--min-cov-partial <F>` | `0.50` | tier 2 coverage gate; must not exceed `--min-cov` |
 | `--require-full-length` | off | tier 1 requires 100% coverage instead of `--min-cov` |
 | `--min-pident <F>` | `60.0` | minimum identity for an HSP to be tiled |
+| `--genetic-code <N>` | `11` | NCBI genetic code id for translation and the stop scan (the shipped C. auris ERG11 marker needs `12`) |
+| `--non-coding` | off | treat the reference as non-coding: no stop scan, no frame rule |
 | `--max-internal-stops <N>` | `0` | premature stops tolerated in the clean tiers |
 | `--allow-frameshift-alts` | off | let accessions with a frameshift into the clean tiers instead of `FLAGGED_FRAMESHIFT` |
+| `--allow-mixed` | off | let accessions whose own HSPs disagree about a base into the clean tiers instead of `FLAGGED_MIXED_HSPS` |
 | `--samples-per-haplotype <N>` | `10` | representative accessions per haplotype in the TSV |
-| `--max-records <N>` | | stop after N input rows (for previews) |
+| `--max-records <N>` | | stop after N input rows (for previews); the accession in progress is finished, so the last row of a preview is not mis-tiered |
 | `--no-a2m` | off | skip the A2M output |
 | `--allow-empty` | off | exit 0 when the clean cohort is empty (non-zero otherwise) |
 

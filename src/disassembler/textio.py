@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import gzip
 import io
+import zlib
 from pathlib import Path
 
 GZIP_MAGIC = b"\x1f\x8b"
@@ -20,7 +21,40 @@ ZSTD_REFUSED = ("zstd-compressed; only plain and gzip-compressed input is read. 
                 "Decompress it first (zstd -d)")
 
 
-def text_stream(raw) -> io.TextIOWrapper:
+class _Gunzip(io.RawIOBase):
+    """A gzip stream whose read errors are `ValueError`, naming the source.
+
+    PL-21. `gzip.GzipFile` raises `EOFError` for a truncated member and `zlib.error` for a
+    corrupt one. Neither is caught by `except (OSError, ValueError)`, which is what
+    `lexicmap`, `msa`, `sieve`, `stratify`, `reconstruct` and `from-lexicmap` all use, so a
+    half-downloaded `.gz` ended in a traceback from every one of them. Fixed here rather than
+    in six `except` clauses, because here is where the cause is known.
+
+    `BadGzipFile` (a flipped byte, so the CRC fails) is an `OSError` and was already caught,
+    but the message it carries is "CRC check failed 0x... != 0x..." and names no file. It is
+    wrapped for that reason alone.
+    """
+
+    def __init__(self, gz, name):
+        self._gz, self._name = gz, name
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        try:
+            return self._gz.readinto(b)
+        except (EOFError, zlib.error, gzip.BadGzipFile) as e:
+            raise ValueError(f"{self._name}: truncated or corrupt gzip data ({e})") from e
+
+    def close(self):
+        try:
+            self._gz.close()
+        finally:
+            super().close()
+
+
+def text_stream(raw, name: str = None) -> io.TextIOWrapper:
     """UTF-8 text from a binary stream, gunzipped when it starts with the gzip magic bytes.
     A stream without `peek` (an HTTP body) is buffered first."""
     buf = raw if hasattr(raw, "peek") else io.BufferedReader(raw)
@@ -28,7 +62,8 @@ def text_stream(raw) -> io.TextIOWrapper:
     if head.startswith(ZSTD_MAGIC):
         raise ValueError(f"the input is {ZSTD_REFUSED}")
     if head.startswith(GZIP_MAGIC):
-        buf = gzip.GzipFile(fileobj=buf)
+        label = name or getattr(raw, "name", None) or "the input"
+        buf = io.BufferedReader(_Gunzip(gzip.GzipFile(fileobj=buf), label))
     return io.TextIOWrapper(buf, encoding="utf-8")
 
 

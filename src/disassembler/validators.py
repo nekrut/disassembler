@@ -155,3 +155,29 @@ def validate_api_key_file(path: str | None) -> str | None:
             f"key must be a non-empty token."
         )
     return None
+
+
+# The longest file stem to build from an untrusted record id. Most filesystems cap a single
+# component at 255 bytes, and this module adds suffixes of up to about 30.
+FILE_STEM_LIMIT = 200
+
+
+def file_safe_name(name, limit: int = FILE_STEM_LIMIT) -> str:
+    """A record or target name reduced to one safe path component. `""` when nothing is left.
+
+    PL-10. `lexicmap` interpolated the reference FASTA's record id straight into an output
+    path (`msa/{ref_name}`, or `<out-dir>/{ref_name}`), unsanitised. Real ids break on that:
+    `hCoV-19/Wuhan/WIV04/2019|EPI_ISL_402124|...` and `A/California/07/2009(H1N1)` exit with
+    ENOENT before a single row is read, and an id over about 220 bytes fails with ENAMETOOLONG.
+    A crafted id is worse: `../../../d/x` or an absolute id writes all twelve outputs into a
+    directory elsewhere, and because the cohort files are opened before the table is checked,
+    even a failing run truncates whatever was there.
+
+    Changed as little as `harvest.safe_target_name` already changes a kmindex target name, so
+    ids that work today (`lcl|NC_045512.2_cds_...`) keep the names they have. A `resolve()`
+    containment check is unnecessary once the separators are gone, and it breaks a symlinked
+    output directory.
+    """
+    name = str(name).replace("/", "_").replace("\\", "_").replace("\0", "_").strip(". ")
+    name = name.encode()[:limit].decode(errors="ignore").rstrip(". ")
+    return "" if name in (".", "..") else name

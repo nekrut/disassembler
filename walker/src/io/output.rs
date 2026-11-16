@@ -395,9 +395,18 @@ fn quantiles(mut v: Vec<f64>) -> String {
         return "null".to_string();
     }
     v.sort_by(f64::total_cmp);
+    // Linear interpolation between the two neighbouring order statistics (numpy "linear",
+    // `statistics.quantiles(method="inclusive")`), which is what the Python side does.
+    //
+    // PL-15. Both sides used to pick a rounded index, so an even cohort's median was one of
+    // the two middle values. Worse for a contract that says `p50` means `p50` on both
+    // pathways: Rust's `round` goes half away from zero and Python's goes to even, so the
+    // two stages disagreed on exactly the inputs where the choice mattered.
     let at = |q: f64| {
-        let i = ((v.len() as f64 - 1.0) * q).round() as usize;
-        v[i.min(v.len() - 1)]
+        let pos = (v.len() as f64 - 1.0) * q;
+        let lo = pos.floor() as usize;
+        let hi = (lo + 1).min(v.len() - 1);
+        v[lo] + (v[hi] - v[lo]) * (pos - lo as f64)
     };
     let mean = v.iter().sum::<f64>() / v.len() as f64;
     format!(

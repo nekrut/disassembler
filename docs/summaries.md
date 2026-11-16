@@ -202,7 +202,7 @@ Summaries are byte-comparable between runs once the volatile fields are masked:
 | `harvest` | one target | score quantiles | `failed`, `empty`, `bad_target` |
 | `stratify` | one target | selection rate | under-filled bins |
 | `walker` | one accession | cov and pident quantiles, distinct primaries, singleton rate | fetch failures, `no_logan_data`, `too_large`, and the full variant rejection breakdown |
-| `lexicmap` | one accession (the former ledger row) | tiers, quantiles, entropy, top N | `malformed`, `other_query`, `qlen_mismatch` |
+| `lexicmap` | one accession (the former ledger row) | tiers, quantiles, entropy (raw, full-coverage and folded), top N | `malformed`, `other_query`, `qlen_mismatch`, and the flagged tiers |
 | `sieve` | one output haplotype | dedup ratio, admission rate | dedup drops, completeness-gate drops, table saturation |
 | `msa` | one row | rows in and out, length agreement | rows dropped or lengthened by MAFFT |
 | composites | one stage | none | which stage failed |

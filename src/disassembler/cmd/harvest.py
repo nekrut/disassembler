@@ -37,23 +37,16 @@ from disassembler.textio import decode_bytes, read_text
 from disassembler.validators import positive_int, validate_api_key_file
 
 from disassembler import __version__
+from disassembler import galaxy
 from disassembler import summary as summary_io
 
 ATTEMPTS = 5
 
 
-def get_galaxy_api_key(key_file: str | None = None) -> str:
-    if key_file and Path(key_file).exists():
-        return Path(key_file).read_text().strip()
-    if os.environ.get("GALAXY_API_KEY"):
-        return os.environ["GALAXY_API_KEY"].strip()
-    default_tmp = Path("/tmp/gxy.txt")
-    if default_tmp.exists():
-        return default_tmp.read_text().strip()
-    raise RuntimeError(
-        "Galaxy API key not found. Provide --api-key-file, set GALAXY_API_KEY, "
-        "or write /tmp/gxy.txt."
-    )
+def get_galaxy_api_key(key_file: str | None = None, api_key: str | None = None) -> str:
+    """The Galaxy API key. One implementation, in `disassembler.galaxy` (PL-27). This copy
+    took no `api_key` argument, so `--api-key` worked for `lexicmap` and not for `harvest`."""
+    return galaxy.api_key(api_key, key_file)
 
 
 def safe_target_name(raw):

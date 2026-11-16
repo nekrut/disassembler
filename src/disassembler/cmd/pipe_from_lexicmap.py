@@ -27,7 +27,7 @@ from pathlib import Path
 from disassembler.cmd import lexicmap as lexicmap_cmd
 from disassembler.cmd import msa as msa_cmd
 from disassembler.cmd import sieve as sieve_cmd
-from disassembler.resolve import resolve_sieve
+from disassembler.resolve import resolve_sieve, not_found_message, EX_TOOL_NOT_FOUND
 from disassembler.stage import stage_args
 
 
@@ -120,6 +120,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                             "indel into the clean tiers instead of FLAGGED_FRAMESHIFT (a "
                             "reading-frame shift lasting 30 or more bases). "
                             "Premature stops still flag. Off by default.")
+    g_lex.add_argument("--genetic-code", type=int, default=11, help="NCBI genetic code id for translation and the stop scan (default: 11, bacterial and plant plastid). The shipped Candida auris ERG11 marker is a CTG-clade yeast and needs 12; TGA is Trp in code 4 and the mitochondrial codes.")
+    g_lex.add_argument("--non-coding", action="store_true", help="Treat the reference as non-coding: no stop scan, no frame rule, and haplotypes are classed NonCoding_*. A length that is not a multiple of 3 already implies this; pass it for a non-coding target whose length happens to be one, which is one target in three.")
+    g_lex.add_argument("--allow-mixed", action="store_true",
+                       help="Let accessions whose own HSPs disagree about a base into the clean tiers instead of FLAGGED_MIXED_HSPS. Logan leaves an unpopped SNP bubble as two contigs, both of which align; the tiler picks the one each position lies deeper inside and records the disagreement, because which allele the sample carries is not something it can know. Off by default.")
     g_lex.add_argument("--require-full-length", action="store_true",
                        help="Require 100%% reference coverage (every position tiled) for "
                             "the clean full-length tier, instead of the --min-cov "
@@ -242,16 +246,11 @@ def _write_manifest(args, stages, started, status=None, error=None) -> None:
 
 
 def _run(args, stages) -> int:
-    if not args.dataset and not args.file:
-        print("from-lexicmap: must specify either -d/--dataset <GALAXY_ID> or "
-              "-f/-i/--file <PATH> (or '-' for stdin).", file=sys.stderr)
-        return 2
-
-    if args.min_cov_partial > args.min_cov:
-        print(f"from-lexicmap: --min-cov-partial ({args.min_cov_partial}) must be "
-              f"<= --min-cov ({args.min_cov}); otherwise the partial tier is "
-              f"empty by construction.", file=sys.stderr)
-        return 2
+    # PL-28: one copy of the checks, in `lexicmap`, so one added there reaches both. It runs
+    # before --out-dir is created, which is why it is not left to the stage itself.
+    bad = lexicmap_cmd.validate_args(args, "from-lexicmap")
+    if bad is not None:
+        return bad
 
     if not Path(args.ref).is_file():
         print(f"from-lexicmap: reference FASTA not found: {args.ref}", file=sys.stderr)
@@ -280,10 +279,9 @@ def _run(args, stages) -> int:
     prefix = out_dir / "lexicmap"
 
     if args.sieve and not resolve_sieve(args.sieve_bin):
-        print("from-lexicmap: kmer-diversity-sieve not found. Build it "
-              "(`cd extern/kmer-diversity-sieve && make serial`), or pass --sieve-bin.",
-              file=sys.stderr)
-        return 1
+        # PL-27: the composites exited 1 where the stage they wrap exits 127.
+        print(not_found_message("sieve", "from-lexicmap"), file=sys.stderr)
+        return EX_TOOL_NOT_FOUND
 
     # Warn on sieve knobs whose stage will not run. Defaults kept in sync with
     # add_parser above.
@@ -319,6 +317,9 @@ def _run(args, stages) -> int:
         min_pident=args.min_pident,
         max_internal_stops=args.max_internal_stops,
         allow_frameshift_alts=args.allow_frameshift_alts,
+        allow_mixed=args.allow_mixed,
+        genetic_code=args.genetic_code,
+        non_coding=args.non_coding,
         require_full_length=args.require_full_length,
         max_records=args.max_records,
         samples_per_haplotype=args.samples_per_haplotype,

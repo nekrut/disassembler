@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import bisect
 import json
 import os
 import time
@@ -53,7 +54,19 @@ def quantiles(values) -> dict | None:
         return None
 
     def at(q: float) -> float:
-        return v[min(len(v) - 1, max(0, round((len(v) - 1) * q)))]
+        """Linear interpolation between the two neighbouring order statistics.
+
+        PL-15. This used to be `v[round((n - 1) * q)]`, which with banker's rounding returned
+        one of the two middle values of an even cohort, sometimes the lower and sometimes the
+        upper. The p50s drive lexicmap's divergent-regime call, so coverages of 0.55 and 0.65
+        (true median 0.60) reported 0.55 and `divergent`, while 0.50/0.55/0.65/0.70 reported
+        0.65 and `conserved`. This is numpy's "linear" and
+        `statistics.quantiles(method="inclusive")`.
+        """
+        pos = (len(v) - 1) * q
+        lo = int(pos)
+        hi = min(lo + 1, len(v) - 1)
+        return v[lo] + (v[hi] - v[lo]) * (pos - lo)
 
     return {
         "p10": round(at(0.10), 4),
@@ -62,6 +75,45 @@ def quantiles(values) -> dict | None:
         "p75": round(at(0.75), 4),
         "p90": round(at(0.90), 4),
         "mean": round(sum(v) / len(v), 4),
+    }
+
+
+def quantiles_from_counts(counts, scale: float = 1.0) -> dict | None:
+    """`quantiles` over a multiset given as {value: how many}, each value times `scale`.
+
+    PL-24. A stage that streams millions of records cannot keep one Python float per record
+    just to report five quantiles; where the values are small integers, such as how many
+    reference positions an accession covered, a Counter is bounded by the range instead and
+    is exact. The result has to agree with `quantiles` on the same multiset, including the
+    interpolation, so the order statistics are addressed by index rather than recomputed.
+    """
+    total = sum(counts.values())
+    if total == 0:
+        return None
+    values = sorted(counts)
+    cumulative, running = [], 0
+    for v in values:
+        running += counts[v]
+        cumulative.append(running)
+
+    def nth(i: int) -> float:
+        """The i-th smallest value, 0-based."""
+        return values[bisect.bisect_right(cumulative, i)] * scale
+
+    def at(q: float) -> float:
+        pos = (total - 1) * q
+        lo = int(pos)
+        hi = min(lo + 1, total - 1)
+        return nth(lo) + (nth(hi) - nth(lo)) * (pos - lo)
+
+    mean = sum(v * n for v, n in counts.items()) * scale / total
+    return {
+        "p10": round(at(0.10), 4),
+        "p25": round(at(0.25), 4),
+        "p50": round(at(0.50), 4),
+        "p75": round(at(0.75), 4),
+        "p90": round(at(0.90), 4),
+        "mean": round(mean, 4),
     }
 
 

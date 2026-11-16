@@ -26,7 +26,7 @@ import os
 import subprocess
 import sys
 
-from disassembler.resolve import resolve_walker
+from disassembler.resolve import resolve_walker, not_found_message, EX_TOOL_NOT_FOUND
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -48,13 +48,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 def _resolved_or_report(walker_bin: str | None) -> str | None:
     resolved = resolve_walker(walker_bin)
     if not resolved:
-        print(
-            "walker: logan-walker not found. Build it "
-            "(`cd walker && cargo build --release`), put it on PATH, or pass "
-            "--walker-bin. Resolution order: --walker-bin, "
-            "$DISASSEMBLER_WALKER_BIN, PATH, walker/target/release/logan-walker.",
-            file=sys.stderr,
-        )
+        print(not_found_message("walker", "walker"), file=sys.stderr)
     return resolved
 
 

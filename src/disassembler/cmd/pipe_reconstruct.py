@@ -14,7 +14,7 @@ from pathlib import Path
 from disassembler.cmd import msa as msa_cmd
 from disassembler.cmd import sieve as sieve_cmd
 from disassembler.cmd import walker as walker_cmd
-from disassembler.resolve import resolve_sieve, resolve_walker
+from disassembler.resolve import resolve_sieve, resolve_walker, not_found_message, EX_TOOL_NOT_FOUND
 from disassembler.stage import stage_args
 from disassembler.validators import (
 
@@ -203,9 +203,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=run)
 
 
-def _die(msg: str) -> int:
-    print(f"reconstruct: {msg}", file=sys.stderr)
-    return 1
+def _die(msg: str, code: int = 1) -> int:
+    # `code` so a missing binary can exit 127 here as it does in the stage (PL-27). The
+    # message already names the command, so it is not prefixed twice.
+    print(msg if msg.startswith("reconstruct: ") else f"reconstruct: {msg}", file=sys.stderr)
+    return code
 
 
 # Walker flags whose value the composite computes itself. If the user re-sets
@@ -352,10 +354,8 @@ def _run(args, stages) -> int:
         return _die(scrub_err)
 
     if not resolve_walker(args.walker_bin):
-        return _die(
-            f"logan-walker not found. Build it (`cd walker && cargo build --release`), "
-            f"put it on PATH, or pass --walker-bin."
-        )
+        # PL-27: the same message the `walker` stage prints, and the same exit code.
+        return _die(not_found_message("walker", "reconstruct"), EX_TOOL_NOT_FOUND)
 
     _warn_inert_knobs(args)
 

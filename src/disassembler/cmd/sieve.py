@@ -20,7 +20,7 @@ import time
 import sys
 from pathlib import Path
 
-from disassembler.resolve import resolve_sieve
+from disassembler.resolve import resolve_sieve, not_found_message, EX_TOOL_NOT_FOUND
 from disassembler.textio import open_text
 from disassembler.validators import fasta_record_lengths, fraction, positive_int
 
@@ -155,13 +155,8 @@ def sieve_run(
     """
     resolved = resolve_sieve(sieve_bin)
     if not resolved:
-        print(
-            "sieve: kmer-diversity-sieve not found. Build it "
-            "(`cd extern/kmer-diversity-sieve && make serial`), put it on PATH, "
-            "or pass --sieve-bin.",
-            file=sys.stderr,
-        )
-        return 127
+        print(not_found_message("sieve", "sieve"), file=sys.stderr)
+        return EX_TOOL_NOT_FOUND
 
     if min_len is None:
         if ref is None:

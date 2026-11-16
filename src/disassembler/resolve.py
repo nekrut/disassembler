@@ -62,3 +62,42 @@ def resolve_sieve(explicit: str | None = None) -> str | None:
             _repo_root() / "extern" / "kmer-diversity-sieve" / "l1_pipeline_serial"
         )
     )
+
+
+# What each tool is called, where it comes from, and how to build it. The four sites that
+# report a missing binary used to write their own message: `sieve` said "put it on PATH"
+# without naming the file it looks for (`l1_pipeline_serial`, not `kmer-diversity-sieve`,
+# which is what a user would reasonably install) or the environment override, and the
+# composites exited 1 where the stages exited 127 (PL-27).
+TOOLS = {
+    "walker": {
+        "file": "logan-walker",
+        "env": "DISASSEMBLER_WALKER_BIN",
+        "flag": "--walker-bin",
+        "build": "cd walker && cargo build --release",
+        "conda": "conda install -c conda-forge -c bioconda logan-walker",
+    },
+    "sieve": {
+        "file": "l1_pipeline_serial",
+        "env": "DISASSEMBLER_SIEVE_BIN",
+        "flag": "--sieve-bin",
+        "build": "cd extern/kmer-diversity-sieve && make serial",
+        "conda": "conda install -c conda-forge -c bioconda kmer-diversity-sieve",
+    },
+}
+
+EX_TOOL_NOT_FOUND = 127
+
+
+class ToolNotFound(RuntimeError):
+    """A required external binary could not be resolved. Exit 127, as a shell would."""
+
+
+def not_found_message(tool: str, prog: str = "disassembler") -> str:
+    """One message naming the file, the resolution order, and how to get it."""
+    t = TOOLS[tool]
+    return (
+        f"{prog}: {t['file']} not found. It is looked for as {t['flag']}, then "
+        f"${t['env']}, then on PATH, then in this checkout. Build it "
+        f"(`{t['build']}`) or install it (`{t['conda']}`)."
+    )
