@@ -15,11 +15,70 @@
 use crate::error::{file_err, Error, Result};
 use std::path::{Path, PathBuf};
 
+/// Whether the run should keep its scratch files, `LOGAN_KEEP_SCRATCH`.
+///
+/// TW-08. Four sites read the variable directly and any value, even `0`, turned cleanup off.
+/// A developer who follows `docs/walker.md` and exports it then saw four cleanup tests fail
+/// on a correct build. `cfg!(test)` makes the unit tests ignore the environment; the CLI
+/// tests clear it from the child's environment instead, since they run a real binary.
+pub fn keep_scratch() -> bool {
+    !cfg!(test) && std::env::var_os("LOGAN_KEEP_SCRATCH").is_some()
+}
+
+/// A scratch directory owned by one unit test, removed when the test's guard drops (TW-10).
+///
+/// Several test helpers built a `Config` around a path under the system temp directory and
+/// never removed it. `write_gfa` creates the directory, the test removed only the GFA, and a
+/// `cargo test` run left about seven empty `logan_*_test_*` directories behind. On a machine
+/// where the temp directory is `/dev/shm` those are not even on disk.
+///
+/// The name carries a per-call counter as well as the PID, so two tests running in parallel
+/// never share a directory and one guard dropping cannot delete the other's files.
+#[cfg(test)]
+pub struct TestDir(PathBuf);
+
+#[cfg(test)]
+impl TestDir {
+    /// A fresh, not-yet-created directory path tagged with `tag`.
+    pub fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        Self(std::env::temp_dir().join(format!(
+            "logan_{tag}_test_{}_{n}",
+            std::process::id()
+        )))
+    }
+    pub fn path(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 const PREFIX: &str = "logan-walker.";
+/// Marks a scratch directory as claimed by a live run (WF-01).
+const LOCK: &str = ".lock";
+/// Written beside it under `LOGAN_KEEP_SCRATCH`, so a kept directory is never swept.
+const KEEP: &str = ".keep";
 
 pub struct Scratch {
     path: PathBuf,
     keep: bool,
+    /// The run's `.lock`, held open and `flock`ed for the life of the run (WF-01).
+    ///
+    /// Liveness used to be `kill(pid, 0)`, which sees only the caller's PID namespace on the
+    /// caller's host, so a live run in another container or on another node sharing the base
+    /// looked dead and had its in-flight directory **deleted**. The victim did not notice:
+    /// the directory was silently recreated and the vanished GAF became the biological
+    /// answer `no_path`, with exit 0. A held lock is a fact about the filesystem rather than
+    /// about one process table.
+    _lock: Option<std::fs::File>,
 }
 
 impl Scratch {
@@ -36,7 +95,7 @@ impl Scratch {
                 base.display()
             );
         }
-        let keep = std::env::var_os("LOGAN_KEEP_SCRATCH").is_some();
+        let keep = keep_scratch();
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -45,7 +104,11 @@ impl Scratch {
         for attempt in 0..16u32 {
             let path = base.join(format!("{PREFIX}{pid}.{nanos:08x}{attempt:x}"));
             match make_private_dir(&path) {
-                Ok(()) => return Ok(Scratch { path, keep }),
+                Ok(()) => {
+                    // Claim it before anything is written into it.
+                    let lock = claim(&path, keep);
+                    return Ok(Scratch { path, keep, _lock: lock });
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => {
                     return Err(Error::Usage(format!(
@@ -68,9 +131,28 @@ impl Scratch {
 
     /// On SIGINT, SIGTERM or SIGHUP, remove the directory, then end the process as the
     /// signal would have, so the caller still sees "terminated by SIGTERM".
+    ///
+    /// **Signals the process inherited as ignored are left ignored** (WF-02). Registering a
+    /// handler for one is a 0.1.1 regression that breaks `nohup`: bash sends SIGHUP to every
+    /// job when an SSH session drops, `nohup` exists to set that signal to ignored, and
+    /// catching it anyway killed the run with exit 129. Since outputs are written at the end,
+    /// the whole run was lost. 0.1.0 had no signal code at all, so this never affected it.
+    ///
+    /// It matters a second time for the children: a *caught* signal is reset to the default
+    /// across `exec`, so GraphAligner stopped inheriting the ignore and died of the same
+    /// hangup. Leaving the disposition alone passes the ignore through.
     pub fn remove_on_signal(&self) -> Result<()> {
         use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-        let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+        let wanted: Vec<i32> = [SIGINT, SIGTERM, SIGHUP]
+            .into_iter()
+            .filter(|&s| !is_ignored(s))
+            .collect();
+        if wanted.is_empty() {
+            // Every signal we would clean up on is ignored, so there is nothing to hook.
+            // `Drop` still removes the directory on an ordinary exit.
+            return Ok(());
+        }
+        let mut signals = signal_hook::iterator::Signals::new(&wanted)?;
         let (path, keep) = (self.path.clone(), self.keep);
         std::thread::spawn(move || {
             if let Some(sig) = signals.forever().next() {
@@ -93,6 +175,97 @@ impl Drop for Scratch {
             remove(&self.path);
         }
     }
+}
+
+/// Whether this process inherited `SIG_IGN` for `sig`.
+///
+/// WF-02. `sigaction` with a null action reads the current disposition without changing it.
+fn is_ignored(sig: libc::c_int) -> bool {
+    // SAFETY: `sigaction` with a null `act` only reads. `old` is a valid, owned struct, and
+    // the call is made before any handler is installed.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(sig, std::ptr::null(), &mut old) != 0 {
+            return false; // cannot tell; register as before
+        }
+        old.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// This kernel's boot id, or the hostname if the kernel does not publish one.
+///
+/// WF-01. A `flock` is only meaningful on the machine that took it: NFS mounted `nolock`, or
+/// Lustre mounted `localflock`, does not carry it between nodes. Recording the machine makes
+/// the sweep fail SAFE there, leaking directories rather than deleting a live run's.
+fn machine_id() -> String {
+    if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Take this run's `.lock`, and write `.keep` when the directory is meant to survive.
+///
+/// A failure here is not fatal: the run proceeds unlocked and the only consequence is that
+/// its directory is never swept later. Leaking a directory is the safe side of this trade.
+#[cfg(unix)]
+fn claim(dir: &Path, keep: bool) -> Option<std::fs::File> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    if keep {
+        // `LOGAN_KEEP_SCRATCH` must outlive this process, and a released lock is not enough.
+        let _ = std::fs::write(dir.join(KEEP), b"");
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(LOCK))
+        .ok()?;
+    // SAFETY: a valid open fd owned by `file`; LOCK_NB cannot block.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return None;
+    }
+    file.write_all(machine_id().as_bytes()).ok()?;
+    file.flush().ok()?;
+    Some(file)
+}
+
+#[cfg(not(unix))]
+fn claim(_dir: &Path, _keep: bool) -> Option<std::fs::File> {
+    None
+}
+
+/// Whether `dir`'s lock says it belongs to this machine and nobody is holding it.
+///
+/// A missing lock means the directory predates WF-01, and is left alone. A lock naming
+/// another machine is left alone: we cannot reason about it from here.
+#[cfg(unix)]
+fn lock_is_free(dir: &Path, me: &str) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let path = dir.join(LOCK);
+    let Ok(owner) = std::fs::read_to_string(&path) else { return false };
+    if owner.trim() != me {
+        return false;
+    }
+    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&path) else {
+        return false;
+    };
+    // SAFETY: a valid open fd owned by `file`; LOCK_NB cannot block.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return false; // someone is running in there
+    }
+    // SAFETY: the same fd, releasing the probe lock.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    true
 }
 
 /// `remove_dir_all`, tried twice: a worker can create a file in the directory while it is
@@ -124,34 +297,56 @@ fn make_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir(path)
 }
 
-/// Remove run directories in `base` that are ours and whose process no longer exists.
-/// Another user's directory, or one whose PID is alive (even if reused by another program),
-/// is left alone. Returns how many were removed.
+/// Remove run directories in `base` that are ours, on this machine, and not in use.
+///
+/// WF-01. This used to decide with `kill(pid, 0)`, which answers only about the caller's PID
+/// namespace on the caller's host: a live run in another container, or on another node
+/// sharing the base over Lustre or NFS, looked dead and had its directory deleted mid-flight.
+/// The victim recreated the directory silently and reported the affected accessions as
+/// `no_path`, the biological answer, with exit 0. Reproduced twice; one reproduction lost 4
+/// of 8 accessions.
+///
+/// Four conditions now, all required:
+///
+/// 1. the name is exactly what `create` builds, `logan-walker.<digits>.<hex>`;
+/// 2. it is a directory we own;
+/// 3. it holds a `.lock` naming **this** machine, so another node's directory is never
+///    touched even where its lock is invisible to us;
+/// 4. that lock is free, which `flock(LOCK_NB)` establishes, and there is no `.keep`.
+///
+/// This run protects itself for free: it holds its own lock, so condition 4 refuses it. A
+/// directory left by 0.1.x has no lock and is never swept, so the release notes should ask
+/// for a one-time manual cleanup. `process_exists` is gone: a PID is not evidence.
 #[cfg(unix)]
 fn sweep_stale(base: &Path) -> usize {
     use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(base) else { return 0 };
     // SAFETY: getuid cannot fail and has no preconditions.
     let uid = unsafe { libc::getuid() };
+    let me = machine_id();
     let mut removed = 0;
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name
-            .to_str()
-            .and_then(|n| n.strip_prefix(PREFIX))
-            .and_then(|rest| rest.split('.').next())
-            .and_then(|p| p.parse::<i32>().ok())
-        else {
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(PREFIX)) else { continue };
+        // `<digits>.<hex>`, which is what `create` builds and nothing else.
+        let Some((pid, suffix)) = rest.split_once('.') else { continue };
+        if pid.is_empty()
+            || !pid.bytes().all(|b| b.is_ascii_digit())
+            || suffix.is_empty()
+            || !suffix.bytes().all(|b| b.is_ascii_hexdigit())
+        {
             continue;
-        };
+        }
         let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_dir() || meta.uid() != uid || pid as u32 == std::process::id() {
+        if !meta.is_dir() || meta.uid() != uid {
             continue;
         }
-        if !process_exists(pid) {
-            remove(&entry.path());
-            removed += 1;
+        let dir = entry.path();
+        if dir.join(KEEP).exists() || !lock_is_free(&dir, &me) {
+            continue;
         }
+        remove(&dir);
+        removed += 1;
     }
     removed
 }
@@ -161,13 +356,33 @@ fn sweep_stale(_base: &Path) -> usize {
     0
 }
 
-/// `kill(pid, 0)`: it fails with ESRCH only when no such process exists. EPERM means it
-/// exists under another user.
-#[cfg(unix)]
-fn process_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 delivers nothing; it only checks that the process exists.
-    let r = unsafe { libc::kill(pid, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+
+#[cfg(all(test, unix))]
+mod signal_tests {
+    use super::is_ignored;
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+
+    /// WF-02. `nohup` works by setting SIGHUP to ignored before exec. The walker registered a
+    /// handler for it regardless, so bash's hangup on an SSH drop killed the run with exit
+    /// 129 and, because outputs are written at the end, lost all of it. The fix is to read
+    /// the inherited disposition first, which is what this asserts.
+    #[test]
+    fn an_inherited_ignore_is_detected() {
+        assert!(!is_ignored(SIGTERM), "SIGTERM is not ignored by default");
+
+        // Ignore SIGHUP the way `nohup` does, then check we can see it.
+        // SAFETY: a test-local disposition change on a signal this test then restores.
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = libc::SIG_IGN;
+            let mut old: libc::sigaction = std::mem::zeroed();
+            assert_eq!(libc::sigaction(SIGHUP, &act, &mut old), 0);
+            assert!(is_ignored(SIGHUP), "an inherited SIG_IGN must be visible");
+            assert_eq!(libc::sigaction(SIGHUP, &old, std::ptr::null_mut()), 0);
+        }
+        assert!(!is_ignored(SIGHUP), "restored to the default");
+        assert!(!is_ignored(SIGINT));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -175,15 +390,20 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn base(name: &str) -> PathBuf {
-        let b = std::env::temp_dir().join(format!("logan_scratch_{}_{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&b);
-        b
+    /// A base directory for one test, removed when the returned guard drops (TW-10).
+    ///
+    /// The manual `remove_dir_all` these tests used to end with ran only when the test
+    /// reached it, so an assertion failure leaked the directory, and the sweep test leaked
+    /// one on every run: it deliberately leaves behind the directories the sweep must not
+    /// touch, and so could never have ended by removing its base.
+    fn base(name: &str) -> TestDir {
+        TestDir::new(name)
     }
 
     #[test]
     fn a_private_directory_removed_on_drop() {
-        let b = base("drop");
+        let d = base("drop");
+        let b = d.path();
         let s = Scratch::create(Some(&b)).unwrap();
         let p = s.path().to_path_buf();
         assert!(p.starts_with(&b) && p.is_dir());
@@ -191,49 +411,93 @@ mod tests {
         std::fs::write(p.join("x.sub.gfa"), b"H\n").unwrap();
         drop(s);
         assert!(!p.exists(), "the run's directory must be removed with its files");
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]
     fn runs_get_separate_directories() {
-        let b = base("two");
+        let d = base("two");
+        let b = d.path();
         let (s1, s2) = (Scratch::create(Some(&b)).unwrap(), Scratch::create(Some(&b)).unwrap());
         assert_ne!(s1.path(), s2.path());
         drop((s1, s2));
-        let _ = std::fs::remove_dir_all(&b);
     }
 
+    /// WF-01. Liveness is a held lock, not a PID.
+    ///
+    /// The old rule was `kill(pid, 0)`, which answers only about the caller's PID namespace
+    /// on the caller's host, so a live run in another container or on another node sharing
+    /// the base looked dead and had its in-flight directory deleted. Each case below turns on
+    /// something that survives a namespace boundary; none turns on a PID.
     #[test]
-    fn a_dead_runs_directory_is_swept_and_a_live_ones_kept() {
-        let b = base("sweep");
+    fn sweeping_is_decided_by_the_lock_not_the_pid() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let d = base("sweep");
+        let b = d.path();
         std::fs::create_dir_all(&b).unwrap();
-        // A PID that has just exited stands in for a run killed with SIGKILL.
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let dead = child.id();
-        child.wait().unwrap();
-        let stale = b.join(format!("{PREFIX}{dead}.0"));
-        std::fs::create_dir(&stale).unwrap();
-        std::fs::write(stale.join("left.sub.gfa"), b"H\n").unwrap();
-        let live = b.join(format!("{PREFIX}1.0")); // PID 1 always exists
+        let me = super::machine_id();
+
+        // A run that ended: lock free. Its PID is 1, which is always alive, to prove the PID
+        // is no longer consulted.
+        let ended = b.join(format!("{PREFIX}1.0a"));
+        std::fs::create_dir(&ended).unwrap();
+        std::fs::write(ended.join(LOCK), me.as_bytes()).unwrap();
+        std::fs::write(ended.join("left.sub.gfa"), b"H\n").unwrap();
+
+        // A run in flight: lock HELD. Its PID cannot exist.
+        let live = b.join(format!("{PREFIX}99999999.0b"));
         std::fs::create_dir(&live).unwrap();
+        let mut held = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true).open(live.join(LOCK)).unwrap();
+        held.write_all(me.as_bytes()).unwrap();
+        held.flush().unwrap();
+        // SAFETY: a valid open fd owned by `held`, held for the rest of the test.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+
+        // A run on another node sharing this base over a cluster filesystem.
+        let elsewhere = b.join(format!("{PREFIX}4242.0c"));
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(LOCK), b"another-kernel-boot-id").unwrap();
+
+        // Left by 0.1.x: no lock at all.
+        let legacy = b.join(format!("{PREFIX}4243.0d"));
+        std::fs::create_dir(&legacy).unwrap();
+
+        // LOGAN_KEEP_SCRATCH asked for this one to survive.
+        let kept = b.join(format!("{PREFIX}4244.0e"));
+        std::fs::create_dir(&kept).unwrap();
+        std::fs::write(kept.join(LOCK), me.as_bytes()).unwrap();
+        std::fs::write(kept.join(KEEP), b"").unwrap();
+
+        // Names that are not ours, including one that only looks close.
         let other = b.join("not-ours");
         std::fs::create_dir(&other).unwrap();
+        let nearly = b.join(format!("{PREFIX}notanumber.0f"));
+        std::fs::create_dir(&nearly).unwrap();
 
         let s = Scratch::create(Some(&b)).unwrap();
-        assert!(!stale.exists(), "the dead run's directory is removed");
-        assert!(live.exists() && other.exists(), "only dead runs' directories are touched");
+
+        assert!(!ended.exists(), "a free lock on this machine is swept, whatever the PID");
+        assert!(live.exists(), "a HELD lock is a live run, even at an impossible PID");
+        assert!(elsewhere.exists(), "another machine's directory is never touched");
+        assert!(legacy.exists(), "a 0.1.x directory has no lock and is left for the user");
+        assert!(kept.exists(), "LOGAN_KEEP_SCRATCH survives the next run's sweep");
+        assert!(other.exists() && nearly.exists(), "only our own name pattern is considered");
+        assert!(s.path().join(LOCK).exists(), "and this run claims its own directory");
+
+        drop(held);
         drop(s);
         let _ = std::fs::remove_dir_all(&b);
     }
 
     #[test]
     fn an_unwritable_base_names_itself() {
-        let b = base("ro");
+        let d = base("ro");
+        let b = d.path();
         std::fs::create_dir_all(&b).unwrap();
         std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o500)).unwrap();
         let err = Scratch::create(Some(&b)).err().map(|e| e.to_string());
         std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let _ = std::fs::remove_dir_all(&b);
         if unsafe { libc::geteuid() } == 0 {
             return; // root writes anywhere
         }

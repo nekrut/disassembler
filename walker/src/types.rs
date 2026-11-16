@@ -218,7 +218,7 @@ pub struct Subgraph {
 impl Drop for Subgraph {
     fn drop(&mut self) {
         // Set LOGAN_KEEP_SCRATCH=1 to retain the GFA for debugging a specific accession.
-        if self.owns_gfa && std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
+        if self.owns_gfa && !crate::scratch::keep_scratch() {
             let _ = std::fs::remove_file(&self.gfa_path);
         }
     }
@@ -774,13 +774,10 @@ mod tests {
 
         std::fs::write(&owned, b"H\tVN:Z:1.0\n").unwrap();
         drop(make(&owned, true));
-        // The env override still wins, so assert whichever contract is in force rather than
-        // mutating the environment, which is not sound in a threaded test binary (TW-08).
-        if std::env::var_os("LOGAN_KEEP_SCRATCH").is_some() {
-            assert!(owned.exists(), "LOGAN_KEEP_SCRATCH is set, so even an owned GFA must stay");
-        } else {
-            assert!(!owned.exists(), "Drop left a file the Subgraph did create");
-        }
+        // TW-08: `scratch::keep_scratch()` ignores the environment under `cfg(test)`, so this
+        // asserts one contract rather than branching on the developer's shell. The branch
+        // that used to be here was the workaround for the variable leaking into the suite.
+        assert!(!owned.exists(), "Drop left a file the Subgraph did create");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

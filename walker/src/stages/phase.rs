@@ -24,7 +24,7 @@
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::stages::parse;
+use crate::stages::{extract, parse};
 use crate::types::{Branch, Bubble, Strand, Subgraph, UnitigGraph, UnitigId};
 use std::collections::HashMap;
 
@@ -181,7 +181,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
                 let (node, strand) = unlocal(b);
                 let ab = graph.abundance[node as usize];
                 let vaf = ab as f64 / total;
-                if ab >= cfg.min_abund && vaf >= cfg.min_vaf {
+                if extract::survives(ab, cfg.min_abund) && vaf >= cfg.min_vaf {
                     kept.push(Branch { node, strand, abundance: ab, vaf });
                 }
             }
@@ -224,10 +224,18 @@ mod tests {
     fn build(fa: &str) -> UnitigGraph {
         parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
     }
-    fn cfg() -> Config {
-        let mut d = std::env::temp_dir();
-        d.push(format!("logan_phase_test_{}", std::process::id()));
-        Config { k: 31, min_abund: 5.0, min_vaf: 0.10, scratch_dir: d, ..Config::default() }
+    /// A config and the guard that removes its scratch directory (TW-10). Every test binds
+    /// the guard as `_d`; dropping it early would delete the GFA the test is still reading.
+    fn cfg() -> (Config, crate::scratch::TestDir) {
+        let d = crate::scratch::TestDir::new("phase");
+        let c = Config {
+            k: 31,
+            min_abund: 5.0,
+            min_vaf: 0.10,
+            scratch_dir: d.path(),
+            ..Config::default()
+        };
+        (c, d)
     }
     /// Build the whole graph as one subgraph, so phasing sees every node.
     fn whole(cfg: &Config, g: &UnitigGraph) -> Subgraph {
@@ -242,7 +250,7 @@ mod tests {
     /// each end, which is a chain, not a choice.
     #[test]
     fn a_neighbour_at_each_end_is_not_a_fork() {
-        let c = cfg();
+        let (c, _d) = cfg();
         let g = build(concat!(
             ">T_0 ka:f:50.0   L:-:1:+  L:+:2:-\nACGT\n",
             ">T_1 ka:f:50.0   L:-:0:+\nTTTT\n",
@@ -257,7 +265,7 @@ mod tests {
     /// A real bubble: one end of unitig 0 leads to either 1 or 2, and both reach 3.
     #[test]
     fn detects_a_genuine_two_branch_bubble() {
-        let c = cfg();
+        let (c, _d) = cfg();
         let g = build(concat!(
             ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
             ">T_1 ka:f:60.0   L:-:0:-  L:+:3:+\nTTTT\n",
@@ -305,7 +313,7 @@ mod tests {
     /// but the smallest was discarded before the dedup was even reached.
     #[test]
     fn a_fork_with_two_merges_reports_both() {
-        let c = cfg();
+        let (c, _d) = cfg();
         // 0+ forks to 1+ and 2+; both reach 3+ AND both reach 4+. Two genuine diamonds
         // sharing one fork.
         let g = build(concat!(
@@ -336,7 +344,7 @@ mod tests {
     /// direction of `bubbles.json`. Found by brute-force search over reversal-closed graphs.
     #[test]
     fn a_bubble_whose_directions_disagree_on_the_merge_survives() {
-        let c = cfg();
+        let (c, _d) = cfg();
         let g = build(concat!(
             ">T_0 ka:f:50.0  L:-:1:-  L:-:1:+  L:-:2:+  L:-:3:-  L:+:2:-  L:+:2:+\nACGT\n",
             ">T_1 ka:f:50.0  L:-:0:+  L:-:3:-  L:+:0:+  L:+:2:+\nTTTT\n",
@@ -365,7 +373,7 @@ mod tests {
     /// that bubble, and must not dilute the real alleles' VAFs.
     #[test]
     fn a_branch_that_misses_the_merge_is_not_an_allele() {
-        let c = cfg();
+        let (c, _d) = cfg();
         // 0+ exits to 1+, 2+ and 3+. Only 1+ and 2+ reach 4+; 3+ goes to 5+ and carries
         // enough coverage to push the minority allele under min_vaf if it were counted.
         let g = build(concat!(
@@ -397,7 +405,7 @@ mod tests {
     /// A branch below the coverage floor is a sequencing error, not a variant.
     #[test]
     fn low_coverage_branch_is_dropped() {
-        let c = cfg();
+        let (c, _d) = cfg();
         let g = build(concat!(
             ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
             ">T_1 ka:f:95.0   L:-:0:-  L:+:3:+\nTTTT\n",
@@ -413,7 +421,7 @@ mod tests {
     /// Real but rare: above the coverage floor yet below the frequency floor.
     #[test]
     fn branch_below_vaf_floor_is_dropped() {
-        let c = cfg();
+        let (c, _d) = cfg();
         let g = build(concat!(
             ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
             ">T_1 ka:f:1000.0 L:-:0:-  L:+:3:+\nTTTT\n",
@@ -429,7 +437,7 @@ mod tests {
     /// Diverging without meeting again is not a bubble.
     #[test]
     fn fork_without_reconvergence_is_not_a_bubble() {
-        let c = cfg();
+        let (c, _d) = cfg();
         let g = build(concat!(
             ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
             ">T_1 ka:f:60.0   L:-:0:-\nTTTT\n",
@@ -443,7 +451,7 @@ mod tests {
 
     #[test]
     fn empty_subgraph_yields_nothing() {
-        let c = cfg();
+        let (c, _d) = cfg();
         let g = build(">T_0 ka:f:9.0\nACGT\n");
         let sub = Subgraph {
             accession: "T".into(), nodes: vec![], seqs: vec![],
@@ -457,9 +465,143 @@ mod tests {
         assert!(phase(&c, &g, &sub).unwrap().is_empty());
     }
 
+    /// Two diamonds in a chain, asserted literally: the whole bubble list, not a filtered
+    /// view of it (TW-06).
+    ///
+    /// Every other fixture here searches the result for the one bubble it cares about, so an
+    /// extra bubble, a duplicated mirror direction or a branch attached to the wrong fork
+    /// would go unnoticed. `0+ -> {1,2} -> 3+` and `3+ -> {4,5} -> 6+` share unitig 3, which
+    /// is a merge in one bubble and a fork in the next, and the eight oriented edges give
+    /// four forks of out-degree two: the two diamonds and their two mirrors. Exactly two
+    /// bubbles may survive the dedup, in this order, with these branches and these VAFs.
+    #[test]
+    fn two_chained_diamonds_report_exactly_two_bubbles() {
+        let (c, _d) = cfg();
+        let g = build(concat!(
+            ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
+            ">T_1 ka:f:60.0   L:-:0:-  L:+:3:+\nTTTT\n",
+            ">T_2 ka:f:40.0   L:-:0:-  L:+:3:+\nGGGG\n",
+            ">T_3 ka:f:100.0  L:-:1:-  L:-:2:-  L:+:4:+  L:+:5:+\nCCCC\n",
+            ">T_4 ka:f:70.0   L:-:3:-  L:+:6:+\nAAAA\n",
+            ">T_5 ka:f:30.0   L:-:3:-  L:+:6:+\nACAC\n",
+            ">T_6 ka:f:100.0  L:-:4:-  L:-:5:-\nCACA\n",
+        ));
+        assert_reversal_closed(&g);
+        let sub = whole(&c, &g);
+        let b = phase(&c, &g, &sub).unwrap();
+        cleanup(&sub);
+
+        let got: Vec<(UnitigId, Strand, UnitigId, Strand, Vec<UnitigId>, Vec<Strand>)> = b
+            .iter()
+            .map(|x| {
+                (
+                    x.fork,
+                    x.fork_strand,
+                    x.merge,
+                    x.merge_strand,
+                    x.branches.iter().map(|v| v.node).collect(),
+                    x.branches.iter().map(|v| v.strand).collect(),
+                )
+            })
+            .collect();
+        let f = Strand::Forward;
+        assert_eq!(
+            got,
+            vec![
+                (0, f, 3, f, vec![1, 2], vec![f, f]),
+                (3, f, 6, f, vec![4, 5], vec![f, f]),
+            ],
+            "the complete bubble list, mirrors deduped"
+        );
+
+        let vafs: Vec<f64> = b.iter().flat_map(|x| x.branches.iter().map(|v| v.vaf)).collect();
+        for (got, want) in vafs.iter().zip([0.6, 0.4, 0.7, 0.3]) {
+            assert!((got - want).abs() < 1e-9, "VAFs {vafs:?}");
+        }
+    }
+
+    /// A diamond whose surviving direction is the reverse strand (TW-06).
+    ///
+    /// `(0,-) -> {(1,+), (2,+)} -> (3,-)`: the fork and merge are both reverse ends, and the
+    /// two branches are entered forward. The dedup keeps the lexicographically smaller
+    /// oriented pair, which here is the reverse direction, so this is the half of the rule
+    /// the forward fixtures never exercise. A reader of `bubbles.json` needs the strands to
+    /// be the ones actually traversed, because that is what decides which end of each branch
+    /// the allele sequence starts at.
+    #[test]
+    fn a_diamond_on_the_reverse_strand_keeps_its_strands() {
+        let (c, _d) = cfg();
+        let g = build(concat!(
+            ">T_0 ka:f:100.0  L:-:1:+  L:-:2:+\nACGT\n",
+            ">T_1 ka:f:60.0   L:-:0:+  L:+:3:-\nTTTT\n",
+            ">T_2 ka:f:40.0   L:-:0:+  L:+:3:-\nGGGG\n",
+            ">T_3 ka:f:100.0  L:+:1:-  L:+:2:-\nCCCC\n",
+        ));
+        assert_reversal_closed(&g);
+        let sub = whole(&c, &g);
+        let b = phase(&c, &g, &sub).unwrap();
+        cleanup(&sub);
+
+        assert_eq!(b.len(), 1, "one diamond, reported once");
+        assert_eq!((b[0].fork, b[0].fork_strand), (0, Strand::Reverse));
+        assert_eq!((b[0].merge, b[0].merge_strand), (3, Strand::Reverse));
+        let branches: Vec<(UnitigId, Strand)> =
+            b[0].branches.iter().map(|x| (x.node, x.strand)).collect();
+        assert_eq!(
+            branches,
+            vec![(1, Strand::Forward), (2, Strand::Forward)],
+            "the fork is reverse; the branches are entered forward"
+        );
+    }
+
+    /// Two tandem-repeat shapes, neither of which is a bubble (TW-06).
+    ///
+    /// Logan collapses a tandem array into one unitig carrying a self-loop, so the repeat
+    /// unit has out-degree two off one end: on to itself, and on out of the array. The
+    /// second shape is the two-copy array, where the copies differ enough to stay separate
+    /// unitigs and both lead back to the start of the array, so the fork is reachable from
+    /// every one of its own branches.
+    ///
+    /// Tandem arrays are common in the genes this tool is pointed at, and both shapes are
+    /// ways of reporting a variant at a site that has only one sequence: the first would
+    /// make the repeat unit an allele of itself, and the second would publish a bubble whose
+    /// merge IS its fork, which is what `c != fork` in the reconvergence filter prevents.
+    /// Coverage is well clear of both gates in each fixture, so an empty result can only be
+    /// the topology.
+    #[test]
+    fn tandem_repeats_are_not_bubbles() {
+        let (c, _d) = cfg();
+
+        // One unitig, self-looping: 0 -> 1, 1 -> 1, 1 -> 2.
+        let collapsed = build(concat!(
+            ">T_0 ka:f:100.0  L:+:1:+\nACGT\n",
+            ">T_1 ka:f:400.0  L:-:0:-  L:+:1:+  L:-:1:-  L:+:2:+\nTTTT\n",
+            ">T_2 ka:f:100.0  L:-:1:-\nGGGG\n",
+        ));
+
+        // Two copies that both return to the start of the array: 1 forks to 2 and 3, and
+        // both lead back to 1.
+        let two_copy = build(concat!(
+            ">T_0 ka:f:100.0  L:+:1:+\nACGT\n",
+            ">T_1 ka:f:100.0  L:-:0:-  L:+:2:+  L:+:3:+  L:-:2:-  L:-:3:-\nTTTT\n",
+            ">T_2 ka:f:50.0   L:-:1:-  L:+:1:+\nGGGG\n",
+            ">T_3 ka:f:50.0   L:-:1:-  L:+:1:+\nCCCC\n",
+        ));
+
+        for (name, g) in [("collapsed", collapsed), ("two-copy", two_copy)] {
+            assert_reversal_closed(&g);
+            let sub = whole(&c, &g);
+            let b = phase(&c, &g, &sub).unwrap();
+            cleanup(&sub);
+            let seen: Vec<(UnitigId, Strand, UnitigId, Strand)> =
+                b.iter().map(|x| (x.fork, x.fork_strand, x.merge, x.merge_strand)).collect();
+            assert!(b.is_empty(), "{name}: a repeat is not an allele of itself, got {seen:?}");
+        }
+    }
+
     #[test]
     fn output_is_deterministic() {
-        let c = cfg();
+        let (c, _d) = cfg();
         let g = build(concat!(
             ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
             ">T_1 ka:f:60.0   L:-:0:-  L:+:3:+\nTTTT\n",
@@ -563,12 +705,21 @@ mod phase_diagnostic {
     #[test]
     #[ignore]
     fn shows_why_the_count_drops() {
-        let Ok(dir) = std::env::var("LOGAN_TEST_DIR") else { return };
+        // TW-11: say SKIP rather than returning in silence. The golden CI job fails on any
+        // `SKIP:` line, so a diagnostic that quietly does nothing looked like a pass.
+        let Ok(dir) = std::env::var("LOGAN_TEST_DIR") else {
+            eprintln!("SKIP: set LOGAN_TEST_DIR");
+            return;
+        };
         for (acc, qpath) in [
             ("ERR2028820", "../queries/pfcrt_only.fasta"),
             ("SRR8209082", "../queries/query_hiv1_pol.fasta"),
         ] {
-            let Ok(compressed) = std::fs::read(format!("{dir}/{acc}.unitigs.fa.zst")) else { continue };
+            let path = format!("{dir}/{acc}.unitigs.fa.zst");
+            let Ok(compressed) = std::fs::read(&path) else {
+                eprintln!("SKIP: no data for {acc} at {path}");
+                continue;
+            };
             let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();

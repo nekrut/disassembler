@@ -601,11 +601,16 @@ mod tests {
 mod repo_files {
     use super::*;
 
+    /// Every shipped query FASTA must be readable.
+    ///
+    /// TW-11: this logged bad files and asserted only `n > 0`, so a malformed FASTA under
+    /// `queries/` passed, and it was `#[ignore]`d so it did not run on push at all. It needs
+    /// nothing but repository files, so there is no reason to skip it.
     #[test]
-    #[ignore]
     fn surveys_real_query_fastas() {
         let dirs = ["../queries/markers", "../queries"];
         let mut n = 0;
+        let mut errors: Vec<String> = Vec::new();
         for d in dirs {
             let Ok(entries) = std::fs::read_dir(d) else { continue };
             for e in entries.flatten() {
@@ -624,10 +629,11 @@ mod repo_files {
                             if q.seq.len() % 3 == 0 { "" } else { "  <-- not in frame" }
                         );
                     }
-                    Err(err) => eprintln!("  ERR  {}: {err}", p.display()),
+                    Err(err) => errors.push(format!("{}: {err}", p.display())),
                 }
             }
         }
+        assert!(errors.is_empty(), "unreadable query FASTAs: {errors:#?}");
         assert!(n > 0, "expected to find some query fastas");
     }
 }

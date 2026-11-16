@@ -200,6 +200,12 @@ impl Fixture {
 
     fn cmd_ga(&self, ga: &str, cache: &str, extra: &[&str]) -> Command {
         let mut c = Command::new(BIN);
+        // TW-08: the binary reads this from the environment, and any value turns cleanup off,
+        // so a developer who exports it saw four cleanup tests fail on a correct build.
+        c.env_remove("LOGAN_KEEP_SCRATCH");
+        // TW-10: keep scratch inside the fixture. Without this the CLI tests use, and sweep,
+        // the machine-wide /dev/shm, and leave directories there when a test kills the walker.
+        c.arg("--scratch-dir").arg(self.dir.join("scratch"));
         c.arg("--graphaligner").arg(self.dir.join(ga))
             .arg("-l").arg(self.dir.join("accs.txt"))
             .arg("-q").arg(self.dir.join("q.fasta"))
@@ -234,6 +240,67 @@ fn wait_or_kill(child: &mut std::process::Child, limit: Duration) -> Option<std:
     let _ = child.kill();
     let _ = child.wait();
     None
+}
+
+/// TW-05. Results are stored in the order the accessions were listed, whatever order they
+/// finish in.
+///
+/// The unit test that claimed to cover this sorted a vector of its own and never entered the
+/// pipeline, so it passed with the production sort deleted. Without that sort every output
+/// follows completion order, which S3 and graph size decide: `summary.json`, the FASTA, the
+/// VCFs and `snvs.tsv` all reorder run to run, and `--sieve` keeps whichever duplicate
+/// finished first. Reproducibility goes silently.
+///
+/// This forces the first-listed accession to finish LAST by giving the stand-in aligner a
+/// sleep keyed on its name, which the scratch GFA path carries.
+#[test]
+fn results_are_stored_in_input_order_not_completion_order() {
+    // `matching` so every accession actually reaches the aligner; with the default fixture
+    // they stop at `no_anchors` and the stall below never fires.
+    let fx = Fixture::matching("order", 4);
+    // A stand-in aligner that stalls only on SRRFAKE0, so it completes after the others.
+    let slow_first = fx.dir.join("ga_order");
+    std::fs::write(
+        &slow_first,
+        "#!/bin/sh\n         [ \"$1\" = --version ] && { echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }\n         case \"$*\" in *SRRFAKE0*) sleep 2;; esac\n         exit 0\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&slow_first, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = fx
+        .cmd_ga("ga_order", "cache", &["-w", "4", "--fetch-workers", "4", "--allow-empty"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    // The progress lines go to stdout, and are emitted as each accession lands, so they show
+    // completion order.
+    let progress = String::from_utf8_lossy(&out.stdout);
+    let finished: Vec<&str> = progress
+        .lines()
+        .filter_map(|l| l.split(']').nth(1))
+        .filter_map(|l| l.split(':').next())
+        .map(str::trim)
+        .filter(|s| s.starts_with("SRRFAKE"))
+        .collect();
+    assert_eq!(
+        finished.last(),
+        Some(&"SRRFAKE0"),
+        "the fixture must make SRRFAKE0 finish last or it proves nothing: {finished:?}"
+    );
+
+    // ... and the stored order is the input order regardless.
+    let summary = std::fs::read_to_string(fx.dir.join("out").join("q.summary.json")).unwrap();
+    let order: Vec<String> = summary
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("\"acc\": \""))
+        .filter_map(|l| l.split('"').next().map(str::to_string))
+        .collect();
+    assert_eq!(
+        order,
+        vec!["SRRFAKE0", "SRRFAKE1", "SRRFAKE2", "SRRFAKE3"],
+        "summary.json must be in input order"
+    );
 }
 
 /// `logan-walker ... | head -1` used to panic on the closed pipe and then hang: the fetch

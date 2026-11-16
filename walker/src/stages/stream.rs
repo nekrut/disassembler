@@ -410,8 +410,21 @@ mod size_cap_tests {
         format!("http://127.0.0.1:{port}/u/X/X.unitigs.fa.zst")
     }
 
+    /// A fetcher that talks to the loopback server directly.
+    ///
+    /// TW-09. `Fetcher::new` leaves ureq's `Proxy::try_from_env()` in place, which is correct
+    /// in production. In these tests it means that with `HTTPS_PROXY` set and no `NO_PROXY`
+    /// entry for loopback, the request goes to the proxy and both tests fail with "refused at
+    /// the cap", which reads like a size-cap regression rather than an environment problem.
     fn fetcher(cap: u64) -> Fetcher {
-        Fetcher::new(&Config { max_compressed_bytes: cap, ..Config::default() })
+        let mut f = Fetcher::new(&Config { max_compressed_bytes: cap, ..Config::default() });
+        f.agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .proxy(None)
+                .http_status_as_error(false)
+                .build(),
+        );
+        f
     }
 
     #[test]

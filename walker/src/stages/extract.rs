@@ -179,6 +179,18 @@ pub fn relative_floor(frac: f64, depth: f32, min_abund: f32) -> f32 {
     }
 }
 
+/// Whether a unitig at `abund` clears a coverage floor. At the floor exactly, it does.
+///
+/// TW-06. Three sites pruned on this comparison: `prune_nodes`, the surviving-node count in
+/// `pipeline::run_one` (which carried the comment "Predicate must match `prune_nodes`
+/// exactly") and the branch gate in `phase`. A comment is not a guarantee: if one of them
+/// had drifted to `>`, the count reported in `PruneReport` would have disagreed with the
+/// pruning actually done, and a unitig sitting exactly on the floor would have been both
+/// kept and counted as dropped. Stated once, it cannot drift.
+pub fn survives(abund: f32, floor: f32) -> bool {
+    abund >= floor
+}
+
 /// Keep only the unitigs carrying at least `floor` coverage.
 ///
 /// Node-level, not edge-level: an error branch is a *unitig* that should not be in the
@@ -192,7 +204,7 @@ pub fn prune_nodes(
     let mut kn = Vec::with_capacity(nodes.len());
     let mut ks = Vec::with_capacity(seqs.len());
     for (id, seq) in nodes.into_iter().zip(seqs) {
-        if graph.abundance[id as usize] >= floor {
+        if survives(graph.abundance[id as usize], floor) {
             kn.push(id);
             ks.push(seq);
         }
@@ -307,8 +319,22 @@ pub fn write_gfa(
         });
     }
 
-    std::fs::create_dir_all(&cfg.scratch_dir)
-        .map_err(crate::error::file_err("create", &cfg.scratch_dir))?;
+    // WF-01. This used to be a bare `create_dir_all`, which silently put back a scratch
+    // directory another run had deleted mid-flight, and put it back with the default mode
+    // 0755 instead of 0700. That silence is half of why the deletion surfaced as the
+    // biological answer `no_path` rather than as a fault. The directory is created by
+    // `Scratch::create` and should already be here; say so when it is not, and restore the
+    // private mode rather than widening it.
+    if !cfg.scratch_dir.exists() {
+        eprintln!(
+            "[warn] {} vanished during the run and is being recreated. Another process \
+             removed this run's scratch directory; if several runs share a --scratch-dir, \
+             give each its own.",
+            cfg.scratch_dir.display()
+        );
+        private_dir_all(&cfg.scratch_dir)
+            .map_err(crate::error::file_err("create", &cfg.scratch_dir))?;
+    }
     let gfa_path = cfg.scratch_dir.join(format!("{}.sub.gfa", scratch_stem(&graph.accession)));
     // A failed write (a full tmpfs) removes the partial file instead of leaving it behind.
     let n_edges = write_gfa_file(cfg, graph, &nodes, &seqs, &gfa_path).map_err(|e| {
@@ -328,6 +354,18 @@ pub fn write_gfa(
 }
 
 /// The GFA bytes for `write_gfa`. Returns the number of `L` lines.
+/// `create_dir_all` that leaves the final component mode 0700, not the default 0755.
+#[cfg(unix)]
+fn private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).recursive(true).create(path)
+}
+
+#[cfg(not(unix))]
+fn private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
 fn write_gfa_file(
     cfg: &Config,
     graph: &UnitigGraph,
@@ -580,15 +618,40 @@ mod recall_study_subgraphs {
     use crate::types::FetchedUnitigs;
     use std::path::Path;
 
+    /// Load a study fixture. `None` means the file is absent; anything else panics.
+    ///
+    /// TW-12: read, decode and parse failures all used to become `None`, and the caller
+    /// printed `SKIP: no data for {acc}` and carried on. A truncated or non-zstd fixture
+    /// therefore reported `ok` locally with a false reason, and in CI the `SKIP:` guard
+    /// failed the job with a message pointing at missing data. The sibling tests panic.
     fn load(dir: &str, acc: &str) -> Option<UnitigGraph> {
         let p = format!("{dir}/{acc}.unitigs.fa.zst");
-        let compressed = std::fs::read(&p).ok()?;
-        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
-        let g = {
-            let rd = stream::decoder(&f).ok()?;
-            parse::build(&f.accession, rd).ok()
+        let compressed = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => panic!("{p}: {e}"),
         };
-        g
+        let f = FetchedUnitigs { index: 0, accession: acc.into(), compressed_len: compressed.len(), compressed, fetch_secs: 0.0 };
+        let rd = stream::decoder(&f).unwrap_or_else(|e| panic!("{p}: not decodable: {e}"));
+        Some(parse::build(&f.accession, rd).unwrap_or_else(|e| panic!("{p}: not parseable: {e}")))
+    }
+
+    /// TW-12: a corrupt fixture must fail loudly, not be reported as "no data".
+    #[test]
+    // The zstd reader is lazy, so a bad frame surfaces at parse rather than at decode. Match
+    // the filename, which both panics carry, rather than pinning which stage noticed.
+    #[should_panic(expected = "ERRCORRUPT.unitigs.fa.zst")]
+    fn a_corrupt_fixture_panics_rather_than_reading_as_absent() {
+        let dir = std::env::temp_dir().join(format!("logan-recall-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("ERRCORRUPT.unitigs.fa.zst");
+        std::fs::write(&p, b"this is plainly not a zstd frame").unwrap();
+        let out = std::panic::catch_unwind(|| load(dir.to_str().unwrap(), "ERRCORRUPT"));
+        let _ = std::fs::remove_dir_all(&dir);
+        match out {
+            Err(e) => std::panic::resume_unwind(e),
+            Ok(_) => panic!("a corrupt fixture must not load"),
+        }
     }
 
     #[test]
@@ -758,10 +821,11 @@ mod gfa_tests {
     fn graph(fa: &str) -> UnitigGraph {
         parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec()))).unwrap()
     }
-    fn tmp_cfg(tag: &str) -> Config {
-        let mut d = std::env::temp_dir();
-        d.push(format!("logan_gfa_test_{}_{}", std::process::id(), tag));
-        Config { scratch_dir: d, ..Config::default() }
+    /// A config and the guard that removes its scratch directory (TW-10). Bind the guard,
+    /// usually as `_d`, for as long as the config is in use.
+    fn tmp_cfg(tag: &str) -> (Config, crate::scratch::TestDir) {
+        let d = crate::scratch::TestDir::new(tag);
+        (Config { scratch_dir: d.path(), ..Config::default() }, d)
     }
     fn render(cfg: &Config, g: &UnitigGraph, nodes: Vec<UnitigId>) -> String {
         let seqs = collect_seqs(g, &nodes).unwrap();
@@ -780,7 +844,8 @@ mod gfa_tests {
     #[test]
     fn writes_the_exact_gfa_line_format() {
         let g = graph(">ACC_0 ka:f:5.3   L:-:1:+  L:+:1:-\nACGT\n>ACC_1 ka:f:9.0   L:+:0:+\nTTGCA\n");
-        let cfg = Config { graph_k: 31, ..tmp_cfg("fmt") };
+        let (base, _d) = tmp_cfg("fmt");
+        let cfg = Config { graph_k: 31, ..base };
         let got = render(&cfg, &g, vec![0, 1]);
         assert_eq!(
             got,
@@ -800,7 +865,7 @@ mod gfa_tests {
         let g = graph(
             ">ACC_0 L:+:1:+ L:+:2:+\nACGT\n>ACC_1 L:+:0:+\nTTTT\n>ACC_2 L:+:0:+\nGGGG\n",
         );
-        let cfg = tmp_cfg("dangling");
+        let (cfg, _d) = tmp_cfg("dangling");
         let got = render(&cfg, &g, vec![0, 1]);
         assert!(got.contains("L\t0\t+\t1\t+\t30M\n"), "kept edge missing:\n{got}");
         assert!(!got.contains("\t2\t"), "edge to excluded node 2 leaked:\n{got}");
@@ -811,7 +876,8 @@ mod gfa_tests {
     fn overlap_follows_k() {
         let g = graph(">ACC_0 L:+:1:+\nACGT\n>ACC_1 L:+:0:+\nTTTT\n");
         for (k, want) in [(31usize, "30M"), (21, "20M")] {
-            let cfg = Config { graph_k: k, ..tmp_cfg(&format!("k{k}")) };
+            let (base, _d) = tmp_cfg(&format!("k{k}"));
+            let cfg = Config { graph_k: k, ..base };
             let got = render(&cfg, &g, vec![0, 1]);
             assert!(got.contains(want), "k={k} expected {want} in:\n{got}");
         }
@@ -820,7 +886,7 @@ mod gfa_tests {
     #[test]
     fn reports_edge_count_and_path() {
         let g = graph(">ACC_0 L:+:1:+\nACGT\n>ACC_1 L:+:0:+\nTTTT\n");
-        let cfg = tmp_cfg("count");
+        let (cfg, _d) = tmp_cfg("count");
         let seqs = collect_seqs(&g, &[0, 1]).unwrap();
         let sub = write_gfa(&cfg, &g, vec![0, 1], seqs).unwrap();
         assert_eq!(sub.n_edges, 2, "one connection, recorded from both ends");
@@ -834,19 +900,57 @@ mod gfa_tests {
         std::fs::remove_file(&sub.gfa_path).ok();
     }
 
+    /// An edge pointing past the end of the graph: refused by `expand`, skipped by the GFA
+    /// writer, a panic in neither (TW-06).
+    ///
+    /// Logan's headers are reciprocal and in range, so this is malformed input rather than
+    /// something seen in the wild; the point is that the two readers of `graph.edges` treat
+    /// it the way they treat every other structural fault, which is to say not with an
+    /// out-of-bounds index. They differ in kind deliberately: `expand` is choosing the
+    /// search space and cannot quietly drop part of it, while the writer is emitting the
+    /// space already chosen, and a target outside the graph cannot be one of `nodes`, so
+    /// there is nothing to emit and nothing to report.
+    #[test]
+    fn an_edge_past_the_end_of_the_graph_is_refused_then_skipped() {
+        use crate::types::Anchors;
+        let g = graph(concat!(
+            ">ACC_0 ka:f:10.0  L:+:1:+  L:+:99:+\nACGT\n",
+            ">ACC_1 ka:f:10.0  L:-:0:-\nTTTT\n",
+        ));
+        assert_eq!(g.n_unitigs, 2);
+
+        let (cfg, _d) = tmp_cfg("oob");
+        let anchors = Anchors { ids: vec![0], shared_kmers: vec![1], fraction_of_graph: 0.5 };
+        let err = expand(&cfg, &g, &anchors).expect_err("an edge out of range must be reported");
+        assert!(
+            matches!(err, Error::Parse { .. }) && err.to_string().contains("99"),
+            "expected a parse error naming the target, got {err}"
+        );
+
+        // The writer is handed both real nodes and must drop only the dangling L line.
+        let seqs = collect_seqs(&g, &[0, 1]).unwrap();
+        let sub = write_gfa(&cfg, &g, vec![0, 1], seqs).unwrap();
+        let mut got = String::new();
+        std::fs::File::open(&sub.gfa_path).unwrap().read_to_string(&mut got).unwrap();
+        assert!(got.contains("L\t0\t+\t1\t+\t30M\n"), "the in-range edge is kept:\n{got}");
+        assert!(got.contains("L\t1\t-\t0\t-\t30M\n"), "its mirror is kept:\n{got}");
+        assert!(!got.contains("99"), "the dangling edge leaked:\n{got}");
+        assert_eq!(sub.n_edges, 2, "two L lines, not three");
+    }
+
     #[test]
     fn empty_subgraph_writes_a_header_only_file() {
         // GraphAligner aborts with SIGABRT on a nodeless graph, so align must refuse to run
         // rather than be handed this. Writing it is still valid GFA.
         let g = graph(">ACC_0\nACGT\n");
-        let cfg = tmp_cfg("empty");
+        let (cfg, _d) = tmp_cfg("empty");
         assert_eq!(render(&cfg, &g, vec![]), "H\tVN:Z:1.0\n");
     }
 
     #[test]
     fn mismatched_nodes_and_seqs_is_rejected() {
         let g = graph(">ACC_0\nACGT\n>ACC_1\nTTTT\n");
-        let cfg = tmp_cfg("mismatch");
+        let (cfg, _d) = tmp_cfg("mismatch");
         assert!(write_gfa(&cfg, &g, vec![0, 1], vec![b"ACGT".to_vec()]).is_err());
     }
 }
@@ -902,12 +1006,23 @@ mod cross_check {
         let seqs = collect_seqs(&graph, &nodes).unwrap();
         let sub = write_gfa(&cfg, &graph, nodes, seqs).unwrap();
 
+        // TW-13: copy the GFA to a stable name BEFORE `sub` drops. `Drop for Subgraph`
+        // unlinks the file it created, so this helper used to report "wrote <path>" and then
+        // delete it, leaving `LOGAN_GFA_OUT` holding only anchors.txt. The name it printed
+        // also embedded the PID, so it was not a name another tool could be pointed at.
+        //
+        // This is not TW-01: here the walker really did create the file, so the ownership
+        // flag is correct and the copy is the fix.
+        let kept = format!("{outdir}/{}.sub.gfa", f.accession);
+        std::fs::copy(&sub.gfa_path, &kept)
+            .unwrap_or_else(|e| panic!("could not keep {}: {e}", sub.gfa_path.display()));
+
         // The exact anchor ids, so another implementation can be driven with the same input.
         let list: Vec<String> = a.ids.iter().map(|i| i.to_string()).collect();
         std::fs::write(format!("{outdir}/anchors.txt"), list.join("\n")).unwrap();
         eprintln!(
             "  wrote {} ({} nodes, {} edges) and {} anchors",
-            sub.gfa_path.display(),
+            kept,
             sub.nodes.len(),
             sub.n_edges,
             a.ids.len()
@@ -955,6 +1070,34 @@ mod depth_tests {
     fn an_empty_alignment_has_no_depth() {
         let g = graph(">T_0 ka:f:100.0\nACGT\n");
         assert_eq!(path_depth(&g, &[]), 0.0);
+    }
+
+    /// At the floor exactly, a unitig is kept (TW-06).
+    ///
+    /// `depth_floor` computes the floor as an f32 product, so "exactly at the floor" is a
+    /// value the pipeline really does produce, not a contrived one: 1% of a 14,500x gene is
+    /// 145.0, and a unitig at 145.0 is the commonest kind of boundary case here because the
+    /// floor is derived from the median of these same abundances. The rule is `>=`, and it
+    /// is `survives` that says so for all three sites that prune.
+    #[test]
+    fn a_unitig_exactly_at_the_floor_survives() {
+        let c = Config { prune_frac: 0.01, min_abund: 5.0, ..Config::default() };
+        let floor = depth_floor(&c, 14_500.0);
+        assert_eq!(floor, 145.0, "the floor this fixture is built around");
+
+        assert!(survives(floor, floor), "at the floor is in");
+        assert!(survives(floor + 0.1, floor));
+        assert!(!survives(144.9, floor), "below the floor is out");
+
+        let g = graph(concat!(
+            ">T_0 ka:f:145.0\nACGT\n",
+            ">T_1 ka:f:144.9\nTTTT\n",
+            ">T_2 ka:f:145.1\nGGGG\n",
+        ));
+        let (kept, seqs) =
+            prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A'], vec![b'C'], vec![b'G']], floor);
+        assert_eq!(kept, vec![0, 2], "only the unitig under the floor is removed");
+        assert_eq!(seqs, vec![vec![b'A'], vec![b'G']], "sequences stay paired with their nodes");
     }
 
     /// Pruning is on by default at 1% of depth; `0.0` is how it is switched off, and that

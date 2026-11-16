@@ -130,6 +130,21 @@ the SNV table for any longer gene (SARS-CoV-2 ORF1ab is 21,290 nt) while the run
 256 MiB, which refuses the case that is actually expensive, a short but highly divergent pair,
 and says so.
 
+Each run claims its scratch directory with a `.lock` it holds open, and the next run sweeps a
+directory only when that lock names this machine and is free. Liveness used to be
+`kill(pid, 0)`, which answers only about the caller's PID namespace on the caller's host, so a
+run in another container or on another node sharing a `--scratch-dir` looked dead and had its
+in-flight files deleted; the victim then recreated the directory silently and reported those
+accessions as `no_path`, the biological answer, with exit 0. A vanished GFA or query is now an
+error naming the cause. **Directories left by 0.1.x carry no lock and are never swept**, so
+clear them out once by hand.
+
+A signal the walker inherited as ignored stays ignored, so `nohup logan-walker ... &` survives
+the SSH session dropping. Until 0.2.0 the walker registered a SIGHUP handler regardless, so
+bash's hangup killed the run with exit 129 and, because outputs are written at the end, lost
+all of it. GraphAligner children inherit the ignore too, which they could not while the signal
+was caught.
+
 The summary is always written, even when another output fails: every writer is attempted and
 the first error is returned at the end. Each file appears at its final path only once it is
 complete, so an interrupted run leaves no truncated output. A rerun with a writer switched off

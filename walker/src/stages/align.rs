@@ -224,11 +224,27 @@ pub fn run(
 
     let bytes = match std::fs::read(gaf_out) {
         Ok(b) => b,
-        // Exited cleanly but wrote nothing: no alignment found. This mapping is only sound
-        // because `extract::scratch_stem` keys the GAF on PID and a per-task counter, so no
-        // other worker or process can have deleted it out from under us; keyed on the
-        // accession alone, a file another run unlinked arrived here as a biological negative.
+        // Exited cleanly but wrote nothing: no alignment found. That reading holds only
+        // while the scratch directory is still ours, which `extract::scratch_stem`'s PID and
+        // per-task counter do not guarantee on their own: until WF-01 another run sharing the
+        // base could delete the whole directory mid-alignment, and this branch then published
+        // the deletion as the biological answer `no_path`, with exit 0.
+        //
+        // So check what is actually missing. If the INPUTS are gone too, nothing was aligned
+        // and this is not a negative result; it is an error, and the run must say so.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !subgraph.gfa_path.exists() || !query_fa.exists() {
+                return Err(Error::GraphAligner {
+                    accession: subgraph.accession.to_string(),
+                    detail: format!(
+                        "scratch files vanished while GraphAligner ran ({} / {}). Another \
+                         process removed this run's scratch directory; if several runs share \
+                         a --scratch-dir, give each its own.",
+                        subgraph.gfa_path.display(),
+                        query_fa.display(),
+                    ),
+                });
+            }
             let _ = std::fs::remove_file(&query_fa);
             return Ok(HashMap::new());
         }
@@ -238,7 +254,7 @@ pub fn run(
             return Err(file_err("read", gaf_out)(e));
         }
     };
-    if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
+    if !crate::scratch::keep_scratch() {
         let _ = std::fs::remove_file(gaf_out);
         let _ = std::fs::remove_file(&query_fa);
     }
@@ -319,74 +335,18 @@ pub fn parse_gaf_multi(
     Ok(out)
 }
 
-/// Parse the GAF GraphAligner emits and return the best alignment.
+/// Parse the GAF GraphAligner emits and return the best alignment for one reference.
 ///
 /// Column 6 is the path, e.g. `>860013>579233<27101`. The best row is the one with the most
 /// residue matches (column 10), chosen with a stable sort so ties keep file order.
+///
+/// TW-07: this used to be a second, independent implementation with no production caller,
+/// while `align::run` has used [`parse_gaf_multi`] since multi-anchor mode landed. Seven
+/// tests pinned the dead copy, so the parser that actually runs was covered by three. It is
+/// now a thin wrapper, which keeps those tests' single-reference shape and points every one
+/// of them at the live code.
 pub fn parse_gaf(gaf_bytes: &[u8], expect: &str) -> Result<Option<GafPath>> {
-    let text = std::str::from_utf8(gaf_bytes)
-        .map_err(|e| Error::Usage(format!("GAF is not valid UTF-8: {e}")))?;
-
-    let mut rows: Vec<Vec<&str>> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
-            continue;
-        }
-        let f: Vec<&str> = line.split('\t').collect();
-        // 12 columns is the GAF minimum; anything shorter cannot carry the fields we need.
-        if f.len() >= 11 {
-            rows.push(f);
-        }
-    }
-    if rows.is_empty() {
-        return Ok(None);
-    }
-
-    // GAF column 1 is the query name, which GraphAligner copies from the FASTA record
-    // (`pfcrt`, `hiv1_pol`). Taking the best row without checking it is what let one gene's
-    // path be published under another gene's name.
-    let mine: Vec<Vec<&str>> = rows.iter().filter(|r| r[0] == expect).cloned().collect();
-    let mut rows = if !mine.is_empty() {
-        mine
-    } else {
-        // Only one record was ever handed to GraphAligner, so these rows are this query
-        // under a name the tool spelled differently. Say so rather than silently dropping
-        // the alignment, and carry on with what is there.
-        let mut names: Vec<&str> = rows.iter().map(|r| r[0]).collect();
-        names.sort_unstable();
-        names.dedup();
-        eprintln!(
-            "[warn] GAF carries no row for query {expect:?} (names present: {names:?}); \
-             using the best row anyway"
-        );
-        rows
-    };
-
-    let matches_of = |r: &Vec<&str>| r[9].parse::<usize>().unwrap_or(0);
-    rows.sort_by_key(|r| std::cmp::Reverse(matches_of(r)));
-    let best = &rows[0];
-
-    let num = |i: usize| -> Result<usize> {
-        best[i].parse::<usize>().map_err(|e| {
-            Error::Usage(format!("GAF column {} is not a number: {e}", i + 1))
-        })
-    };
-    let steps = parse_path(best[5]);
-    if steps.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(GafPath {
-        steps,
-        query_start: num(2)?,
-        query_end: num(3)?,
-        path_len: num(6)?,
-        path_start: num(7)?,
-        path_end: num(8)?,
-        num_matches: num(9)?,
-        aln_len: num(10)?,
-    }))
+    Ok(parse_gaf_multi(gaf_bytes, &[expect])?.remove(expect))
 }
 
 /// Split a GAF path string into oriented steps. `>` is forward, `<` reverse-complement.
@@ -498,10 +458,25 @@ mod tests {
 
     /// Only one record is ever handed to GraphAligner, so an unrecognised name means the
     /// tool spelled it differently, not that a foreign gene crept in. Warn, do not drop.
+        /// TW-07. A row whose query name is not the one we asked for is NOT returned.
+    ///
+    /// This test used to assert the opposite, and passed, because it exercised a second
+    /// `parse_gaf` implementation that no production path had called since multi-anchor mode
+    /// landed. The live parser attributes rows to references by name, which it must: in
+    /// multi-anchor mode a row for `Delta` is not an answer about `Omicron`. The lenient
+    /// behaviour the old test pinned was never available to a user.
+    ///
+    /// Upstream, `run` turns this into a warning naming the rows that were present, so a
+    /// mangled query header is diagnosable rather than silently a `no_path`.
     #[test]
-    fn unknown_query_name_still_parses() {
+    fn a_row_for_another_query_is_not_returned() {
         let gaf = "some_other_spelling\t10\t0\t10\t+\t>5\t10\t0\t10\t7\t8\t60\n";
-        let g = parse_gaf(gaf.as_bytes(), "pfcrt").unwrap().expect("a path");
+        assert!(
+            parse_gaf(gaf.as_bytes(), "pfcrt").unwrap().is_none(),
+            "a row naming another reference is not an alignment of this one"
+        );
+        // The same bytes, asked for by the name they carry, do parse.
+        let g = parse_gaf(gaf.as_bytes(), "some_other_spelling").unwrap().expect("a path");
         assert_eq!(g.steps[0].node, 5);
     }
 

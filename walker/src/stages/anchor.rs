@@ -636,8 +636,9 @@ mod recall_study_kmers {
     use crate::io::input::read_query;
     use std::path::Path;
 
+    /// TW-11: not `#[ignore]`d. It reads only repository files, so there is nothing to skip
+    /// for, and while it was ignored it never ran on push.
     #[test]
-    #[ignore]
     fn matches_the_recall_study_kmer_counts() {
         // (query file, canonical 31-mer count the study recorded)
         let cases = [

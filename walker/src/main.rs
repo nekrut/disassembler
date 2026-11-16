@@ -271,8 +271,11 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
                 i += 1;
                 continue;
             }
-            "--no-indel-alts" => {
-                args.cfg.allow_indel_alts = false;
+            // TW-04 found this was the only boolean without a positive spelling, while the
+            // other six all have one. It is a no-op against the default, but a user scripting
+            // the flags should not have to know which direction each one is written in.
+            "--indel-alts" | "--no-indel-alts" => {
+                args.cfg.allow_indel_alts = flag == "--indel-alts";
                 i += 1;
                 continue;
             }
@@ -706,6 +709,122 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // accession errored. Outputs are already written above, so they stay on disk for
     // inspection.
     check_run(&summary.results, args.allow_empty)
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::{error, parse_args, Args, USAGE};
+
+    fn args(extra: &[&str]) -> error::Result<Args> {
+        let mut v: Vec<String> = ["-a", "SRR1", "-q", "q.fa"].iter().map(|s| s.to_string()).collect();
+        v.extend(extra.iter().map(|s| s.to_string()));
+        parse_args(&v)
+    }
+
+    /// TW-04. Every long flag the usage text advertises must actually be accepted.
+    ///
+    /// `parse_args` is a hand-written match over about 40 spellings and nothing checked that
+    /// the match and the help agree. A mutant parser that swapped `--min-vaf` with
+    /// `--min-cov`, inverted `--prefer-majority`, ignored `--emit-vcf` and skipped unknown
+    /// flags passed the entire suite. This test is self-maintaining: a flag added to USAGE
+    /// but not to the parser fails here without anyone remembering to extend a list.
+    #[test]
+    fn every_flag_in_the_usage_text_is_accepted() {
+        // Flags that need a value get a plausible one; the rest are bare.
+        let value_for = |flag: &str| -> Option<&'static str> {
+            match flag {
+                "--min-cov" | "--min-vaf" | "--prune-frac" | "--min-abund-frac" => Some("0.5"),
+                "--min-abund" => Some("5"),
+                "--max-alts" | "--max-alt-indel" | "--alt-max-detour" | "--hops"
+                | "--min-shared-kmers" | "--max-size-mb" | "-w" | "--workers"
+                | "--fetch-workers" | "-t" | "--threads" | "-k" | "--graph-k" => Some("2"),
+                "--subgraph-nodes-per-base-guard" => Some("3"),
+                "--primary-metric" => Some("matched"),
+                "-a" | "--accession" => Some("SRR1"),
+                "-l" | "--accession-list" | "-q" | "--query" | "-o" | "--out-dir"
+                | "-f" | "--out-fasta" | "--scratch-dir" | "--unitigs-cache"
+                | "--graphaligner" | "--walker-bin" => Some("x"),
+                _ => None,
+            }
+        };
+        let mut checked = 0;
+        for token in USAGE.split_whitespace() {
+            let flag = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+            // `--help` and `--version` are answered in `main` before `parse_args` ever runs,
+            // so the parser does not know them and should not.
+            if !flag.starts_with("--")
+                || flag.len() < 4
+                || flag.contains('<')
+                || matches!(flag, "--help" | "--version")
+            {
+                continue;
+            }
+            let mut argv = vec![flag];
+            if let Some(v) = value_for(flag) {
+                argv.push(v);
+            }
+            match args(&argv) {
+                Err(error::Error::Usage(m)) if m.starts_with("unknown flag") => {
+                    panic!("{flag} is in the usage text but the parser rejects it: {m}")
+                }
+                _ => checked += 1, // accepted, or refused for a reason that is not "unknown"
+            }
+        }
+        assert!(checked > 25, "expected to exercise most of the flags, saw {checked}");
+    }
+
+    /// The other half: a flag the parser does not know must be refused, not ignored. The
+    /// mutant accepted `--emit-vfc` and exited 0 having silently written no VCF.
+    #[test]
+    fn an_unknown_flag_is_refused() {
+        let err = match args(&["--emit-vfc"]) {
+            Err(e) => e,
+            Ok(_) => panic!("a misspelled flag must not be accepted"),
+        };
+        assert!(
+            matches!(&err, error::Error::Usage(m) if m.contains("unknown flag --emit-vfc")),
+            "a misspelled flag must not be ignored, got {err:?}"
+        );
+    }
+
+    /// TW-04. Each flag sets the field it names, and the boolean pairs move in opposite
+    /// directions. Covers the 0.2.0 additions, which are the ones with no history behind
+    /// them.
+    #[test]
+    fn each_flag_sets_the_field_it_names() {
+        let base = args(&[]).unwrap();
+        assert_eq!(base.cfg.min_cov, 0.85);
+        assert_eq!(base.cfg.min_vaf, 0.10);
+
+        // The pair the mutant swapped.
+        let a = args(&["--min-cov", "0.3", "--min-vaf", "0.5"]).unwrap();
+        assert_eq!((a.cfg.min_cov, a.cfg.min_vaf), (0.3, 0.5));
+
+        // --max-size-mb is megabytes in, bytes out; the mutant scaled it twice.
+        let a = args(&["--max-size-mb", "1"]).unwrap();
+        assert_eq!(a.cfg.max_compressed_bytes, 1024 * 1024);
+
+        // Booleans, both directions, including every flag 0.2.0 added.
+        for (flag, get) in [
+            ("prefer-majority", (|c: &crate::config::Config| c.prefer_majority) as fn(&_) -> bool),
+            ("emit-vcf", |c| c.emit_vcf),
+            ("emit-snv-table", |c| c.emit_snv_table),
+            ("emit-alts", |c| c.emit_alts),
+            ("indel-alts", |c| c.allow_indel_alts),
+            ("summary-seqs", |c| c.summary_seqs),
+            ("rescue-minority", |c| c.rescue_minority),
+        ] {
+            let on = args(&[&format!("--{flag}")]).unwrap();
+            let off = args(&[&format!("--no-{flag}")]).unwrap();
+            assert!(get(&on.cfg), "--{flag} must turn it on");
+            assert!(!get(&off.cfg), "--no-{flag} must turn it off");
+        }
+
+        let a = args(&["--max-alts", "7"]).unwrap();
+        assert_eq!(a.cfg.max_alts, 7);
+        let a = args(&["--allow-frameshift-alts"]).unwrap();
+        assert!(a.cfg.allow_frameshift_alts);
+    }
 }
 
 #[cfg(test)]

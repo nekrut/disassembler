@@ -282,6 +282,19 @@ fn inherited_floor_config(cfg: &Config, prune: Option<&PruneReport>) -> Option<C
         .then(|| Config { min_abund: r.floor, ..cfg.clone() })
 }
 
+/// Put results back into the order the user listed the accessions in.
+///
+/// Results arrive in completion order, which S3 and graph size decide, so without this every
+/// output file is ordered differently from run to run: `summary.json`, the FASTA, the VCFs
+/// and `snvs.tsv` all follow it, and `--sieve` keeps whichever duplicate finished first.
+///
+/// TW-05: this is a named function so that a unit test can exercise the real thing. The test
+/// that claimed to cover it sorted a vector of its own and never called into the pipeline, so
+/// it passed with the production sort deleted, as did every other test.
+fn restore_input_order(results: &mut [AccessionResult]) {
+    results.sort_by_key(|r| r.index);
+}
+
 /// Fan accessions through the two pools and collect results.
 ///
 /// `queries` is the reference pool. In today's single-anchor path it holds one [`Query`];
@@ -362,7 +375,7 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
     // output file is byte-reproducible across runs and `--sieve`'s representative is chosen
     // by the list the user supplied rather than by which S3 fetch happened to win.
     let mut results = results;
-    results.sort_by_key(|r| r.index);
+    restore_input_order(&mut results);
 
     // Every accession must come back with a result, or it vanishes from every output and
     // from the success count. The pools are built so this cannot happen; if it ever does,
@@ -379,7 +392,7 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
                 ));
             }
         }
-        results.sort_by_key(|r| r.index);
+        restore_input_order(&mut results);
     }
 
     let success = results
@@ -756,11 +769,12 @@ fn run_one(
             // out keeps the unpruned subgraph in that branch, which is the same "never a
             // regression" rule the failed-realign path applies.
             //
-            // Predicate must match `prune_nodes` exactly.
+            // The predicate is `extract::survives`, the same function `prune_nodes` calls,
+            // so this count cannot drift from the pruning it reports on (TW-06).
             let surviving = subgraph
                 .nodes
                 .iter()
-                .filter(|&&id| graph.abundance[id as usize] >= floor)
+                .filter(|&&id| stages::extract::survives(graph.abundance[id as usize], floor))
                 .count();
 
             let unpruned_span = (path.query_start, path.query_end);
@@ -868,7 +882,7 @@ fn run_one(
 
     // Upstream's explicit scratch cleanup, applied to whichever subgraph ended up active:
     // the fallback replaces `subgraph` above when pruning cost us the haplotype.
-    if std::env::var_os("LOGAN_KEEP_SCRATCH").is_none() {
+    if !crate::scratch::keep_scratch() {
         let _ = std::fs::remove_file(&subgraph.gfa_path);
     }
     // Intra-host variant recovery. `prune_frac` is not part of this: it cleans the graph
@@ -1072,7 +1086,7 @@ mod ordering_tests {
             "fixture must start scrambled or it proves nothing"
         );
 
-        results.sort_by_key(|r| r.index);
+        super::restore_input_order(&mut results);
 
         let got: Vec<&str> = results.iter().map(|r| r.accession.as_str()).collect();
         assert_eq!(got, input, "stored order must be the input order");
