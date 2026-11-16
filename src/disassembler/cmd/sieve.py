@@ -14,11 +14,17 @@ duplicates first and reports what the binary's completeness gate will drop.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import re
+import shutil
+import signal
 import subprocess
+import tempfile
 import time
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 from disassembler.resolve import resolve_sieve, not_found_message, EX_TOOL_NOT_FOUND
 from disassembler.textio import open_text
@@ -56,38 +62,123 @@ def auto_min_len(ref: Path) -> int | None:
     return int(length * 0.95)
 
 
-def byte_exact_dedup(src: Path, dst: Path) -> tuple[int, int]:
+# PM-01: `--warmup` is read with `atoi` and the admission test is `n_mine > warmup`, so a
+# value nothing can exceed disarms the gate. After 2,000 records the binary used to reject a
+# record whose count of never-seen k-mers exceeded `mean + outlier_sd*sqrt(var) + 0.5`, and a
+# rejected record is never sketched, promoted or counted, so the rest of its clade was
+# rejected with it: in a cohort of near-identical unique haplotypes the cut-off is about
+# 1/(3*sqrt(n)) novel divergence, 0.5% at n = 5,000, whatever the gene length. A divergent
+# lineage placed after record 2,000 vanished from the MSA and tree at exit 0, and which
+# lineages survived depended on file order. `--outlier-sd 1e9` is not the fix: it still
+# rejects when the variance is 0.
+ADMISSION_OFF_WARMUP = 2 ** 31 - 1
+_REJECT_RE = re.compile(r"REJECT \(error\)\s*:\s*(\d+)")
+
+# PM-02: the promoted set's LSH index is a 2^20-slot open-addressing table that is never
+# grown, and lookup stops only at an empty slot, so once 2^20 distinct band keys are stored
+# the next lookup of an absent key loops forever at 100% CPU. Each promoted record inserts up
+# to 16 band keys; 65,536 records with fully distinct bands is the worst case, and closer
+# cohorts fill at roughly 150k to 430k promoted. This is upstream's code
+# (github.com/stevenweaver/kmer-diversity-sieve) and is not patched here; the wrapper refuses
+# rather than hanging. See the backlog entry for the upstream fix (grow at half load).
+LSH_TABLE_LIMIT = 65536
+
+# PM-08: the per-record k-mer buffer is a fixed 1<<16 entries and is never grown, so k-mers
+# past position ~65,550 are dropped without a message and two records identical over their
+# first 65.5 kb are judged near-duplicates. Also upstream's; warned about here.
+SKETCH_LENGTH_LIMIT = 65550
+
+
+def report_rc(rc: int, what: str, prog: str) -> int:
+    """Turn a `subprocess` return code into a message and a shell-style exit status.
+
+    PM-19. A signal death is negative here, and it was printed and returned as is, so the
+    shell saw 252 for SIGILL and 250 for SIGABRT and the message read "exited -4". The sieve
+    Makefile builds with `-march=native`, so a binary moved to another CPU dies with SIGILL,
+    which is exactly the case the old message hid.
+    """
+    if rc < 0:
+        try:
+            sig = signal.Signals(-rc).name
+        except ValueError:
+            sig = f"signal {-rc}"
+        hint = (" (built with -march=native on another CPU? rebuild it here with "
+                "`make serial`)" if -rc == signal.SIGILL and prog == "sieve" else "")
+        print(f"{prog}: {what} was killed by {sig}{hint}", file=sys.stderr)
+        return 128 - rc
+    if rc:
+        print(f"{prog}: {what} exited {rc}", file=sys.stderr)
+    return rc
+
+
+class DedupReport(NamedTuple):
+    """What one dedup pass saw. The counts used to be two ints and a second read of the file."""
+    n_in: int
+    n_out: int
+    n_empty: int          # header-only records, which used to be counted as duplicates
+    headers: list         # the original header line of record i, which the binary never sees
+    short: int            # below --min-len, which the binary's completeness gate will drop
+    gappy: int            # over --max-gap-frac
+    longest: int = 0      # the longest record, for the sketch-length limit (PM-08)
+
+
+def byte_exact_dedup(src: Path, dst: Path, min_len: int = 0,
+                     max_gap_frac: float = 1.0) -> DedupReport:
     """Write to `dst` the first record of each distinct sequence in `src`, in order.
 
-    Returns (n_in, n_out). Headers are kept verbatim from the first copy; sequences are
-    compared upper-cased with line breaks removed, so line wrapping does not keep two copies
-    apart. Empty records are dropped. `src` may be gzipped; `dst` is always plain, which is
-    how the sieve binary, which reads only plain FASTA, gets a gzipped input.
+    Returns `DedupReport`. Sequences are compared upper-cased with whitespace removed, so
+    line wrapping does not keep two copies apart. `src` may be gzipped; `dst` is always
+    plain, which is how the sieve binary, which reads only plain FASTA, gets a gzipped input.
 
     A later identical copy has novelty 0 and is never promoted, so dropping it loses nothing.
     What duplicates do change is admission: each copy adds a zero to the binary's running
-    singleton-count statistics, and once its 2000-record warmup is over the shrunken mean and
-    SD make it reject genuinely new sequences as outliers ("REJECT (error)"). On four C. auris
-    cohorts (2026-10-30) that rejected 26 to 273 sequences, and none once deduplicated.
-    Below the warmup the two inputs give byte-identical output
-    (tests/test_dedup_sieve_equivalence.py).
+    singleton-count statistics. That gate is now switched off (PM-01), so dedup is a speed-up
+    and a memory saving, not a correctness fix.
+
+    **The records are renumbered `>r0`, `>r1`, ... and the headers returned separately**
+    (PM-04, PM-13). The binary folds a month bucket parsed from `|YYYY-MM` in the header into
+    every LSH band key, so a record was compared only with promoted records of the same
+    month: twelve copies of one sequence with `|2021-01-15` ... `|2021-12-15` headers all
+    survived, while the same twelve with plain ids collapsed to one. It also selects what to
+    emit by the first 255 characters of the header, so two records sharing a header were both
+    emitted when only one had been promoted, and a long `from-lexicmap` header lost its tail.
+    Neutral ids remove both, and the wrapper puts the original headers back.
+
+    Sequences are keyed by a 16-byte digest rather than held whole (PM-24): the set used
+    about 1 GB at 250,000 gene-length rows, transient but before the binary even starts.
     """
-    seen: set[str] = set()
-    n_in = 0
-    n_out = 0
+    seen: set[bytes] = set()
+    headers: list[str] = []
+    n_in = n_out = n_empty = short = gappy = longest = 0
     header: str | None = None
     seq_lines: list[str] = []
 
     def _emit(fout) -> None:
-        nonlocal n_out
+        nonlocal n_out, n_empty, short, gappy, longest
         if header is None:
             return
-        seq = "".join(seq_lines).replace("\n", "").replace("\r", "").upper()
-        if seq and seq not in seen:
-            seen.add(seq)
-            fout.write(header)
-            fout.writelines(seq_lines)
-            n_out += 1
+        # PM-07: the binary strips only \n and \r and counts every other byte as an N, while
+        # the wrapper's own predictor stripped all whitespace, so a file with trailing spaces
+        # was dropped by the completeness gate while the wrapper predicted no loss at all.
+        # Normalise once, here, so both see the same thing.
+        seq = "".join("".join(seq_lines).split())
+        if not seq:
+            n_empty += 1
+            return
+        key = hashlib.blake2b(seq.upper().encode(), digest_size=16).digest()
+        if key in seen:
+            return
+        seen.add(key)
+        # The gate counts measured in the same pass that writes the file (PM-24).
+        if len(seq) > longest:
+            longest = len(seq)
+        if len(seq) < min_len:
+            short += 1
+        elif 1.0 - sum(map(seq.count, "ACGTacgt")) / len(seq) > max_gap_frac:
+            gappy += 1
+        fout.write(f">r{len(headers)}\n{seq}\n")
+        headers.append(header)
+        n_out += 1
 
     with open_text(src) as fin, dst.open("w") as fout:
         for line in fin:
@@ -96,10 +187,14 @@ def byte_exact_dedup(src: Path, dst: Path) -> tuple[int, int]:
                 header = line
                 seq_lines = []
                 n_in += 1
+            elif header is None:
+                if line.strip():
+                    raise ValueError(f"{src}: text before the first '>' header "
+                                     f"({line.strip()[:40]!r})")
             else:
                 seq_lines.append(line)
         _emit(fout)
-    return n_in, n_out
+    return DedupReport(n_in, n_out, n_empty, headers, short, gappy, longest)
 
 
 def completeness_failures(path: Path, min_len: int, max_gap_frac: float) -> tuple[int, int]:
@@ -173,7 +268,14 @@ def sieve_run(
 
     input_fasta = Path(input_fasta)
     output_fasta = Path(output_fasta)
-    output_fasta.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_fasta.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        # PM-20: a path component that is a regular file raises FileExistsError here, which
+        # used to leave a traceback.
+        print(f"sieve: cannot create the output directory "
+              f"{output_fasta.parent}: {e}", file=sys.stderr)
+        return 1
 
     emit_prefix = output_fasta.with_suffix("")
 
@@ -210,34 +312,83 @@ def sieve_run(
         except OSError:
             pass
 
-    def shards() -> list[Path]:
-        return sorted(output_fasta.parent.glob(f"{emit_prefix.name}.rank*.fasta"))
-
-    # Clear any stale shards from a previous run so the concat glob can't pick them up.
-    for stale in shards():
-        stale.unlink()
-
-    # The binary runs on a deduplicated copy, written beside the output and removed after.
-    deduped = output_fasta.with_name(f".tmp_{output_fasta.stem}.deduped.{os.getpid()}.fasta")
+    # PM-05, PM-27: the binary runs in a private directory with neutral names. Its shards
+    # used to be written beside the user's output and found with
+    # `glob(f"{stem}.rank*.fasta")`, unescaped, which deleted `cohort.ranked_by_abundance
+    # .fasta` and `cohort.rank1_manual.fasta` before the input was even read, merged any
+    # look-alike into the output, missed the real shard when the stem held `[` or `]`, and
+    # let two concurrent runs in one directory sweep each other. The scratch names were also
+    # `.tmp_<user name>.<pid>`, predictable enough to plant a symlink at.
+    try:
+        work = Path(tempfile.mkdtemp(prefix=".sieve_", dir=output_fasta.parent))
+    except OSError as e:
+        # PM-20: an unwritable or full output directory is the output's problem, not the
+        # input's, and this is the first thing that touches it.
+        print(f"sieve: cannot write beside the output {output_fasta}: {e}", file=sys.stderr)
+        emit_summary("failed", error=f"cannot write beside the output: {e}")
+        return 1
+    deduped = work / "in.fasta"
+    emit_prefix = work / "promoted"
     try:
         try:
-            n_in, n_unique = byte_exact_dedup(input_fasta, deduped)
-        except (OSError, ValueError) as e:
+            rep = byte_exact_dedup(input_fasta, deduped, min_len, max_gap_frac)
+        except ValueError as e:
             print(f"sieve: cannot read the input FASTA: {e}", file=sys.stderr)
             emit_summary("failed", error=f"cannot read the input FASTA: {e}")
             return 1
+        except OSError as e:
+            # PM-20: `byte_exact_dedup` both reads the input and writes the scratch copy, so
+            # an unwritable or full output directory was reported as "cannot read the input
+            # FASTA", which sends the reader to the wrong file.
+            if e.filename and e.filename != str(input_fasta):
+                print(f"sieve: cannot write beside the output {output_fasta}: {e}",
+                      file=sys.stderr)
+                emit_summary("failed", error=f"cannot write beside the output: {e}")
+            else:
+                print(f"sieve: cannot read the input FASTA: {e}", file=sys.stderr)
+                emit_summary("failed", error=f"cannot read the input FASTA: {e}")
+            return 1
+        n_in, n_unique, short, gappy = rep.n_in, rep.n_out, rep.short, rep.gappy
         if n_unique == 0:
             print(f"sieve: {input_fasta} has no sequences.", file=sys.stderr)
             emit_summary("failed", n_in=n_in, error="the input FASTA has no sequences")
             return 1
+        # PM-15: a header-only record is not an exact duplicate, and counting it as one made
+        # "4 -> 2 records (2 exact duplicates removed)" of two real and two empty records.
+        empty_note = f", {rep.n_empty} empty records dropped" if rep.n_empty else ""
         print(f"[sieve] dedup: {n_in} -> {n_unique} records "
-              f"({n_in - n_unique} exact duplicates removed, first copy kept)", flush=True)
-        short, gappy = completeness_failures(deduped, min_len, max_gap_frac)
+              f"({n_in - n_unique - rep.n_empty} exact duplicates removed, first copy kept"
+              f"{empty_note})", flush=True)
         if short or gappy:
             print(f"[sieve] completeness gate drops {short + gappy} of {n_unique}: "
                   f"{short} shorter than {min_len} nt (--min-len), {gappy} with more than "
                   f"{max_gap_frac:.0%} gaps or other non-ACGT characters (--max-gap-frac)",
                   flush=True)
+
+        # PM-08: the binary's per-record k-mer buffer is a fixed 1<<16 entries and is never
+        # grown, so k-mers past position ~65,550 are dropped silently and two records
+        # identical over their first 65.5 kb are judged near-duplicates: one is dropped at
+        # exit 0 with nothing on stderr. Upstream's code, so this warns rather than patching.
+        if rep.longest > SKETCH_LENGTH_LIMIT:
+            print(f"[warn] the longest record is {rep.longest:,} nt and the sieve binary "
+                  f"sketches only the first {SKETCH_LENGTH_LIMIT:,} of each record "
+                  f"(upstream bug, kmer-diversity-sieve): records identical over that "
+                  f"prefix are judged near-duplicates whatever follows it.", file=sys.stderr)
+
+        # PM-02: refuse rather than hand the binary an input it will hang on. Only admitted
+        # records reach the LSH table.
+        admitted = n_unique - short - gappy
+        if admitted > LSH_TABLE_LIMIT:
+            msg = (f"{admitted:,} records would be admitted, and the sieve binary's LSH "
+                   f"index is a fixed 2^20-slot table that is never grown: past "
+                   f"{LSH_TABLE_LIMIT:,} admitted records it can loop forever instead of "
+                   f"finishing (upstream bug, kmer-diversity-sieve). Raise --min-len or "
+                   f"--max-gap-frac to admit fewer, or sieve a subset. Chunking and "
+                   f"re-sieving is not a way round it: the union can exceed the limit again.")
+            print(f"sieve: {msg}", file=sys.stderr)
+            emit_summary("failed", n_in=n_in, n_unique=n_unique, short=short, gappy=gappy,
+                         error=msg)
+            return 1
 
         cmd = [
             resolved,
@@ -245,53 +396,87 @@ def sieve_run(
             "--min-len", str(min_len),
             "--max-n-frac", str(max_gap_frac),
             "--threshold", str(threshold),
-            "--warmup", "2000",
+            "--warmup", str(ADMISSION_OFF_WARMUP),
             "--sketch", str(sketch),
             "--emit-promoted", str(emit_prefix),
         ]
         print(f"[sieve] {' '.join(cmd)}", flush=True)
-        rc = subprocess.run(cmd).returncode
+        # PM-01: the binary reports its rejections on stdout and nothing read them.
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        sys.stdout.write(proc.stdout)
+        sys.stdout.flush()
+        rc = report_rc(proc.returncode, "kmer-diversity-sieve", "sieve")
         if rc != 0:
-            print(f"sieve: kmer-diversity-sieve exited {rc}", file=sys.stderr)
             emit_summary("failed", n_in=n_in, n_unique=n_unique, short=short, gappy=gappy,
-                         error=f"kmer-diversity-sieve exited {rc}")
+                         error=f"kmer-diversity-sieve exited {proc.returncode}")
             return rc
+        m = _REJECT_RE.search(proc.stdout)
+        if m is None:
+            print("[warn] the sieve binary did not report a REJECT count; it may be a "
+                  "version that still has the admission gate armed.", file=sys.stderr)
+        elif int(m.group(1)) > 0:
+            msg = (f"the sieve binary rejected {m.group(1)} record(s) on admission, which "
+                   f"should be impossible with the gate disarmed. The binary is probably "
+                   f"older than the wrapper; rebuild it.")
+            print(f"sieve: {msg}", file=sys.stderr)
+            emit_summary("failed", n_in=n_in, n_unique=n_unique, short=short, gappy=gappy,
+                         error=msg)
+            return 1
 
-        with output_fasta.open("w") as fh:
-            for rf in shards():
-                fh.write(rf.read_text())
+        # PM-14: the output used to be opened for writing before anything was counted, so a
+        # run that promoted nothing left a 0-byte file over the previous result. Staged, and
+        # renamed in only when there is something to publish. PM-13: the binary's own output
+        # headers are the truncated neutral ids, so the saved originals go back here.
+        shards = sorted(work.glob("promoted.rank*.fasta"),
+                        key=lambda q: int(q.name[len("promoted.rank"):-len(".fasta")]))
+        staged = work / "out.fasta"
+        n_out = 0
+        with staged.open("w") as fh:
+            for rf in shards:
+                with rf.open() as rin:
+                    for line in rin:
+                        if line.startswith(">"):
+                            n_out += 1
+                            idx = line[1:].split()[0]
+                            line = rep.headers[int(idx[1:])] if idx[:1] == "r" else line
+                        fh.write(line)
+        if n_out:
+            os.replace(staged, output_fasta)
     finally:
-        # The binary writes its result as <output>.rank*.fasta shards; the output is their
-        # concatenation. The shards used to be left beside it, a second copy of every record.
-        deduped.unlink(missing_ok=True)
-        for rf in shards():
-            rf.unlink(missing_ok=True)
+        shutil.rmtree(work, ignore_errors=True)
 
     # One record per promoted haplotype: its id and the hash of its sequence, which is how
     # a summary names a sequence without carrying it (docs/summaries.md).
     promoted = []
-    ident, seq = None, []
-    for line in output_fasta.open():
-        if line.startswith(">"):
-            if ident is not None:
-                promoted.append({"id": ident, "seq_sha256": summary_io.seq_sha256("".join(seq)),
-                                 "length": len("".join(seq))})
-            ident, seq = line[1:].split()[0], []
-        else:
-            seq.append(line.strip())
-    if ident is not None:
-        promoted.append({"id": ident, "seq_sha256": summary_io.seq_sha256("".join(seq)),
-                         "length": len("".join(seq))})
-    n_out = len(promoted)
+    if n_out:
+        ident, seq = None, []
+        with output_fasta.open() as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    if ident is not None:
+                        promoted.append({"id": ident,
+                                         "seq_sha256": summary_io.seq_sha256("".join(seq)),
+                                         "length": len("".join(seq))})
+                    ident, seq = line[1:].split()[0], []
+                else:
+                    seq.append(line.strip())
+        if ident is not None:
+            promoted.append({"id": ident, "seq_sha256": summary_io.seq_sha256("".join(seq)),
+                             "length": len("".join(seq))})
     print(f"[sieve] {n_in} -> {n_out} haplotypes "
           f"(tau={threshold}, sketch={sketch}) -> {output_fasta}", flush=True)
     emit_summary("ok" if n_out else "failed", n_in=n_in, n_unique=n_unique, n_out=n_out,
                  short=short, gappy=gappy, records=promoted,
                  error=None if n_out else "promoted 0 haplotypes")
     if n_out == 0:
-        print("sieve: promoted 0 haplotypes; try a lower --threshold, a lower --min-len "
-              "(reconstructions may be shorter than the reference), or a higher "
-              "--max-gap-frac (gapped rows, such as LexicMap partials).",
+        # PM-14: `is_novel` on an empty promoted set returns 1, so zero promoted cannot be a
+        # --threshold problem: every record failed the completeness gate or carries no
+        # A/C/G/T 15-mer. The old hint led with the one cause it could not be.
+        print(f"sieve: promoted 0 of {n_unique} unique records; {output_fasta} is unchanged. "
+              f"{short} were shorter than --min-len {min_len} and {gappy} were over "
+              f"--max-gap-frac {max_gap_frac:.0%}"
+              + ("." if short or gappy else
+                 ", so the records carry no A/C/G/T 15-mer the sieve can sketch."),
               file=sys.stderr)
         return 1
     return 0

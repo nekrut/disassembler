@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""test_dedup_sieve_equivalence.py -- the dedup pass changes nothing below the warmup.
+"""test_dedup_sieve_equivalence.py -- the dedup pass promotes the same sequences.
 
 `sieve_run` folds byte-exact duplicates out of its input before invoking the
-sieve. A later identical copy has novelty 0 and is never promoted, so on a cohort
-smaller than the binary's 2000-record admission warmup (as here) the two paths
-produce byte-identical output. Past the warmup they differ on purpose: duplicates
-skew the admission statistics and get new lineages rejected as errors, which is
-why the wrapper deduplicates (tests/test_sieve_integration.py covers that case).
+sieve. A later identical copy has novelty 0 and is never promoted, so the two
+paths promote the same sequences, in the same order.
+
+Two things changed in 0.2.0 and are reflected here. The admission gate is
+disarmed (PM-01), so these flags carry `--warmup 2147483647` as the wrapper now
+does, and duplicates no longer skew anything: dedup is a speed-up and a memory
+saving, not a correctness fix. And the dedup pass renames records `>r0`, `>r1`,
+... (PM-04, PM-13), because the binary buckets novelty by a month parsed from the
+header and selects what to emit by the header's first 255 characters. The two
+paths therefore cannot be byte-identical any more, so what is asserted is the
+stronger claim the bytes were standing in for: the same sequences in the same
+order, and the saved headers mapping back to exactly the full path's headers.
 
 Also records the dedup fold ratio and (loosely) checks the dedup pass itself is
 cheap. Does NOT assert on wall-clock speedup of the sieve (noisy on CI); the
@@ -20,6 +27,8 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+from disassembler.cmd.sieve import ADMISSION_OFF_WARMUP
 
 REPO = Path(__file__).resolve().parent.parent
 SIEVE_BIN = REPO / "extern" / "kmer-diversity-sieve" / "l1_pipeline_serial"
@@ -70,7 +79,7 @@ def _run_sieve(input_fa: Path, output_fa: Path, min_len: int):
         "--min-len", str(min_len),
         "--max-n-frac", "0.05",
         "--threshold", "0.005",
-        "--warmup", "2000",
+        "--warmup", str(ADMISSION_OFF_WARMUP),
         "--sketch", "256",
         "--emit-promoted", str(emit_prefix),
     ]
@@ -132,35 +141,52 @@ class TestDedupSieveEquivalence(unittest.TestCase):
         sieved_full = self.work / f"c{copies}.sieved_full.fa"
         sieved_from_ded = self.work / f"c{copies}.sieved_from_ded.fa"
         _write_fasta(cohort, self._make_cohort(copies))
-        n_in, n_out = self.dedup(cohort, deduped)
+        rep = self.dedup(cohort, deduped)
         _run_sieve(cohort, sieved_full, self.min_len)
         _run_sieve(deduped, sieved_from_ded, self.min_len)
-        return cohort, deduped, sieved_full, sieved_from_ded, n_in, n_out
+        return cohort, deduped, sieved_full, sieved_from_ded, rep
+
+    @staticmethod
+    def _records(path: Path):
+        """(header, sequence) pairs, in file order."""
+        out, hdr, seq = [], None, []
+        for line in path.read_text().splitlines():
+            if line.startswith(">"):
+                if hdr is not None:
+                    out.append((hdr, "".join(seq)))
+                hdr, seq = line[1:], []
+            else:
+                seq.append(line.strip())
+        if hdr is not None:
+            out.append((hdr, "".join(seq)))
+        return out
+
+    def _assert_same_promotions(self, full: Path, ded: Path, rep):
+        """Same sequences in the same order, and the saved headers map back exactly."""
+        a, b = self._records(full), self._records(ded)
+        self.assertEqual([s for _h, s in a], [s for _h, s in b],
+                         "the two paths promoted different sequences")
+        restored = [rep.headers[int(h.split()[0][1:])].rstrip("\n")[1:] for h, _s in b]
+        self.assertEqual([h for h, _s in a], restored,
+                         "mapping the neutral ids back did not reproduce the headers")
 
     def test_no_duplicates_dedup_pass_is_identity(self):
-        """copies=1: dedup is a no-op; sieve on cohort == sieve on deduped."""
-        _, _, full, ded, n_in, n_out = self._run_both_paths(copies=1)
-        self.assertEqual(n_in, n_out, "dedup should drop nothing when input has no duplicates")
-        self.assertTrue(
-            filecmp.cmp(full, ded, shallow=False),
-            "sieve output must be byte-identical when dedup is a no-op",
-        )
-        self.assertEqual(_sha(full), _sha(ded))
+        """copies=1: dedup is a no-op; the same sequences are promoted either way."""
+        _, _, full, ded, rep = self._run_both_paths(copies=1)
+        self.assertEqual(rep.n_in, rep.n_out,
+                         "dedup should drop nothing when input has no duplicates")
+        self._assert_same_promotions(full, ded, rep)
 
     def test_byte_identical_sieve_output_with_duplicates(self):
         """copies=10: every unique sequence appears 10x in the cohort; sieve outputs
         must still be byte-identical across the two paths (same bytes, same order,
         same headers). This is the core equivalence claim.
         """
-        _, _, full, ded, n_in, n_out = self._run_both_paths(copies=10)
-        self.assertEqual(n_in, 10 * len(self.fixture))
-        self.assertEqual(n_out, len(self.fixture),
+        _, _, full, ded, rep = self._run_both_paths(copies=10)
+        self.assertEqual(rep.n_in, 10 * len(self.fixture))
+        self.assertEqual(rep.n_out, len(self.fixture),
                          "every unique sequence appears once in deduped output")
-        self.assertTrue(
-            filecmp.cmp(full, ded, shallow=False),
-            f"sieve output differs between paths. "
-            f"sha(full)={_sha(full)[:16]} sha(deduped)={_sha(ded)[:16]}",
-        )
+        self._assert_same_promotions(full, ded, rep)
 
     def test_dedup_preserves_first_encountered_header(self):
         """The dedup rule MUST be first-encountered-wins; a different winner (e.g.
@@ -174,12 +200,15 @@ class TestDedupSieveEquivalence(unittest.TestCase):
             ("SRR_M_third", "TTTTTTTTTTTT"),
         ])
         dst = self.work / "ordered.deduped.fa"
-        n_in, n_out = self.dedup(src, dst)
-        self.assertEqual((n_in, n_out), (3, 2))
-        headers = [l for l in dst.read_text().splitlines() if l.startswith(">")]
-        self.assertEqual(headers[0], ">SRR_Z_first",
-                         "first-encountered header wins; alphabetical choice would pick SRR_A_second")
-        self.assertEqual(headers[1], ">SRR_M_third")
+        rep = self.dedup(src, dst)
+        self.assertEqual((rep.n_in, rep.n_out), (3, 2))
+        # The file the binary reads now carries neutral ids (PM-04, PM-13); the headers it
+        # must be given back are the first-encountered ones, in the same order.
+        self.assertEqual([l for l in dst.read_text().splitlines() if l.startswith(">")],
+                         [">r0", ">r1"])
+        self.assertEqual([h.strip() for h in rep.headers],
+                         [">SRR_Z_first", ">SRR_M_third"],
+                         "first-encountered header wins; alphabetical would pick SRR_A_second")
 
 
 if __name__ == "__main__":

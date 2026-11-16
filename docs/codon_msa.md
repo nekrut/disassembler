@@ -1,9 +1,18 @@
 # Codon alignment and phylogeny
 
 The walker reconstructs one primary coding haplotype per accession. To compare them, for a tree
-or as input to a selection analysis, they have to be aligned **in frame**: every column a codon
-position, and gaps whole codons rather than frameshifts. `disassembler msa` does this, and the
-`reconstruct`, `from-kmindex` and `from-lexicmap` composites run it as their last stage.
+or as input to a selection analysis, they have to be put on a common coordinate system.
+`disassembler msa` does this, and the `reconstruct`, `from-kmindex` and `from-lexicmap`
+composites run it as their last stage.
+
+**What the alignment is, precisely.** It is a nucleotide alignment anchored on the reference:
+MAFFT runs with `--auto --keeplength --addfragments`, so every row comes out the reference's
+length, every column is a reference position, and the reference's own frame therefore applies
+to the whole file. That is not the same as a codon-aware alignment. `--keeplength` deletes any
+base a row has beyond the reference, insertions included, and it puts gaps where nucleotide
+scoring wants them, which need not be on codon boundaries. A row carrying a 1 nt indel can
+come back looking intact, or with a gap that splits a codon. From 0.2.0 `msa` measures this
+and says so; it does not change the alignment. See [codon QC](#codon-qc) below.
 
 ## What it produces
 
@@ -26,11 +35,18 @@ directory, where `<gene>` is the reference file's stem.
 - **The reference is the first row**, named `Reference`, because downstream tools (FastTree,
   HyPhy) expect it there.
 - **Record IDs are sanitised** to letters, digits and underscores, and made unique, so Newick
-  and HyPhy parsers accept them.
-- **Coverage gate.** A haplotype with fewer A/C/G/T bases than `--msa-min-cov` (default
-  `0.70`) of the reference length is dropped before alignment rather than aligned as a
-  fragment. Gaps and N do not count, so a LexicMap row, which is reference-length with `-`
-  wherever no hit reached, is measured by what it covers.
+  and HyPhy parsers accept them. They are **not truncated**: ids used to be cut to 40
+  characters, which is where a GISAID or NCBI header carries the accession that tells two
+  records apart. An id that is already clean and unique keeps itself whatever order it
+  arrives in. When any id changed, or any row was reverse-complemented,
+  `<out-aln>.ids.tsv` records `aligned_id`, `original_header` and `reverse_complemented`.
+- **Coverage gate, twice.** A haplotype with fewer A/C/G/T bases than `--msa-min-cov`
+  (default `0.70`) of the reference length is dropped before alignment rather than aligned as
+  a fragment. Gaps and N do not count, so a LexicMap row, which is reference-length with `-`
+  wherever no hit reached, is measured by what it covers. It is **measured again on the
+  aligned row**, with a two-point tolerance, because a contig carrying part of the gene plus
+  flanking sequence passes the first gate on its raw base count and `--keeplength` then trims
+  the flank away, leaving a fragment in the alignment and the tree with nothing said.
 
 - **Orientation.** MAFFT does not reverse-complement its inputs, and `--keeplength` fits any
   input to the reference's length, so a haplotype on the other strand used to align as noise
@@ -39,6 +55,9 @@ directory, where `<gene>` is the reference file's stem.
   always in query orientation already; the case this catches is a FASTA assembled another way,
   such as a CDS annotated on the minus strand of a circular genome. On four real cohorts every
   row shared at least 896 15-mers with its reference's strand and at most 23 with the other.
+  Exact 15-mers find nothing in common once a row is about 30% divergent; when they tie, all
+  11-mers are compared instead and the call is made only with a clear margin, so a row that
+  really cannot be placed is still reported as such rather than aligned as noise.
 - **Identity check.** After MAFFT, each row's identity to the reference is measured over the
   columns where both have a base. Same-gene cohorts measured 0.88 or more (HIV-1 *pol*,
   SARS-CoV-2 spike, C. auris FKS1, H. pylori *vacA*); a row on the wrong strand, or from another
@@ -123,8 +142,11 @@ versus the walker's `-t` (GraphAligner).
 `disassembler lexicmap` writes its clean cohort on the reference's coordinate grid already
 (see [`lexicmap.md`](lexicmap.md#outputs)). With `--require-full-length`, every row is
 reference-length and its only gaps are in-frame deletions (whole codons of `-`). Rows without a
-deletion come through MAFFT unchanged: on three cohorts of 27 to 14,594 sequences, re-running
-MAFFT reproduced them byte for byte. With the default `--min-cov 0.80`, rows can also carry `-`
+deletion come through MAFFT with the same sequence, character for character: on three cohorts
+of 27 to 14,594 sequences, re-running MAFFT reproduced them. MAFFT wraps its output at 60
+columns, so the file is not a byte copy of the input, and `--preservecase` keeps the case
+(without it, which is how 0.1.x ran, the codon MSA was the one lower-case file in the
+pipeline). With the default `--min-cov 0.80`, rows can also carry `-`
 at uncovered reference positions, and MAFFT may place gaps differently. `from-lexicmap` runs `msa` in both cases so that
 both routes produce the same output shape.
 
@@ -160,3 +182,45 @@ carries the rows in, the rows retained, the taxa aligned and how many were rever
 complemented, and `records[]` names each aligned row by id, length and sequence hash. It is
 written on every path, including the failures, so a caller can tell a run that aligned nothing
 from one that never started.
+
+
+## Codon QC
+
+`--keeplength` makes every row the reference's length, which is the only thing the old check
+tested, so a row that had been changed in ways that matter still passed. After alignment each
+row is now compared with what went in, and anything of these kinds is reported on stderr and
+written to `<out-aln>.qc.tsv`:
+
+| column | meaning |
+|---|---|
+| `trimmed_bases` | bases `--keeplength` deleted: an insertion, or overhang past the reference ends |
+| `internal_gap_runs` | the lengths of gap runs that touch neither end of the row |
+| `split_codons` | codons where the row has one or two gaps, not three |
+| `internal_stops` | in-frame stop codons before the last codon |
+| `frameshift` | the trimmed count, or an internal gap run, is not a multiple of 3 |
+
+The alignment is unchanged either way. A frameshifted row is a real finding on walker output,
+where the walker gates frameshifts only for alternative alleles, so the primary of an accession
+carrying a 1 nt indel reaches `msa` as it is; `from-lexicmap` filters those into its own tier 5
+before this stage sees them.
+
+## Tools and versions
+
+The MAFFT and FastTree versions are printed at the start of a run and recorded in the summary.
+MAFFT 7.525 is refused outright: it segfaults on the `--addfragments` path this stage uses, and
+the published recipe leaves MAFFT unpinned, so an environment can resolve it. Install
+`mafft>=7.526`.
+
+`--no-tree` writes only the alignment, and FastTree is then neither looked up nor run, so an
+alignment can be produced on a machine that does not have it. Exactly one of `--out-tree` and
+`--no-tree` is required.
+
+Duplicate rows are aligned once and copied back: under `--addfragments` each row is aligned to
+the reference alone, so every copy of a sequence gets the same row. The identity median is still
+weighted by copy number. A cohort of 600 rows drawn from 30 variants took 129.7 s before and
+8.4 s after, for a byte-identical alignment.
+
+A `--out-aln` or `--out-tree` that is not a plain file (a FIFO, a device such as `/dev/null`, or
+a symlink) is **written into**, not replaced. A rename swaps a directory entry, so these outputs
+used to turn into regular files: as root, which is the default inside a container, `--out-tree
+/dev/null` left the null device holding a Newick tree for the rest of that container's life.

@@ -184,5 +184,172 @@ class TestMsaCoverageGate(unittest.TestCase):
         self.assertEqual(self.msa.real_bases("ACGTacgt-NnRY."), 8)
 
 
+class TestMsaUnits(unittest.TestCase):
+    """PM-03, PM-12, PM-22, PM-26: the pieces, without running either tool."""
+
+    @classmethod
+    def setUpClass(cls):
+        from disassembler.cmd import msa as msa_cmd
+        cls.msa = msa_cmd
+
+    def test_ids_are_not_truncated(self):
+        # PM-26: ids were cut to 40 characters, which is exactly where a GISAID header
+        # carries the accession that tells two records apart.
+        raw = ["hCoV-19/USA/CA-CDC-QDX12345678/2021|EPI_ISL_1000001|x",
+               "hCoV-19/USA/CA-CDC-QDX12345678/2021|EPI_ISL_1000002|x"]
+        ids, changed = self.msa.assign_ids(raw)
+        self.assertTrue(changed)
+        self.assertEqual(len(set(ids)), 2)
+        self.assertIn("EPI_ISL_1000001", ids[0])
+        self.assertIn("EPI_ISL_1000002", ids[1])
+
+    def test_a_clean_unique_id_keeps_its_name_whatever_the_order(self):
+        # PM-26: `SRR1.1` used to be renamed to `SRR1_1`, taking the name of the record that
+        # was already called `SRR1_1`, which was then renamed `SRR1_1_1`.
+        for raw in (["SRR1.1", "SRR1_1"], ["SRR1_1", "SRR1.1"]):
+            ids, _changed = self.msa.assign_ids(raw)
+            with self.subTest(raw=raw):
+                self.assertEqual(ids[raw.index("SRR1_1")], "SRR1_1",
+                                 "an id that is already clean and unique keeps itself")
+                self.assertEqual(len(set(ids)), 2)
+
+    def test_reference_is_reserved(self):
+        ids, _c = self.msa.assign_ids(["Reference", "Reference"])
+        self.assertNotIn("Reference", ids)
+        self.assertEqual(len(set(ids)), 2)
+
+    def test_many_ids_sharing_a_prefix_are_not_quadratic(self):
+        # PM-22: the suffix search restarted at 1 for every record, so n ids with the same
+        # prefix cost about n squared probes; 10,000 took 31.8 s in renaming alone.
+        import time
+        raw = ["Severe_acute_respiratory_syndrome_coronavirus_2_isolate"] * 20000
+        t0 = time.perf_counter()
+        ids, _c = self.msa.assign_ids(raw)
+        self.assertEqual(len(set(ids)), 20000)
+        self.assertLess(time.perf_counter() - t0, 5.0)
+
+    def test_codon_qc_names_what_keeplength_did(self):
+        # PM-03: the only check after MAFFT was a row-length test that --keeplength
+        # guarantees, printed under the banner "Validating codon lengths...".
+        ref = "ATGGCTGAACCCTTTAAA"
+        clean = self.msa.codon_qc(ref, self.msa.real_bases(ref))
+        self.assertFalse(clean["frameshift"])
+        self.assertEqual(clean["split_codons"], [])
+
+        # a 1 nt deletion: one gap, splitting a codon, and a frameshift by base count
+        row = ref[:7] + "-" + ref[8:]
+        q = self.msa.codon_qc(row, self.msa.real_bases(ref))
+        self.assertEqual(q["trimmed"], 1, "one base went missing against the input")
+        self.assertTrue(q["frameshift"])
+        self.assertEqual(q["split_codons"], [3])
+        self.assertEqual(q["internal_gap_runs"], [1])
+
+        # an in-frame 3 nt deletion on a codon boundary: no frameshift, no split codon
+        row3 = ref[:6] + "---" + ref[9:]
+        q3 = self.msa.codon_qc(row3, self.msa.real_bases(ref))
+        self.assertFalse(q3["frameshift"])
+        self.assertEqual(q3["split_codons"], [])
+
+        # an internal stop
+        stop = "ATGTAAGAACCCTTTAAA"
+        self.assertEqual(self.msa.codon_qc(stop, self.msa.real_bases(stop))["internal_stops"], [2])
+
+    def test_an_insertion_that_keeplength_deleted_is_reported(self):
+        # The row MAFFT returns is identical to the reference, which is why nothing noticed.
+        ref = "ATGGCTGAACCCTTTAAA"
+        q = self.msa.codon_qc(ref, self.msa.real_bases(ref) + 1)
+        self.assertEqual(q["trimmed"], 1)
+        self.assertTrue(q["frameshift"])
+
+    def test_a_divergent_reverse_row_is_oriented_by_the_fallback(self):
+        # PM-12: the exact 15-mers find nothing in common once a row is ~30% divergent, and
+        # a tie was written out as given, so a minus-strand row aligned at ~0.43 identity
+        # and stayed in the tree as noise.
+        import random
+        rng = random.Random(5)
+        ref = "".join(rng.choice("ACGT") for _ in range(900))
+        fwd, rev = self.msa.kmer_set(ref), self.msa.kmer_set(self.msa.revcomp(ref))
+        fallback = (self.msa.kmer_set(ref, 1, self.msa.ORIENT_FALLBACK_K),
+                    self.msa.kmer_set(self.msa.revcomp(ref), 1, self.msa.ORIENT_FALLBACK_K))
+        s = list(self.msa.revcomp(ref))
+        for i in range(0, len(s), 12):          # a change every 12 nt: ~8% apart
+            s[i] = rng.choice([b for b in "ACGT" if b != s[i]])
+        row = "".join(s)
+        self.assertEqual(self.msa.orientation(row, fwd, rev), 0, "the 15-mers tie, as before")
+        self.assertEqual(self.msa.orientation(row, fwd, rev, fallback), -1,
+                         "the 11-mers settle it: this row is the other strand")
+
+    def test_a_genuinely_undecidable_row_is_still_undecided(self):
+        import random
+        rng = random.Random(6)
+        ref = "".join(rng.choice("ACGT") for _ in range(900))
+        other = "".join(rng.choice("ACGT") for _ in range(900))
+        fwd, rev = self.msa.kmer_set(ref), self.msa.kmer_set(self.msa.revcomp(ref))
+        fallback = (self.msa.kmer_set(ref, 1, self.msa.ORIENT_FALLBACK_K),
+                    self.msa.kmer_set(self.msa.revcomp(ref), 1, self.msa.ORIENT_FALLBACK_K))
+        self.assertEqual(self.msa.orientation(other, fwd, rev, fallback), 0)
+
+    def test_a_bad_mafft_version_is_refused(self):
+        # PM-17: docs/packaging.md has recorded since 0.1.0 that 7.525 segfaults on the
+        # --addfragments path, and nothing ever ran `mafft --version`.
+        with tempfile.TemporaryDirectory() as d:
+            for text, bad in (("#!/bin/sh\necho 'v7.525 (2024)' >&2\n", True),
+                              ("#!/bin/sh\necho 'v7.526 (2024)' >&2\n", False),
+                              ("#!/bin/sh\necho nonsense\n", False)):
+                stub = Path(d) / "mafft"
+                stub.write_text(text)
+                stub.chmod(0o755)
+                self.msa.tool_version.cache_clear()
+                if bad:
+                    with self.assertRaisesRegex(RuntimeError, "7.525"):
+                        self.msa.check_mafft(str(stub))
+                else:
+                    self.msa.check_mafft(str(stub))
+
+    def test_publish_writes_into_a_fifo_instead_of_replacing_it(self):
+        # PM-09: a rename swaps a directory entry, so a FIFO output became a regular file
+        # and its reader blocked forever; /dev/null became a regular file as root.
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            fifo = Path(d) / "out.fifo"
+            os.mkfifo(fifo)
+            src = Path(d) / "src"
+            src.write_text("hello\n")
+            got = []
+            # daemon: when `publish` renames over the FIFO instead of writing into it,
+            # which is the defect, nothing ever opens the write end and this thread blocks
+            # forever. A non-daemon thread would then hang the whole test run rather than
+            # failing this one test.
+            reader = threading.Thread(target=lambda: got.append(fifo.read_text()),
+                                      daemon=True)
+            reader.start()
+            self.msa.publish(src, fifo)
+            reader.join(timeout=10)
+            self.assertEqual(got, ["hello\n"])
+            self.assertTrue(fifo.is_fifo(), "the FIFO must survive as a FIFO")
+
+    def test_publish_follows_a_symlink_instead_of_replacing_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "target"
+            target.write_text("old\n")
+            link = Path(d) / "link"
+            link.symlink_to(target)
+            src = Path(d) / "src"
+            src.write_text("new\n")
+            self.msa.publish(src, link)
+            self.assertTrue(link.is_symlink(), "the link must still be a link")
+            self.assertEqual(target.read_text(), "new\n")
+
+    def test_publish_renames_onto_a_plain_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "dest"
+            dest.write_text("old\n")
+            src = Path(d) / "src"
+            src.write_text("new\n")
+            self.msa.publish(src, dest)
+            self.assertEqual(dest.read_text(), "new\n")
+            self.assertFalse(src.exists(), "a plain file is still a rename, not a copy")
+
+
 if __name__ == "__main__":
     unittest.main()

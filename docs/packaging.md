@@ -65,7 +65,9 @@ Before enabling a platform, check that it actually solves:
   build 0 sets a floor; `mafft >=7.526` arrives with `0.1.1` build 1. Until that is published,
   list conda-forge before bioconda, or run `conda install 'mafft>=7.526'` in the environment.
   Channel order decides this: `-c` prepends, so `-c conda-forge -c bioconda` gets 7.526 while
-  `-c bioconda -c conda-forge` with flexible priority gets 7.525.
+  `-c bioconda -c conda-forge` with flexible priority gets 7.525. From 0.2.0 `msa` runs
+  `mafft --version` before any work and refuses 7.525 by name, so an environment that
+  resolves it fails with one line instead of a raw `MAFFT failed:` log after the walk.
 - **kmer-diversity-sieve 0.1.0** is upstream commit `70022da`, because upstream has no tagged
   releases. The recipe overrides the Makefile's `-march=native`, so the binary runs on any
   x86-64 machine; the portable build gave byte-identical output on the test fixture.

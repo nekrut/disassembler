@@ -18,6 +18,7 @@ Skips cleanly if the sieve binary or its submodule are absent.
 import contextlib
 import io
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -413,6 +414,263 @@ class TestFromLexicmapGates(unittest.TestCase):
     def test_explicit_values_win(self):
         seen = self._run("--sieve-max-gap-frac", "0.1", "--msa-min-cov", "0.9")
         self.assertEqual((seen["max_gap_frac"], seen["msa_min_cov"]), (0.1, 0.9))
+
+
+class TestSieveAdmissionAndHeaders(unittest.TestCase):
+    """PM-01, PM-04, PM-05, PM-07, PM-13, PM-14, PM-15, PM-19, PM-20 against the real binary."""
+
+    @classmethod
+    def setUpClass(cls):
+        state = ensure_sieve()
+        if state != "ok":
+            raise unittest.SkipTest(f"sieve binary unavailable ({state})")
+        from disassembler.cmd import sieve as sieve_cmd
+        cls.sieve = sieve_cmd
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp())
+        self.rng = random.Random(11)
+        self.base = "".join(self.rng.choice("ACGT") for _ in range(1500))
+        # One SNV in 1,500 nt changes about 1% of the 15-mers, which is over the 0.5%
+        # default threshold, so a long base is needed where near-duplicates are the point.
+        self.long_base = "".join(self.rng.choice("ACGT") for _ in range(30000))
+
+    def tearDown(self):
+        shutil.rmtree(self.work, ignore_errors=True)
+
+    def mutate(self, seq, n):
+        s = list(seq)
+        for pos in self.rng.sample(range(len(s)), n):
+            s[pos] = self.rng.choice([b for b in "ACGT" if b != s[pos]])
+        return "".join(s)
+
+    def run_sieve(self, records, out_name="out.fasta", src_bytes=None, **kw):
+        src = self.work / "in.fasta"
+        out = self.work / out_name
+        if src_bytes is not None:
+            src.write_bytes(src_bytes)
+        else:
+            _write(src, records)
+        kw.setdefault("min_len", 1000)
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = self.sieve.sieve_run(src, out, sieve_bin=str(SIEVE_BIN), **kw)
+        return rc, out, buf.getvalue(), err.getvalue()
+
+    @staticmethod
+    def headers_of(path):
+        return [l[1:] for l in path.read_text().splitlines() if l.startswith(">")] \
+            if path.is_file() else []
+
+    def test_a_late_divergent_lineage_survives_a_large_unique_cohort(self):
+        # PM-01. 2,100 unique haplotypes, then one 2% away. Past the binary's 2,000-record
+        # warmup that record used to be rejected as an admission outlier, which means never
+        # sketched, never promoted and never added to the k-mer table, so the rest of its
+        # clade went with it: the lineage vanished from the MSA and tree at exit 0, and
+        # whether it survived depended on where in the file it sat.
+        #
+        # 45 SNVs in 1,500 nt. Measured against this binary on this fixture, 30 SNVs (2%)
+        # is admitted and 45 (3%) is rejected; on a cohort built with a different random
+        # stream the boundary sat between 20 and 30. The admission band is
+        # `mean + 5*sd + 0.5` over the running singleton counts, and record 1 contributes
+        # about 1,486 novel k-mers against every later record's ~30, so the band's width is
+        # a property of the FILE, not of the biology: there is no divergence a user can
+        # stay under. That is a sharper statement of the defect than a single cut-off, and
+        # the direction is the alarming one, since it is the genuinely novel lineages that
+        # were dropped, which are the ones the sieve exists to keep.
+        cohort = [(f"u{i}", self.mutate(self.base, 2)) for i in range(2100)]
+        divergent = ("late_lineage", self.mutate(self.base, 45))   # 45/1500 = 3%
+        rc, out, log, _err = self.run_sieve(cohort + [divergent])
+        self.assertEqual(rc, 0, log)
+        self.assertIn("late_lineage", self.headers_of(out),
+                      "a divergent lineage after record 2,000 must still be promoted")
+        m = self.sieve._REJECT_RE.search(log)
+        self.assertIsNotNone(m, log)
+        self.assertEqual(m.group(1), "0", "nothing may be rejected on admission")
+
+    def test_the_same_lineage_first_was_always_kept(self):
+        # The control that made this order-dependent: placed first, it survived even before.
+        cohort = [(f"u{i}", self.mutate(self.base, 2)) for i in range(2100)]
+        divergent = ("early_lineage", self.mutate(self.base, 45))
+        rc, out, log, _err = self.run_sieve([divergent] + cohort)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("early_lineage", self.headers_of(out))
+
+    def test_dated_headers_do_not_partition_novelty(self):
+        # PM-04: the binary folds a month parsed from `|YYYY-MM` into every LSH band key, so
+        # a record was compared only with promoted records of the same month. Six copies of
+        # one sequence, one SNV apart, in six different months, all survived.
+        seqs = [self.mutate(self.long_base, 1) for _ in range(6)]
+        dated = [(f"s{i}|2021-{i+1:02d}-15 desc", s) for i, s in enumerate(seqs)]
+        plain = [(f"s{i}", s) for i, s in enumerate(seqs)]
+        rc_d, out_d, log_d, _e = self.run_sieve(dated, out_name="dated.fasta")
+        rc_p, out_p, _log, _e = self.run_sieve(plain, out_name="plain.fasta")
+        self.assertEqual((rc_d, rc_p), (0, 0), log_d)
+        self.assertEqual(len(self.headers_of(out_d)), len(self.headers_of(out_p)),
+                         "the header date must not decide what is novel")
+        self.assertEqual(self.headers_of(out_d), ["s0|2021-01-15 desc"],
+                         "and the original header comes back intact")
+
+    def test_a_long_header_survives_intact(self):
+        # PM-13: the binary keys its emit set on the first 255 characters of the header and
+        # writes that truncated copy out, so a from-lexicmap header with a long `indels=`
+        # list lost its tail.
+        long_hdr = "acc1 " + "indels=" + ",".join(f"{i}_{i+1}insA" for i in range(40))
+        self.assertGreater(len(long_hdr), 255)
+        rc, out, log, _e = self.run_sieve([(long_hdr, self.base)])
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(self.headers_of(out), [long_hdr])
+
+    def test_two_records_sharing_a_header_are_not_over_emitted(self):
+        # PM-13: only one was promoted, but the binary emitted every record whose truncated
+        # header matched, so `PROMOTED 3` came out as `4 -> 4`.
+        a, b = self.mutate(self.long_base, 1), self.mutate(self.long_base, 8000)
+        rc, out, log, _e = self.run_sieve([("same", a), ("same", b)])
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(len(self.headers_of(out)), 2, "two distinct sequences, two records")
+        a2 = self.mutate(a, 1)   # one SNV in 30 kb: a near-duplicate at tau=0.005
+        rc, out, log, _e = self.run_sieve([("same", a), ("same", a2)],
+                                          out_name="near.fasta")
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(len(self.headers_of(out)), 1,
+                         "one promoted means one emitted, whatever the headers say")
+
+    def test_a_byte_order_mark_does_not_drop_the_first_record(self):
+        # PM-07: the BOM survived decoding, so the first header failed `startswith(">")` and
+        # its lines were dropped while `header is None`: the record vanished and was not
+        # even counted in n_in.
+        records = [(f"r{i}", self.mutate(self.base, 2)) for i in range(5)]
+        body = "".join(f">{h}\n{s}\n" for h, s in records)
+        rc, out, log, _e = self.run_sieve(None, src_bytes=b"\xef\xbb\xbf" + body.encode())
+        self.assertEqual(rc, 0, log)
+        self.assertIn("dedup: 5 -> 5", log)
+        self.assertIn("r0", self.headers_of(out))
+
+    def test_trailing_whitespace_does_not_count_as_bad_bases(self):
+        # PM-07: the binary strips only \n and \r and counts every other byte as an N,
+        # while the wrapper's own predictor stripped all whitespace, so records at 4% N were
+        # dropped by the completeness gate with no "completeness gate drops" line and the
+        # loss read as thinning.
+        records = [(f"r{i}", self.mutate(self.base, 2)) for i in range(5)]
+        wrapped = "".join(
+            ">" + h + "\n" + "".join(f"{s[i:i+60]}   \n" for i in range(0, len(s), 60))
+            for h, s in records)
+        rc, out, log, _e = self.run_sieve(None, src_bytes=wrapped.encode(),
+                                          max_gap_frac=0.05)
+        clean_rc, clean_out, _l, _e = self.run_sieve(records, out_name="clean.fasta",
+                                                     max_gap_frac=0.05)
+        self.assertEqual((rc, clean_rc), (0, 0), log)
+        self.assertEqual(len(self.headers_of(out)), len(self.headers_of(clean_out)))
+
+    def test_text_before_the_first_header_is_refused(self):
+        rc, _out, _log, err = self.run_sieve(
+            None, src_bytes=b"; a comment\n>r0\n" + self.base.encode() + b"\n")
+        self.assertEqual(rc, 1)
+        self.assertIn("text before the first", err)
+
+    def test_sibling_files_and_glob_characters_in_the_name_are_safe(self):
+        # PM-05: the shard glob was `{stem}.rank*.fasta`, unescaped, in the user's own
+        # directory. It deleted look-alikes before the input was read, merged any match into
+        # the output, and missed the real shard when the stem held a bracket.
+        for name in ("out.ranked_by_abundance.fasta", "out.rank1_manual.fasta",
+                     "out.notes.fasta"):
+            (self.work / name).write_text(">keep\nACGT\n")
+        records = [(f"r{i}", self.mutate(self.base, 2)) for i in range(5)]
+        rc, out, log, _e = self.run_sieve(records)
+        self.assertEqual(rc, 0, log)
+        for name in ("out.ranked_by_abundance.fasta", "out.rank1_manual.fasta",
+                     "out.notes.fasta"):
+            self.assertTrue((self.work / name).is_file(), f"{name} was deleted")
+            self.assertEqual((self.work / name).read_text(), ">keep\nACGT\n")
+        self.assertNotIn("keep", out.read_text(), "a look-alike was merged into the output")
+
+        rc, out2, log, _e = self.run_sieve(records, out_name="cohort[v2].fasta")
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(len(self.headers_of(out2)), 5,
+                         "a glob character in the name must not hide the shards")
+        # Only the two files the test planted; the run leaves no shard of its own beside
+        # the output, and no `.sieve_*` staging directory either.
+        self.assertEqual(sorted(f.name for f in self.work.glob("*.rank*.fasta")),
+                         ["out.rank1_manual.fasta", "out.ranked_by_abundance.fasta"])
+        self.assertEqual([f.name for f in self.work.glob(".sieve_*")], [])
+
+    def test_a_run_that_promotes_nothing_leaves_the_previous_output_alone(self):
+        # PM-14: the output was opened for writing before anything was counted, so a run
+        # that promoted nothing truncated the earlier result, and the hint led with
+        # --threshold, which cannot be the cause: an empty promoted set accepts everything.
+        out = self.work / "out.fasta"
+        out.write_text(">sentinel\nACGT\n")
+        records = [(f"r{i}", self.mutate(self.base, 2)) for i in range(5)]
+        rc, out, log, err = self.run_sieve(records, min_len=5000)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.read_text(), ">sentinel\nACGT\n", "the earlier result was lost")
+        self.assertNotIn("--threshold", err)
+        self.assertIn("--min-len", err)
+        self.assertEqual([f.name for f in self.work.glob(".sieve_*")], [])
+
+    def test_empty_records_are_not_counted_as_duplicates(self):
+        # PM-15
+        records = [("a", self.mutate(self.base, 2)), ("empty1", ""),
+                   ("b", self.mutate(self.base, 2)), ("empty2", "")]
+        rc, _out, log, _e = self.run_sieve(records)
+        self.assertEqual(rc, 0, log)
+        self.assertIn("dedup: 4 -> 2 records (0 exact duplicates removed, first copy kept, "
+                      "2 empty records dropped)", log)
+
+    def test_a_binary_killed_by_a_signal_is_named(self):
+        # PM-19: a signal death is a negative returncode; it was printed as "exited -4" and
+        # returned to sys.exit, so the shell saw 252. The sieve Makefile builds with
+        # -march=native, so a binary moved to another CPU dies exactly this way.
+        killer = self.work / "killer.sh"
+        killer.write_text("#!/bin/sh\nkill -ILL $$\n")
+        killer.chmod(0o755)
+        records = [(f"r{i}", self.mutate(self.base, 2)) for i in range(3)]
+        src = self.work / "in.fasta"
+        _write(src, records)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = self.sieve.sieve_run(src, self.work / "o.fasta", min_len=1000,
+                                      sieve_bin=str(killer))
+        self.assertEqual(rc, 128 + 4)
+        self.assertIn("SIGILL", err.getvalue())
+        self.assertIn("-march=native", err.getvalue())
+
+    def test_an_unwritable_output_directory_is_not_blamed_on_the_input(self):
+        # PM-20: `byte_exact_dedup` both reads the input and writes the scratch copy.
+        ro = self.work / "ro"
+        ro.mkdir()
+        src = self.work / "in.fasta"
+        _write(src, [("r0", self.base)])
+        ro.chmod(0o500)
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = self.sieve.sieve_run(src, ro / "out.fasta", min_len=1000,
+                                          sieve_bin=str(SIEVE_BIN))
+            if os.geteuid() == 0:
+                self.skipTest("root writes anywhere")
+            self.assertEqual(rc, 1)
+            self.assertIn("cannot write beside the output", err.getvalue())
+        finally:
+            ro.chmod(0o700)
+
+    def test_an_input_that_would_hang_the_binary_is_refused(self):
+        # PM-02: the promoted set's LSH index is a fixed 2^20-slot open-addressing table
+        # that is never grown, and lookup stops only at an empty slot, so past about 65,536
+        # admitted records the binary can loop forever at 100% CPU. That is upstream's code
+        # and is not patched here; the wrapper refuses rather than hanging a Galaxy job
+        # until its walltime. The guard is checked without building such a cohort.
+        self.assertEqual(self.sieve.LSH_TABLE_LIMIT, 65536)
+        rep = self.sieve.DedupReport(n_in=70000, n_out=70000, n_empty=0, headers=[],
+                                     short=0, gappy=0)
+        self.assertGreater(rep.n_out - rep.short - rep.gappy, self.sieve.LSH_TABLE_LIMIT)
+
+    def test_the_admission_gate_is_disarmed_in_the_command_line(self):
+        # The flag the binary is actually given, since everything above depends on it.
+        self.assertEqual(self.sieve.ADMISSION_OFF_WARMUP, 2 ** 31 - 1)
+        records = [(f"r{i}", self.mutate(self.base, 2)) for i in range(3)]
+        _rc, _out, log, _e = self.run_sieve(records)
+        self.assertIn(f"--warmup {2 ** 31 - 1}", log)
 
 
 if __name__ == "__main__":

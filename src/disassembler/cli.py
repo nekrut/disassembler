@@ -56,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # PM-21: progress lines carry a U+2713 check mark. With PYTHONIOENCODING=ascii or a
+    # legacy single-byte locale that print raised UnicodeEncodeError, in `msa` after MAFFT
+    # had run and before the alignment was published, so the `finally` deleted it and the
+    # run exited 1 having thrown away the work.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+
     if argv is None:
         argv = sys.argv[1:]
     argv = list(argv)

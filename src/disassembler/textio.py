@@ -64,7 +64,11 @@ def text_stream(raw, name: str = None) -> io.TextIOWrapper:
     if head.startswith(GZIP_MAGIC):
         label = name or getattr(raw, "name", None) or "the input"
         buf = io.BufferedReader(_Gunzip(gzip.GzipFile(fileobj=buf), label))
-    return io.TextIOWrapper(buf, encoding="utf-8")
+    # PM-07: `utf-8-sig` strips a leading byte-order mark and is identical to `utf-8` when
+    # there is none. With plain `utf-8` the BOM survived as U+FEFF at the head of the first
+    # line, so `line.startswith(">")` was false for record 1 and the record was dropped
+    # without being counted, in `sieve` and in every other reader that comes through here.
+    return io.TextIOWrapper(buf, encoding="utf-8-sig")
 
 
 def open_text(path) -> io.TextIOWrapper:

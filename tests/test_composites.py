@@ -95,8 +95,30 @@ class TestStageArgs(unittest.TestCase):
     def test_a_missing_required_option_is_refused(self):
         from disassembler.cmd import msa
         from disassembler.stage import stage_args
-        with self.assertRaisesRegex(TypeError, "missing required input, out_aln, out_tree"):
+        # `--out-tree` is no longer argparse-required: an alignment can be produced without
+        # FastTree, under `--no-tree` (PM-18). Exactly one of the two is still required, and
+        # msa itself enforces that, so it is checked below rather than here.
+        with self.assertRaisesRegex(TypeError, "missing required input, out_aln"):
             stage_args(msa, ref="r.fa")
+
+    def test_msa_requires_a_tree_path_or_no_tree(self):
+        # In a temp directory: `msa` writes a summary on every exit path, so a relative
+        # --out-aln would drop one into whatever the working directory happens to be.
+        import contextlib, io, tempfile
+        from pathlib import Path as _P
+        from disassembler.cmd import msa
+        from disassembler.stage import stage_args
+        with tempfile.TemporaryDirectory() as d:
+            aln = str(_P(d) / "a.fa")
+            for kw, want in (({}, "--no-tree"),
+                             ({"out_tree": str(_P(d) / "t.nwk"), "no_tree": True},
+                              "mutually exclusive")):
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), \
+                     contextlib.redirect_stderr(err):
+                    rc = msa.run(stage_args(msa, ref="r.fa", input="i.fa", out_aln=aln, **kw))
+                self.assertEqual(rc, 2, err.getvalue())
+                self.assertIn(want, err.getvalue())
 
     def test_a_required_either_or_group_is_enforced(self):
         from disassembler.cmd import pipe_reconstruct

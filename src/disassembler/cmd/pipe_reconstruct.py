@@ -182,8 +182,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                             "--min-cov (default 0.85), which gates which reconstructions "
                             "are produced at all.")
     g_msa.add_argument("--skip-tree", action="store_true",
-                       help="Stop after the walker (and sieve, if enabled). Do not build "
-                            "the MSA or tree. --sieve is also ignored under this flag.")
+                       help="Stop after the walker. The sieve, the MSA and the tree are "
+                            "all skipped.")
 
     # ---- Pass-through -----------------------------------------------------
     g_pass = p.add_argument_group(

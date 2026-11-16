@@ -138,3 +138,37 @@ dropped most of its input. `discards.records` now carries `exact_duplicates`,
 `shorter_than_min_len`, `too_gappy` and `not_promoted`, `cohort` carries the admission rate,
 and `records[]` names each promoted haplotype by id and sequence hash. It is written on every
 exit path, including the failures.
+
+
+## Limits and behaviour worth knowing (0.2.0)
+
+**Admission is off.** The binary has a second gate besides novelty: after a warm-up it rejects
+a record whose count of never-seen k-mers is a statistical outlier, and a rejected record is
+never sketched, promoted or added to the k-mer table, so the rest of its clade goes with it.
+The wrapper used to arm that gate at 2,000 records. It no longer does. The cut-off it imposed
+was not a property of the biology but of the file: the band is `mean + 5*sd` over the running
+singleton counts, and the first record alone contributes about fifty times what a later one
+does, so there was no divergence a user could stay under. Measured on one 2,100-record cohort,
+a lineage 3% divergent placed after record 2,000 was dropped and the same lineage placed first
+was kept. Deduplication is now a speed-up and a memory saving, not a correctness fix.
+
+**Headers are not shown to the binary.** It buckets novelty by a month parsed from `|YYYY-MM`
+in the header, so twelve copies of one sequence dated in twelve different months all survived,
+and it selects what to emit by the header's first 255 characters, so two records sharing a
+header were both emitted when only one was promoted and a long header lost its tail. The
+wrapper gives it `>r0`, `>r1`, ... and puts the original headers back afterwards.
+
+**Two upstream limits the wrapper guards rather than fixes.** These are in
+`kmer-diversity-sieve` itself (github.com/stevenweaver/kmer-diversity-sieve), not in this repo:
+
+- the promoted set's LSH index is a fixed 2^20-slot table that is never grown, and lookup
+  stops only at an empty slot, so past about 65,536 admitted records the binary can loop
+  forever at 100% CPU. An input that would admit more than that is refused, with the count,
+  rather than being handed over. Chunking and re-sieving is not a way round it, since the
+  union can exceed the limit again.
+- only the first ~65,550 k-mers of a record are sketched, so two records identical over their
+  first 65.5 kb are judged near-duplicates whatever follows. A longer record earns a warning.
+
+**`-march=native`.** The Makefile builds for the machine that built it, so a binary copied to
+another CPU dies with SIGILL. That is now reported by name, with the rebuild command, rather
+than as "exited -4".
