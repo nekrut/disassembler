@@ -136,9 +136,11 @@ INTRA-HOST VARIANTS:
 
         --allow-empty             Exit 0 when no accession reconstructed because nothing was
                                   found: no Logan data, over --max-size-mb, no anchors or no
-                                  path. Errors still fail the run. Without it, a run that
-                                  reconstructs nothing exits non-zero, so a wrapper cannot
-                                  mistake an empty shard for a good one
+                                  path. Errors are never forgiven: one erroring accession
+                                  fails the run (exit 4) even when others reconstructed, and
+                                  they are listed in <query stem>.skipped.tsv. Without this
+                                  flag, a run that reconstructs nothing exits non-zero too, so
+                                  a wrapper cannot mistake an empty shard for a good one
 
 SCRATCH:
         --scratch-dir <DIR>       Where the run's private scratch directory is made; it is
@@ -521,16 +523,27 @@ fn check_run(results: &[types::AccessionResult], allow_empty: bool) -> error::Re
     let total = results.len();
     let success = results.iter().filter(|r| r.outcome == types::Outcome::Success).count();
     let errors = results.iter().filter(|r| r.outcome == types::Outcome::Failed).count();
-    if total == 0 || success > 0 {
+    if total == 0 {
         return Ok(());
     }
     if errors == total {
         return Err(error::Error::AllErrored { total });
     }
-    if errors > 0 || !allow_empty {
-        return Err(error::Error::NothingReconstructed { total, errors });
+    // Any error is a failure of the run, even beside successes. This used to return `Ok` the
+    // moment one accession succeeded, so a 5,000-accession run in which 8 panicked exited 0
+    // and the scheduler that launched it saw a green job. The successes are still written;
+    // what changes is that the exit code stops claiming they were the whole story.
+    if errors > 0 {
+        return Err(if success > 0 {
+            error::Error::SomeErrored { total, success, errors }
+        } else {
+            error::Error::NothingReconstructed { total, errors }
+        });
     }
-    Ok(())
+    if success > 0 || allow_empty {
+        return Ok(());
+    }
+    Err(error::Error::NothingReconstructed { total, errors })
 }
 
 /// `--fetch-only` succeeds when every accession is in the cache. `allow_empty` accepts the
@@ -836,6 +849,8 @@ fn real_main(mut args: Args) -> error::Result<()> {
         );
 
         let summary_path = args.out_dir.join("fetch.summary.json");
+        // Decided here so the summary can state the code rather than guess it from counts.
+        let verdict = check_fetch(ok, negatives, errors, args.allow_empty);
         let run = io::output::RunInfo {
             // GraphAligner never runs here, so `tool.external` stays empty rather than
             // naming a tool that did no work.
@@ -845,6 +860,7 @@ fn real_main(mut args: Args) -> error::Result<()> {
             started,
             wall_seconds: run_clock.elapsed().as_secs_f64(),
             n_requested,
+            exit_code: verdict.as_ref().err().map_or(0, |e| e.exit_code()),
         };
         let written = std::fs::create_dir_all(&args.out_dir)
             .map_err(error::file_err("create", &args.out_dir))
@@ -856,11 +872,11 @@ fn real_main(mut args: Args) -> error::Result<()> {
             // A failed write must not mask a failed fetch, and must not be swallowed when
             // the fetch was fine.
             eprintln!("[logan-walker] write failed: {e}");
-            check_fetch(ok, negatives, errors, args.allow_empty)?;
+            verdict?;
             return Err(e);
         }
         eprintln!("[logan-walker --fetch-only] wrote {}", summary_path.display());
-        return check_fetch(ok, negatives, errors, args.allow_empty);
+        return verdict;
     }
 
     // Unwrap the query set for the full pipeline. The guard above ensures it is Some here.
@@ -918,6 +934,9 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // had reconstructed. The run still exits non-zero, so the failure is not hidden.
     std::fs::create_dir_all(&args.out_dir).map_err(error::file_err("create", &args.out_dir))?;
     let mut first_err: Option<error::Error> = None;
+    // The run's verdict, reached before any output is written so the summary can state the
+    // exit code instead of inferring it from counts, and returned unchanged at the end.
+    let verdict = check_run(&summary.results, args.allow_empty);
     // Scoped so the closure's mutable borrow of `first_err` ends before it is read.
     {
     let mut keep = |r: error::Result<()>| {
@@ -959,9 +978,16 @@ fn real_main(mut args: Args) -> error::Result<()> {
         started,
         wall_seconds: run_clock.elapsed().as_secs_f64(),
         n_requested,
+        exit_code: verdict.as_ref().err().map_or(0, |e| e.exit_code()),
     };
     keep(io::output::write_summary(&summary, &run, &summary_path)
         .map_err(|e| e.at("write", &summary_path)));
+    // Beside the summary, and on the same terms: written whatever the run's outcome, so a
+    // workflow can read it without first deciding whether the run went well enough to have
+    // produced one.
+    let skipped_path = args.out_dir.join(format!("{}.skipped.tsv", queries[0].name));
+    keep(io::output::write_skipped(&summary, &skipped_path)
+        .map_err(|e| e.at("write", &skipped_path)));
     }
     if let Some(e) = first_err {
         return Err(e);
@@ -981,7 +1007,7 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // a good shard; until 0.1.1, --allow-empty still did that for a run where every
     // accession errored. Outputs are already written above, so they stay on disk for
     // inspection.
-    check_run(&summary.results, args.allow_empty)
+    verdict
 }
 
 #[cfg(test)]
@@ -1167,10 +1193,41 @@ reference base",
         assert!(decision_lines(&run_of(&[Outcome::NoAnchors]), 0.01).is_empty());
     }
 
+    /// One success no longer excuses an error beside it.
+    ///
+    /// This reverses the rule the walker shipped until 0.2.0, where `check_run` returned `Ok`
+    /// the moment any accession succeeded. Under that rule a 5,000-accession run in which 8
+    /// accessions panicked exited 0, and the only way to notice was to read `records[].status`
+    /// out of the summary by hand.
     #[test]
-    fn one_success_is_enough_whatever_else_happened() {
+    fn an_error_beside_a_success_is_still_a_failed_run() {
         let r = run_of(&[Outcome::Failed, Outcome::Success, Outcome::NoAnchors]);
-        assert!(check_run(&r, false).is_ok());
+        for allow_empty in [false, true] {
+            let e = check_run(&r, allow_empty).unwrap_err();
+            assert!(matches!(e, Error::SomeErrored { total: 3, success: 1, errors: 1 }), "{e}");
+            // Neither 1 nor 3: this run reconstructed something, and a wrapper that wants to
+            // keep the output it did get has to be able to tell it from a run that produced
+            // none and from one where nothing worked at all.
+            assert_eq!(e.exit_code(), 4);
+        }
+    }
+
+    /// Accessions where nothing was found still never fail a run that reconstructed something.
+    ///
+    /// The strict rule is about errors only. Widening it to the negatives would fail almost
+    /// every real cohort, since most accessions simply do not carry the gene.
+    #[test]
+    fn negatives_beside_a_success_are_a_clean_run() {
+        let r = run_of(&[
+            Outcome::Success,
+            Outcome::NoAnchors,
+            Outcome::NoLoganData,
+            Outcome::TooLarge,
+            Outcome::SubgraphTooLarge,
+        ]);
+        for allow_empty in [false, true] {
+            assert!(check_run(&r, allow_empty).is_ok());
+        }
     }
 
     #[test]

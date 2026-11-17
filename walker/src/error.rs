@@ -49,6 +49,15 @@ pub enum Error {
     /// Every accession failed with an error: the run itself did not work. Exit code 3, so a
     /// wrapper can tell this from "nothing found", and `--allow-empty` never hides it.
     AllErrored { total: usize },
+    /// Some accessions errored while others reconstructed. **Any error makes the run
+    /// non-zero**, so this is not success, but the run did produce usable output and must not
+    /// be confused with a run that produced none.
+    ///
+    /// Its own exit code (4) for that reason: 1 means nothing was reconstructed and 3 means
+    /// nothing worked at all, while here `<query>.skipped.tsv` and the FASTA are both real and
+    /// a wrapper may want to keep them. Until 0.2.0 this case exited 0, so a 5,000-accession
+    /// run in which 8 accessions panicked reported success to the scheduler that launched it.
+    SomeErrored { total: usize, success: usize, errors: usize },
     /// `--fetch-only` left accessions out of the cache.
     FetchIncomplete { total: usize, errors: usize, negatives: usize },
 }
@@ -66,6 +75,7 @@ impl Error {
     pub fn exit_code(&self) -> u8 {
         match self {
             Error::AllErrored { .. } => 3,
+            Error::SomeErrored { .. } => 4,
             _ => 1,
         }
     }
@@ -108,6 +118,13 @@ impl fmt::Display for Error {
                 f,
                 "all {total} accessions failed with an error (see the log above); the run \
                  did not work. --allow-empty does not apply to errors"
+            ),
+            Error::SomeErrored { total, success, errors } => write!(
+                f,
+                "{success}/{total} accessions reconstructed, but {errors} of them failed with \
+                 an error (see the log above and the skipped table). The output that was \
+                 produced is still written; an accession that errored is a failure of the run, \
+                 not a thing that was not found, so this is not exit 0"
             ),
             Error::FetchIncomplete { total, errors, negatives } => {
                 write!(f, "{} of {total} accessions were not cached", errors + negatives)?;

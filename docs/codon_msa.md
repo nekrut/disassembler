@@ -131,6 +131,26 @@ Each run removes `reconstructed.sieved.fasta` from an earlier run, since it no l
 reconstruction the walker has just rewritten; with `--sieve`, this run's is written again.
 `from-kmindex` ends in `reconstruct`, so the same applies there.
 
+### When some accessions error
+
+The walker exits 4 when some accessions errored and others reconstructed (see
+[`walker.md`](walker.md#exit-status)). `reconstruct` does not stop there. The haplotypes that
+were produced are real, so the sieve, MSA and tree all run on them, and `reconstruct` then
+exits 4 itself. Discarding a whole cohort's alignment and tree because one accession in
+thousands hit a network error would contradict the walker's own rule that one bad accession
+does not stop the run, and the run still reports failure, which is the part a scheduler reads.
+
+The accessions that failed are named in the walker's `<query stem>.skipped.tsv`, and
+`reconstruct` prints its path when it continues. Any other non-zero walker exit does stop the
+run at stage 1, because 1 means nothing was reconstructed and 3 means nothing worked at all,
+so in both cases there is nothing to carry forward.
+
+When a stage does stop the run, `reconstruct` exits with **that stage's own code**, not a
+flat 1: the walker's 3 and 1 say different things, `msa` returns 2 for a usage error as
+argparse does, and a missing binary is 127. The one exception is a code that is not positive,
+which means the stage did not normalise a signal death; that becomes 1, because the shell
+would otherwise mask it to an unrelated byte.
+
 `--msa-min-cov` gates only the MSA stage. The walker has its own `--min-cov` (default `0.85`)
 that decides which reconstructions exist at all, and `reconstruct` never sets it: lowering
 `--msa-min-cov` cannot admit haplotypes the walker already discarded. To move the walker's gate,

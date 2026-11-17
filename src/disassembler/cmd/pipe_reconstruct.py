@@ -203,6 +203,27 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=run)
 
 
+# logan-walker's exit code for "some accessions reconstructed and some errored". Anything
+# else non-zero from the walker means there is nothing worth carrying forward: 1 is nothing
+# reconstructed, 3 is nothing worked at all, 127 is no binary.
+EX_SOME_ERRORED = 4
+
+
+def _stage_code(rc: int) -> int:
+    """A failed stage's own exit code, carried out of the composite rather than flattened.
+
+    Each stage has a vocabulary worth keeping: the walker's 3 is "no accession worked at all",
+    distinct from its 1, "nothing was reconstructed"; `msa` returns 2 for a usage error, the
+    same meaning argparse gives it; `resolve` returns 127 for a missing binary. Reporting all
+    of them as 1 told a caller only that something went wrong.
+
+    A code that is not positive is a stage that did not normalise a signal death (`sieve` does,
+    via `report_rc`). Returning it as is would let the shell mask it to an unrelated byte, so
+    it becomes 1, which is at least true.
+    """
+    return rc if rc > 0 else 1
+
+
 def _die(msg: str, code: int = 1) -> int:
     # `code` so a missing binary can exit 127 here as it does in the stage (PL-27). The
     # message already names the command, so it is not prefixed twice.
@@ -429,8 +450,22 @@ def _run(args, stages) -> int:
         stages, "walker", t0,
         walker_cmd.run_walker(walker_argv, walker_bin=args.walker_bin),
         out / f"{queries[0].stem}.summary.json")
-    if rc != 0:
-        return _die(f"logan-walker (stage 1) failed (exit {rc}); see its output above.")
+    if rc not in (0, EX_SOME_ERRORED):
+        return _die(f"logan-walker (stage 1) failed (exit {rc}); see its output above.",
+                    _stage_code(rc))
+    # Exit 4 means some accessions errored while others reconstructed. Those haplotypes are
+    # real, and discarding a whole cohort's alignment and tree because one accession in
+    # thousands hit a network error would contradict the walker's own rule that one bad
+    # accession does not stop the run. So the remaining stages run on what was produced, and
+    # the walker's code is carried to this composite's own exit instead of being swallowed.
+    exit_rc = 0
+    if rc == EX_SOME_ERRORED:
+        exit_rc = EX_SOME_ERRORED
+        skipped = out / f"{queries[0].stem}.skipped.tsv"
+        print(f"[reconstruct] warn: logan-walker exited {rc}: some accessions errored, others "
+              f"reconstructed. Continuing with the haplotypes it did produce; this run will "
+              f"still exit {rc}. The accessions that failed are listed in {skipped}.",
+              file=sys.stderr)
 
     n_recon = sum(1 for line in recon.open() if line.startswith(">")) if recon.is_file() else 0
     print(f"[reconstruct] reconstructed {n_recon} haplotype(s) -> {recon}", flush=True)
@@ -470,7 +505,7 @@ def _run(args, stages) -> int:
             ),
             sieved.with_suffix(".summary.json"))
         if rc != 0:
-            return _die(f"sieve failed (exit {rc}); see its output above.")
+            return _die(f"sieve failed (exit {rc}); see its output above.", _stage_code(rc))
         msa_input = sieved
 
     if args.skip_tree:
@@ -479,7 +514,7 @@ def _run(args, stages) -> int:
         for stale in (aln, tree):
             stale.unlink(missing_ok=True)
         print("[reconstruct] --skip-tree: done after reconstruction.")
-        return 0
+        return exit_rc
 
     # ---- stage 2: codon MSA + FastTree ------------------------------------
     print(f"[reconstruct] 2/2 codon MSA + tree: --input {msa_input} --out-aln {aln} "
@@ -497,10 +532,11 @@ def _run(args, stages) -> int:
     rc = summary_io.stage_entry(stages, "msa", t0, msa_cmd.run(msa_args),
                                 aln.with_suffix(".summary.json"))
     if rc != 0:
-        return _die(f"codon MSA / tree (stage 2) failed (exit {rc}); see its output above.")
+        return _die(f"codon MSA / tree (stage 2) failed (exit {rc}); see its output above.",
+                    _stage_code(rc))
 
     print(f"[reconstruct] done:\n"
           f"  haplotypes : {recon}\n"
           f"  codon MSA  : {aln}\n"
           f"  phylogeny  : {tree}")
-    return 0
+    return exit_rc

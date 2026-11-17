@@ -147,6 +147,63 @@ class TestReconstructSieveSeam(unittest.TestCase):
         n = sum(1 for l in sieved.open() if l.startswith(">"))
         self.assertTrue(1 <= n < 33, f"sieve thinned 33 -> {n} (1 <= n < 33)")
 
+    def test_a_partly_errored_walker_still_builds_the_tree_and_still_fails(self):
+        """Walker exit 4: some accessions errored, others reconstructed.
+
+        The haplotypes it produced are real, so the remaining stages run on them, and the
+        composite then carries the walker's code to its own exit instead of reporting
+        success. Dying at stage 1 instead would discard a whole cohort's alignment and tree
+        because one accession in thousands hit a network error, which contradicts the
+        walker's own rule that one bad accession does not stop the run.
+        """
+        partial = self.work / "partial_walker.sh"
+        partial.write_text(self.fake_walker.read_text() + "exit 4\n")
+        partial.chmod(0o755)
+
+        out = self.work / "out-partial"
+        ns = self._make_ns(out, walker_bin=str(partial))
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            rc = self.pipe_reconstruct.run(ns)
+        stdout, stderr = buf.getvalue(), err.getvalue()
+
+        self.assertEqual(rc, 4, f"the walker's code must reach the composite's exit\n{stdout}")
+        self.assertIsNotNone(self.stage2_input, f"the MSA stage must still run\n{stdout}")
+        self.assertTrue((out / "reconstructed.fasta").is_file(), stdout)
+        self.assertIn("skipped.tsv", stderr)
+
+    def test_a_walker_that_failed_outright_stops_the_run_and_keeps_its_code(self):
+        """Only exit 4 is carried past stage 1; the rest stop, with their own code.
+
+        The walker's 3 ("no accession worked at all") and 1 ("nothing was reconstructed")
+        say different things, and 127 says the binary was not found. `_die` used to report
+        every one of them as 1, so a caller learned only that something went wrong.
+        """
+        for code in (1, 3, 127):
+            with self.subTest(code=code):
+                dead = self.work / f"dead_walker_{code}.sh"
+                dead.write_text(self.fake_walker.read_text() + f"exit {code}\n")
+                dead.chmod(0o755)
+                self.stage2_input = None
+                out = self.work / f"out-dead-{code}"
+                ns = self._make_ns(out, walker_bin=str(dead))
+                buf, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                    rc = self.pipe_reconstruct.run(ns)
+                self.assertEqual(rc, code, buf.getvalue())
+                self.assertIsNone(self.stage2_input, "stage 2 must not run")
+                self.assertIn("failed (exit", err.getvalue())
+
+    def test_a_stage_that_died_on_a_signal_is_reported_as_one_not_as_a_masked_byte(self):
+        """A non-positive code means the stage did not normalise a signal death.
+
+        Passing it on would let the shell mask it to an unrelated byte (PM-19's `-4` read as
+        252), so it becomes 1, which is at least true.
+        """
+        self.assertEqual(self.pipe_reconstruct._stage_code(-4), 1)
+        self.assertEqual(self.pipe_reconstruct._stage_code(0), 1)
+        self.assertEqual(self.pipe_reconstruct._stage_code(3), 3)
+
     def test_sieve_sketch_reaches_the_binary_cli(self):
         out = self.work / "out_sketch"
         ns = self._make_ns(out, sieve_sketch=128)

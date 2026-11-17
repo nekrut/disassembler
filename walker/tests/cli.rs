@@ -378,6 +378,46 @@ fn every_accession_erroring_exits_3_even_with_allow_empty() {
     }
 }
 
+/// Any accession that errors makes the run non-zero, even beside a reconstruction.
+///
+/// Until 0.2.0 one success was enough for exit 0, so a cohort in which some accessions
+/// crashed reported a green job to whatever launched it. A 5,000-accession run on 2026-11-17
+/// did exactly that: 8 accessions panicked, 156 reconstructed, exit 0. The output the run did
+/// produce is still written, which is why this is its own code rather than 1 ("nothing
+/// reconstructed") or 3 ("nothing worked").
+#[test]
+fn an_accession_that_errors_fails_the_run_that_reconstructed_the_others() {
+    let f = Fixture::bubble("mixed-exit");
+    // SRRFAKE0 is in the cache and reconstructs. SRRGONE is not, and under --offline a cache
+    // miss is an error, not one of the negatives --allow-empty forgives.
+    std::fs::write(f.dir.join("accs.txt"), "SRRFAKE0\nSRRGONE\n").unwrap();
+
+    for extra in [&[][..], &["--allow-empty"][..]] {
+        let out = f.cmd_ga("ga_replay", "cache", extra).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(4), "{extra:?} stderr:\n{stderr}");
+        assert!(stderr.contains("1/2 accessions reconstructed"), "{stderr}");
+    }
+
+    // Non-zero, but not empty-handed: the reconstruction is still on disk and the drop is a
+    // row a workflow can branch on rather than a line in a log.
+    let outdir = f.dir.join("out");
+    let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
+    assert!(recon.contains(">SRRFAKE0_primary"), "the success must still be written:\n{recon}");
+    let skipped = std::fs::read_to_string(outdir.join("q.skipped.tsv")).unwrap();
+    let rows: Vec<&str> = skipped.lines().collect();
+    assert_eq!(rows[0], "accession\toutcome\tbytes\tdetail");
+    assert!(rows[1].starts_with("SRRGONE\terror\t"), "{skipped}");
+    assert!(!skipped.contains("SRRFAKE0"), "a reconstructed accession is not a drop:\n{skipped}");
+    assert_eq!(rows.len(), 2, "{skipped}");
+
+    // The summary must state the code the process exits with. It used to derive the field
+    // from `status`, which made it 0 here and 1 for a run that exits 3.
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
+    assert!(summary.contains("\"status\": \"partial\""), "{summary}");
+    assert!(summary.contains("\"exit_code\": 4"), "{summary}");
+}
+
 /// A gzipped query and accession list, not named `.gz`, give the same run as plain ones.
 #[test]
 fn gzipped_query_and_list_are_read() {

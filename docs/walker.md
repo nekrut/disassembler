@@ -109,6 +109,7 @@ must now span as much of the reference as the unpruned one (see `--prune-frac` b
 | `<out-dir>/alt_haplotypes.fasta` | unless `--no-emit-alts` | intra-host alternatives, `>ACC_altN …` with their VAF and fork, at most 32 per accession |
 | `<out-dir>/bubbles.json` | always | bubbles in the local subgraph |
 | `<out-dir>/<query stem>.summary.json` | always | the run's provenance, settings, totals, discards and cohort statistics, then one record per accession (below) |
+| `<out-dir>/<query stem>.skipped.tsv` | always | one row per accession that produced no haplotype: `accession`, `outcome`, `bytes`, `detail`. Written even when empty, so it can be read without first testing whether it exists |
 | `<out-dir>/<ACC>.vcf` | `--emit-vcf` | intra-host SNVs of one accession, written only when it has at least one (a VCF an earlier run left for an accession with none is removed) |
 | `<out-dir>/snvs.tsv` | `--emit-snv-table` | one row per (accession, site, allele) across the run. Rows sharing a `block` come from one alternative haplotype, so they do co-occur |
 
@@ -273,7 +274,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `-o, --out-dir <DIR>` | `walker_output` | output directory |
 | `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | primary haplotypes |
 | `--scratch-dir <DIR>` | `/dev/shm`, else the system temp directory | where the run's private scratch directory is made (see [Scratch files](#scratch-files)) |
-| `--allow-empty` | off | exit 0 when no accession was reconstructed because nothing was found; errors still fail (see [Exit status](#exit-status)) |
+| `--allow-empty` | off | exit 0 when no accession was reconstructed because nothing was found; errors still fail the run, beside successes as well as alone (see [Exit status](#exit-status)) |
 
 ### Anchoring, fetching and walking
 
@@ -676,14 +677,32 @@ Each accession ends with one status, printed as it finishes and recorded in the 
 | `subgraph_too_large` | the gene's neighbourhood is over `--max-subgraph-nodes` | nothing found |
 | `error` | anything else: a network or cache failure, a corrupt file, GraphAligner crashing | error |
 
-One bad accession does not stop the run, and one success is enough for it to exit 0. When none
-succeeds:
+One bad accession does not stop the run: the others are still walked, and whatever was
+reconstructed is still written. **It does make the run fail, though.** An accession that
+errored is a failure of the run, not a thing that was not found, so from 0.2.0 any error at
+all puts the exit code above zero:
 
 | exit | when |
 |---|---|
-| `0` | every accession found nothing, and `--allow-empty` is set |
-| `1` | every accession found nothing, without `--allow-empty`; or some found nothing and the rest errored |
+| `0` | no accession errored, and either something was reconstructed or `--allow-empty` is set |
+| `1` | nothing was reconstructed: either nothing was found and `--allow-empty` is not set, or some found nothing and the rest errored |
 | `3` | every accession errored. The run did not work, so `--allow-empty` does not apply |
+| `4` | something was reconstructed and at least one accession errored |
+
+`2` is deliberately absent. The `disassembler` CLI in front of the walker is a Python
+argparse program, and argparse exits 2 when it rejects a command line, so a 2 always means
+"those arguments were not understood" and never names an outcome of the walk. No walker exit
+code is assigned to it.
+
+Exit 4 is the new one, and it is separate from 1 and 3 on purpose: the run produced real
+output, so a wrapper that wants to keep `reconstructed.fasta` and carry on can tell this case
+from a run that produced nothing. The accessions that failed are listed in
+`<query stem>.skipped.tsv` with their `error` outcome and detail.
+
+Until 0.2.0 this case exited 0, because one success was enough for the whole run to pass. A
+5,000-accession run on 2026-11-17 in which 8 accessions crashed reported success to the
+scheduler that launched it, and the only way to see the failures was to read
+`records[].status` out of the summary by hand.
 
 Usage and I/O errors also exit 1. Until 0.1.1, `--allow-empty` turned every one of these into 0,
 including a run in which GraphAligner failed on every accession, and `no_logan_data` and

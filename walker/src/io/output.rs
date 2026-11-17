@@ -436,6 +436,13 @@ pub struct RunInfo<'a> {
     /// Accessions asked for, before any were skipped. `n_requested - n_records` is itself a
     /// discard and is reported as one.
     pub n_requested: usize,
+    /// The exit code this run will end with, as `check_run`/`check_fetch` decided it.
+    ///
+    /// Passed in rather than inferred from the outcome counts, because the policy that maps
+    /// outcomes to a code lives with the CLI and depends on `--allow-empty`, which this
+    /// struct does not carry. A summary that guesses it is a summary that can disagree with
+    /// the process that wrote it.
+    pub exit_code: u8,
 }
 
 fn write_tool(w: &mut impl Write, run: &RunInfo) -> Result<()> {
@@ -553,7 +560,11 @@ fn write_run_block(w: &mut impl Write, s: &Summary, run: &RunInfo) -> Result<()>
     let sum = |f: fn(&Timing) -> f64| s.results.iter().map(|r| f(&r.timing)).sum::<f64>();
     writeln!(w, "  \"run\": {{")?;
     writeln!(w, "    \"status\": \"{status}\",")?;
-    writeln!(w, "    \"exit_code\": {},", i32::from(status == "failed"))?;
+    // The code the process will actually end with, decided by the caller before this is
+    // written. Deriving it from `status` here instead, as this did until 0.2.0, got two cases
+    // wrong: a run where every accession errored says `failed` and exits 3, and a run that
+    // reconstructed some while others errored says `partial` and exits 4.
+    writeln!(w, "    \"exit_code\": {},", run.exit_code)?;
     writeln!(w, "    \"started\": \"{}\",", iso8601(run.started))?;
     writeln!(w, "    \"wall_seconds\": {:.3},", run.wall_seconds)?;
     writeln!(
@@ -904,6 +915,37 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
         t.stream, t.parse, t.anchor, t.extract, t.align, t.stitch, t.phase, t.total
     )?;
     writeln!(w, "    }}{}", if last { "" } else { "," })?;
+    Ok(())
+}
+
+/// Every accession that produced no haplotype, as a tab-separated table.
+///
+/// `summary.json` has carried all of this since the summary contract landed, but a workflow
+/// branches on tabular data, not on a field inside a JSON blob, so the drops were visible
+/// without being usable. The columns are the ones a retry branch needs: `bytes` is what
+/// decides whether re-running with a raised `--max-size-mb` would help, and it is known for a
+/// `too_large` accession precisely because the refusal is made on the `Content-Length`
+/// without reading the body.
+///
+/// Written on every run, including a run with nothing to report, so a consumer can read it
+/// unconditionally: an absent file would be indistinguishable from a tool that is too old to
+/// write one. Successes are left out; they are the FASTA.
+pub fn write_skipped(summary: &Summary, path: &Path) -> Result<()> {
+    let mut w = create(path)?;
+    writeln!(w, "accession\toutcome\tbytes\tdetail")?;
+    for r in summary.results.iter().filter(|r| r.outcome != Outcome::Success) {
+        // Tabs and newlines would make a detail string span columns or rows. They have not
+        // been seen in one, but a detail carries a message from S3, from zstd or from
+        // GraphAligner, so it is not the walker's to guarantee.
+        let detail = r
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .replace(['\t', '\n', '\r'], " ");
+        let bytes = r.payload.bytes.map(|b| b.to_string()).unwrap_or_default();
+        writeln!(w, "{}\t{}\t{}\t{}", r.accession, outcome_str(r.outcome), bytes, detail)?;
+    }
+    w.flush()?;
     Ok(())
 }
 
@@ -2135,7 +2177,7 @@ mod vcf_tests {
 
 #[cfg(test)]
 mod identity_label_tests {
-    use super::{write_alts, write_fasta};
+    use super::{write_alts, write_fasta, write_skipped};
     use crate::pipeline::Summary;
     use crate::types::{AccessionResult, AltHaplotype, Haplotype, Outcome, Strand, Timing};
 
@@ -2205,6 +2247,7 @@ mod identity_label_tests {
             started: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_200_000),
             wall_seconds: 1.5,
             n_requested: 1,
+            exit_code: 0,
         };
         super::write_summary(s, &run, p)
     }
@@ -2328,6 +2371,7 @@ mod identity_label_tests {
             started: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_200_000),
             wall_seconds: 0.5,
             n_requested: 1,
+            exit_code: 0,
         };
         let p = tmp("fetch_only.json");
         super::write_summary(&s, &run, &p).unwrap();
@@ -2365,6 +2409,53 @@ mod identity_label_tests {
             length_delta: 0,
             replaced_span: 1,
         }
+    }
+
+    /// The skipped table is the drops as a dataset: one row per accession that produced no
+    /// haplotype, with the size a retry branch needs and no successes.
+    ///
+    /// `too_large` is the row that carries a size without any bytes having been read, which
+    /// is the whole point of the column: it is what decides whether re-running with a raised
+    /// `--max-size-mb` would help.
+    #[test]
+    fn the_skipped_table_lists_every_drop_with_its_size_and_no_successes() {
+        use crate::types::{Payload, PayloadSource};
+        let mut s = summary(hap("ACC_primary", false), vec![]);
+        s.results[0].accession = "KEPT".into();
+        let mut big = AccessionResult::empty(1, "BIG".into(), Outcome::TooLarge, None);
+        big.payload = Payload { source: PayloadSource::S3, bytes: Some(5_430_011_894), ..Default::default() };
+        let mut bad = AccessionResult::empty(2, "BAD".into(), Outcome::Failed,
+            Some("internal error: a stage\tpanicked".into()));
+        bad.payload = Payload { source: PayloadSource::S3, bytes: Some(4096), ..Default::default() };
+        let none = AccessionResult::empty(3, "EMPTY".into(), Outcome::NoLoganData, None);
+        s.results.extend([big, bad, none]);
+        s.total = 4;
+
+        let p = tmp("skipped.tsv");
+        write_skipped(&s, &p).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        let rows: Vec<&str> = out.lines().collect();
+
+        assert_eq!(rows[0], "accession\toutcome\tbytes\tdetail");
+        assert!(!out.contains("KEPT"), "a reconstructed accession is the FASTA, not a drop:\n{out}");
+        assert_eq!(rows[1], "BIG\ttoo_large\t5430011894\t");
+        // The tab inside the detail would otherwise push "panicked" into a fifth column.
+        assert_eq!(rows[2], "BAD\terror\t4096\tinternal error: a stage panicked");
+        // Unknown size is an empty cell, not a 0 that reads as "this object was empty".
+        assert_eq!(rows[3], "EMPTY\tno_logan_data\t\t");
+        assert_eq!(rows.len(), 4);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Written even with nothing to report, so a consumer never has to tell an absent file
+    /// from a run that dropped nothing.
+    #[test]
+    fn the_skipped_table_exists_even_when_nothing_was_skipped() {
+        let s = summary(hap("ACC_primary", false), vec![]);
+        let p = tmp("skipped_empty.tsv");
+        write_skipped(&s, &p).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "accession\toutcome\tbytes\tdetail\n");
+        std::fs::remove_file(&p).ok();
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
