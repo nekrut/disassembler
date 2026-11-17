@@ -73,11 +73,16 @@ TUNING:
                                   cov_x_pident [default: matched, the fraction of the
                                   reference's bases matched]. Ignored in single-anchor mode
         --min-shared-kmers <N>    Anchor threshold, validated 1..=5 [default: 3]
-        --max-size-mb <N>         Maximum compressed SRA size in MB [default: 1024]
+        --max-size-mb <N>         Maximum compressed SRA size in MB [default: 4096, which
+                                  refuses 0.16% of Logan accessions; 1024 refused 2.26%]. Costs
+                                  disk, not memory: see the disk bound printed at startup
         --spool-dir <DIR>         Where adjacency spills once it outgrows 4 MiB. Defaults to
                                   --unitigs-cache, else the system temp directory. Not
                                   --scratch-dir, which is /dev/shm by default: spilling into a
-                                  tmpfs is not a saving
+                                  tmpfs is not a saving. An accession whose spool will not fit
+                                  the free space here is skipped as too_large, from its real
+                                  size rather than from --max-size-mb; the startup lines print
+                                  what the run can need
         --max-subgraph-nodes <N>  Refuse an accession whose anchor neighbourhood exceeds N
                                   unitigs, as subgraph_too_large [default: 1000000; 0 = off].
                                   Everything after extraction is proportional to the
@@ -661,6 +666,19 @@ fn real_main(mut args: Args) -> error::Result<()> {
         // Saying "0 parsed graphs at up to 1.7x = 0.0 GB" invites the reader to wonder what
         // would make it non-zero. Nothing would: --fetch-only never builds one.
         ", and no parsed graphs, because --fetch-only does not parse".to_string()
+    } else if args.cfg.graph_bound_is_set_by_the_gene() {
+        // The graph term stopped scaling with the file when adjacency began spooling, but
+        // this line went on quoting --max-size-mb x 1.7 and leaving the next line to correct
+        // it by a factor of fifty. It now states the bound that applies and that the parser
+        // enforces; the next line says what makes it true.
+        format!(
+            ", plus {graphs} parsed graph{} bounded by --max-subgraph-nodes {} at {:.2} GB \
+             each = {:.2} GB",
+            plural(graphs),
+            args.cfg.max_subgraph_nodes,
+            gb(args.cfg.max_graph_bytes_per_accession()),
+            gb(args.cfg.max_graph_resident_bytes_for(n)),
+        )
     } else {
         format!(
             ", plus {graphs} parsed graph{} at up to {:.1}x their compressed size = {:.1} GB",
@@ -669,27 +687,127 @@ fn real_main(mut args: Args) -> error::Result<()> {
             gb(args.cfg.max_graph_resident_bytes_for(n)),
         )
     };
+    // The compressed term used to be the whole story and is now, usually, nothing. A
+    // download is written to disk as it arrives, so an in-flight accession costs one copy
+    // buffer rather than its own size, and `--max-size-mb` stops appearing in the memory
+    // bound at all. Stated in the units it actually has: "0.00 GB" invites the reader to
+    // wonder what is being hidden, where "2.0 MiB" answers it.
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let buffer_clause = if args.cfg.downloads_stream_to_disk() {
+        format!(
+            "{buffers} in-flight accession{} ({shape}{capped}) x a {} KiB stream buffer = \
+             {:.1} MiB, because compressed objects go to disk as they arrive",
+            plural(buffers),
+            config::DOWNLOAD_BUFFER_BYTES / 1024,
+            mib(args.cfg.max_compressed_resident_bytes_for(n)),
+        )
+    } else {
+        format!(
+            "{buffers} compressed buffer{} ({shape}{capped}) x {} MB cap = {:.1} GB",
+            plural(buffers),
+            args.cfg.max_compressed_bytes / (1024 * 1024),
+            gb(args.cfg.max_compressed_resident_bytes_for(n)),
+        )
+    };
+    // Two decimals, because the number this prints is now routinely under 1 GB: at the
+    // defaults it is 1.18, and one decimal made the total read 0.1 next to a graph term of
+    // 0.15, which looks like an arithmetic error rather than a rounding one.
     eprintln!(
-        "[logan-walker] memory bound: {buffers} compressed buffer{} ({shape}{capped}) x {} MB \
-         cap = {:.1} GB{graph_clause}; {:.1} GB worst case. Excludes GraphAligner, the \
-         scratch GFA and the output buffers.",
-        plural(buffers),
-        args.cfg.max_compressed_bytes / (1024 * 1024),
-        gb(args.cfg.max_compressed_resident_bytes_for(n)),
+        "[logan-walker] memory bound: {buffer_clause}{graph_clause}; {:.2} GB worst case. \
+         Excludes GraphAligner, the scratch GFA and the output buffers.",
         gb(args.cfg.max_resident_bytes_for(n)),
     );
-    // The bound above assumes the graph is in RAM and scales with --max-size-mb. With
-    // adjacency spooled and the neighbourhood capped, neither is true, and the real ceiling is
-    // far lower and no longer mentions the file size at all. Printed as well as, not instead
-    // of, the above: the first is what the run cannot exceed, this is what it should use.
-    if let Some(per) = args.cfg.max_subgraph_resident_bytes() {
+    // This used to restate the graph term with the correct number, because the line above
+    // had the wrong one. The line above is now right, so this says what makes it right, and
+    // what happens when the thing that makes it right is unavailable.
+    if args.cfg.graph_bound_is_set_by_the_gene() && !args.cfg.fetch_only {
         eprintln!(
-            "[logan-walker] with adjacency spooled to {} and --max-subgraph-nodes {}, the \
-             graphs are bounded by {graphs} x {:.2} GB = {:.2} GB regardless of accession size",
+            "[logan-walker] that bound does not mention --max-size-mb, because nothing in the \
+             walk scales with accession size: adjacency spools to {} and the neighbourhood is \
+             capped. An accession whose adjacency cannot spill there is refused as too_large \
+             rather than parsed in RAM.",
             args.cfg.spool_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
-            args.cfg.max_subgraph_nodes,
-            gb(per),
-            gb(per.saturating_mul(graphs as u64)),
+        );
+    }
+
+    // Disk, which neither line above covers and which spooling made load-bearing: the memory
+    // win of stage 3 was paid for in bytes that now land on a filesystem nobody was asked to
+    // size. Two consumers, named separately rather than summed, because they do not share a
+    // shape. The spool is transient, dies with its accession and scales with `-w`; the cache
+    // is persistent, outlives the run and scales with the accession count. At a 28 GB cap the
+    // spool term is 15 GB at `-w 1` and 120 GB at `-w 8`, while the cache term for 50
+    // accessions is 1.4 TB at either. Summing them would suggest that lowering `-w` helps
+    // with the larger of the two, and it does not.
+    let spool_bytes = args.cfg.max_spool_bytes_for(n);
+    let cache_bytes = args.cfg.max_cache_bytes_for(n);
+    // The bytes streaming moved off the heap. With a cache they land in it and are counted
+    // there; without one they are unlinked files under --spool-dir, one per in-flight
+    // accession, which is exactly the term that used to be in the memory line above.
+    let download_bytes = args.cfg.max_download_bytes_for(n);
+    if spool_bytes > 0 || download_bytes > 0 || cache_bytes.is_some() {
+        let mut terms: Vec<String> = Vec::new();
+        // Distinct directories, in the order they are named. The spool defaults to the cache,
+        // so the common case has one filesystem and should report its free space once.
+        let mut dirs: Vec<&std::path::Path> = Vec::new();
+        if let (true, Some(d)) = (download_bytes > 0, &args.cfg.spool_dir) {
+            terms.push(format!(
+                "{buffers} downloaded object{} x {} MB cap = {:.2} GB transient in {}",
+                plural(buffers),
+                args.cfg.max_compressed_bytes / (1024 * 1024),
+                gb(download_bytes),
+                d.display(),
+            ));
+            dirs.push(d.as_path());
+        }
+        if let (true, Some(d)) = (spool_bytes > 0, &args.cfg.spool_dir) {
+            terms.push(format!(
+                "{graphs} spool{} x {:.2} GB = {:.2} GB transient in {}",
+                plural(graphs),
+                gb(args.cfg.max_spool_bytes_per_accession()),
+                gb(spool_bytes),
+                d.display(),
+            ));
+            if !dirs.contains(&d.as_path()) {
+                dirs.push(d.as_path());
+            }
+        }
+        if let (Some(b), Some(d)) = (cache_bytes, &args.cfg.unitigs_cache) {
+            terms.push(format!(
+                "{n} accession{} x {} MB = {:.2} GB persistent in {}",
+                plural(n),
+                args.cfg.max_compressed_bytes / (1024 * 1024),
+                gb(b),
+                d.display(),
+            ));
+            if !dirs.contains(&d.as_path()) {
+                dirs.push(d.as_path());
+            }
+        }
+        // A filesystem that will not answer is left out rather than reported as zero, the
+        // same way the fetch gate disables itself on one.
+        let free: Vec<String> = dirs
+            .iter()
+            .filter_map(|d| {
+                types::available_bytes(d).map(|a| format!("{:.1} GB free in {}", gb(a), d.display()))
+            })
+            .collect();
+        let free_clause =
+            if free.is_empty() { String::new() } else { format!("; {} now", free.join(", ")) };
+        // Only name the axis of a term that is actually printed. `--fetch-only` has no spool
+        // and an `--offline` run has no cache, and telling either of them what `-w` does to a
+        // number it is not being shown is how a reader learns to stop reading these lines.
+        let axes = match (spool_bytes > 0 || download_bytes > 0, cache_bytes.is_some()) {
+            (true, true) => {
+                " The transient terms move with the worker counts, the cache term with the \
+                 list length."
+            }
+            (true, false) => " The transient terms move with the worker counts.",
+            _ => " The cache term moves with the list length, not with the worker counts.",
+        };
+        eprintln!(
+            "[logan-walker] disk bound: {}{free_clause}. Worst case, every accession at the \
+             cap.{axes}",
+            terms.join("; "),
         );
     }
 

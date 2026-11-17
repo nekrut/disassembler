@@ -4,13 +4,13 @@
     "name": "logan-walker",
     "version": "0.1.1",
     "disassembler": null,
-    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/disassembler/bin/GraphAligner"}]
+    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/__logan-walker@0.1.0/bin/GraphAligner"}]
   },
   "inputs": {
     "references": [
       {"id": "hiv1_pol", "length": 2739, "sha256": "9f67a60456c9ba3de95d04886a28d98ac89d674546aa44a5444700373b95f099"}
     ],
-    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/golden_cache", "n_requested": 1}
+    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/golden-cache2", "n_requested": 1}
   },
   "settings": {
     "k": 21,
@@ -18,7 +18,7 @@
     "min_shared_kmers": 3,
     "hops": 5,
     "subgraph_nodes_per_base_guard": 3.0,
-    "max_size_mb": 1024,
+    "max_size_mb": 4096,
     "min_cov": 0.85,
     "primary_metric": "matched",
     "prune_frac": 0.01,
@@ -41,9 +41,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-16T19:15:54Z",
-    "wall_seconds": 0.625,
-    "stage_seconds": {"stream": 0.001, "parse": 0.048, "anchor": 0.000, "extract": 0.043, "align": 0.501, "stitch": 0.005, "phase": 0.014},
+    "started": "2026-11-17T03:42:30Z",
+    "wall_seconds": 0.620,
+    "stage_seconds": {"stream": 0.001, "parse": 0.044, "anchor": 0.000, "extract": 0.031, "align": 0.514, "stitch": 0.005, "phase": 0.013},
     "n_records": 1,
     "n_ok": 1
   },
@@ -91,7 +91,7 @@
       "minority_left": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 10, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0},
       "variants": {"depth": 16000.0, "floor": 5.0, "forks": 136, "biallelic": 1, "recovered": 1, "beyond_cap": 0, "indels": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 15000.0, "floor": 150.0, "unitigs": 34582, "unitigs_kept": 6901, "unpruned_span": [0, 2738], "pruned_span": [0, 2738]},
-      "timing": {"stream": 0.001, "parse": 0.048, "anchor": 0.000, "extract": 0.043, "align": 0.501, "stitch": 0.005, "phase": 0.014, "total": 0.615}
+      "timing": {"stream": 0.001, "parse": 0.044, "anchor": 0.000, "extract": 0.031, "align": 0.514, "stitch": 0.005, "phase": 0.013, "total": 0.610}
     }
   ]
 }

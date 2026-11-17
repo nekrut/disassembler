@@ -41,10 +41,28 @@ pub struct Fetcher {
     attempts: u32,
     cache_dir: Option<PathBuf>,
     offline: bool,
+    /// Where adjacency will spill, so the fetch can refuse an accession whose spool will not
+    /// fit. `None` disables the check: no spool directory means adjacency stays in RAM, where
+    /// `max_graph_bytes_per_accession` already bounds it.
+    spool_dir: Option<PathBuf>,
+    /// Spools that can exist at once, which is `peak_graphs_for` the run's own work. Zero
+    /// under `--fetch-only`, which parses nothing and so spools nothing.
+    spool_slots: usize,
 }
 
 impl Fetcher {
+    /// A fetcher sized for a pipeline that could fill every slot. Tests and callers with no
+    /// accession count in hand.
     pub fn new(cfg: &Config) -> Self {
+        Self::new_for(cfg, usize::MAX)
+    }
+
+    /// As `new`, told how much work the run actually has.
+    ///
+    /// Only the spool gate uses it, and it matters there: quoting `compute_workers` concurrent
+    /// spools at a two-accession run would refuse on four times the disk the run can use. The
+    /// same correction `max_resident_bytes_for` makes to the printed memory bound.
+    pub fn new_for(cfg: &Config, n_accessions: usize) -> Self {
         let agent_config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(cfg.fetch_timeout_secs)))
             .timeout_connect(Some(Duration::from_secs(cfg.fetch_connect_timeout_secs)))
@@ -58,16 +76,71 @@ impl Fetcher {
             attempts: cfg.fetch_attempts.max(1),
             cache_dir: cfg.unitigs_cache.clone(),
             offline: cfg.offline,
+            spool_dir: cfg.spool_dir.clone(),
+            spool_slots: cfg.peak_graphs_for(n_accessions),
         }
     }
 
-    /// Download one accession's compressed unitig file into memory.
+    /// Refuse an accession whose spooled adjacency will not fit the spool directory.
+    ///
+    /// Decided on the accession's real size, never on `--max-size-mb`. The cap is a worst case
+    /// that assumes every accession sits at it, and real ones do not: at the 1 GB default it
+    /// predicts 4.4 GiB of spool for a cohort that writes a few hundred MB. That number is
+    /// honest as a printed bound and dishonest as a gate, because it would refuse runs needing
+    /// a fiftieth of it. Here the size is known exactly, from `Content-Length` or from the
+    /// cached file, so the prediction is `SPOOL_BYTES_PER_COMPRESSED_BYTE` applied to a real
+    /// number.
+    ///
+    /// Multiplied by `spool_slots` because that many accessions can be parsing at once.
+    /// `available_bytes` already sees every spool that exists (they are unlinked, not hidden),
+    /// so the only unknown is forward growth, and the assumption is that the other workers
+    /// hold accessions about this size. For the homogeneous cohorts Logan runs are made of
+    /// that is close; for a mixed one it errs in both directions, which is why the write path
+    /// in `parse::spill_error` still has to handle a disk that fills anyway. This is the cheap
+    /// layer that catches the obvious case before 11 GB is transferred, not a guarantee.
+    fn spool_room(&self, len: u64) -> std::result::Result<(), String> {
+        let Some(dir) = self.spool_dir.as_ref() else {
+            return Ok(());
+        };
+        if self.spool_slots == 0 {
+            return Ok(());
+        }
+        let per = crate::config::spool_bytes_for_compressed(len);
+        // Below the spill threshold adjacency never reaches disk at all, so there is nothing
+        // to refuse and no reason to stat a filesystem.
+        if per <= crate::types::SPILL_ADJACENCY_AT as u64 {
+            return Ok(());
+        }
+        // A filesystem that will not answer disables the gate rather than failing the
+        // accession: refusing on an unknown is worse than the behaviour this replaces.
+        let Some(avail) = crate::types::available_bytes(dir) else {
+            return Ok(());
+        };
+        let need = per.saturating_mul(self.spool_slots as u64);
+        if need <= avail {
+            return Ok(());
+        }
+        Err(format!(
+            "spooled adjacency for {len} compressed bytes needs about {per} bytes, {need} \
+             across {} concurrent worker(s), and {} has {avail} free",
+            self.spool_slots,
+            dir.display()
+        ))
+    }
+
+    /// Get one accession's compressed unitig file, as a handle wherever possible.
+    ///
+    /// **Nothing here reads an object into memory.** A cache hit is opened and streamed; a
+    /// download is written to disk as it arrives, into the cache entry when there is one and
+    /// into an unlinked file under `--spool-dir` otherwise. Only a caller that configured
+    /// neither gets a `Vec`, which no CLI run can be.
     ///
     /// With `--unitigs-cache`: read from `<dir>/<ACC>.unitigs.fa.zst` if present, otherwise
-    /// (under `--offline`) fail, otherwise download and write back atomically. A cached file's
-    /// contents are trusted, because a truncated file could only have arrived from a killed
-    /// writer, and the atomic rename below prevents that. Its size is not: `--max-size-mb`
-    /// bounds memory, and a cache filled under a higher cap used to be read whole regardless.
+    /// (under `--offline`) fail, otherwise download straight into a tempfile that is renamed
+    /// into place once the body is complete. A cached file's contents are trusted, because a
+    /// truncated file could only have arrived from a killed writer and the rename prevents
+    /// that. **Its size is not**, and that check outlived the reason it was added: see
+    /// `the_size_cap_decides_the_same_way_wherever_the_bytes_came_from`.
     ///
     /// Returns the compressed bytes only. Decompression is `decoder`'s job, and happens in
     /// the compute pool so the fetch thread can immediately start the next transfer.
@@ -87,11 +160,24 @@ impl Fetcher {
                     accession: accession.clone(),
                     detail: format!("cache read {}: {e}", path.display()),
                 })?;
+                // `--max-size-mb` applies here exactly as it applies to a download, and it
+                // is no longer about memory: a cache hit costs a file handle, and since 0.2.0
+                // nothing in the walk scales with accession size. What it is about now is that
+                // the flag names a property of the accession, not of the transport. It is
+                // threaded from the Python cohort pipelines into every walk, so if the cache
+                // ignored it, a warm run and a cold run of the same command would include
+                // different accessions and the summary, which records `max_size_mb` and not
+                // the cache's history, could not explain the difference. `disassembler fetch`
+                // has its own `--max-size-mb`, so filling a cache at a high cap and walking at
+                // a low one is a supported thing to do; this is what makes the walk's cap the
+                // one that decides.
                 if len > self.max_compressed_bytes {
                     return Err(Error::TooLarge {
                         accession: accession.clone(),
                         detail: format!(
-                            "cached file {} is {len} bytes, over max_compressed_bytes {}",
+                            "cached file {} is {len} bytes, over --max-size-mb ({} bytes); the \
+                             cap applies wherever the bytes came from, so raise it to include \
+                             this accession",
                             path.display(),
                             self.max_compressed_bytes
                         ),
@@ -106,6 +192,21 @@ impl Fetcher {
                     return Err(Error::Fetch {
                         accession: accession.clone(),
                         detail: format!("cache file is empty: {}", path.display()),
+                    });
+                }
+                // Checked before the file is hashed, which is a full pass over it: an
+                // accession that cannot be spooled is not worth reading 11 GB to fingerprint.
+                // A cache hit is exactly where this bites, because the bytes are already
+                // here and the size cap has already let them through.
+                if let Err(detail) = self.spool_room(len) {
+                    return Err(Error::TooLarge {
+                        accession: accession.clone(),
+                        detail,
+                        payload: Box::new(Payload {
+                            source: PayloadSource::Cache,
+                            bytes: Some(len),
+                            ..Payload::default()
+                        }),
                     });
                 }
                 // Hashed here rather than at the point of download, so the digest covers
@@ -144,37 +245,12 @@ impl Fetcher {
 
         for attempt in 1..=self.attempts {
             match self.try_once(index, accession, &url) {
-                Ok(mut f) => {
-                    if let Some(dir) = &self.cache_dir {
-                        match f.compressed.as_slice() {
-                            Some(bytes) => match write_cache_atomic(dir, accession, bytes) {
-                                // Written, so the bytes exist on disk and there is no reason
-                                // to keep carrying them. Swapping the buffer for the handle
-                                // drops this accession's compressed size before it reaches
-                                // the compute worker, which is where a buffer is held
-                                // longest: for the whole parse. A reopen that fails is not
-                                // worth failing the fetch over, so the buffer simply stays.
-                                Ok(path) => match std::fs::File::open(&path) {
-                                    Ok(file) => f.compressed = Compressed::File(file),
-                                    Err(e) => eprintln!(
-                                        "[{accession}] warning: cached but could not reopen \
-                                         {}: {e}",
-                                        path.display()
-                                    ),
-                                },
-                                // Cache-write failure must not lose a successful fetch. Warn
-                                // and hand the bytes back so the compute stage still runs;
-                                // the next run will just have to fetch again.
-                                Err(e) => eprintln!(
-                                    "[{accession}] warning: could not write cache entry: {e}"
-                                ),
-                            },
-                            // Already file-backed: nothing downloaded it into memory.
-                            None => {}
-                        }
-                    }
-                    return Ok(f);
-                }
+                // No cache write here any more. `try_once` streams the body straight into the
+                // cache entry, so by the time it returns the bytes are already on disk and
+                // already renamed into place. The old shape read the object into a `Vec`,
+                // wrote that `Vec` out, and then reopened the file to drop the `Vec`: three
+                // copies of the same decision and one of them the size of the accession.
+                Ok(f) => return Ok(f),
                 Err(FetchAttempt::Permanent(detail)) => {
                     return Err(Error::Fetch {
                         accession: accession.clone(),
@@ -255,52 +331,168 @@ impl Fetcher {
                     Box::new(payload),
                 ));
             }
+            // The same pre-transfer refusal, for the disk the parse will need rather than
+            // the memory the download will need. Both decided from one `Content-Length`, in
+            // the ~50 ms before any body is read.
+            if let Err(detail) = self.spool_room(len) {
+                return Err(FetchAttempt::TooLarge(detail, Box::new(payload)));
+            }
         }
 
-        // ureq caps read_to_vec at 10 MB by default, which every real accession exceeds.
-        // The limit here doubles as the guard for a missing or lying Content-Length. ureq
-        // refuses a body that reaches its limit, so the limit is one byte over the cap: a file
-        // of exactly the cap passes, as it does the Content-Length check above.
-        //
-        // Running into the limit is the size cap, not a transient failure. It used to be
-        // retried, downloading up to the cap three times before reporting a fetch error.
-        let compressed = resp
-            .body_mut()
-            .with_config()
-            .limit(self.max_compressed_bytes.saturating_add(1))
-            .read_to_vec()
-            .map_err(|e| match e {
-                ureq::Error::BodyExceedsLimit(_) => FetchAttempt::TooLarge(
+        // Decided before a byte is read, so the bytes have somewhere to go the moment they
+        // arrive and are never assembled in RAM first.
+        let mut sink = self.open_sink(accession);
+
+        // One pass over the body: counted, hashed and written as it streams. The count is
+        // ours rather than ureq's `limit`, so the cap is enforced by code that can say which
+        // limit was reached and stop the transfer at exactly that point. The hash is free
+        // here, where the bytes are already in a register; computing it afterwards would be
+        // a second full pass over a file that can be 11 GB (the nn1 probe measured that pass
+        // at 91 s).
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; crate::config::DOWNLOAD_BUFFER_BYTES as usize];
+        let mut total: u64 = 0;
+        let mut reader = resp.body_mut().as_reader();
+        loop {
+            let got = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                // A dropped connection mid-body. Worth retrying, and the partial sink is
+                // discarded so the next attempt starts from nothing.
+                Err(e) => {
+                    sink.abandon();
+                    return Err(FetchAttempt::Transient(format!(
+                        "body read failed after {total} bytes: {e}"
+                    )));
+                }
+            };
+            total += got as u64;
+            // The guard for a missing or lying `Content-Length`. A body of exactly the cap
+            // passes, as it does the pre-transfer check above; the transfer stops here rather
+            // than running to completion first.
+            if total > self.max_compressed_bytes {
+                sink.abandon();
+                return Err(FetchAttempt::TooLarge(
                     format!(
-                        "compressed size exceeds max_compressed_bytes {} (the server sent no \
-                         Content-Length, so this was found by downloading)",
+                        "compressed size exceeds max_compressed_bytes {} (found by \
+                         downloading: the server sent no Content-Length, or an untrue one)",
                         self.max_compressed_bytes
                     ),
-                    // All that is known here is "over the cap". A Content-Length cannot
-                    // have been both present and honest, or the check above would have
-                    // fired, so its value is dropped rather than recorded as a size.
+                    // All that is known here is "over the cap". A Content-Length cannot have
+                    // been both present and honest, or the check above would have fired, so
+                    // its value is dropped rather than recorded as a size.
                     Box::new(Payload { bytes: None, ..payload.clone() }),
-                ),
-                e => FetchAttempt::Transient(format!("body read failed: {e}")),
-            })?;
+                ));
+            }
+            hasher.update(&buf[..got]);
+            if let Err(e) = sink.write_all(&buf[..got]) {
+                let where_ = sink.describe();
+                sink.abandon();
+                return Err(download_write_error(where_, total, e, &payload));
+            }
+        }
 
-        if compressed.is_empty() {
+        if total == 0 {
+            sink.abandon();
             return Err(FetchAttempt::Transient("empty body".to_string()));
         }
 
         // Content-Length is the server's claim; this is the bytes that were actually read,
         // and it is what every downstream stage consumed.
-        payload.bytes = Some(compressed.len() as u64);
-        payload.sha256 = Some(crate::types::sha256_hex(&compressed));
+        payload.bytes = Some(total);
+
+        // The spool gate again, for a server that sent no `Content-Length`: then the size is
+        // only knowable by downloading, and refusing here still beats failing mid-parse with
+        // the transfer already spent.
+        if let Err(detail) = self.spool_room(total) {
+            sink.abandon();
+            return Err(FetchAttempt::TooLarge(detail, Box::new(payload)));
+        }
+
+        let mut hex = String::with_capacity(64);
+        for b in hasher.finalize() {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        payload.sha256 = Some(hex);
+
+        // The rename into the cache happens here, after the last byte and after every
+        // refusal, so a skipped accession never leaves a cache entry behind.
+        let compressed = sink.finish().map_err(|e| {
+            FetchAttempt::Transient(format!("could not commit the downloaded body: {e}"))
+        })?;
 
         Ok(FetchedUnitigs {
             index,
             accession: accession.clone(),
-            compressed_len: compressed.len(),
-            compressed: Compressed::Memory(compressed),
+            compressed_len: total as usize,
+            compressed,
             fetch_secs: 0.0,
             payload,
         })
+    }
+
+    /// Choose where this download's bytes will land.
+    ///
+    /// Preference order, and both fallbacks are warnings rather than failures, for the same
+    /// reason `scan_in` falls back when a spool cannot be created: a storage problem should
+    /// cost performance, not the accession.
+    ///
+    /// 1. `--unitigs-cache`, where the bytes are wanted anyway, so the download and the cache
+    ///    write are the same write.
+    /// 2. `--spool-dir`, as an unlinked file. The run still never holds the object.
+    /// 3. RAM, which is what every download used to do.
+    fn open_sink(&self, accession: &Accession) -> BodySink {
+        if let Some(dir) = &self.cache_dir {
+            match open_cache_tmp(dir, accession) {
+                Ok(sink) => return sink,
+                Err(e) => eprintln!(
+                    "[{accession}] warning: could not open a cache entry in {} for writing \
+                     ({e}); this accession will not be cached",
+                    dir.display()
+                ),
+            }
+        }
+        if let Some(dir) = &self.spool_dir {
+            match crate::types::transient_file(dir, "dl") {
+                Ok(file) => return BodySink::Transient(file),
+                Err(e) => eprintln!(
+                    "[{accession}] warning: could not open a download file in {} ({e}); \
+                     holding the compressed object in memory instead",
+                    dir.display()
+                ),
+            }
+        }
+        BodySink::Memory(Vec::new())
+    }
+}
+
+/// Classify a failed write of a downloaded body.
+///
+/// The same decision `parse::spill_error` makes, for the same reason: a disk that fills up is
+/// a budget the run exceeded, so it is a `too_large` negative that leaves the other accessions
+/// and the exit code alone. Anything else is a real failure, and it is permanent rather than
+/// transient because retrying a read-only directory three times helps nobody.
+fn download_write_error(
+    where_: &str,
+    after: u64,
+    e: std::io::Error,
+    payload: &Payload,
+) -> FetchAttempt {
+    match e.kind() {
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => {
+            FetchAttempt::TooLarge(
+                format!(
+                    "ran out of space writing the downloaded object to {where_} after {after} \
+                     bytes ({e}); lower --fetch-workers or -w, lower --max-size-mb, or point \
+                     --unitigs-cache or --spool-dir at a larger filesystem"
+                ),
+                Box::new(payload.clone()),
+            )
+        }
+        _ => FetchAttempt::Permanent(format!(
+            "could not write the downloaded object to {where_} after {after} bytes: {e}"
+        )),
     }
 }
 
@@ -371,34 +563,112 @@ enum FetchAttempt {
     TooLarge(String, Box<Payload>),
 }
 
-/// Write `bytes` to `<dir>/<ACC>.unitigs.fa.zst` via a tempfile-and-rename so a killed
-/// process cannot leave a partial file behind. A partial file that survived a crash would
-/// otherwise look valid to a subsequent `--offline` run and corrupt the analysis.
-fn write_cache_atomic(dir: &Path, accession: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+/// Where a download's bytes go as they arrive.
+///
+/// The object is never assembled in memory first. This is what takes `--max-size-mb` out of
+/// the memory bound entirely: before it, a download was `read_to_vec`'d whole, which the nn1
+/// probe measured at **10.5 GB of peak RSS on an 11 GB accession**, and at the defaults
+/// sixteen of those can be in flight at once.
+enum BodySink {
+    /// Into `--unitigs-cache`, through a tempfile renamed into place only once the whole
+    /// body has arrived. A partial file that survived a crash would look valid to a later
+    /// `--offline` run and quietly corrupt the analysis, so nothing is ever renamed early.
+    Cache { file: std::fs::File, tmp: PathBuf, final_path: PathBuf },
+    /// Into an unlinked file under `--spool-dir`. No cache was configured, so the bytes are
+    /// wanted only for this run; they die with the process and need no sweeping.
+    Transient(std::fs::File),
+    /// Held in RAM, as every download used to be. Only reachable when neither a cache nor a
+    /// spool directory exists, which no CLI run can produce.
+    Memory(Vec<u8>),
+}
+
+impl BodySink {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        match self {
+            BodySink::Cache { file, .. } | BodySink::Transient(file) => file.write_all(buf),
+            BodySink::Memory(v) => {
+                v.extend_from_slice(buf);
+                Ok(())
+            }
+        }
+    }
+
+    /// Commit the body and hand back the handle the pipeline will decode from.
+    ///
+    /// The rename happens here and nowhere else, so the cache only ever gains whole files.
+    /// A renamed file keeps its inode, so the handle opened on the tempfile is already a
+    /// handle on the final path and no reopen is needed; it is rewound because the caller
+    /// just finished writing to it.
+    fn finish(self) -> std::io::Result<Compressed> {
+        match self {
+            BodySink::Cache { mut file, tmp, final_path } => {
+                file.flush_and_rewind()?;
+                if let Err(e) = std::fs::rename(&tmp, &final_path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+                Ok(Compressed::File(file))
+            }
+            BodySink::Transient(mut file) => {
+                file.flush_and_rewind()?;
+                Ok(Compressed::File(file))
+            }
+            BodySink::Memory(v) => Ok(Compressed::Memory(v)),
+        }
+    }
+
+    /// Give up without committing. The tempfile must not outlive a failed download.
+    fn abandon(self) {
+        if let BodySink::Cache { tmp, .. } = self {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+
+    /// What `payload.source` should say. A download is `S3` wherever its bytes landed.
+    fn describe(&self) -> &'static str {
+        match self {
+            BodySink::Cache { .. } => "cache",
+            BodySink::Transient(_) => "spool",
+            BodySink::Memory(_) => "memory",
+        }
+    }
+}
+
+/// `flush` then `seek(0)`, which every file-backed sink wants and neither trait provides.
+trait FlushAndRewind {
+    fn flush_and_rewind(&mut self) -> std::io::Result<()>;
+}
+
+impl FlushAndRewind for std::fs::File {
+    fn flush_and_rewind(&mut self) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        self.flush()?;
+        self.seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+}
+
+/// A readable-writable tempfile beside the cache entry it will become.
+///
+/// Same directory as the final path so the `rename` is same-filesystem and therefore atomic.
+/// PID plus nanoseconds is enough uniqueness for one host writing its own cache; two
+/// processes racing on the same accession may both download, and one rename wins, which is
+/// harmless because the bytes are the same.
+fn open_cache_tmp(dir: &Path, accession: &str) -> std::io::Result<BodySink> {
     std::fs::create_dir_all(dir)?;
     let final_path = cache_path(dir, accession);
-    // Tempfile in the same directory so `rename` is same-filesystem and atomic. PID + nanos
-    // is enough uniqueness for one host writing its own cache; two processes racing on the
-    // same accession may both fetch and one rename wins, which is fine (same bytes).
     let ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = dir.join(format!(".{accession}.{}.{ns}.tmp", std::process::id()));
-    // Written-then-renamed. Errors during write must not leave the tempfile around either;
-    // the finally-style branch below handles that.
-    let write_result = std::fs::write(&tmp, bytes);
-    match write_result {
-        Ok(()) => std::fs::rename(&tmp, &final_path)
-            .inspect_err(|_| {
-                let _ = std::fs::remove_file(&tmp);
-            })
-            .map(|()| final_path),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    Ok(BodySink::Cache { file, tmp, final_path })
 }
 
 /// A streaming zstd decoder over the compressed buffer.
@@ -531,7 +801,10 @@ mod network_tests {
         assert_eq!(got.compressed_len, 1_861_058, "unexpected compressed size");
         assert_eq!(
             got.compressed_len,
-            got.compressed.as_slice().expect("no cache was set, so this is in memory").len()
+            got.compressed
+                .as_slice()
+                .expect("neither a cache nor a spool dir was set, so this is in memory")
+                .len()
         );
 
         // The bytes must be usable by the next stage, not merely non-empty.
@@ -742,26 +1015,158 @@ mod cache_tests {
         dir
     }
 
-    /// `--max-size-mb` bounds memory, so it applies to a cached file as it does to a
-    /// download. A cache filled under a higher cap used to be read whole whatever the cap.
+    /// The size cap decides the same way wherever the bytes came from.
+    ///
+    /// This check was added because `--max-size-mb` bounded memory and a cached file was read
+    /// whole. Neither is true since 0.2.0: a cache hit is a file handle, and nothing in the
+    /// walk scales with accession size. The check stays for a different and stronger reason.
+    /// `--max-size-mb` names a property of the accession, not of the transport, and the
+    /// Python cohort pipelines thread it into every walk; if the cache ignored it, the same
+    /// command over the same list would include different accessions depending on what
+    /// happened to be cached, and `summary.json` records the cap but not the cache's history,
+    /// so nothing in the output could explain the difference.
+    ///
+    /// Three cases, because the property is about agreement, not about one refusal: the
+    /// boundary is exact, `--offline` does not relax it, and neither does the origin being
+    /// reachable (nothing here has a network, so a fall-through to S3 would hang or fail
+    /// rather than quietly pass).
     #[test]
-    fn a_cached_file_over_the_size_cap_is_too_large() {
+    fn the_size_cap_decides_the_same_way_wherever_the_bytes_came_from() {
         let dir = tempdir("cap");
         let bytes = zstd::encode_all(&b">CACHED0002_0\nACGTACGTACGT\n"[..], 3).unwrap();
         std::fs::write(cache_path(&dir, "CACHED0002"), &bytes).unwrap();
-        let fetcher = |cap: u64| Fetcher::new(&Config {
+        let fetcher = |cap: u64, offline: bool| Fetcher::new(&Config {
             unitigs_cache: Some(dir.clone()),
-            offline: true,
+            offline,
             max_compressed_bytes: cap,
             ..Config::default()
         });
         let acc = "CACHED0002".to_string();
-        match fetcher(bytes.len() as u64 - 1).fetch(0, &acc) {
-            Err(Error::TooLarge { detail, .. }) => assert!(detail.contains("cached file"), "{detail}"),
+        let len = bytes.len() as u64;
+
+        for offline in [true, false] {
+            match fetcher(len - 1, offline).fetch(0, &acc) {
+                Err(Error::TooLarge { detail, payload, .. }) => {
+                    assert!(detail.contains("cached file"), "{detail}");
+                    assert!(detail.contains("--max-size-mb"), "the skip must name the flag: {detail}");
+                    // The summary has to be able to explain the skip on its own.
+                    assert_eq!(payload.bytes, Some(len));
+                    assert_eq!(payload.source, PayloadSource::Cache);
+                }
+                other => panic!(
+                    "offline={offline}: expected TooLarge, got {:?}",
+                    other.map(|f| f.compressed_len)
+                ),
+            }
+        }
+
+        // Exact at the boundary, the same as the `Content-Length` check on a download: a file
+        // of exactly the cap passes.
+        let got = fetcher(len, true).fetch(0, &acc).unwrap();
+        assert_eq!(decoded(&got), b">CACHED0002_0\nACGTACGTACGT\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An accession whose spool will not fit is refused as a negative, before the bytes are
+    /// read, hashed or parsed.
+    ///
+    /// The cache hit is where this matters most: the size cap has already let the object
+    /// through, the bytes are already local, and nothing else between here and `scan_in`
+    /// looks at disk at all. Without the gate the run would download or open an 11 GB
+    /// accession, parse for ten minutes, and fail on a write.
+    ///
+    /// The demand is made unsatisfiable with the worker count rather than with a small
+    /// filesystem, which a unit test cannot create: `usize::MAX` concurrent spools saturates
+    /// the multiplication, so the refusal does not depend on how much space the machine
+    /// running the suite happens to have. What the test still proves is that the gate is what
+    /// refused, because the identical file and cap pass once `spool_dir` is `None`.
+    #[test]
+    fn an_accession_whose_spool_will_not_fit_is_too_large() {
+        let dir = tempdir("spool-gate");
+        // Over the spill threshold once multiplied by SPOOL_BYTES_PER_COMPRESSED_BYTE: a
+        // smaller file never reaches disk and must not be gated. Contents are irrelevant,
+        // because the refusal happens before anything decodes them.
+        let big = vec![0u8; 16 * 1024 * 1024];
+        std::fs::write(cache_path(&dir, "BIGACC0001"), &big).unwrap();
+        let acc = "BIGACC0001".to_string();
+
+        let base = Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            spool_dir: Some(dir.clone()),
+            compute_workers: usize::MAX,
+            ..Config::default()
+        };
+
+        match Fetcher::new(&base).fetch(0, &acc) {
+            Err(Error::TooLarge { detail, payload, .. }) => {
+                assert!(detail.contains("spooled adjacency"), "{detail}");
+                assert!(detail.contains("free"), "{detail}");
+                // The payload is what makes the skip actionable, the same as for the size
+                // cap: the size that tripped it, as a number, and where the bytes came from.
+                assert_eq!(payload.bytes, Some(big.len() as u64));
+                assert_eq!(payload.source, PayloadSource::Cache);
+            }
             other => panic!("expected TooLarge, got {:?}", other.map(|f| f.compressed_len)),
         }
-        let got = fetcher(bytes.len() as u64).fetch(0, &acc).unwrap();
-        assert_eq!(decoded(&got), b">CACHED0002_0\nACGTACGTACGT\n");
+
+        // Same file, same cap, no spool directory: adjacency stays in RAM, where the graph
+        // budget bounds it, so there is nothing for this gate to decide.
+        let no_spool = Config { spool_dir: None, ..base.clone() };
+        let got = Fetcher::new(&no_spool).fetch(0, &acc).expect("no spool dir, no gate");
+        assert_eq!(got.compressed_len, big.len());
+
+        // And `--fetch-only` parses nothing, so it spools nothing: the gate must not refuse
+        // the one mode whose whole job is to put large accessions in the cache.
+        let fetch_only = Config { fetch_only: true, ..base.clone() };
+        let got = Fetcher::new(&fetch_only).fetch(0, &acc).expect("--fetch-only never spools");
+        assert_eq!(got.compressed_len, big.len());
+
+        // A spool directory nothing can be learned about disables the gate rather than
+        // refusing on it. An empty path has no existing ancestor to walk up to, so
+        // `available_bytes` cannot answer; treating that as zero free would refuse every
+        // accession on a filesystem the walker simply failed to stat.
+        let unknowable = Config { spool_dir: Some(PathBuf::from("")), ..base.clone() };
+        let got = Fetcher::new(&unknowable).fetch(0, &acc).expect("an unanswerable fs must not refuse");
+        assert_eq!(got.compressed_len, big.len());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Below the spill threshold adjacency never reaches disk, so the gate must not fire
+    /// however little space there is. Without this the check would refuse every accession on
+    /// a nearly full filesystem, including the ones that would have parsed entirely in RAM.
+    #[test]
+    fn an_accession_too_small_to_spill_is_never_gated() {
+        let dir = tempdir("spool-gate-small");
+        let small = vec![0u8; 1024 * 1024];
+        std::fs::write(cache_path(&dir, "SMALLACC01"), &small).unwrap();
+        // The same unsatisfiable demand as above; only the file size differs.
+        let cfg = Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            spool_dir: Some(dir.clone()),
+            compute_workers: usize::MAX,
+            ..Config::default()
+        };
+        let got = Fetcher::new(&cfg).fetch(0, &"SMALLACC01".to_string()).expect("must not gate");
+        assert_eq!(got.compressed_len, small.len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A short list cannot fill the pipeline, so it cannot hold `compute_workers` spools at
+    /// once, and quoting that many would refuse on disk the run has no way to use.
+    #[test]
+    fn the_gate_counts_the_spools_the_run_can_actually_hold() {
+        let dir = tempdir("spool-gate-slots");
+        let cfg = Config {
+            spool_dir: Some(dir.clone()),
+            compute_workers: 8,
+            ..Config::default()
+        };
+        assert_eq!(Fetcher::new_for(&cfg, 2).spool_slots, 2);
+        assert_eq!(Fetcher::new_for(&cfg, 64).spool_slots, 8);
+        assert_eq!(Fetcher::new(&cfg).spool_slots, 8);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -886,22 +1291,164 @@ mod cache_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `write_cache_atomic` uses a tempfile + rename, so a mid-write crash cannot leave a
-    /// partial file at the final path.
-    #[test]
-    fn atomic_write_lands_the_final_file_and_leaves_no_tempfile() {
-        let dir = tempdir("atomic");
-        write_cache_atomic(&dir, "ATOMIC1", b"payload").unwrap();
-        let final_path = cache_path(&dir, "ATOMIC1");
-        assert!(final_path.exists());
-        assert_eq!(std::fs::read(&final_path).unwrap(), b"payload");
-        // No stray .tmp files linger.
-        let leftover: Vec<_> = std::fs::read_dir(&dir)
+    fn tmpfiles_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
-            .collect();
-        assert!(leftover.is_empty(), "leftover tempfiles: {leftover:?}");
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    /// The cache gains whole files or nothing. The rename is the commit, and it happens only
+    /// in `finish`.
+    ///
+    /// This matters more than it did. The old code assembled the object in memory and wrote
+    /// it out in one `fs::write`, so a partial cache entry was close to impossible; now the
+    /// bytes land in the tempfile as they arrive, and the only thing standing between a
+    /// half-downloaded 11 GB object and a cache entry that a later `--offline` run would
+    /// trust is that the rename has not happened yet.
+    #[test]
+    fn a_committed_download_lands_whole_and_an_abandoned_one_lands_not_at_all() {
+        let dir = tempdir("atomic");
+
+        let mut sink = open_cache_tmp(&dir, "ATOMIC1").unwrap();
+        sink.write_all(b"pay").unwrap();
+        sink.write_all(b"load").unwrap();
+        // Mid-download: the final path must not exist yet, and the bytes must be in a
+        // tempfile rather than nowhere.
+        assert!(!cache_path(&dir, "ATOMIC1").exists(), "renamed before the body finished");
+        assert_eq!(tmpfiles_in(&dir).len(), 1);
+        sink.finish().unwrap();
+        assert_eq!(std::fs::read(cache_path(&dir, "ATOMIC1")).unwrap(), b"payload");
+        assert!(tmpfiles_in(&dir).is_empty(), "leftover tempfiles: {:?}", tmpfiles_in(&dir));
+
+        // An abandoned download leaves neither a cache entry nor a tempfile. Every refusal
+        // and every transport failure in `try_once` goes through this path.
+        let mut sink = open_cache_tmp(&dir, "ATOMIC2").unwrap();
+        sink.write_all(b"half of an object").unwrap();
+        sink.abandon();
+        assert!(!cache_path(&dir, "ATOMIC2").exists(), "an abandoned download was cached");
+        assert!(tmpfiles_in(&dir).is_empty(), "leftover tempfiles: {:?}", tmpfiles_in(&dir));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Where a download lands, decided before a byte of it arrives.
+    ///
+    /// The ordering is the whole of the memory fix: an object only reaches RAM when there is
+    /// nowhere on disk to put it, and `main` always resolves a spool directory, so no CLI run
+    /// can reach that case. Checked here rather than through a real download because the
+    /// decision is made from configuration alone and the suite has no network.
+    #[test]
+    fn a_download_lands_in_the_cache_then_the_spool_then_memory() {
+        let cache = tempdir("sink-cache");
+        let spool = tempdir("sink-spool");
+        let acc = "SINKACC001".to_string();
+
+        // 1. A cache is where the bytes are wanted anyway, so the download writes it directly.
+        let cfg = Config {
+            unitigs_cache: Some(cache.clone()),
+            spool_dir: Some(spool.clone()),
+            ..Config::default()
+        };
+        let sink = Fetcher::new(&cfg).open_sink(&acc);
+        assert!(matches!(sink, BodySink::Cache { .. }), "a cache must win");
+        assert_eq!(sink.describe(), "cache");
+        sink.abandon();
+
+        // 2. No cache, but a spool directory: an unlinked file, so still never in RAM.
+        let cfg = Config { spool_dir: Some(spool.clone()), ..Config::default() };
+        let sink = Fetcher::new(&cfg).open_sink(&acc);
+        assert!(matches!(sink, BodySink::Transient(_)), "a spool dir must be used");
+        assert_eq!(sink.describe(), "spool");
+
+        // 3. Neither: the old behaviour, and the only path that costs the object's size.
+        let cfg = Config::default();
+        assert!(!cfg.downloads_stream_to_disk());
+        let sink = Fetcher::new(&cfg).open_sink(&acc);
+        assert!(matches!(sink, BodySink::Memory(_)), "nowhere on disk, so RAM");
+
+        // 4. An unusable cache directory falls through rather than failing the accession,
+        //    the same way an unusable spool directory does in `scan_in`.
+        let blocked = cache.join("not-a-dir");
+        std::fs::write(&blocked, b"x").unwrap();
+        let cfg = Config {
+            unitigs_cache: Some(blocked.join("under-a-file")),
+            spool_dir: Some(spool.clone()),
+            ..Config::default()
+        };
+        let sink = Fetcher::new(&cfg).open_sink(&acc);
+        assert!(matches!(sink, BodySink::Transient(_)), "an unusable cache must fall through");
+
+        std::fs::remove_dir_all(&cache).ok();
+        std::fs::remove_dir_all(&spool).ok();
+    }
+
+    /// Name a `FetchAttempt` variant for a panic message; it has no `Debug` and does not
+    /// need one outside tests.
+    fn kind_of(a: &FetchAttempt) -> &'static str {
+        match a {
+            FetchAttempt::Transient(_) => "Transient",
+            FetchAttempt::Permanent(_) => "Permanent",
+            FetchAttempt::Missing => "Missing",
+            FetchAttempt::TooLarge(..) => "TooLarge",
+        }
+    }
+
+    /// A download that fills the disk is the user's budget, not a broken run, and it is
+    /// classified exactly as `parse::spill_error` classifies the same failure one stage later.
+    #[test]
+    fn a_download_that_fills_the_disk_is_a_negative_not_an_error() {
+        let p = Payload::default();
+        for raw in [libc::ENOSPC, libc::EDQUOT] {
+            match download_write_error("cache", 99, std::io::Error::from_raw_os_error(raw), &p) {
+                FetchAttempt::TooLarge(detail, _) => {
+                    assert!(detail.contains("ran out of space"), "{detail}");
+                    assert!(detail.contains("after 99 bytes"), "{detail}");
+                    assert!(detail.contains("--unitigs-cache"), "{detail}");
+                }
+                other => panic!("errno {raw} must be a negative, got {}", kind_of(&other)),
+            }
+        }
+        // Anything else is a real failure, and permanent: retrying a read-only directory
+        // three times would just download the object three times to fail the same way.
+        for raw in [libc::EACCES, libc::EIO] {
+            match download_write_error("spool", 99, std::io::Error::from_raw_os_error(raw), &p) {
+                FetchAttempt::Permanent(detail) => {
+                    assert!(detail.contains("could not write"), "{detail}")
+                }
+                other => panic!("errno {raw} must be permanent, got {}", kind_of(&other)),
+            }
+        }
+    }
+
+    /// A download with no cache still never holds the object: it goes to an unlinked file
+    /// under `--spool-dir`, which is readable, rewound and leaves nothing on the filesystem.
+    #[test]
+    fn a_transient_sink_is_readable_and_leaves_nothing_behind() {
+        let dir = tempdir("transient");
+        let before = std::fs::read_dir(&dir).unwrap().count();
+
+        let mut sink = BodySink::Transient(crate::types::transient_file(&dir, "dl").unwrap());
+        sink.write_all(b"compressed bytes").unwrap();
+        let compressed = sink.finish().unwrap();
+
+        // File-backed, so nothing may read it into a Vec by accident...
+        assert!(compressed.as_slice().is_none());
+        // ...but it is rewound and readable, which is what `decoder` needs.
+        match &compressed {
+            Compressed::File(f) => {
+                let mut got = Vec::new();
+                let mut h = f;
+                h.read_to_end(&mut got).unwrap();
+                assert_eq!(got, b"compressed bytes");
+            }
+            _ => panic!("a transient sink must be file-backed"),
+        }
+        // Unlinked at creation, so the directory never saw it.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
+        drop(compressed);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

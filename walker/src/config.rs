@@ -422,10 +422,31 @@ pub struct Config {
     pub fetch_attempts: u32,
     /// Refuse accessions whose compressed size exceeds this.
     ///
-    /// This is a safety valve, not a tuning knob. Compressed size is held in memory per
-    /// in-flight accession, and decompressed size runs 4-5x higher again. Default 1 GB still
-    /// drops multi-gigabyte environmental metagenomes in 50 ms via Content-Length, while
-    /// keeping the deep viral runs the earlier 350 MB cap refused (it cost ~7.5% of the panel).
+    /// This is a safety valve, not a tuning knob, and since 0.2.0 it guards disk and time
+    /// rather than memory: nothing in the walker scales with accession size any more, so the
+    /// cap no longer appears in the memory bound at all.
+    ///
+    /// **Default 4 GB**, raised from 1 GB on 2026-11-16 once that became true. Chosen from the
+    /// bucket rather than from a machine: a 57,000-accession sample of the Logan object sizes
+    /// (S3 `ListObjectsV2` returns `Size` with the key, so 57 requests cover 57,000 keys,
+    /// spread over 57 prefixes because neighbouring accessions come from one submission and
+    /// correlate) puts the median at 3.4 MB, p90 at 168 MB, p95 at 395 MB, p99 at 1.86 GB and
+    /// p99.9 at 5.8 GB. Refusal rates by cap: 350 MB 5.57%, 1 GB 2.26%, 2 GB 0.90%, **4 GB
+    /// 0.16%**, 8 GB 0.07%. 4 GB is the knee, cutting refusals fourteenfold against 1 GB and
+    /// recovering the 2.10% of accessions in the 1 to 4 GB band (mean 1.81 GB); past it the
+    /// gains are negligible and the disk cost keeps doubling.
+    ///
+    /// What it still costs is disk, in the worst case where every in-flight accession sits at
+    /// the cap: `16 x cap` of downloaded objects plus `8 x 0.55 x cap` of spool at the
+    /// defaults, so 81.6 GiB at 4 GB against 20.4 GiB at 1 GB. A real cohort is nowhere near
+    /// it (p95 is 395 MB, which is about 8 GiB), and the startup disk line prints both the
+    /// bound and the free space. `--unitigs-cache` moves the download term into the
+    /// persistent cache term.
+    ///
+    /// It is deliberately **not** set at the walker's structural ceiling. The 30-bit unitig id
+    /// packing runs out near 29 GB compressed, and the largest object in the sample is 19.7
+    /// GB, so a cap there would refuse nothing; but the cap is also a relevance filter, and
+    /// the two 11 GB accessions probed on nn1 each took 16 minutes and returned `no_path`.
     pub max_compressed_bytes: u64,
 
     // ---- io ----
@@ -516,21 +537,41 @@ impl Config {
         }
     }
 
-    /// Worst-case bytes resident in compressed buffers alone, if every accession is at the
-    /// `--max-size-mb` cap.
+    /// Whether a downloaded object is written to disk as it arrives instead of being held.
     ///
-    /// This is a bound, not a prediction: real accessions are far below the cap (`ERR2028820`
-    /// is 33 MB, the ERG11 panel reaches 343 MB against a 1 GB default). It excludes the parsed
-    /// graphs (`max_graph_resident_bytes`) and any transient growth inside `read_to_vec` while
-    /// the receiving `Vec` reallocates.
+    /// True when there is anywhere to put it: `--unitigs-cache` (where it is wanted anyway) or
+    /// `--spool-dir` (an unlinked file that dies with the process). `main` always resolves a
+    /// spool directory, so this is true for every CLI run; it is false for library callers and
+    /// tests that configure neither, who keep the old in-memory behaviour.
+    ///
+    /// This is the single switch that decides whether memory scales with `--max-size-mb`. When
+    /// it is true, nothing in the walker does.
+    pub fn downloads_stream_to_disk(&self) -> bool {
+        self.unitigs_cache.is_some() || self.spool_dir.is_some()
+    }
+
+    /// Worst-case bytes resident in compressed buffers alone.
+    ///
+    /// With `downloads_stream_to_disk`, a download costs one `DOWNLOAD_BUFFER_BYTES` copy
+    /// buffer while it is in flight and nothing afterwards, so this is a constant and the cap
+    /// does not appear in it. Without it, every in-flight accession can be a full buffer at
+    /// the `--max-size-mb` cap, which is what this used to be unconditionally.
+    ///
+    /// Either way a bound, not a prediction: real accessions are far below the cap
+    /// (`ERR2028820` is 33 MB, the ERG11 panel reaches 343 MB against a 1 GB default). It
+    /// excludes the parsed graphs (`max_graph_resident_bytes`).
     pub fn max_compressed_resident_bytes(&self) -> u64 {
         self.max_compressed_resident_bytes_for(usize::MAX)
     }
 
     /// As above, for a run with `n_accessions` of work.
     pub fn max_compressed_resident_bytes_for(&self, n_accessions: usize) -> u64 {
-        (self.peak_compressed_buffers_for(n_accessions) as u64)
-            .saturating_mul(self.max_compressed_bytes)
+        let per = if self.downloads_stream_to_disk() {
+            DOWNLOAD_BUFFER_BYTES
+        } else {
+            self.max_compressed_bytes
+        };
+        (self.peak_compressed_buffers_for(n_accessions) as u64).saturating_mul(per)
     }
 
     /// The budget one parsed graph may use, which is what `stages::parse` enforces.
@@ -539,7 +580,33 @@ impl Config {
     /// out makes the per-accession limit the single definition both the printed bound and the
     /// parser work from, so the promise and the enforcement cannot drift apart.
     pub fn max_graph_bytes_per_accession(&self) -> u64 {
-        (self.max_compressed_bytes as f64 * GRAPH_PEAK_PER_COMPRESSED_BYTE) as u64
+        match self.max_subgraph_resident_bytes() {
+            // Adjacency spools and the neighbourhood is capped, so the resident graph is a
+            // property of the gene and not of the file. This is the number the startup line
+            // leads with, and enforcing the cap-derived one instead would mean promising one
+            // bound and policing another about fifty times larger. Plus the flush buffers
+            // `scan_in` keeps on the way to the spool, so they do not eat the neighbourhood's
+            // allowance; they are cleared on every flush and stay near `SPILL_ADJACENCY_AT`.
+            //
+            // It also governs the degraded path, deliberately. A spool that cannot be created
+            // falls back to keeping adjacency in RAM, which used to mean an accession quietly
+            // using up to `--max-size-mb` x 1.7 after the run had announced a figure fifty
+            // times smaller. Now it means the accession is refused as `too_large`, next to the
+            // warning naming the directory that failed, and the run stays inside what it said.
+            Some(per) => per.saturating_add(SPILL_HEADROOM),
+            // No spool directory, or `--max-subgraph-nodes 0`: nothing bounds the graph by the
+            // gene, so the only bound left is the one calibrated against compressed size.
+            None => (self.max_compressed_bytes as f64 * GRAPH_PEAK_PER_COMPRESSED_BYTE) as u64,
+        }
+    }
+
+    /// Whether the graph budget is set by the gene rather than by `--max-size-mb`.
+    ///
+    /// True for every CLI run, since `main` always resolves a spool directory and
+    /// `--max-subgraph-nodes` defaults to 1,000,000. The startup lines branch on it, because
+    /// the two cases want different sentences and not just different numbers.
+    pub fn graph_bound_is_set_by_the_gene(&self) -> bool {
+        self.max_subgraph_resident_bytes().is_some()
     }
 
     /// Resident bytes one neighbourhood costs, once adjacency has gone to disk.
@@ -563,10 +630,15 @@ impl Config {
     }
 
     /// As above, for a run with `n_accessions` of work.
+    ///
+    /// Built from `max_graph_bytes_per_accession` rather than from its own copy of the
+    /// formula, which is what that function's doc comment always claimed and what makes the
+    /// printed bound and the parser's refusal the same number by construction. They were two
+    /// expressions of the same arithmetic until the per-accession budget stopped being
+    /// `cap x 1.7`, at which point the duplicate would have silently disagreed.
     pub fn max_graph_resident_bytes_for(&self, n_accessions: usize) -> u64 {
-        // A float-to-integer cast saturates, so an unlimited cap stays u64::MAX.
-        (self.peak_graphs_for(n_accessions) as f64 * self.max_compressed_bytes as f64
-            * GRAPH_PEAK_PER_COMPRESSED_BYTE) as u64
+        (self.peak_graphs_for(n_accessions) as u64)
+            .saturating_mul(self.max_graph_bytes_per_accession())
     }
 
     /// Worst-case resident bytes for the run: compressed buffers plus parsed graphs. What the
@@ -580,6 +652,74 @@ impl Config {
         self.max_compressed_resident_bytes_for(n_accessions)
             .saturating_add(self.max_graph_resident_bytes_for(n_accessions))
     }
+
+    // ---- disk ----
+    //
+    // Two consumers, and they do not share a shape. The spool is transient, dies with the
+    // accession and scales with `compute_workers`; the cache is persistent, outlives the run
+    // and scales with the accession count. A single "disk needed" number would hide that one
+    // of them is unaffected by `-w` and the other is unaffected by how long the list is.
+
+    /// Spool bytes one accession at the `--max-size-mb` cap would write.
+    ///
+    /// The disk twin of `max_graph_bytes_per_accession`, and the better-grounded of the two:
+    /// see `SPOOL_BYTES_PER_COMPRESSED_BYTE`. Zero without a `spool_dir`, because then
+    /// adjacency never leaves RAM and `max_graph_bytes_per_accession` is the only bound that
+    /// applies.
+    pub fn max_spool_bytes_per_accession(&self) -> u64 {
+        if self.spool_dir.is_none() {
+            return 0;
+        }
+        spool_bytes_for_compressed(self.max_compressed_bytes)
+    }
+
+    /// Worst-case spool bytes on disk at once, for a run with `n_accessions` of work.
+    ///
+    /// One spool per compute worker, each from an accession at the cap. `peak_graphs_for` is
+    /// the same count the graph bound uses, so the two move together: a spool exists exactly
+    /// when a graph is being parsed, and `--fetch-only` has neither.
+    pub fn max_spool_bytes_for(&self, n_accessions: usize) -> u64 {
+        (self.peak_graphs_for(n_accessions) as u64)
+            .saturating_mul(self.max_spool_bytes_per_accession())
+    }
+
+    /// Worst-case bytes of downloaded objects sitting on disk at once, outside the cache.
+    ///
+    /// With `--unitigs-cache` a download lands in the cache and is counted there, permanently;
+    /// this is the other case, where it lands in `--spool-dir` as an unlinked file that lives
+    /// only as long as the accession does. One per in-flight accession, so it is the same
+    /// count the memory bound used to apply the cap to: this term is precisely the RAM that
+    /// streaming moved onto disk, and it is the same size.
+    pub fn max_download_bytes_for(&self, n_accessions: usize) -> u64 {
+        if self.unitigs_cache.is_some() || !self.downloads_stream_to_disk() {
+            return 0;
+        }
+        (self.peak_compressed_buffers_for(n_accessions) as u64)
+            .saturating_mul(self.max_compressed_bytes)
+    }
+
+    /// Worst-case bytes `--unitigs-cache` can reach over a run of `n_accessions`, or `None`
+    /// when nothing will be written to it.
+    ///
+    /// Every accession at the cap, which no cohort reaches, and it ignores what the directory
+    /// already holds: a bound, like the memory line, not a prediction. The shape is what
+    /// matters, and it is `n x cap` with no worker term at all, so lowering `-w` does not
+    /// move it. `--offline` writes nothing, so there is no bound to state.
+    pub fn max_cache_bytes_for(&self, n_accessions: usize) -> Option<u64> {
+        if self.unitigs_cache.is_none() || self.offline {
+            return None;
+        }
+        Some((n_accessions as u64).saturating_mul(self.max_compressed_bytes))
+    }
+}
+
+/// Spool bytes one accession of `compressed_bytes` is predicted to write.
+///
+/// Free-standing because the fetch gate works from an accession's real `Content-Length`
+/// rather than from the cap, which is the whole point of deciding there: `--max-size-mb`
+/// bounds the run, this bounds the accession in hand.
+pub fn spool_bytes_for_compressed(compressed_bytes: u64) -> u64 {
+    (compressed_bytes as f64 * SPOOL_BYTES_PER_COMPRESSED_BYTE) as u64
 }
 
 /// Peak memory of a parsed `UnitigGraph`, per byte of its compressed unitig file.
@@ -591,6 +731,46 @@ impl Config {
 /// This replaces a fixed ~43 MB per worker, which was the array lengths of one 33 MB
 /// accession; the 348 MB one's graph peaked at 498 MB.
 pub const GRAPH_PEAK_PER_COMPRESSED_BYTE: f64 = 1.7;
+
+/// Headroom in the graph budget for the adjacency the parser holds before it spills.
+///
+/// `scan_in` lets adjacency grow to `SPILL_ADJACENCY_AT` before it creates a spool, and the
+/// `Vec`s grow by doubling and are never shrunk, so their capacity can reach twice that and
+/// then stays at the high-water mark for the rest of the accession. Four times the threshold
+/// leaves a factor of two over that worst case.
+///
+/// It matters most at a small `--max-subgraph-nodes`, where the neighbourhood's own allowance
+/// is the smaller term: at 1,000 nodes that allowance is 150 KB, against roughly 8 MiB of
+/// retained flush-buffer capacity, so without this every accession would be refused in pass 1
+/// for holding its own buffers.
+const SPILL_HEADROOM: u64 = 4 * crate::types::SPILL_ADJACENCY_AT as u64;
+
+/// The copy buffer a download uses on its way from the socket to disk.
+///
+/// The whole of what one in-flight accession costs in RAM once objects stream. 128 KiB to
+/// match `Payload::read_file`, large enough that the syscall count is irrelevant next to the
+/// network and small enough that 16 of them do not register against a parsed graph.
+pub const DOWNLOAD_BUFFER_BYTES: u64 = 128 * 1024;
+
+/// Spooled adjacency bytes, per byte of compressed unitig file.
+///
+/// The spool is two files of `u32` and nothing else: one offset per unitig plus a terminator,
+/// and one entry per edge. No sequences, no abundances, and no slack from an allocator that
+/// grows by doubling, because it is written out rather than grown. That is why this is a far
+/// tighter constant than `GRAPH_PEAK_PER_COMPRESSED_BYTE`, whose measured spread was 1.24x to
+/// 1.62x. Measured 2026-11-16 over a 340x size range:
+///
+/// | accession | compressed | spool | ratio | edges per unitig |
+/// |---|---|---|---|---|
+/// | `ERR2028820` | 32.4 MB | 15.4 MB | 0.477 | 2.02 |
+/// | `DRR240330` | 11.02 GB | 5.24 GiB | 0.510 | 2.64 |
+/// | `DRR212963` | 10.99 GB | 5.41 GiB | 0.529 | 2.64 |
+///
+/// Unitigs per compressed byte holds at 0.0350 to 0.0376 across all three. The term that
+/// drifts is edges per unitig, and it drifts *upward* with size because larger assemblies are
+/// branchier, so a constant taken from small accessions under-predicts the large ones this
+/// exists to bound. 0.55 is the largest measured ratio rounded up, not an average.
+pub const SPOOL_BYTES_PER_COMPRESSED_BYTE: f64 = 0.55;
 
 /// Resident bytes per retained neighbourhood node, once adjacency is spooled.
 ///
@@ -632,7 +812,7 @@ impl Default for Config {
             fetch_timeout_secs: 900,
             fetch_connect_timeout_secs: 15,
             fetch_attempts: 3,
-            max_compressed_bytes: 1024 * 1024 * 1024,
+            max_compressed_bytes: 4096 * 1024 * 1024,
             scratch_dir: std::env::temp_dir().join("logan-walker-test"),
             graphaligner_bin: String::from("GraphAligner"),
             unitigs_cache: None,
@@ -645,7 +825,11 @@ impl Default for Config {
 
 #[cfg(test)]
 mod memory_bound_tests {
-    use super::Config;
+    use super::{
+        spool_bytes_for_compressed, Config, DOWNLOAD_BUFFER_BYTES,
+        GRAPH_PEAK_PER_COMPRESSED_BYTE,
+    };
+    use std::path::PathBuf;
 
     /// The documented ceiling was `channel_capacity` alone. Three places hold a compressed
     /// buffer at once, so at the defaults the real figure is 20, not 4.
@@ -661,12 +845,20 @@ mod memory_bound_tests {
         );
     }
 
-    /// 20 buffers at the 1 GB default cap is ~20 GB, the figure that made this a finding.
+    /// 20 buffers at the then 1 GB default cap is ~20 GB, the figure that made this a
+    /// finding. Written against the cap rather than against a number of gigabytes, because
+    /// the default has moved twice since and the claim is about the multiplier.
     #[test]
     fn worst_case_bytes_track_the_size_cap() {
         let cfg = Config::default();
-        assert_eq!(cfg.max_compressed_bytes, 1024 * 1024 * 1024);
-        assert_eq!(cfg.max_compressed_resident_bytes(), 16 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.max_compressed_bytes, 4096 * 1024 * 1024, "the 0.2.0 default");
+        // `Config::default()` configures no cache and no spool dir, so downloads are still
+        // held and the cap is still the per-buffer size. A CLI run is the streaming case.
+        assert!(!cfg.downloads_stream_to_disk());
+        assert_eq!(
+            cfg.max_compressed_resident_bytes(),
+            cfg.peak_compressed_buffers() as u64 * cfg.max_compressed_bytes
+        );
 
         // The ERG11 panel's largest accession, a real-data case.
         let panel = 343u64 * 1024 * 1024;
@@ -698,17 +890,241 @@ mod memory_bound_tests {
         assert_eq!(cfg.max_compressed_resident_bytes(), u64::MAX);
         assert_eq!(cfg.max_graph_resident_bytes(), u64::MAX);
         assert_eq!(cfg.max_resident_bytes(), u64::MAX);
+        // The disk bounds multiply the same cap, so they need the same protection. 0.55 of
+        // u64::MAX does not itself overflow a f64-to-u64 cast, but the worker and accession
+        // multiplications do.
+        let cfg = Config {
+            max_compressed_bytes: u64::MAX,
+            spool_dir: Some(PathBuf::from("/tmp")),
+            unitigs_cache: Some(PathBuf::from("/tmp")),
+            ..Config::default()
+        };
+        assert_eq!(cfg.max_spool_bytes_for(usize::MAX), u64::MAX);
+        assert_eq!(cfg.max_cache_bytes_for(1_000_000), Some(u64::MAX));
+    }
+
+    /// The graph budget is set by the gene, and the printed bound is the budget.
+    ///
+    /// Two claims, and the second is the one that used to be false. The startup line quoted
+    /// `--max-size-mb` x 1.7 while the parser enforced the same figure, and a second line then
+    /// corrected the number by a factor of about fifty; whichever of the two a reader
+    /// believed, one of them was wrong. They are now one expression.
+    #[test]
+    fn the_graph_budget_is_set_by_the_gene_and_is_what_gets_printed() {
+        let gene = Config {
+            spool_dir: Some(PathBuf::from("/tmp")),
+            ..Config::default()
+        };
+        assert!(gene.graph_bound_is_set_by_the_gene());
+        // Raising the size cap a hundredfold must not move it.
+        let big = Config { max_compressed_bytes: gene.max_compressed_bytes * 100, ..gene.clone() };
+        assert_eq!(
+            big.max_graph_bytes_per_accession(),
+            gene.max_graph_bytes_per_accession(),
+            "the graph budget must not mention the size cap once adjacency spools"
+        );
+        // It is the neighbourhood cap that moves it.
+        let narrow = Config { max_subgraph_nodes: 1000, ..gene.clone() };
+        assert!(narrow.max_graph_bytes_per_accession() < gene.max_graph_bytes_per_accession());
+        // Pass 1 holds adjacency in RAM until it reaches `SPILL_ADJACENCY_AT`, and the Vecs
+        // keep that capacity for the rest of the accession, so the budget has to leave room
+        // for it however small the neighbourhood cap is. Without the headroom,
+        // `--max-subgraph-nodes 1000` would budget 150 KB against ~8 MiB of retained buffers
+        // and refuse every accession in pass 1.
+        let tiny = Config { max_subgraph_nodes: 1, ..gene.clone() };
+        assert!(
+            tiny.max_graph_bytes_per_accession()
+                > 2 * crate::types::SPILL_ADJACENCY_AT as u64,
+            "the budget must clear the flush buffers pass 1 holds before it spills, even at \
+             the smallest neighbourhood cap"
+        );
+
+        // The printed bound is the budget times the graphs, not a second copy of a formula.
+        assert_eq!(
+            gene.max_graph_resident_bytes_for(usize::MAX),
+            gene.peak_graphs_for(usize::MAX) as u64 * gene.max_graph_bytes_per_accession()
+        );
+
+        // Without a spool directory, or with the neighbourhood cap off, nothing bounds the
+        // graph by the gene and the budget falls back to the compressed size.
+        for cfg in [
+            Config::default(),
+            Config { max_subgraph_nodes: 0, ..gene.clone() },
+        ] {
+            assert!(!cfg.graph_bound_is_set_by_the_gene());
+            assert_eq!(
+                cfg.max_graph_bytes_per_accession(),
+                (cfg.max_compressed_bytes as f64 * GRAPH_PEAK_PER_COMPRESSED_BYTE) as u64
+            );
+        }
+    }
+
+    /// Streaming downloads is what takes `--max-size-mb` out of the memory bound.
+    ///
+    /// Before it, every in-flight accession could be a full buffer at the cap, which is why
+    /// the cap could not be raised: at 28 GB the defaults would have promised 437 GB of RAM,
+    /// and meant it. The test that matters is the last one, that raising the cap a
+    /// hundredfold does not move the number at all.
+    #[test]
+    fn streaming_downloads_take_the_cap_out_of_the_memory_bound() {
+        let held = Config::default();
+        assert!(!held.downloads_stream_to_disk(), "neither a cache nor a spool dir");
+        assert_eq!(
+            held.max_compressed_resident_bytes(),
+            held.peak_compressed_buffers() as u64 * held.max_compressed_bytes
+        );
+
+        for cfg in [
+            Config { spool_dir: Some(PathBuf::from("/tmp")), ..Config::default() },
+            Config { unitigs_cache: Some(PathBuf::from("/tmp")), ..Config::default() },
+        ] {
+            assert!(cfg.downloads_stream_to_disk());
+            assert_eq!(
+                cfg.max_compressed_resident_bytes(),
+                cfg.peak_compressed_buffers() as u64 * DOWNLOAD_BUFFER_BYTES
+            );
+            // 16 x 128 KiB, against 16 GB before.
+            assert!(cfg.max_compressed_resident_bytes() < 4 * 1024 * 1024);
+            let hundredfold = Config {
+                max_compressed_bytes: cfg.max_compressed_bytes * 100,
+                ..cfg.clone()
+            };
+            assert_eq!(
+                hundredfold.max_compressed_resident_bytes(),
+                cfg.max_compressed_resident_bytes(),
+                "the cap must not appear in the memory bound once objects stream"
+            );
+        }
+    }
+
+    /// A downloaded object is on disk in exactly one place, and counted in exactly one term.
+    ///
+    /// With a cache it lands there and stays; without one it is an unlinked file that dies
+    /// with the accession. Counting it in both would double the printed disk bound, and
+    /// counting it in neither would hide the bytes that streaming moved off the heap.
+    #[test]
+    fn a_downloaded_object_is_counted_once_and_in_the_right_term() {
+        let dir = || Some(PathBuf::from("/tmp"));
+        let cap = Config::default().max_compressed_bytes;
+
+        let spool_only = Config { spool_dir: dir(), ..Config::default() };
+        assert_eq!(
+            spool_only.max_download_bytes_for(50),
+            spool_only.peak_compressed_buffers_for(50) as u64 * cap
+        );
+        assert_eq!(spool_only.max_cache_bytes_for(50), None);
+
+        let cached = Config { spool_dir: dir(), unitigs_cache: dir(), ..Config::default() };
+        assert_eq!(cached.max_download_bytes_for(50), 0, "already counted as cache");
+        assert_eq!(cached.max_cache_bytes_for(50), Some(50 * cap));
+
+        let neither = Config::default();
+        assert_eq!(neither.max_download_bytes_for(50), 0, "held in RAM, counted as memory");
+    }
+
+    /// `SPOOL_BYTES_PER_COMPRESSED_BYTE` is a bound, so it must sit above every accession it
+    /// was measured on, and close enough above them to be worth stating.
+    ///
+    /// The three span a 340x size range. The prediction has to cover the largest ratio,
+    /// because an under-prediction is a gate that lets through an accession that then fills
+    /// the disk; it must not cover it by so much that the gate refuses feasible runs.
+    #[test]
+    fn the_spool_constant_bounds_every_accession_it_was_measured_on() {
+        // (compressed bytes, spool bytes) as measured.
+        let measured: [(u64, u64); 3] = [
+            (32_400_000, 15_438_276),          // ERR2028820
+            (11_023_800_656, 5_626_407_158),   // DRR240330
+            (10_989_106_976, 5_808_943_268),   // DRR212963
+        ];
+        for (compressed, spool) in measured {
+            let predicted = spool_bytes_for_compressed(compressed);
+            assert!(
+                predicted >= spool,
+                "{compressed} compressed: predicted {predicted} under the measured {spool}"
+            );
+            assert!(
+                predicted as f64 <= spool as f64 * 1.2,
+                "{compressed} compressed: predicted {predicted} over the measured {spool} by \
+                 more than 20%"
+            );
+        }
+    }
+
+    /// The two disk consumers do not share a shape, and the startup line says so because the
+    /// numbers do. The spool moves with `-w` and is capped by the pipeline; the cache moves
+    /// with the list length and ignores `-w` entirely.
+    #[test]
+    fn the_spool_scales_with_workers_and_the_cache_with_the_list() {
+        let base = Config {
+            spool_dir: Some(PathBuf::from("/tmp")),
+            unitigs_cache: Some(PathBuf::from("/tmp")),
+            ..Config::default()
+        };
+        let wide = Config { compute_workers: 16, ..base.clone() };
+        // Workers move the spool...
+        assert!(wide.max_spool_bytes_for(usize::MAX) > base.max_spool_bytes_for(usize::MAX));
+        // ...and do not move the cache.
+        assert_eq!(wide.max_cache_bytes_for(50), base.max_cache_bytes_for(50));
+        // The list moves the cache without limit...
+        assert!(base.max_cache_bytes_for(1000) > base.max_cache_bytes_for(50));
+        // ...and moves the spool only until the pipeline is full.
+        assert_eq!(base.max_spool_bytes_for(1000), base.max_spool_bytes_for(8));
+        assert!(base.max_spool_bytes_for(2) < base.max_spool_bytes_for(8));
+        // At 8 workers and a 50-accession list: 4.4 x cap of transient spool against 50 x
+        // cap of cache. Summing them would hide which one `-w` touches.
+        let cap = base.max_compressed_bytes as f64;
+        let spool = base.max_spool_bytes_for(50) as f64;
+        assert!((spool - 8.0 * 0.55 * cap).abs() / spool < 1e-6);
+        assert_eq!(base.max_cache_bytes_for(50), Some(50 * base.max_compressed_bytes));
+    }
+
+    /// No spool directory means adjacency never leaves RAM, where the graph budget already
+    /// bounds it. Claiming disk for it would have the startup line reserve space nothing
+    /// writes, and would arm a fetch gate against a spool that cannot exist.
+    #[test]
+    fn without_a_spool_directory_there_is_no_disk_bound() {
+        let cfg = Config::default();
+        assert!(cfg.spool_dir.is_none());
+        assert_eq!(cfg.max_spool_bytes_per_accession(), 0);
+        assert_eq!(cfg.max_spool_bytes_for(usize::MAX), 0);
+        // And no cache means nothing is written to one, `--offline` most of all: it is the
+        // mode that reads a cache and never adds to it.
+        assert_eq!(cfg.max_cache_bytes_for(50), None);
+        let offline = Config {
+            unitigs_cache: Some(PathBuf::from("/tmp")),
+            offline: true,
+            ..Config::default()
+        };
+        assert_eq!(offline.max_cache_bytes_for(50), None);
+    }
+
+    /// `--fetch-only` parses nothing, so it spools nothing, but filling the cache is the
+    /// whole mode: the one case where the persistent term exists and the transient one does
+    /// not.
+    #[test]
+    fn fetch_only_spools_nothing_and_caches_everything() {
+        let cfg = Config {
+            fetch_only: true,
+            spool_dir: Some(PathBuf::from("/tmp")),
+            unitigs_cache: Some(PathBuf::from("/tmp")),
+            ..Config::default()
+        };
+        assert_eq!(cfg.max_spool_bytes_for(usize::MAX), 0);
+        assert_eq!(cfg.max_cache_bytes_for(50), Some(50 * cfg.max_compressed_bytes));
     }
 
     /// The parsed graphs come on top of the buffers: one per compute worker, up to 1.7x the
-    /// cap each, so the defaults' worst case is ~33.6 GB, not the ~20 GB once printed.
+    /// cap each. At the old 1 GB default that was ~33.6 GB, not the ~20 GB once printed.
     #[test]
     fn the_bound_includes_the_parsed_graphs() {
         let cfg = Config::default();
-        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-        assert!((gib(cfg.max_graph_resident_bytes()) - 8.0 * 1.7).abs() < 1e-6);
-        // 16 GB of buffers plus 13.6 GB of graphs. It was 33.6 until the queue depth went to 0.
-        assert!((gib(cfg.max_resident_bytes()) - 29.6).abs() < 1e-6);
+        let cap = cfg.max_compressed_bytes as f64;
+        let graphs = cfg.max_graph_resident_bytes() as f64;
+        assert!((graphs - 8.0 * 1.7 * cap).abs() / graphs < 1e-6);
+        // Buffers plus graphs: 16 x cap + 8 x 1.7 x cap = 29.6 x cap. It was 33.6 until the
+        // queue depth went to 0.
+        let total = cfg.max_resident_bytes() as f64;
+        assert!((total - 29.6 * cap).abs() / total < 1e-6);
         let more = Config { compute_workers: 16, ..Config::default() };
         assert!(more.max_graph_resident_bytes() > cfg.max_graph_resident_bytes());
     }
@@ -726,9 +1142,10 @@ mod memory_bound_tests {
         assert_eq!(cfg.peak_compressed_buffers_for(16), 16);
         assert_eq!(cfg.peak_compressed_buffers_for(10_000), 16);
         assert_eq!(cfg.peak_graphs_for(10_000), 8);
-        // 1 x 1 GB + 1 x 1.7 GB, against 29.6 GB for a list long enough to fill the pipeline.
-        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-        assert!((gib(cfg.max_resident_bytes_for(1)) - 2.7).abs() < 1e-6);
+        // 1 x cap + 1 x 1.7 x cap, against 29.6 x cap for a list long enough to fill the
+        // pipeline.
+        let one = cfg.max_resident_bytes_for(1) as f64;
+        assert!((one - 2.7 * cfg.max_compressed_bytes as f64).abs() / one < 1e-6);
         assert_eq!(cfg.max_resident_bytes_for(usize::MAX), cfg.max_resident_bytes());
     }
 

@@ -207,7 +207,7 @@ pub fn run_fetch_only(
         Arc::new(Mutex::new(rx))
     };
 
-    let fetcher = stages::stream::Fetcher::new(cfg);
+    let fetcher = stages::stream::Fetcher::new_for(cfg, total);
     let fetcher = &fetcher;
     // Results, not counts. A fetch-only run used to report three integers to stderr and exit,
     // so the frozen-input route (`disassembler fetch` into a cache, then `--offline`) left no
@@ -295,7 +295,12 @@ fn result_for_error(
     use crate::error::Error;
     match e {
         Error::NoLoganData { .. } => AccessionResult::empty(index, accession, Outcome::NoLoganData, None),
-        // The bare detail: the report line already says "too_large, skipped by --max-size-mb".
+        // The bare detail, which now has to carry the reason as well as the size: `too_large`
+        // is no longer only `--max-size-mb`. It is also a graph over the parse budget, an
+        // accession whose spool will not fit the spool directory, and a spool write that ran
+        // out of space. Every site writes a self-describing detail, and the report line below
+        // prints it rather than naming a flag that may not be the one at fault.
+        //
         // The payload is what makes the skip actionable: it carries the size that tripped the
         // cap as a number, where before it survived only as prose inside `detail`.
         Error::TooLarge { detail: d, payload, .. } => {
@@ -370,7 +375,7 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
 
     // One pooled HTTP client shared by every fetch thread. The bucket is a single host,
     // so per-thread agents would just multiply TLS handshakes.
-    let fetcher = stages::stream::Fetcher::new(cfg);
+    let fetcher = stages::stream::Fetcher::new_for(cfg, total);
     let fetcher = &fetcher;
 
     let results = std::thread::scope(|scope| {
@@ -484,7 +489,7 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
             r.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default()
         ),
         Outcome::TooLarge => println!(
-            "[{done}/{total}] {}: too_large, skipped by --max-size-mb ({})",
+            "[{done}/{total}] {}: too_large, skipped ({})",
             r.accession,
             r.error.as_deref().unwrap_or("over the cap")
         ),

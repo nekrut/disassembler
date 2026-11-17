@@ -2249,7 +2249,7 @@ mod identity_label_tests {
             "\"primary_metric\": \"matched\"",
             "\"prune_frac\": 0.01",
             "\"min_abund\": 5.0",
-            "\"max_size_mb\": 1024",
+            "\"max_size_mb\": 4096",
             "\"summary_seqs\": false",
             // The run block, with the clock the test pinned.
             "\"status\": \"ok\"",

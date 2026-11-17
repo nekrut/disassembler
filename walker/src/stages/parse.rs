@@ -110,6 +110,67 @@ fn base_code(b: u8, record: u64) -> std::result::Result<u8, String> {
     }
 }
 
+/// A decode that produced no unitig records: absent data, or a file the walker cannot read.
+///
+/// An **empty** stream is a property of the data, not a failure of the run. Logan publishes a
+/// 55-byte zstd frame, a valid frame with nothing in it, for accessions it assembled nothing
+/// from: 20 of a random 5,000 sampled from the bucket on 2026-11-16 were exactly that, 0.4%.
+/// The walker used to call that a parse error, which told a scheduler the run had broken over
+/// something it should treat exactly as it treats a 404. It is now `NoLoganData`, the same
+/// negative the 404 path returns, because it is the same fact about the same accession
+/// arriving by a different route.
+///
+/// A stream that had **content** but no `>` record stays an error. That is a malformed file
+/// rather than an absent one, and collapsing the two would hide a real defect: the first is
+/// Logan having nothing to say, the second is Logan saying something the walker cannot read.
+fn no_records_error(accession: &Accession, bytes_read: u64) -> Error {
+    if bytes_read == 0 {
+        Error::NoLoganData { accession: accession.clone() }
+    } else {
+        Error::Parse {
+            accession: accession.clone(),
+            detail: format!("no unitig records found in {bytes_read} bytes of decompressed data"),
+        }
+    }
+}
+
+/// Classify a failed spill write: out of space is a negative, anything else is an error.
+///
+/// A spool directory that fills up is the run exceeding a budget the operator set, exactly
+/// like a `Content-Length` over `--max-size-mb`, so it gets the same `too_large` outcome
+/// rather than one that makes the run look broken. The distinction is not cosmetic: a
+/// `too_large` accession is a negative that `--allow-empty` tolerates and that leaves the
+/// exit code alone, while a `Parse` error counts towards `AllErrored` and exit code 3. A
+/// cohort where one 11 GB accession fills the disk should not report that the walker failed.
+///
+/// Everything else keeps the error. A short write to a healthy filesystem, an EIO, or a
+/// handle that went away are not budget decisions and must stay loud.
+///
+/// Note that `AdjacencySpool::create` failing is handled separately and more gently, in
+/// `scan_in`: a spool that cannot be *created* falls back to RAM with a warning, because the
+/// accession can still be parsed the old way. Once spilling has begun that door is shut, as
+/// the rows already written are the only copy.
+fn spill_error(accession: &Accession, what: &str, after: u64, e: std::io::Error) -> Error {
+    match e.kind() {
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => Error::TooLarge {
+            accession: accession.clone(),
+            detail: format!(
+                "the spool directory ran out of space writing adjacency {what} after {after} \
+                 unitigs ({e}); lower -w, lower --max-size-mb, or point --spool-dir at a \
+                 larger filesystem"
+            ),
+            // Nothing is known here about the object's provenance: `scan_in` sees a reader,
+            // not the fetch that produced it. The size that matters is in `detail`, and it is
+            // the spool's, not the payload's.
+            payload: Box::new(crate::types::Payload::default()),
+        },
+        _ => Error::Parse {
+            accession: accession.clone(),
+            detail: format!("spill {what} after {after} unitigs: {e}"),
+        },
+    }
+}
+
 /// Pass 1: adjacency only, with every base handed to `sink` as it goes.
 ///
 /// Adjacency stays in RAM. Use `scan_in` to let it spill to disk past
@@ -150,6 +211,9 @@ pub fn scan_in<S: RecordSink>(
     let mut targets: Vec<u32> = Vec::new();
 
     let mut expected_id: u64 = 0;
+    // Decompressed bytes seen. What tells an absent file from an unreadable one when no
+    // records turn up; see `no_records_error`.
+    let mut bytes_read: u64 = 0;
     let mut in_record = false;
     let mut iters: u64 = 0;
     // The ceiling warning used to scan the stored abundances. Nothing stores them here, so the
@@ -172,8 +236,8 @@ pub fn scan_in<S: RecordSink>(
                     accession: accession.clone(),
                     detail: format!(
                         "graph adjacency reached {used} bytes after {expected_id} unitigs, over \
-                         the {budget_bytes}-byte budget (--max-size-mb x \
-                         GRAPH_PEAK_PER_COMPRESSED_BYTE)"
+                         the {budget_bytes}-byte per-accession graph budget, which is \
+                         the memory bound printed at startup"
                     ),
                     payload: Box::new(crate::types::Payload::default()),
                 });
@@ -187,6 +251,7 @@ pub fn scan_in<S: RecordSink>(
         if n == 0 {
             break;
         }
+        bytes_read += n as u64;
         while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
             line.pop();
         }
@@ -226,9 +291,11 @@ pub fn scan_in<S: RecordSink>(
             }
             if let Some(s) = spool.as_mut() {
                 if held >= SPOOL_FLUSH_AT {
-                    s.push_offsets(&offsets).map_err(|e| bad(format!("spill offsets: {e}")))?;
+                    s.push_offsets(&offsets)
+                        .map_err(|e| spill_error(accession, "offsets", expected_id, e))?;
                     offsets.clear();
-                    s.push_targets(&targets).map_err(|e| bad(format!("spill targets: {e}")))?;
+                    s.push_targets(&targets)
+                        .map_err(|e| spill_error(accession, "targets", expected_id, e))?;
                     targets.clear();
                 }
             }
@@ -252,7 +319,7 @@ pub fn scan_in<S: RecordSink>(
     }
 
     if expected_id == 0 {
-        return Err(bad("no unitig records found".into()));
+        return Err(no_records_error(accession, bytes_read));
     }
     offsets.push(
         u32::try_from(n_targets).map_err(|_| bad("edge count exceeds u32 addressing".into()))?,
@@ -260,8 +327,8 @@ pub fn scan_in<S: RecordSink>(
     warn_ka_ceiling(accession, max_abundance);
 
     if let Some(s) = spool.as_mut() {
-        s.push_offsets(&offsets).map_err(|e| bad(format!("spill offsets: {e}")))?;
-        s.push_targets(&targets).map_err(|e| bad(format!("spill targets: {e}")))?;
+        s.push_offsets(&offsets).map_err(|e| spill_error(accession, "offsets", expected_id, e))?;
+        s.push_targets(&targets).map_err(|e| spill_error(accession, "targets", expected_id, e))?;
         offsets = Vec::new();
         targets = Vec::new();
     }
@@ -365,8 +432,9 @@ pub fn collect(
                             accession: accession.clone(),
                             detail: format!(
                                 "graph reached {used} bytes while collecting {next} of {} \
-                                 neighbourhood unitigs, over the {budget_bytes}-byte budget \
-                                 (--max-size-mb x GRAPH_PEAK_PER_COMPRESSED_BYTE)",
+                                 neighbourhood unitigs, over the {budget_bytes}-byte \
+                                 per-accession graph budget, which is the memory bound \
+                                 printed at startup",
                                 wanted.len()
                             ),
                             payload: Box::new(crate::types::Payload::default()),
@@ -678,6 +746,8 @@ pub fn build(
 
     let mut expected_id: u64 = 0;
     let mut total_bases: u64 = 0;
+    // As in `scan_in`: absent data and unreadable data are different outcomes.
+    let mut bytes_read: u64 = 0;
     let mut in_record = false;
     let mut iters: u64 = 0;
 
@@ -696,8 +766,8 @@ pub fn build(
                     accession: accession.clone(),
                     detail: format!(
                         "parsed graph reached {used} bytes after {expected_id} unitigs, over \
-                         the {budget_bytes}-byte budget (--max-size-mb x \
-                         GRAPH_PEAK_PER_COMPRESSED_BYTE)"
+                         the {budget_bytes}-byte per-accession graph budget, which is \
+                         the memory bound printed at startup"
                     ),
                     // Filled in by the caller, which is the only place that knows where the
                     // bytes came from.
@@ -712,6 +782,7 @@ pub fn build(
         if n == 0 {
             break;
         }
+        bytes_read += n as u64;
         while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
             line.pop();
         }
@@ -754,7 +825,7 @@ pub fn build(
     }
 
     if expected_id == 0 {
-        return Err(bad("no unitig records found".into()));
+        return Err(no_records_error(accession, bytes_read));
     }
     let n_unitigs = expected_id as usize;
     offsets.push(
@@ -1241,6 +1312,129 @@ mod tests {
         std::fs::remove_file(&file).ok();
     }
 
+    /// An empty Logan object is absent data, not a broken run; an unreadable one is not.
+    ///
+    /// Logan serves a 55-byte zstd frame, valid and holding nothing, for accessions it
+    /// assembled nothing from. 20 of a random 5,000 sampled from the bucket on 2026-11-16
+    /// were exactly that, and every one of them used to be reported as `error`, which is what
+    /// a scheduler reads as "this run broke" and what `--allow-empty` refuses to forgive. It
+    /// is the same fact as a 404 and now gets the same outcome.
+    ///
+    /// The second half is what keeps that from being a blanket excuse. A stream that carried
+    /// bytes but no `>` record is a file the walker could not read, which is a defect worth
+    /// surfacing, so it stays an `error` and says how many bytes it saw.
+    #[test]
+    fn an_empty_unitig_file_is_absent_data_and_a_contentful_one_without_records_is_not() {
+        // "   \n" is deliberately not here: a line of spaces survives the newline trim and
+        // is read as sequence data, so it fails earlier with "sequence data before the first
+        // header". That is also an error, and also right, but it is a different check.
+        for (name, input, want_absent) in [
+            ("an empty object", "", true),
+            ("blank lines only", "\n\n\n", false),
+        ] {
+            // Both parsers: `scan` is pass 1 of the two-pass path, `build` the single-pass one.
+            for pass in ["scan", "build"] {
+                let got = if pass == "scan" {
+                    scan(&"T".to_string(), cursor(input), u64::MAX, &mut ())
+                } else {
+                    build(&"T".to_string(), cursor(input), u64::MAX)
+                };
+                match got {
+                    Err(Error::NoLoganData { accession }) => {
+                        assert!(want_absent, "{pass}/{name}: absent, but it had content");
+                        assert_eq!(accession, "T");
+                    }
+                    Err(Error::Parse { detail, .. }) => {
+                        assert!(!want_absent, "{pass}/{name}: an empty file must be a negative");
+                        assert!(detail.contains("no unitig records"), "{detail}");
+                        assert!(detail.contains("bytes"), "it must say how much it saw: {detail}");
+                    }
+                    other => panic!("{pass}/{name}: unexpected {:?}", other.map(|_| ())),
+                }
+            }
+        }
+    }
+
+    /// The fallback to RAM is still policed by the budget the run announced.
+    ///
+    /// Before the budget was re-based, this was the hole in the memory promise: a spool
+    /// directory that could not be created meant adjacency stayed in RAM and grew to
+    /// `--max-size-mb` x 1.7, while the startup line had announced a figure about fifty times
+    /// smaller. Now the budget is the announced one, so the same accession is refused instead.
+    /// The warning still names the directory, so the cause is visible either way.
+    #[test]
+    fn a_fallback_to_memory_over_the_budget_is_refused_rather_than_grown_into() {
+        let mut fa = String::new();
+        for i in 0..200_000u32 {
+            fa.push_str(&format!(">T_{i} ka:f:5.0 L:+:1:+\nACGT\n"));
+        }
+        // Same unusable path as the test above: the parent is a file.
+        let file = std::env::temp_dir().join(format!("logan-fallback-budget-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let blocked = file.join("nope");
+
+        // With room, the fallback parses, which is what the sibling test asserts.
+        let ok = scan_in(&"T".to_string(), cursor(&fa), u64::MAX, &mut (), Some(&blocked), 1 << 12);
+        assert!(ok.is_ok(), "the fallback must still work when the budget allows it");
+
+        // With the budget the startup line would have promised, it does not.
+        let err = scan_in(&"T".to_string(), cursor(&fa), 64 * 1024, &mut (), Some(&blocked), 1 << 12);
+        match err {
+            Err(Error::TooLarge { detail, .. }) => {
+                assert!(detail.contains("graph adjacency reached"), "{detail}");
+                assert!(detail.contains("per-accession graph budget"), "{detail}");
+            }
+            Err(e) => panic!("a budget refusal must be a negative, got {e}"),
+            Ok(_) => panic!("the fallback grew past the budget the run announced"),
+        }
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// A spool that fills the disk is a budget the run exceeded, not a broken file.
+    ///
+    /// The two outcomes are not interchangeable. `TooLarge` is a negative: the accession is
+    /// skipped, `--allow-empty` tolerates it, and a cohort where one giant accession filled
+    /// the disk still reports the others as found. `Parse` is an error: it counts towards
+    /// `AllErrored` and exit code 3, so a disk that filled would have told a scheduler the
+    /// walker itself was broken.
+    ///
+    /// Exercised through the classifier rather than through a real `ENOSPC`, which would need
+    /// a filesystem sized for the test. Both directions are asserted, because mapping every
+    /// write failure to a negative would be just as wrong in the other direction: an EIO is
+    /// not a budget decision and must stay loud.
+    #[test]
+    fn a_spool_write_that_runs_out_of_space_is_a_negative_not_an_error() {
+        let acc = "ACC".to_string();
+        let full = |raw: i32| spill_error(&acc, "offsets", 42, std::io::Error::from_raw_os_error(raw));
+
+        // ENOSPC, and EDQUOT, which is the same decision made by a quota rather than by the
+        // device: both arrive at `write_all` on a spool that cannot grow.
+        for raw in [libc::ENOSPC, libc::EDQUOT] {
+            match full(raw) {
+                Error::TooLarge { accession, detail, .. } => {
+                    assert_eq!(accession, acc);
+                    assert!(detail.contains("ran out of space"), "{detail}");
+                    assert!(detail.contains("after 42 unitigs"), "{detail}");
+                    // The message has to say what to do, because the remedy is not obvious:
+                    // the accession is within every size cap the run set.
+                    assert!(detail.contains("--spool-dir"), "{detail}");
+                }
+                other => panic!("errno {raw} must be a negative, got {other:?}"),
+            }
+        }
+
+        // Anything else keeps the error.
+        for raw in [libc::EIO, libc::EBADF, libc::EFBIG] {
+            match full(raw) {
+                Error::Parse { accession, detail } => {
+                    assert_eq!(accession, acc);
+                    assert!(detail.contains("spill offsets"), "{detail}");
+                }
+                other => panic!("errno {raw} must stay an error, got {other:?}"),
+            }
+        }
+    }
+
     /// Asking for an id the graph does not hold is a bug in the caller, and says so.
     #[test]
     fn reading_an_unretained_unitig_panics_with_a_useful_message() {
@@ -1274,6 +1468,46 @@ mod tests {
             got >= 1024 * size_of::<u32>() as u64,
             "counted {got} bytes for a Vec holding one element in a 1024-slot allocation"
         );
+    }
+
+    /// What `collect` measures must fit inside what `--max-subgraph-nodes` budgets for it.
+    ///
+    /// The graph budget is now `max_subgraph_nodes` x `BYTES_PER_SUBGRAPH_NODE`, and `collect`
+    /// polices it with `csr_bytes`. If a node costs more in `csr_bytes` than the constant
+    /// allows, a neighbourhood inside the node cap would be refused for being over the byte
+    /// budget, which is a false negative on legitimate data. The two are measured differently
+    /// (`BYTES_PER_SUBGRAPH_NODE` is a slope of peak RSS, `csr_bytes` is a sum of capacities),
+    /// so this checks that the margin between them is real rather than assumed.
+    #[test]
+    fn a_neighbourhood_inside_the_node_cap_fits_the_byte_budget() {
+        // A neighbourhood with the shape real ones have: ~2.6 edges per node and unitigs long
+        // enough to matter, since the 2-bit sequence is the largest per-node term.
+        const N: usize = 50_000;
+        const BASES: usize = 200;
+        let mut offsets: Vec<u32> = Vec::with_capacity(N + 1);
+        let mut targets: Vec<u32> = Vec::with_capacity(N * 3);
+        let mut seq_offset: Vec<u32> = Vec::with_capacity(N + 1);
+        for i in 0..N {
+            offsets.push(targets.len() as u32);
+            for e in 0..3 {
+                targets.push(((i + e + 1) % N) as u32);
+            }
+            seq_offset.push((i * BASES / 4) as u32);
+        }
+        offsets.push(targets.len() as u32);
+        seq_offset.push((N * BASES / 4) as u32);
+        let abundance: Vec<f32> = vec![5.0; N];
+        let seq_2bit: Vec<u8> = vec![0; N * BASES / 4];
+
+        let got = csr_bytes(&offsets, &targets, &abundance, &seq_2bit, &seq_offset);
+        let budget = N as u64 * crate::config::BYTES_PER_SUBGRAPH_NODE;
+        assert!(
+            got < budget,
+            "a {N}-node neighbourhood measures {got} bytes against a {budget}-byte budget; \
+             BYTES_PER_SUBGRAPH_NODE no longer covers what csr_bytes counts"
+        );
+        // And the margin is not a rounding accident.
+        assert!(got * 2 < budget * 3, "the margin is under 1.5x: {got} against {budget}");
     }
 
     /// The budget must not refuse what fits. An ordinary small graph parses under a budget

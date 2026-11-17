@@ -814,8 +814,12 @@ fn a_graph_over_its_budget_is_a_too_large_negative_not_an_error() {
         .arg("--offline")
         .arg("-o").arg(f.dir.join("out"))
         .arg("-f").arg(f.dir.join("out").join("r.fasta"))
-        // 1 MB cap, so the graph budget is 1.7 MB. The compressed fixture is far below the
-        // cap, so only the graph budget can refuse it.
+        // `--max-subgraph-nodes 0` turns off the neighbourhood cap, which is what normally
+        // sets the graph budget; without it the budget falls back to `--max-size-mb` x 1.7,
+        // so 1 MB means 1.7 MB. The compressed fixture is far below the size cap itself, so
+        // only the graph budget can refuse it. Driving it from the size cap is the point:
+        // this is the branch where the gene does not bound the graph and the file must.
+        .arg("--max-subgraph-nodes").arg("0")
         .arg("--max-size-mb").arg("1")
         .arg("--allow-empty")
         .output()
@@ -864,8 +868,11 @@ fn a_graph_over_its_budget_is_a_too_large_negative_not_an_error() {
         String::from_utf8_lossy(&ok.stdout)
     );
     assert_eq!(ok.status.code(), Some(0), "log:\n{ok_log}");
+    // The report line, not the bare word: the startup lines mention `too_large` when they
+    // explain what an unspillable accession becomes, and a substring match on that would pass
+    // or fail on wording rather than on behaviour.
     assert!(
-        !ok_log.contains("too_large"),
+        !ok_log.contains("SRRDENSE: too_large"),
         "a 64 MB cap gives the graph room, so nothing should be refused:\n{ok_log}"
     );
 }

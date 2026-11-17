@@ -10,8 +10,10 @@ Logan's unitig graphs. It is a Rust binary (`walker/`), packaged on Bioconda as 
 For each accession, given a reference CDS:
 
 1. **Stream** the compressed unitig file,
-   `https://logan-pub.s3.amazonaws.com/u/<ACC>/<ACC>.unitigs.fa.zst`, into memory. An accession
-   whose `Content-Length` exceeds `--max-size-mb` is refused before anything is downloaded.
+   `https://logan-pub.s3.amazonaws.com/u/<ACC>/<ACC>.unitigs.fa.zst`, onto disk as it arrives:
+   into `--unitigs-cache` when one is set, otherwise into an unlinked file under
+   `--spool-dir`. It is never held in memory. An accession whose `Content-Length` exceeds
+   `--max-size-mb` is refused before anything is downloaded.
 2. **Parse** it in one streaming pass into a compact graph: adjacency, `ka:f` abundance and
    2-bit sequence for every unitig. The decompressed text is never held, so a 1.28M-unitig
    accession takes about 43 MB.
@@ -280,7 +282,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `-k, --k <N>` | `21` | anchor k-mer size, 1 to 32 (the Logan graph's own k stays 31) |
 | `--min-shared-kmers <N>` | `3` | shared k-mers a unitig needs to be an anchor, 1 to 5 |
 | `--hops <N>` | `5` | hop radius of the subgraph around the anchors |
-| `--max-size-mb <N>` | `1024` | refuse accessions above this compressed size |
+| `--max-size-mb <N>` | `4096` | refuse accessions above this compressed size. See [Choosing the size cap](#choosing-the-size-cap) |
 | `--fetch-workers <N>` | `8` | parallel S3 downloads (bandwidth saturates around 8); at least 1 |
 | `-w, --workers <N>` | `8` | compute workers (see [Memory](#memory) before raising); at least 1 |
 | `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
@@ -316,23 +318,35 @@ Options that are on by default are turned off with a `--no-…` form.
 
 ## Memory
 
-A compressed unitig file can be held by a fetch worker waiting to hand it over
+A compressed unitig file used to be held by a fetch worker waiting to hand it over
 (`--fetch-workers`) and by a compute worker for the whole parse (`-w`). At the defaults that is
-up to 8 + 8 = 16 files, so **16 GB** at the 1 GB `--max-size-mb` cap.
+up to 8 + 8 = 16 files, which at the then 1 GB `--max-size-mb` cap was **16 GB**. That term
+is gone.
 
-Two things keep that figure from being reached in practice, both new in 0.2.0:
+Three things removed it, all new in 0.2.0:
 
-- **A cached accession costs a file handle, not its own size.** A cache hit opens the file and
-  the zstd decoder streams from the handle, so the bytes are never resident. A download with
-  `--unitigs-cache` set is written to the cache and the buffer dropped for the handle, which is
-  what removes the compute worker's copy, the one held longest. Only a download with no cache
-  configured is still held in RAM. Measured over 20 cached 34 MB accessions at
-  `-w 1 --fetch-workers 8`, peak RSS fell from 516.4 MiB to **49.9 MiB**, a 10.4x reduction,
-  with the wall clock unchanged and every output byte-identical. At `-w 8 --fetch-workers 8`
-  the floor is the eight resident graphs, 366.9 MiB.
+- **No compressed object is ever held.** A cache hit is opened, not read, and the zstd decoder
+  streams from the handle. A download is written to disk as it arrives: into the cache entry
+  when `--unitigs-cache` is set, and into an unlinked file under `--spool-dir` otherwise. The
+  only path that still builds a `Vec` is a caller who configured neither, which no CLI run can
+  be, because the walker always resolves a spool directory. Measured with `--fetch-only` on
+  one accession, peak RSS went from 50.5 MiB to **5.0 MiB** on a 48.5 MB object and from
+  350.5 MiB to **4.8 MiB** on a 364 MB one: the old figure tracked the object, the new one does
+  not move. In exchange, an in-flight accession costs one 128 KiB copy buffer, so 16 of them
+  come to 2 MiB whatever `--max-size-mb` says. This is what makes the cap raisable: before it,
+  a 28 GB cap would have promised 437 GB of RAM and meant it.
 - **The queue between fetch and compute no longer holds anything.** It was four slots deep,
   which is four more capped buffers in the bound for no throughput: a fetch worker with bytes
   in hand and nowhere to put them is already a held buffer. It is now a rendezvous.
+- **A cached accession costs a file handle.** Measured over 20 cached 34 MB accessions at
+  `-w 1 --fetch-workers 8`, peak RSS fell from 516.4 MiB to **49.9 MiB**, a 10.4x reduction,
+  with the wall clock unchanged and every output byte-identical. At `-w 8 --fetch-workers 8`
+  the floor is the eight resident graphs, 366.9 MiB.
+
+The object's SHA-256 is computed as the bytes stream past rather than afterwards, so the
+provenance digest costs nothing on a download. It is still a separate pass over a cache hit,
+whose bytes the walker never saw arrive; on an 11 GB file the nn1 probe measured that pass at
+91 s.
 
 On top of that, each compute worker holds a parsed graph, which the walker budgets at 1.7
 times the compressed size of its file.
@@ -384,11 +398,11 @@ is unparseable, negative or not finite, fails in `scan`, over the same bytes fro
 in both readers, because a disagreement between the two decodes has to stay an error rather
 than becoming a wrong answer.
 
-The 1.7 budget was calibrated before that split, on the single-pass graph, measured one
+The 1.7 figure was calibrated before that split, on the single-pass graph, measured one
 accession at a time as peak memory minus the process baseline and the compressed file. It is
-kept as the budget because it is the figure the printed bound and the parser both work from,
-and because it is now a ceiling the two-pass graph sits well under rather than a prediction of
-what it will use:
+no longer the budget (see below); it survives as the fallback for a run with no spool directory
+or no neighbourhood cap, and as the reason a two-pass graph sits so far under what a
+single-pass one needed:
 
 | accession | compressed | single-pass graph at peak |
 |---|---|---|
@@ -398,29 +412,35 @@ what it will use:
 | `SRR15477033` | 289.1 MB | 1.62x |
 | `ERR9831160` | 347.6 MB | 1.43x |
 
-The walker counts each graph at 1.7 times the cap, so the default worst case is 16 GB plus
-8 x 1.7 GB, **29.6 GB**, and it prints the bound for the settings and the accession list it was
-actually given at startup. (Before 0.1.1 it counted a fixed 43 MB per graph; before 0.2.0 the
-buffer term was 20 GB, because the fetch-to-compute queue held four more.)
+### What the budget actually is
 
-The printed bound is capped by the work available: a run of n accessions can hold at most n
-buffers and at most min(n, `-w`) graphs, so a single-accession run prints 2.7 GB rather than
-29.6. `--fetch-only` prints one buffer per fetch worker and no graphs, because it never parses.
+A graph's budget is **`--max-subgraph-nodes` x 150 bytes**, plus the flush buffers the parser
+keeps on the way to the spool. At the defaults that is 0.15 GB per compute worker, so `-w 8`
+is **1.18 GB, and the same number at a 4 GB cap and at a 28 GB one**. Nothing in the walk
+scales with accession size: the compressed object is on disk, the adjacency is on disk, and
+what is left in RAM is the gene's neighbourhood.
 
-That bound assumes the graph is in RAM and scales with `--max-size-mb`. With adjacency spooled
-and `--max-subgraph-nodes` set, neither holds, and the walker prints a second line with the
-ceiling that actually applies: about 150 bytes per retained node, so `-w 8` with the default
-1,000,000-node cap is **1.12 GB regardless of accession size**. That figure does not mention
-the file size at all, which is the point. It is also what `--max-size-mb` can eventually be
-relaxed against, since the compressed cap exists to bound memory and memory is now bounded by
-the gene instead.
+That budget is both what the startup line prints and what the parser enforces, which was not
+true before 0.2.0's last change. The line used to quote `--max-size-mb` x 1.7 and a second line
+then corrected it by a factor of about fifty; whichever of the two you believed, one of them
+was wrong. They are now one expression, so the promise and the refusal cannot drift apart.
 
-Spilling trades RAM for disk: up to roughly the compressed size again per in-flight accession,
-so `-w 8 --fetch-workers 8` at the 1 GB cap can want several GB of scratch under
-`--spool-dir`. It defaults to `--unitigs-cache` when set, otherwise the system temp directory,
-and deliberately not `--scratch-dir`, which is `/dev/shm` by default: spilling into a tmpfs
-moves bytes from one part of RAM to another and measures as a saving while being none. The
-walker warns if you point it there anyway.
+It is capped by the work available: a run of n accessions holds at most min(n, `-w`) graphs, so
+a single-accession run prints 0.15 GB rather than 1.18, and `--fetch-only` prints no graphs at
+all because it never parses. (Before 0.1.1 the walker counted a fixed 43 MB per graph; before
+0.2.0 the compressed-buffer term was 20 GB, because the fetch-to-compute queue held four more,
+then 16 GB, then nothing.)
+
+**Without a spool directory, or with `--max-subgraph-nodes 0`, nothing bounds the graph by the
+gene** and the budget falls back to `--max-size-mb` x 1.7. That is the only remaining place the
+size cap touches memory, and no CLI run reaches it: the walker always resolves a spool
+directory, and the node cap defaults to 1,000,000.
+
+The fallback matters in one more case. If adjacency cannot spill, because the spool directory
+is unwritable, the parser keeps it in RAM, and it is still held to the budget above: the
+accession is refused as `too_large`, next to the warning naming the directory that failed,
+rather than quietly growing into fifty times the memory the run announced. Spilling trades RAM
+for disk, and that disk is a resource the run states and enforces. See [Disk](#disk).
 
 That 1.7 figure came from measuring real accessions one at a time, and two things make it hold
 over a long list rather than drift:
@@ -432,7 +452,7 @@ over a long list rather than drift:
 - **The parser enforces the budget.** 1.7x is a property of the accessions measured, not of the
   file format: a dense enough file can build a graph many times its compressed size, and
   nothing used to stop it. Both passes measure what the graph holds and refuse the accession as
-  `too_large` once it passes `--max-size-mb` x 1.7, so neither a link-dense file in pass 1 nor a
+  `too_large` once it passes the budget, so neither a link-dense file in pass 1 nor a
   neighbourhood that turns out to be most of the graph in pass 2 can exceed the printed bound.
   The arrays grow by doubling and are measured periodically, so the refusal lands within one
   doubling of the budget rather than exactly on it, which is why the bound says "up to".
@@ -440,9 +460,132 @@ over a long list rather than drift:
 This is a worst case: it assumes every accession sits at the cap. `ERR2028820` is 33 MB, and the
 largest *C. auris* ERG11 accession tested was 343 MB. To contain a run, lower `--max-size-mb` and
 the two worker counts together, since they multiply. `-w 16 --fetch-workers 16`, for example,
-allows 32 buffers and 16 graphs. The cap applies to files read from `--unitigs-cache` too: a
-cached file over it is skipped as `too_large`, like a download, and so is one whose parsed graph
-would exceed the budget above.
+allows 32 buffers and 16 graphs. An accession whose parsed graph would exceed the budget above
+is skipped as `too_large`, and so is one over the cap, wherever its bytes came from (see
+[Choosing the size cap](#choosing-the-size-cap)).
+
+## Disk
+
+The spool is a far more predictable quantity than the graph it replaced. It is two files of
+`u32` and nothing else: one offset per unitig plus a terminator, and one entry per edge. No
+sequences, no abundances, and no slack from an allocator growing by doubling, because it is
+written out rather than grown.
+
+| accession | compressed | spool | spool / compressed | edges per unitig |
+|---|---|---|---|---|
+| `ERR2028820` | 32.4 MB | 15.4 MB | 0.477 | 2.02 |
+| `DRR240330` | 11.02 GB | 5.24 GiB | 0.510 | 2.64 |
+| `DRR212963` | 10.99 GB | 5.41 GiB | 0.529 | 2.64 |
+
+An 11% spread over a 340x size range, against 1.24x to 1.62x for the memory constant above.
+The walker uses **0.55**, the largest measured ratio rounded up rather than an average,
+because the term that drifts is edges per unitig and it drifts upward with size: larger
+assemblies are branchier, so a constant taken from small accessions under-predicts the large
+ones this exists to bound.
+
+From it the walker prints a disk bound at startup alongside the memory ones, with the
+consumers named separately rather than summed, because they do not share a shape:
+
+- **The downloaded objects are transient**, when there is no cache for them to live in. One
+  per in-flight accession, so `-w 8 --fetch-workers 8` at the 4 GB cap is 64 GB. This term is
+  precisely the RAM that streaming moved onto disk, and it is the same size: that is the
+  trade, stated rather than hidden.
+- **The spool is transient.** It dies with its accession, and the ceiling is one spool per
+  compute worker, so `-w 8` at the 4 GB cap is 17.6 GB. Lowering `-w` lowers it.
+- **The cache is persistent.** `--unitigs-cache` outlives the run and grows with the accession
+  list, not with the worker count, so 50 accessions at the 4 GB cap is 200 GB whatever `-w` is.
+  With a cache set, a download lands in it and is counted here instead of as a transient
+  object, never in both.
+
+Summing them would suggest that lowering the worker counts helps with the largest of them, and
+at any realistic cohort size it does not.
+
+`--spool-dir` defaults to `--unitigs-cache` when set, otherwise the system temp directory, and
+deliberately not `--scratch-dir`, which is `/dev/shm` by default: spilling into a tmpfs moves
+bytes from one part of RAM to another and measures as a saving while being none. The walker
+warns if you point it there anyway.
+
+Three layers keep a full disk from turning into a failed run:
+
+1. **The fetch refuses what will not fit.** An accession's spool is predicted from its real
+   size, taken from `Content-Length` or from the cached file, never from `--max-size-mb`. The
+   cap is a worst case that assumes every accession sits at it, and deciding on it here would
+   refuse runs needing a fiftieth of what it predicts. The prediction is multiplied by the
+   number of spools the run can hold at once and compared with the free space under
+   `--spool-dir`; over it, the accession is a `too_large` negative, decided before any body is
+   transferred when the server sent a `Content-Length`. An accession too small to spill at all
+   is never gated, and a filesystem that will not answer disables the check rather than
+   refusing everything on it.
+2. **A download that runs out of space is a negative.** A write that fails with `ENOSPC` or a
+   quota refusal is reported as `too_large`, the same as the size cap. Any other write failure
+   is a permanent fetch error rather than a transient one: retrying a read-only directory
+   three times only downloads the object three times. A cache entry that cannot be *opened*
+   falls through to the spool directory with a warning, and a spool file that cannot be opened
+   falls through to RAM, because a storage problem should cost performance rather than the
+   accession.
+3. **A spool write that runs out of space is a negative too.** The free space seen at the gate
+   cannot account for growth that has not happened yet, so a disk can still fill mid-parse.
+   `ENOSPC` and a quota refusal are reported as `too_large`, not as a parse error, so one
+   oversized accession filling the disk does not make the run tell a scheduler that the walker
+   failed. Any other write failure stays an error. A spool that cannot be **created** is
+   gentler still: a warning, and that accession keeps its adjacency in RAM.
+
+## Choosing the size cap
+
+`--max-size-mb` defaults to **4096**, raised from 1024 in 0.2.0. It no longer guards memory,
+which does not scale with accession size at all any more; it guards disk, time, and relevance.
+
+The number comes from the bucket. A 57,000-accession sample of Logan object sizes, taken with
+S3 `ListObjectsV2` (which returns the size with the key, so 57 requests cover 57,000
+accessions) spread across 57 prefixes:
+
+| percentile | size | | cap | refuses | worst-case transient disk at the defaults |
+|---|---|---|---|---|---|
+| p50 | 3.4 MB | | 350 MB | 5.57% | 7.0 GiB |
+| p75 | 26.2 MB | | 1024 MB | 2.26% | 20.4 GiB |
+| p90 | 168.3 MB | | 2048 MB | 0.90% | 40.8 GiB |
+| p95 | 395.1 MB | | **4096 MB** | **0.16%** | **81.6 GiB** |
+| p99 | 1,857.5 MB | | 8192 MB | 0.07% | 163.2 GiB |
+| p99.9 | 5,796.3 MB | | 28000 MB | 0.00% | 557 GiB |
+| max | 19,689.1 MB | | | | |
+
+The distribution is heavily skewed: the median accession is 3.4 MB and the mean is 94 MB.
+**4 GB is the knee.** It cuts refusals fourteenfold against 1 GB and recovers the 2.10% of
+accessions in the 1 to 4 GB band (mean 1.81 GB). Past it the gains are negligible while the
+disk cost keeps doubling.
+
+The disk column is `16 x cap + 8 x 0.55 x cap` and assumes every one of the sixteen in-flight
+accessions sits exactly at the cap, which no real cohort does: at p95 the same run uses about
+8 GiB. Setting `--unitigs-cache` moves the download term into the persistent cache term rather
+than adding to it. The startup disk line prints both the bound and the free space where it
+will land, so check that line rather than this table.
+
+### The cap applies wherever the bytes came from
+
+A cached file over `--max-size-mb` is skipped as `too_large`, exactly as a download of the same
+object would be. That used to be a memory argument, and it is not one any more: a cache hit
+costs a file handle, and since 0.2.0 nothing in the walk scales with accession size.
+
+It stays because the flag names a property of the accession, not of the transport. It is
+threaded from the `disassembler` pipelines into every walk, so if the cache ignored it, a warm
+run and a cold run of the same command over the same list would include different accessions,
+and `summary.json` records the cap but not the cache's history, so nothing in the output could
+explain the difference. `disassembler fetch` has its own `--max-size-mb`, which makes filling a
+cache at a high cap and walking at a low one a supported thing to do; this is what makes the
+walk's cap the one that decides.
+
+The practical consequence: if you populated a cache with `disassembler fetch --max-size-mb
+20000` and the walk skips those accessions, raise the walk's cap to match. The skip names the
+flag and the size that tripped it.
+
+### Not the structural ceiling
+
+The cap is deliberately **not** set at the walker's structural ceiling. Unitig ids are packed
+into 30 bits, which runs out near 29 GB compressed, and the largest object in the sample is
+19.7 GB, so a cap there would refuse nothing. But the cap is also a relevance filter: the two
+11 GB accessions measured took about 16 minutes each and both returned `no_path`, which is
+what a single-gene walk over an environmental metagenome tends to do. Raise it per run when
+you want those accessions, with the disk to match.
 
 ## Scratch files
 
@@ -486,14 +629,15 @@ was built from:
   A run with a cache and no `--offline` reports `cache+s3` at the run level while each
   accession came from exactly one of the two, and this is where that is recorded.
 - `etag` is the object's own identifier. Below S3's 5 GB single-PUT limit it is the MD5 of the
-  content, which `--max-size-mb` (default 1024) keeps every ingested object well inside, so it
+  content, which `--max-size-mb` (default 4096) keeps every ingested object inside, so it
   is directly comparable with what the bucket serves today. Above that limit S3 appends
   `-<parts>` and the value is opaque.
 - `fetched_at` is absent for a cache hit, whose bytes may predate the run by any amount.
   `run.started` is the only honest clock there.
 
-A `too_large` skip carries a `payload` too, with the size that tripped `--max-size-mb`, taken
-from `Content-Length` before any body was transferred.
+A `too_large` skip carries a `payload` too, with the size that decided it, taken from
+`Content-Length` before any body was transferred, or from the cached file. The skip's `detail`
+says which limit was reached, since `too_large` is not only `--max-size-mb`.
 
 To check whether a cohort's inputs have moved since a run, compare each record's `etag` against
 a `HEAD` of its object. The bucket also honours conditional requests, so
@@ -527,8 +671,8 @@ Each accession ends with one status, printed as it finishes and recorded in the 
 | `success` | a primary haplotype was reconstructed | |
 | `no_anchors` | no unitig shares enough k-mers with the reference: the gene is not there | nothing found |
 | `no_path` | anchors were found, but no alignment through the subgraph covers `--min-cov` of the reference | nothing found |
-| `no_logan_data` | Logan has no unitigs for the accession (HTTP 404) | nothing found |
-| `too_large` | over `--max-size-mb`, so skipped before downloading, or its parsed graph would exceed `--max-size-mb` x 1.7 | nothing found |
+| `no_logan_data` | Logan has no unitigs for the accession: the bucket returns 404, or it serves an object that decompresses to nothing (a 55-byte empty zstd frame, which about 0.4% of accessions have) | nothing found |
+| `too_large` | over `--max-size-mb`, so skipped before downloading; or its parsed graph would exceed the per-accession graph budget; or its spooled adjacency will not fit under `--spool-dir` (see [Disk](#disk)) | nothing found |
 | `subgraph_too_large` | the gene's neighbourhood is over `--max-subgraph-nodes` | nothing found |
 | `error` | anything else: a network or cache failure, a corrupt file, GraphAligner crashing | error |
 

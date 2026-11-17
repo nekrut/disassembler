@@ -4,13 +4,13 @@
     "name": "logan-walker",
     "version": "0.1.1",
     "disassembler": null,
-    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/disassembler/bin/GraphAligner"}]
+    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/__logan-walker@0.1.0/bin/GraphAligner"}]
   },
   "inputs": {
     "references": [
       {"id": "candida_auris_erg11", "length": 1575, "sha256": "764e6d1a429dcfda48e8904d8b438425aee42833d5fe1a354743e07bf629ce11"}
     ],
-    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/golden_cache", "n_requested": 1}
+    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/golden-cache2", "n_requested": 1}
   },
   "settings": {
     "k": 21,
@@ -18,7 +18,7 @@
     "min_shared_kmers": 3,
     "hops": 5,
     "subgraph_nodes_per_base_guard": 3.0,
-    "max_size_mb": 1024,
+    "max_size_mb": 4096,
     "min_cov": 0.85,
     "primary_metric": "matched",
     "prune_frac": 0.01,
@@ -41,9 +41,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-16T19:15:53Z",
-    "wall_seconds": 1.423,
-    "stage_seconds": {"stream": 0.025, "parse": 1.030, "anchor": 0.000, "extract": 0.329, "align": 0.036, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-17T03:42:29Z",
+    "wall_seconds": 1.292,
+    "stage_seconds": {"stream": 0.025, "parse": 1.013, "anchor": 0.000, "extract": 0.215, "align": 0.037, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
@@ -89,7 +89,7 @@
       "minority_rescues": 0,
       "hit_pass_cap": false,
       "prune": {"outcome": "applied", "depth": 42.2, "floor": 5.0, "unitigs": 296, "unitigs_kept": 135, "unpruned_span": [0, 1575], "pruned_span": [0, 1575]},
-      "timing": {"stream": 0.025, "parse": 1.030, "anchor": 0.000, "extract": 0.329, "align": 0.036, "stitch": 0.000, "phase": 0.000, "total": 1.396}
+      "timing": {"stream": 0.025, "parse": 1.013, "anchor": 0.000, "extract": 0.215, "align": 0.037, "stitch": 0.000, "phase": 0.000, "total": 1.265}
     }
   ]
 }

@@ -4,13 +4,13 @@
     "name": "logan-walker",
     "version": "0.1.1",
     "disassembler": null,
-    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/disassembler/bin/GraphAligner"}]
+    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/__logan-walker@0.1.0/bin/GraphAligner"}]
   },
   "inputs": {
     "references": [
       {"id": "pfcrt", "length": 1275, "sha256": "128ff9b07e60b60846f70618970d195db4f97cc71bdca13f69576a6cdb841ba4"}
     ],
-    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/golden_cache", "n_requested": 1}
+    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/golden-cache2", "n_requested": 1}
   },
   "settings": {
     "k": 21,
@@ -18,7 +18,7 @@
     "min_shared_kmers": 3,
     "hops": 5,
     "subgraph_nodes_per_base_guard": 3.0,
-    "max_size_mb": 1024,
+    "max_size_mb": 4096,
     "min_cov": 0.85,
     "primary_metric": "matched",
     "prune_frac": 0.01,
@@ -41,9 +41,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-16T19:15:52Z",
-    "wall_seconds": 1.018,
-    "stage_seconds": {"stream": 0.017, "parse": 0.739, "anchor": 0.000, "extract": 0.216, "align": 0.043, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-17T03:42:28Z",
+    "wall_seconds": 0.948,
+    "stage_seconds": {"stream": 0.017, "parse": 0.735, "anchor": 0.000, "extract": 0.152, "align": 0.041, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
@@ -90,7 +90,7 @@
       "hit_pass_cap": false,
       "variants": {"depth": 180.0, "floor": 5.0, "forks": 11, "biallelic": 4, "recovered": 0, "beyond_cap": 0, "indels": 0, "no_rejoin": 1, "not_substitution": 0, "over_indel_cap": 2, "frameshifting": 1, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 180.0, "floor": 5.0, "unitigs": 747, "unitigs_kept": 479, "unpruned_span": [0, 1275], "pruned_span": [0, 1275]},
-      "timing": {"stream": 0.017, "parse": 0.739, "anchor": 0.000, "extract": 0.216, "align": 0.043, "stitch": 0.000, "phase": 0.000, "total": 0.999}
+      "timing": {"stream": 0.017, "parse": 0.735, "anchor": 0.000, "extract": 0.152, "align": 0.041, "stitch": 0.000, "phase": 0.000, "total": 0.929}
     }
   ]
 }

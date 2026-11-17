@@ -152,6 +152,43 @@ impl AdjacencySpool {
     }
 }
 
+/// Bytes an unprivileged process can still write under `dir`, or `None` if it cannot be asked.
+///
+/// `f_bavail`, not `f_bfree`: they differ by the blocks reserved for root, and the walker is
+/// not root. The spool's files are unlinked the moment they are created, so their blocks are
+/// still charged to the filesystem and this figure already accounts for every live spool,
+/// including other workers' and other processes'. What it cannot see is growth that has not
+/// happened yet, which is why callers multiply by the number of concurrent spools.
+///
+/// Walks up to the nearest existing ancestor, because a spool directory is created lazily by
+/// the first spill and may not exist when the bound is printed or the gate is checked. `None`
+/// rather than 0 on failure, so a filesystem that will not answer disables the check instead
+/// of refusing everything on it.
+pub fn available_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut p = dir;
+    while !p.exists() {
+        p = p.parent()?;
+    }
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a NUL-terminated path that outlives the call, and `st` is a correctly
+    // sized `statvfs` that is only read after the call reports success.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    (st.f_bavail as u64).checked_mul(st.f_frsize as u64)
+}
+
+/// A file that exists only as an open handle, created under `dir` and immediately unlinked.
+///
+/// Two callers: the adjacency spool, and a downloaded object with no `--unitigs-cache` to land
+/// in. Both want the same thing, which is bytes that do not live in RAM and do not survive the
+/// process. Nothing is left behind by a crash or a signal, and nothing needs sweeping.
+pub fn transient_file(dir: &std::path::Path, tag: &str) -> std::io::Result<std::fs::File> {
+    anon_file(dir, tag)
+}
+
 /// A file that is unlinked the moment it exists, so it needs no cleanup and survives no crash.
 fn anon_file(dir: &std::path::Path, tag: &str) -> std::io::Result<std::fs::File> {
     std::fs::create_dir_all(dir)?;
@@ -302,10 +339,13 @@ impl Payload {
 /// At `-w 8 --fetch-workers 8` the floor is the eight resident graphs: 366.9 MiB.
 #[derive(Debug)]
 pub enum Compressed {
-    /// Held in RAM. A download with no `--unitigs-cache` to spool into, and the test fixtures.
+    /// Held in RAM. The test fixtures, and a download by a caller that configured neither
+    /// `--unitigs-cache` nor `--spool-dir`, so there was nowhere on disk to put it. No CLI run
+    /// reaches that case, because `main` always resolves a spool directory.
     Memory(Vec<u8>),
-    /// An open handle to a file holding exactly the compressed object: a cache hit, or a
-    /// download that was streamed into the cache. Decoded without being read whole.
+    /// An open handle to a file holding exactly the compressed object: a cache hit, a download
+    /// streamed into the cache, or one streamed into an unlinked file under `--spool-dir`.
+    /// Decoded without being read whole.
     File(std::fs::File),
 }
 
@@ -1241,5 +1281,29 @@ mod tests {
         assert!(!owned.exists(), "Drop left a file the Subgraph did create");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The spool directory is created lazily by the first spill, so both callers of
+    /// `available_bytes` routinely ask about a path that is not there yet: the startup line
+    /// prints before any accession is fetched, and the fetch gate runs before any is parsed.
+    /// Answering `None` for those would disable the check on exactly the first run of a new
+    /// `--unitigs-cache`, which is the run most likely to fill a disk.
+    #[test]
+    fn available_bytes_answers_through_a_directory_that_does_not_exist_yet() {
+        let root = std::env::temp_dir();
+        let here = available_bytes(&root).expect("the system temp directory must answer");
+        assert!(here > 0, "a writable filesystem reported no free space");
+
+        // Three levels of nothing, under a directory that does exist.
+        let missing = root.join(format!("logan-absent-{}", std::process::id())).join("a").join("b");
+        assert!(!missing.exists());
+        let through = available_bytes(&missing).expect("must walk up to an existing ancestor");
+        // The same filesystem, so the same answer give or take other processes writing.
+        let drift = (through as f64 - here as f64).abs() / here as f64;
+        assert!(drift < 0.05, "{through} against {here} is not the same filesystem");
+
+        // A path with no existing ancestor at all cannot be answered, and must not be
+        // reported as zero free: the callers read `None` as "do not check" and 0 as "refuse".
+        assert_eq!(available_bytes(std::path::Path::new("")), None);
     }
 }
