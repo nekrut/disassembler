@@ -229,7 +229,7 @@ pub fn scan_in<S: RecordSink>(
         // Adjacency is the only thing growing, so the budget is measured over it alone. See
         // `build` for why this exists at all.
         iters += 1;
-        if iters % BUDGET_CHECK_EVERY == 0 && budget_bytes != u64::MAX {
+        if iters.is_multiple_of(BUDGET_CHECK_EVERY) && budget_bytes != u64::MAX {
             let used = (offsets.capacity() + targets.capacity()) as u64 * size_of::<u32>() as u64;
             if used > budget_bytes {
                 return Err(Error::TooLarge {
@@ -759,7 +759,7 @@ pub fn build(
         // one. Refusing it is `too_large`, the same answer the size cap gives, because it is
         // the same judgement: this accession does not fit the budget the user set.
         iters += 1;
-        if iters % BUDGET_CHECK_EVERY == 0 && budget_bytes != u64::MAX {
+        if iters.is_multiple_of(BUDGET_CHECK_EVERY) && budget_bytes != u64::MAX {
             let used = csr_bytes(&offsets, &targets, &abundance, &seq_2bit, &seq_offset);
             if used > budget_bytes {
                 return Err(Error::TooLarge {

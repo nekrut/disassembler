@@ -7,6 +7,17 @@ on:
   pull_request:
     branches: [main]
 
+# One run per branch at a time. Without this, pushing twice in quick succession left the
+# first run going while the second started, so a failure arrived by email for a commit that
+# had already been superseded. A superseded run is cancelled, and GitHub does not email for
+# a cancellation, only for a failure.
+#
+# The group includes the ref, so a tag push (the release gate) has its own group and is never
+# cancelled by a push to main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 

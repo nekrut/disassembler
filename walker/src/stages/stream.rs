@@ -820,9 +820,16 @@ mod network_tests {
         let f = Fetcher::new(&Config::default());
         let started = std::time::Instant::now();
         let err = f.fetch(0, &"NOTAREALACCESSION999".to_string()).err().expect("should fail");
-        let msg = err.to_string();
-        eprintln!("{msg}");
-        assert!(msg.contains("404"), "expected a 404, got: {msg}");
+        eprintln!("{err}");
+        // Matched on the variant, not on the message. This asserted `msg.contains("404")`
+        // until 0.2.0, when the bucket's 404 and its 55-byte empty object became one fact
+        // and the Display text stopped naming the HTTP status: the test then failed on every
+        // golden run, and because it is `#[ignore]` nothing offline noticed. The variant is
+        // what the pipeline branches on, so it is also what this should pin.
+        assert!(
+            matches!(err, Error::NoLoganData { .. }),
+            "a missing accession must be absent Logan data, got: {err}"
+        );
         // A permanent failure must not sleep through the retry schedule.
         assert!(started.elapsed() < Duration::from_secs(5), "404 should fail fast");
     }
