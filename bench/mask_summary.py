@@ -28,6 +28,11 @@ Masked, and why:
                                                      whether or not they were there, so the
                                                      two forms compare equal
 
+`records[].payload.revalidated` is deliberately NOT masked either, for the same reason and
+more sharply: it exists only under `--revalidate`, and its `replaced` value means the bucket
+served different bytes than the cache held. That is a fact about the data, not about the
+runner, and it is exactly what a gate should refuse to let pass silently.
+
 `records[].payload.bytes` and `.sha256` are deliberately NOT masked. They are the same on
 every ingest path (a cache file is byte-identical to the S3 object), and gating them makes the
 golden run detect an upstream regeneration of a gated accession: the Logan objects are
@@ -80,6 +85,9 @@ def mask(doc):
                     "etag": PLACEHOLDER,
                     "last_modified": PLACEHOLDER,
                     "fetched_at": PLACEHOLDER,
+                    # Gated, not masked, and kept last so it is absent on a run that did not
+                    # revalidate rather than normalised to a placeholder. See the note below.
+                    **{k: payload[k] for k in ("revalidated",) if k in payload},
                 }
     return doc
 

@@ -418,6 +418,34 @@ fn an_accession_that_errors_fails_the_run_that_reconstructed_the_others() {
     assert!(summary.contains("\"exit_code\": 4"), "{summary}");
 }
 
+/// `--revalidate` is refused where it cannot do anything, rather than silently ignored.
+///
+/// A flag that quietly does nothing is worse than one that is rejected: the summary records
+/// `revalidate: true` either way, so a run that could not revalidate would look like one
+/// that did and found everything current.
+#[test]
+fn revalidate_requires_a_cache_and_refuses_offline() {
+    let fx = Fixture::new("reval-usage", 1);
+
+    // Nothing to revalidate without a cache.
+    let out = Command::new(BIN)
+        .arg("--revalidate")
+        .arg("-l")
+        .arg(fx.dir.join("accs.txt"))
+        .arg("-q")
+        .arg(fx.dir.join("q.fasta"))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("--revalidate requires --unitigs-cache"), "{err}");
+
+    // `Fixture::cmd` always passes --offline, which forbids the network this needs.
+    let (code, err) = fx.code("cache", &["--revalidate"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("mutually exclusive"), "{err}");
+}
+
 /// A gzipped query and accession list, not named `.gz`, give the same run as plain ones.
 #[test]
 fn gzipped_query_and_list_are_read() {

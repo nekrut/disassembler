@@ -154,6 +154,13 @@ OFFLINE / CACHE:
                                   to the S3 object
         --offline                 Refuse the S3 fallback. A cache miss becomes a hard error
                                   naming the missing accession. Requires --unitigs-cache
+        --revalidate              Confirm each cache hit against the bucket before using it.
+                                  Logan's objects are mutable, so a warm cache can serve
+                                  bytes the bucket has since replaced and nothing in the
+                                  output says so. Sends a conditional request against the
+                                  ETag recorded beside the cached object: unchanged costs a
+                                  round trip and no transfer, changed refreshes the entry and
+                                  says so. Requires --unitigs-cache; not with --offline
         --fetch-only              Fetch every accession into --unitigs-cache and exit before
                                   the compute stages. Requires --unitigs-cache; -q is not
                                   required in this mode. Writes fetch.summary.json into
@@ -323,6 +330,11 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             }
             "--offline" => {
                 args.cfg.offline = true;
+                i += 1;
+                continue;
+            }
+            "--revalidate" => {
+                args.cfg.revalidate = true;
                 i += 1;
                 continue;
             }
@@ -569,6 +581,23 @@ fn real_main(mut args: Args) -> error::Result<()> {
     if args.cfg.fetch_only && args.cfg.unitigs_cache.is_none() {
         return Err(error::Error::Usage(
             "--fetch-only requires --unitigs-cache <DIR>".into(),
+        ));
+    }
+    if args.cfg.revalidate && args.cfg.unitigs_cache.is_none() {
+        return Err(error::Error::Usage(
+            "--revalidate requires --unitigs-cache <DIR>: there is nothing to revalidate \
+             without a cache"
+                .into(),
+        ));
+    }
+    // Refused rather than silently ignored. Both flags are about trusting the cache and they
+    // want opposite things: --offline forbids the network this needs, so a run with both
+    // would quietly do no revalidation at all while its settings claimed otherwise.
+    if args.cfg.revalidate && args.cfg.offline {
+        return Err(error::Error::Usage(
+            "--revalidate and --offline are mutually exclusive: revalidating means asking \
+             the bucket, which --offline forbids"
+                .into(),
         ));
     }
 

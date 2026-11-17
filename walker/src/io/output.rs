@@ -511,7 +511,7 @@ fn write_settings(w: &mut impl Write, run: &RunInfo) -> Result<()> {
     let c = run.cfg;
     // Everything that changes which accessions are processed or what they produce. Workers,
     // timeouts and paths change neither, and are left out.
-    let settings: [(&str, String); 24] = [
+    let settings: [(&str, String); 25] = [
         ("k", c.k.to_string()),
         ("graph_k", c.graph_k.to_string()),
         ("min_shared_kmers", c.min_shared_kmers.to_string()),
@@ -538,6 +538,11 @@ fn write_settings(w: &mut impl Write, run: &RunInfo) -> Result<()> {
         ("emit_alts", c.emit_alts.to_string()),
         ("emit_vcf", c.emit_vcf.to_string()),
         ("emit_snv_table", c.emit_snv_table.to_string()),
+        // Belongs here by this block's own rule: it can change what an accession produces,
+        // because a cache entry the bucket has replaced is refreshed and the newer bytes are
+        // what gets walked. (`offline` is absent for the mirror-image reason: it forbids a
+        // fallback without changing what any accession yields.)
+        ("revalidate", c.revalidate.to_string()),
     ];
     writeln!(w, "  \"settings\": {{")?;
     for (i, (k, v)) in settings.iter().enumerate() {
@@ -733,7 +738,8 @@ fn write_cohort(w: &mut impl Write, s: &Summary) -> Result<()> {
 }
 
 /// What the accession was built from: `{"source": .., "bytes": .., "sha256": .., "etag": ..,
-/// "last_modified": .., "fetched_at": ..}` on one line, absent members omitted.
+/// "last_modified": .., "fetched_at": .., "revalidated": ..}` on one line, absent members
+/// omitted.
 ///
 /// Always written, including `{"source": "none"}` for an accession whose bytes were never
 /// read, so that "this run did not record provenance" and "there was nothing to record" are
@@ -755,6 +761,13 @@ fn write_payload(w: &mut impl Write, p: &Payload) -> Result<()> {
         if let Some(v) = value {
             write!(w, ", \"{key}\": \"{}\"", esc(v))?;
         }
+    }
+    // Only when `--revalidate` ran, so its absence means the question was not asked rather
+    // than asked and answered "fine". `"replaced"` is the one a reader should alert on: the
+    // bucket served different bytes than the cache held, so an earlier run of the same
+    // command analysed different data.
+    if let Some(v) = p.revalidated {
+        write!(w, ", \"revalidated\": \"{v}\"")?;
     }
     writeln!(w, "}},")?;
     Ok(())
@@ -2267,6 +2280,7 @@ mod identity_label_tests {
             etag: Some("d2dd288b238c3c88b46acdcd78860dce".into()),
             last_modified: Some("2024-03-31T17:38:36Z".into()),
             fetched_at: Some("2026-11-16T16:47:50Z".into()),
+                    revalidated: None,
         };
         s.results[0].prune = Some(PruneReport {
             result: PruneResult::RefusedShorterSpan, depth: 1700.0, floor: 17.0,

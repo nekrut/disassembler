@@ -472,6 +472,21 @@ pub struct Config {
     /// A cache miss becomes a hard error naming the missing accession, rather than a silent
     /// download. Off by default; opt in for reproducibility runs or air-gapped hosts.
     pub offline: bool,
+    /// Confirm each cache hit against the bucket before using it.
+    ///
+    /// Logan's `u/` objects are mutable and unversioned, so a warm cache can serve bytes the
+    /// bucket has since replaced, and nothing in any output says so: two runs of the same
+    /// command then analyse different data and agree in every field that records what was
+    /// asked for. This turns that into a detected event.
+    ///
+    /// A conditional `If-None-Match` GET against the `ETag` the sidecar recorded. The
+    /// confirming answer is a 304, which carries no body, so a warm run that is still current
+    /// costs one round trip per accession and no transfer. Off by default for exactly that
+    /// reason: it is a round trip a run that trusts its cache should not have to pay.
+    ///
+    /// Requires `unitigs_cache` and is incompatible with `offline`, which forbids the network
+    /// this needs.
+    pub revalidate: bool,
     /// Where adjacency spills when it outgrows `types::SPILL_ADJACENCY_AT`.
     ///
     /// Resolved in `main` as `--spool-dir`, else `--unitigs-cache`, else the system temp
@@ -818,6 +833,7 @@ impl Default for Config {
             unitigs_cache: None,
             spool_dir: None,
             offline: false,
+            revalidate: false,
             fetch_only: false,
         }
     }

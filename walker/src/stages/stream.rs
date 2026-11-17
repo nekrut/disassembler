@@ -30,6 +30,13 @@ pub fn cache_path(dir: &Path, accession: &str) -> PathBuf {
     dir.join(format!("{accession}.unitigs.fa.zst"))
 }
 
+/// The provenance sidecar beside a cached object. See `types::Sidecar`.
+pub fn sidecar_path(object: &Path) -> PathBuf {
+    let mut p = object.as_os_str().to_os_string();
+    p.push(".provenance");
+    PathBuf::from(p)
+}
+
 /// A pooled HTTP client, shared by every fetch thread.
 ///
 /// Built once in `pipeline::run`. Connection reuse matters: TLS setup is a meaningful share
@@ -39,6 +46,8 @@ pub struct Fetcher {
     agent: ureq::Agent,
     max_compressed_bytes: u64,
     attempts: u32,
+    /// `--revalidate`: confirm each cache hit against the bucket before using it.
+    revalidate: bool,
     cache_dir: Option<PathBuf>,
     offline: bool,
     /// Where adjacency will spill, so the fetch can refuse an accession whose spool will not
@@ -76,6 +85,7 @@ impl Fetcher {
             attempts: cfg.fetch_attempts.max(1),
             cache_dir: cfg.unitigs_cache.clone(),
             offline: cfg.offline,
+            revalidate: cfg.revalidate,
             spool_dir: cfg.spool_dir.clone(),
             spool_slots: cfg.peak_graphs_for(n_accessions),
         }
@@ -147,6 +157,39 @@ impl Fetcher {
     pub fn fetch(&self, index: usize, accession: &Accession) -> Result<FetchedUnitigs> {
         if let Some(dir) = &self.cache_dir {
             let path = cache_path(dir, accession);
+            // What `--revalidate` decided about this entry, if it ran. `None` here means the
+            // cached bytes are used as they always were.
+            let mut revalidated: Option<&'static str> = None;
+            if path.exists() && self.revalidate && !self.offline {
+                match self.check_cached(index, accession, &path, &unitigs_url(accession)) {
+                    Revalidation::Current => revalidated = Some("current"),
+                    Revalidation::Unavailable => revalidated = Some("unavailable"),
+                    // The bytes changed, and the conditional GET already brought the new
+                    // ones down and rewrote the entry. This is the event the flag exists to
+                    // surface: an earlier run of the same command saw different data.
+                    Revalidation::Replaced(fresh) => {
+                        let mut fresh = *fresh;
+                        eprintln!(
+                            "[logan-walker] [{accession}] REPLACED: the bucket now serves \
+                             different bytes than the cache held; the cache has been \
+                             refreshed and this run uses the new object."
+                        );
+                        fresh.payload.revalidated = Some("replaced");
+                        return Ok(fresh);
+                    }
+                    // Nothing recorded what the cached bytes were a copy of, so there is
+                    // nothing to revalidate against. Falling through to the ordinary
+                    // download both answers the question and leaves a sidecar, so the cache
+                    // heals on first use rather than staying unverifiable forever.
+                    Revalidation::NoOrigin => {
+                        eprintln!(
+                            "[logan-walker] [{accession}] no recorded origin for the cached \
+                             object, so it cannot be revalidated; downloading it again."
+                        );
+                        return self.download(index, accession, Some("refetched"));
+                    }
+                }
+            }
             if path.exists() {
                 // Opened, not read. The handle is what crosses the channel and what `decoder`
                 // streams from, so a cached accession never costs its own size in RAM. The
@@ -214,12 +257,31 @@ impl Fetcher {
                 // HTTP response to take an ETag from, and they are exactly the runs whose
                 // inputs are least self-evident. Streamed in chunks and rewound, so this
                 // costs a pass over the file, not the file.
-                let payload = Payload::read_file(PayloadSource::Cache, &mut file).map_err(|e| {
-                    Error::Fetch {
-                        accession: accession.clone(),
-                        detail: format!("cache read {}: {e}", path.display()),
+                let mut payload =
+                    Payload::read_file(PayloadSource::Cache, &mut file).map_err(|e| {
+                        Error::Fetch {
+                            accession: accession.clone(),
+                            detail: format!("cache read {}: {e}", path.display()),
+                        }
+                    })?;
+                // What the object was downloaded from, when a sidecar beside it says so.
+                // Believed only when its digest matches the bytes just hashed: a sidecar that
+                // disagrees is describing an object that has since been replaced underneath
+                // it, which is exactly the substitution this provenance exists to expose.
+                // An entry written before 0.2.0 has no sidecar and reads as it always did.
+                if let Some(side) = read_sidecar(&path) {
+                    if side.describes(payload.sha256.as_deref()) {
+                        payload.adopt(&side);
+                    } else {
+                        eprintln!(
+                            "[logan-walker] warn: [{accession}] {} describes different bytes \
+                             than the file beside it; ignoring it. The cached object is \
+                             intact, but its recorded origin is not trustworthy.",
+                            sidecar_path(&path).display()
+                        );
                     }
-                })?;
+                }
+                payload.revalidated = revalidated;
                 return Ok(FetchedUnitigs {
                     index,
                     accession: accession.clone(),
@@ -240,17 +302,34 @@ impl Fetcher {
             }
         }
 
+        self.download(index, accession, None)
+    }
+
+    /// The cold path: fetch the object, with retries, and mark how it came to be fetched.
+    ///
+    /// `mark` lands on `payload.revalidated`. It is `Some("refetched")` only when
+    /// `--revalidate` sent us here because the cache held an object with no recorded origin,
+    /// and `None` for an ordinary download.
+    fn download(
+        &self,
+        index: usize,
+        accession: &Accession,
+        mark: Option<&'static str>,
+    ) -> Result<FetchedUnitigs> {
         let url = unitigs_url(accession);
         let mut last: String = String::from("no attempt made");
 
         for attempt in 1..=self.attempts {
-            match self.try_once(index, accession, &url) {
+            match self.try_once(index, accession, &url, None) {
                 // No cache write here any more. `try_once` streams the body straight into the
                 // cache entry, so by the time it returns the bytes are already on disk and
                 // already renamed into place. The old shape read the object into a `Vec`,
                 // wrote that `Vec` out, and then reopened the file to drop the `Vec`: three
                 // copies of the same decision and one of them the size of the accession.
-                Ok(f) => return Ok(f),
+                Ok(mut f) => {
+                    f.payload.revalidated = mark;
+                    return Ok(f);
+                }
                 Err(FetchAttempt::Permanent(detail)) => {
                     return Err(Error::Fetch {
                         accession: accession.clone(),
@@ -261,6 +340,13 @@ impl Fetcher {
                     return Err(Error::NoLoganData {
                         accession: accession.clone(),
                     })
+                }
+                // Unreachable: this loop never sends `If-None-Match`, so the server has
+                // nothing to answer 304 against. Treated as transport noise rather than
+                // panicking, because a proxy inventing one must not take down a run.
+                Err(FetchAttempt::NotModified) => {
+                    last = "unconditional request answered 304".to_string();
+                    continue;
                 }
                 Err(FetchAttempt::TooLarge(detail, payload)) => {
                     return Err(Error::TooLarge {
@@ -285,16 +371,80 @@ impl Fetcher {
         })
     }
 
-    fn try_once(&self, index: usize, accession: &Accession, url: &str) -> std::result::Result<FetchedUnitigs, FetchAttempt> {
-        let mut resp = self
-            .agent
-            .get(url)
+    /// Ask the bucket whether the cached object is still what it serves.
+    ///
+    /// A conditional GET, so the three answers arrive in one round trip: 304 (still current,
+    /// no body), 200 (replaced, and the new bytes come with it and have already been written
+    /// into the cache by `try_once`), or a failure. A failure is deliberately not fatal: the
+    /// cached bytes are still a usable analysis, and refusing to run because a revalidation
+    /// could not be made would turn a network blip into a lost cohort. It is recorded as
+    /// `unavailable` so the summary does not claim a check that did not happen.
+    fn check_cached(
+        &self,
+        index: usize,
+        accession: &Accession,
+        path: &Path,
+        url: &str,
+    ) -> Revalidation {
+        let Some(tag) = read_sidecar(path).and_then(|s| s.etag) else {
+            return Revalidation::NoOrigin;
+        };
+        match self.try_once(index, accession, url, Some(&tag)) {
+            Err(FetchAttempt::NotModified) => Revalidation::Current,
+            Ok(fresh) => Revalidation::Replaced(Box::new(fresh)),
+            // The object is gone from the bucket. The cached copy is still readable and is
+            // still the best answer available, so the run continues on it and says so.
+            Err(FetchAttempt::Missing) => {
+                eprintln!(
+                    "[logan-walker] warn: [{accession}] the bucket no longer holds this \
+                     accession; using the cached copy."
+                );
+                Revalidation::Unavailable
+            }
+            Err(FetchAttempt::TooLarge(detail, _)) => {
+                eprintln!(
+                    "[logan-walker] warn: [{accession}] could not revalidate ({detail}); \
+                     using the cached copy."
+                );
+                Revalidation::Unavailable
+            }
+            Err(FetchAttempt::Permanent(detail)) | Err(FetchAttempt::Transient(detail)) => {
+                eprintln!(
+                    "[logan-walker] warn: [{accession}] could not revalidate ({detail}); \
+                     using the cached copy."
+                );
+                Revalidation::Unavailable
+            }
+        }
+    }
+
+    /// One attempt at the object. `if_none_match` makes it conditional: the server answers
+    /// 304 with no body when the cached `ETag` is still the current one, which is what makes
+    /// `--revalidate` cost a round trip rather than a download.
+    fn try_once(
+        &self,
+        index: usize,
+        accession: &Accession,
+        url: &str,
+        if_none_match: Option<&str>,
+    ) -> std::result::Result<FetchedUnitigs, FetchAttempt> {
+        let req = self.agent.get(url);
+        // Quoted on the way out: the stored value has them stripped for comparison, but the
+        // header is an entity-tag and S3 will not match a bare one.
+        let req = match if_none_match {
+            Some(tag) => req.header("If-None-Match", &format!("\"{tag}\"")),
+            None => req,
+        };
+        let mut resp = req
             .call()
             .map_err(|e| FetchAttempt::Transient(format!("request failed: {e}")))?;
 
         let status = resp.status().as_u16();
         match status {
             200 => {}
+            // Only reachable when `if_none_match` was sent, and it is the answer that run
+            // wanted: the cached bytes are the object the bucket still serves.
+            304 => return Err(FetchAttempt::NotModified),
             404 => return Err(FetchAttempt::Missing),
             // 4xx other than 404 is our fault and will not improve on retry.
             400..=499 => return Err(FetchAttempt::Permanent(format!("HTTP {status}"))),
@@ -418,7 +568,7 @@ impl Fetcher {
 
         // The rename into the cache happens here, after the last byte and after every
         // refusal, so a skipped accession never leaves a cache entry behind.
-        let compressed = sink.finish().map_err(|e| {
+        let compressed = sink.finish(&payload).map_err(|e| {
             FetchAttempt::Transient(format!("could not commit the downloaded body: {e}"))
         })?;
 
@@ -561,6 +711,24 @@ enum FetchAttempt {
     /// the user's cap, not an error. Carries what the response said about the object, so the
     /// skip is recorded with a size and an identity rather than only a sentence.
     TooLarge(String, Box<Payload>),
+    /// HTTP 304 to a conditional request: the cached object is still the current one.
+    ///
+    /// Not a failure. It is only ever produced when `--revalidate` sent an `If-None-Match`,
+    /// and it is the answer that run was hoping for.
+    NotModified,
+}
+
+/// What `--revalidate` learned about one cached object.
+enum Revalidation {
+    /// HTTP 304: the cache holds what the bucket still serves.
+    Current,
+    /// HTTP 200: different bytes now, already downloaded and written over the cache entry.
+    /// Boxed because `FetchedUnitigs` is much larger than the other variants.
+    Replaced(Box<FetchedUnitigs>),
+    /// Nothing records what the cached bytes were a copy of, so there is nothing to ask about.
+    NoOrigin,
+    /// The question could not be answered. The cached bytes are used.
+    Unavailable,
 }
 
 /// Where a download's bytes go as they arrive.
@@ -600,13 +768,27 @@ impl BodySink {
     /// A renamed file keeps its inode, so the handle opened on the tempfile is already a
     /// handle on the final path and no reopen is needed; it is rewound because the caller
     /// just finished writing to it.
-    fn finish(self) -> std::io::Result<Compressed> {
+    fn finish(self, payload: &Payload) -> std::io::Result<Compressed> {
         match self {
             BodySink::Cache { mut file, tmp, final_path } => {
                 file.flush_and_rewind()?;
                 if let Err(e) = std::fs::rename(&tmp, &final_path) {
                     let _ = std::fs::remove_file(&tmp);
                     return Err(e);
+                }
+                // After the object, never before. A crash between the two leaves an object
+                // with no sidecar, which is what every cache entry written before 0.2.0 looks
+                // like and is handled; the other order would leave a sidecar describing a
+                // file that is not there. A sidecar that cannot be written is not worth
+                // failing a download over: it costs provenance, not bytes.
+                let side = sidecar_path(&final_path);
+                if let Err(e) = write_sidecar(&side, payload) {
+                    eprintln!(
+                        "[logan-walker] warn: cached {} but could not write {}: {e}. \
+                         The object is usable; --revalidate will refetch it.",
+                        final_path.display(),
+                        side.display()
+                    );
                 }
                 Ok(Compressed::File(file))
             }
@@ -655,6 +837,36 @@ impl FlushAndRewind for std::fs::File {
 /// PID plus nanoseconds is enough uniqueness for one host writing its own cache; two
 /// processes racing on the same accession may both download, and one rename wins, which is
 /// harmless because the bytes are the same.
+/// The sidecar beside a cached object, when there is a legible one.
+///
+/// Absent is the normal answer for any entry written before 0.2.0, and unreadable is treated
+/// the same way: provenance is worth reporting, never worth failing an accession over.
+fn read_sidecar(object: &Path) -> Option<crate::types::Sidecar> {
+    std::fs::read_to_string(sidecar_path(object))
+        .ok()
+        .map(|t| crate::types::Sidecar::from_text(&t))
+}
+
+/// Write a sidecar through a tempfile, so a reader never sees a half-written one.
+fn write_sidecar(path: &Path, payload: &Payload) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".provenance.{}.{ns}.tmp", std::process::id()));
+    let mut f = std::fs::File::create(&tmp)?;
+    let r = f
+        .write_all(payload.sidecar().to_text().as_bytes())
+        .and_then(|()| f.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
 fn open_cache_tmp(dir: &Path, accession: &str) -> std::io::Result<BodySink> {
     std::fs::create_dir_all(dir)?;
     let final_path = cache_path(dir, accession);
@@ -902,12 +1114,192 @@ mod size_cap_tests {
     #[test]
     fn a_body_over_the_cap_without_content_length_is_too_large_not_transient() {
         let url = serve_without_length(vec![b'A'; 100]);
-        match fetcher(10).try_once(0, &"X".to_string(), &url) {
+        match fetcher(10).try_once(0, &"X".to_string(), &url, None) {
             Err(FetchAttempt::TooLarge(d, _)) => assert!(d.contains("no Content-Length"), "{d}"),
             Err(FetchAttempt::Transient(d)) => panic!("retried as transient: {d}"),
             Err(_) => panic!("wrong failure"),
             Ok(f) => panic!("accepted {} bytes over a 10-byte cap", f.compressed_len),
         }
+    }
+
+    /// A download into the cache leaves a sidecar, and a later warm run reads it back.
+    ///
+    /// The `ETag` is on the wire exactly once. Without writing it down beside the object, a
+    /// warm run can never say which bucket object its bytes are a copy of, and `--revalidate`
+    /// has nothing to send an `If-None-Match` for.
+    #[test]
+    fn a_download_into_the_cache_records_where_the_bytes_came_from() {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("logan-walker-sidecar-w-{}-{ns}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let body = zstd::encode_all(&b">CACHED0011_0\nACGT\n"[..], 3).unwrap();
+        let url = serve_once(
+            "ETag: \"d2dd288b238c3c88b46acdcd78860dce\"\r\n\
+             Last-Modified: Sun, 31 Mar 2024 17:38:36 GMT\r\n",
+            body.clone(),
+        );
+        let mut f = fetcher(u64::MAX);
+        f.cache_dir = Some(dir.clone());
+        let got = match f.try_once(0, &"CACHED0011".to_string(), &url, None) {
+            Ok(got) => got,
+            Err(FetchAttempt::Missing) => panic!("download failed: missing"),
+            Err(FetchAttempt::TooLarge(d, _)) => panic!("download failed, too large: {d}"),
+            Err(FetchAttempt::Permanent(d)) => panic!("download failed, permanent: {d}"),
+            Err(FetchAttempt::Transient(d)) => panic!("download failed, transient: {d}"),
+            Err(FetchAttempt::NotModified) => panic!("304 to an unconditional request"),
+        };
+        assert_eq!(got.payload.etag.as_deref(), Some("d2dd288b238c3c88b46acdcd78860dce"));
+
+        let obj = cache_path(&dir, "CACHED0011");
+        let side = read_sidecar(&obj).expect("a cached object must get a sidecar");
+        assert!(
+            side.describes(Some(&crate::types::sha256_hex(&body))),
+            "the sidecar must name the digest of the object it sits beside"
+        );
+        assert_eq!(side.etag.as_deref(), Some("d2dd288b238c3c88b46acdcd78860dce"));
+        assert_eq!(side.last_modified.as_deref(), Some("2024-03-31T17:38:36Z"));
+        assert!(side.fetched_at.is_some(), "and when it was fetched");
+
+        // The run that matters: offline, no response to learn anything from, and it still
+        // knows what these bytes are a copy of.
+        let warm = Fetcher::new(&Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            ..Config::default()
+        });
+        let p = warm.fetch(0, &"CACHED0011".to_string()).expect("cache hit").payload;
+        assert_eq!(p.source, PayloadSource::Cache);
+        assert_eq!(p.etag.as_deref(), Some("d2dd288b238c3c88b46acdcd78860dce"));
+        assert_eq!(p.last_modified.as_deref(), Some("2024-03-31T17:38:36Z"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Serve one request with an arbitrary status line, for the 304 a conditional GET gets.
+    fn serve_status(status: &str, extra: &str, body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
+            body.len()
+        );
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&body);
+        });
+        format!("http://127.0.0.1:{port}/x")
+    }
+
+    /// A cache dir holding one object, with or without a sidecar naming `etag`.
+    fn cached_with(tag: &str, etag: Option<&str>, body: &[u8]) -> (PathBuf, Fetcher) {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("logan-walker-reval-{tag}-{}-{ns}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = cache_path(&dir, "REVAL1");
+        std::fs::write(&obj, body).unwrap();
+        if let Some(e) = etag {
+            let side = crate::types::Sidecar {
+                sha256: Some(crate::types::sha256_hex(body)),
+                etag: Some(e.to_string()),
+                ..Default::default()
+            };
+            std::fs::write(sidecar_path(&obj), side.to_text()).unwrap();
+        }
+        let mut f = fetcher(u64::MAX);
+        f.cache_dir = Some(dir.clone());
+        f.revalidate = true;
+        (dir, f)
+    }
+
+    /// 304 is the answer a warm run wants: the cache holds what the bucket still serves, and
+    /// no body crossed the wire to establish it.
+    #[test]
+    fn a_cache_entry_the_bucket_still_serves_is_current() {
+        let body = zstd::encode_all(&b">REVAL1_0\nACGT\n"[..], 3).unwrap();
+        let (dir, f) = cached_with("current", Some("tag-abc"), &body);
+        let url = serve_status("304 Not Modified", "", Vec::new());
+        let got = f.check_cached(0, &"REVAL1".to_string(), &cache_path(&dir, "REVAL1"), &url);
+        assert!(matches!(got, Revalidation::Current), "a 304 must read as current");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 200 to a conditional request means the object changed. The new bytes arrive in the
+    /// same round trip and replace the cache entry, which is the point: the next run, with
+    /// or without `--revalidate`, sees the current object rather than the stale one.
+    #[test]
+    fn a_cache_entry_the_bucket_replaced_comes_back_with_the_new_bytes() {
+        let old = zstd::encode_all(&b">REVAL1_0\nACGT\n"[..], 3).unwrap();
+        let new = zstd::encode_all(&b">REVAL1_0\nTTTTTTTT\n"[..], 3).unwrap();
+        assert_ne!(old, new);
+        let (dir, f) = cached_with("replaced", Some("tag-old"), &old);
+        let url = serve_status("200 OK", "ETag: \"tag-new\"\r\n", new.clone());
+
+        let got = f.check_cached(0, &"REVAL1".to_string(), &cache_path(&dir, "REVAL1"), &url);
+        match got {
+            Revalidation::Replaced(fresh) => {
+                assert_eq!(fresh.compressed_len, new.len());
+                assert_eq!(fresh.payload.etag.as_deref(), Some("tag-new"));
+            }
+            _ => panic!("a 200 to a conditional request must read as replaced"),
+        }
+        // The entry on disk is the new object, and its sidecar names the new ETag: a later
+        // run must not find the bytes this one just proved stale.
+        let obj = cache_path(&dir, "REVAL1");
+        assert_eq!(std::fs::read(&obj).unwrap(), new, "the cache must hold the new bytes");
+        let side = read_sidecar(&obj).expect("sidecar rewritten");
+        assert_eq!(side.etag.as_deref(), Some("tag-new"));
+        assert!(side.describes(Some(&crate::types::sha256_hex(&new))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With nothing recording what the cached bytes are a copy of, there is no question to
+    /// ask. Every entry written before sidecars existed is in this state.
+    #[test]
+    fn a_cache_entry_with_no_recorded_origin_cannot_be_revalidated() {
+        let body = zstd::encode_all(&b">REVAL1_0\nACGT\n"[..], 3).unwrap();
+        let (dir, f) = cached_with("noorigin", None, &body);
+        let got = f.check_cached(
+            0,
+            &"REVAL1".to_string(),
+            &cache_path(&dir, "REVAL1"),
+            "http://127.0.0.1:1/never-used",
+        );
+        assert!(matches!(got, Revalidation::NoOrigin));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A revalidation that cannot be made is not a failed accession.
+    ///
+    /// The cached bytes are still a usable analysis, and turning a network blip into a lost
+    /// cohort would be a worse answer than running on them and saying the check did not
+    /// happen. Recorded as `unavailable` so the summary never claims a check it did not make.
+    #[test]
+    fn a_revalidation_that_cannot_be_made_falls_back_to_the_cached_bytes() {
+        let body = zstd::encode_all(&b">REVAL1_0\nACGT\n"[..], 3).unwrap();
+        let (dir, f) = cached_with("unavail", Some("tag-abc"), &body);
+        // Nothing listening: a transport error, not an HTTP answer.
+        let got = f.check_cached(
+            0,
+            &"REVAL1".to_string(),
+            &cache_path(&dir, "REVAL1"),
+            "http://127.0.0.1:1/dead",
+        );
+        assert!(matches!(got, Revalidation::Unavailable), "must not fail the accession");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Serve one request with `extra` headers and a correct Content-Length, so the size
@@ -942,7 +1334,7 @@ mod size_cap_tests {
             "ETag: \"d2dd288b238c3c88b46acdcd78860dce\"\r\nLast-Modified: Sun, 31 Mar 2024 17:38:36 GMT\r\n",
             body.clone(),
         );
-        let got = fetcher(1024).try_once(0, &"X".to_string(), &url).ok().expect("fetch");
+        let got = fetcher(1024).try_once(0, &"X".to_string(), &url, None).ok().expect("fetch");
         let p = &got.payload;
         assert_eq!(p.source, PayloadSource::S3);
         assert_eq!(p.bytes, Some(32));
@@ -960,7 +1352,7 @@ mod size_cap_tests {
     fn a_response_without_those_headers_still_hashes_what_it_read() {
         let body = vec![b'Q'; 8];
         let got = fetcher(1024)
-            .try_once(0, &"X".to_string(), &serve_once("", body.clone()))
+            .try_once(0, &"X".to_string(), &serve_once("", body.clone()), None)
             .ok()
             .expect("fetch");
         assert_eq!(got.payload.sha256.as_deref(), Some(crate::types::sha256_hex(&body).as_str()));
@@ -973,7 +1365,7 @@ mod size_cap_tests {
     #[test]
     fn a_refusal_on_content_length_records_what_was_refused() {
         let url = serve_once("ETag: \"abc123\"\r\n", vec![b'Z'; 100]);
-        match fetcher(10).try_once(0, &"X".to_string(), &url) {
+        match fetcher(10).try_once(0, &"X".to_string(), &url, None) {
             Err(FetchAttempt::TooLarge(_, p)) => {
                 assert_eq!(p.bytes, Some(100), "the size that tripped the cap must be a number");
                 assert_eq!(p.etag.as_deref(), Some("abc123"));
@@ -989,7 +1381,7 @@ mod size_cap_tests {
     #[test]
     fn a_body_of_exactly_the_cap_is_accepted() {
         let url = serve_without_length(vec![b'A'; 10]);
-        let got = fetcher(10).try_once(0, &"X".to_string(), &url).ok().expect("refused at the cap");
+        let got = fetcher(10).try_once(0, &"X".to_string(), &url, None).ok().expect("refused at the cap");
         assert_eq!(got.compressed_len, 10);
     }
 }
@@ -1209,11 +1601,14 @@ mod cache_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A cache hit has no HTTP response to take an ETag from, which is exactly why the
-    /// digest is computed from the bytes: `--offline` runs are the ones whose inputs are
-    /// least self-evident, and they used to record nothing at all.
+    /// A cache entry with no sidecar records its own bytes and claims nothing more.
+    ///
+    /// This is every entry written before 0.2.0, and the reason the digest is computed from
+    /// the bytes at all: a cache hit has no HTTP response to take an `ETag` from, and
+    /// `--offline` runs are the ones whose inputs are least self-evident. A sidecar, when
+    /// there is one, fills the rest in; see the tests below.
     #[test]
-    fn a_cache_hit_records_the_bytes_it_read() {
+    fn a_cache_hit_with_no_sidecar_records_the_bytes_it_read() {
         let dir = tempdir("prov");
         let bytes = zstd::encode_all(&b">CACHED0003_0\nACGT\n"[..], 3).unwrap();
         std::fs::write(cache_path(&dir, "CACHED0003"), &bytes).unwrap();
@@ -1226,11 +1621,75 @@ mod cache_tests {
         assert_eq!(p.source, PayloadSource::Cache);
         assert_eq!(p.bytes, Some(bytes.len() as u64));
         assert_eq!(p.sha256.as_deref(), Some(crate::types::sha256_hex(&bytes).as_str()));
-        assert_eq!(p.etag, None, "there was no response to take one from");
-        assert_eq!(
-            p.fetched_at, None,
-            "cached bytes may predate the run by any amount; run.started is the honest clock"
-        );
+        assert_eq!(p.etag, None, "no sidecar, so nothing says what this is a copy of");
+        assert_eq!(p.fetched_at, None, "and nothing says when it was fetched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sidecar beside a cached object tells a warm run what the bytes are a copy of.
+    ///
+    /// Without it a cache hit knows its own digest and nothing else, so it cannot say which
+    /// bucket object it came from and `--revalidate` has no `ETag` to send. Logan's `u/`
+    /// objects are mutable, which is what makes that gap matter.
+    #[test]
+    fn a_sidecar_gives_a_cache_hit_the_origin_its_bytes_came_from() {
+        let dir = tempdir("sidecar-read");
+        let bytes = zstd::encode_all(&b">CACHED0009_0\nACGT\n"[..], 3).unwrap();
+        let obj = cache_path(&dir, "CACHED0009");
+        std::fs::write(&obj, &bytes).unwrap();
+        let side = crate::types::Sidecar {
+            bytes: Some(bytes.len() as u64),
+            sha256: Some(crate::types::sha256_hex(&bytes)),
+            etag: Some("d2dd288b238c3c88b46acdcd78860dce".into()),
+            last_modified: Some("2024-03-31T17:38:36Z".into()),
+            fetched_at: Some("2026-11-17T22:08:24Z".into()),
+        };
+        std::fs::write(sidecar_path(&obj), side.to_text()).unwrap();
+
+        let f = Fetcher::new(&Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            ..Config::default()
+        });
+        let p = f.fetch(0, &"CACHED0009".to_string()).expect("cache hit").payload;
+        assert_eq!(p.source, PayloadSource::Cache, "the bytes still came from the cache");
+        assert_eq!(p.etag.as_deref(), Some("d2dd288b238c3c88b46acdcd78860dce"));
+        assert_eq!(p.last_modified.as_deref(), Some("2024-03-31T17:38:36Z"));
+        assert_eq!(p.fetched_at.as_deref(), Some("2026-11-17T22:08:24Z"));
+        // Measured from the file, not adopted: the sidecar is believed about provenance
+        // precisely because it is checked against these.
+        assert_eq!(p.bytes, Some(bytes.len() as u64));
+        assert_eq!(p.sha256.as_deref(), Some(crate::types::sha256_hex(&bytes).as_str()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sidecar that describes other bytes is ignored, not believed.
+    ///
+    /// This is the case the digest exists for: someone replaced the object and left the old
+    /// sidecar, so the recorded origin now names something these bytes are not a copy of.
+    /// Believing it would attach a false `ETag` to a real accession, which is worse than
+    /// having none, and would make `--revalidate` compare against the wrong object.
+    #[test]
+    fn a_sidecar_that_does_not_match_the_object_is_ignored() {
+        let dir = tempdir("sidecar-stale");
+        let bytes = zstd::encode_all(&b">CACHED0010_0\nACGT\n"[..], 3).unwrap();
+        let obj = cache_path(&dir, "CACHED0010");
+        std::fs::write(&obj, &bytes).unwrap();
+        let stale = crate::types::Sidecar {
+            sha256: Some("0".repeat(64)),
+            etag: Some("stale-etag".into()),
+            ..Default::default()
+        };
+        std::fs::write(sidecar_path(&obj), stale.to_text()).unwrap();
+
+        let f = Fetcher::new(&Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            ..Config::default()
+        });
+        let p = f.fetch(0, &"CACHED0010".to_string()).expect("cache hit").payload;
+        assert_eq!(p.etag, None, "a sidecar for other bytes must not be adopted");
+        assert_eq!(p.sha256.as_deref(), Some(crate::types::sha256_hex(&bytes).as_str()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1326,7 +1785,7 @@ mod cache_tests {
         // tempfile rather than nowhere.
         assert!(!cache_path(&dir, "ATOMIC1").exists(), "renamed before the body finished");
         assert_eq!(tmpfiles_in(&dir).len(), 1);
-        sink.finish().unwrap();
+        sink.finish(&Payload::default()).unwrap();
         assert_eq!(std::fs::read(cache_path(&dir, "ATOMIC1")).unwrap(), b"payload");
         assert!(tmpfiles_in(&dir).is_empty(), "leftover tempfiles: {:?}", tmpfiles_in(&dir));
 
@@ -1400,6 +1859,7 @@ mod cache_tests {
             FetchAttempt::Permanent(_) => "Permanent",
             FetchAttempt::Missing => "Missing",
             FetchAttempt::TooLarge(..) => "TooLarge",
+            FetchAttempt::NotModified => "NotModified",
         }
     }
 
@@ -1439,7 +1899,7 @@ mod cache_tests {
 
         let mut sink = BodySink::Transient(crate::types::transient_file(&dir, "dl").unwrap());
         sink.write_all(b"compressed bytes").unwrap();
-        let compressed = sink.finish().unwrap();
+        let compressed = sink.finish(&Payload::default()).unwrap();
 
         // File-backed, so nothing may read it into a Vec by accident...
         assert!(compressed.as_slice().is_none());

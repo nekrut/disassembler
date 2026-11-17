@@ -253,6 +253,48 @@ disassembler walker -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/r
 `fetch` skips accessions already in the cache; delete a file to refetch it. The composites take
 the same two flags.
 
+### What a cached object is a copy of
+
+Beside each cached object the walker writes `<ACC>.unitigs.fa.zst.provenance`, a few lines of
+`key value` recording the object's size, its sha256, and the `ETag`, `Last-Modified` and fetch
+time of the S3 object it came from. The digest is in there so the record cannot drift from the
+file: if it does not match the bytes beside it, something replaced the object and the record is
+ignored with a warning rather than believed.
+
+Without it a warm run knows the digest of the bytes it holds and nothing about where they came
+from, because the `ETag` is on the wire only on the run that downloaded them. An entry written
+before 0.2.0 has no sidecar and is read exactly as it always was.
+
+### `--revalidate`
+
+Logan's `u/` objects are mutable and unversioned. A cache that was correct when it was filled
+can be serving bytes the bucket has since replaced, and nothing in any output says so: two runs
+of the same command analyse different data and agree in every field that records what was
+asked for.
+
+`--revalidate` makes each cache hit ask. It sends a conditional request against the `ETag` in
+the sidecar, so the confirming answer is a 304 with no body: a cache that is still current
+costs one round trip per accession and no transfer. It needs `--unitigs-cache`, and it is
+refused with `--offline`, which forbids the network it depends on.
+
+What it records, per accession, in `payload.revalidated`:
+
+| value | meaning |
+|---|---|
+| `current` | the bucket confirmed the cached object |
+| `replaced` | the bucket serves different bytes now. The cache has been refreshed and **this run used the new object**, and an earlier run of the same command did not |
+| `refetched` | nothing recorded what the cached bytes were a copy of, so they were downloaded again rather than trusted |
+| `unavailable` | the check could not be made, and the cached bytes were used anyway |
+
+`replaced` is the one to alert on, and it is printed to stderr as well. `unavailable` is
+deliberately not fatal: a cached object is still a usable analysis, and turning a network blip
+into a lost cohort would be the worse answer. The field is absent when the flag was off, so
+"not asked" and "asked, and fine" stay different answers.
+
+It is off by default because it is a round trip per accession that a run which trusts its
+cache should not have to pay. Reach for it when a result has to be defensible, not on every
+iteration.
+
 `fetch` also writes `fetch.summary.json` into `--out-dir`, listing every accession with the
 size and sha256 of the bytes that landed in the cache, plus the `ETag` and `Last-Modified` of
 each object it downloaded. That is what makes a filled cache a frozen input you can cite rather
@@ -315,6 +357,7 @@ Options that are on by default are turned off with a `--no-…` form.
 |---|---|
 | `--unitigs-cache <DIR>` | read-through cache of compressed unitig files |
 | `--offline` | refuse the S3 fallback; requires `--unitigs-cache` |
+| `--revalidate` | confirm each cache hit against the bucket before using it; requires `--unitigs-cache`, refused with `--offline` (see [`--revalidate`](#--revalidate)) |
 | `--fetch-only` | fill `--unitigs-cache` and exit before any analysis |
 
 ## Memory

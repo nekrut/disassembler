@@ -10,7 +10,7 @@
     "references": [
       {"id": "pfcrt", "length": 1275, "sha256": "128ff9b07e60b60846f70618970d195db4f97cc71bdca13f69576a6cdb841ba4"}
     ],
-    "source": {"kind": "cache+s3", "id": "/tmp/claude-1000/-home-andrew-Documents-repos-disassembler/2e662031-f672-4405-a14e-f56454033b26/scratchpad/golden-cache2", "n_requested": 1}
+    "source": {"kind": "s3", "id": "https://logan-pub.s3.amazonaws.com/u/", "n_requested": 1}
   },
   "settings": {
     "k": 21,
@@ -36,14 +36,15 @@
     "summary_seqs": false,
     "emit_alts": true,
     "emit_vcf": true,
-    "emit_snv_table": true
+    "emit_snv_table": true,
+    "revalidate": false
   },
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-17T03:42:28Z",
-    "wall_seconds": 0.948,
-    "stage_seconds": {"stream": 0.017, "parse": 0.735, "anchor": 0.000, "extract": 0.152, "align": 0.041, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-17T23:02:28Z",
+    "wall_seconds": 12.418,
+    "stage_seconds": {"stream": 11.440, "parse": 0.768, "anchor": 0.000, "extract": 0.164, "align": 0.043, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
@@ -71,7 +72,7 @@
     {
       "acc": "ERR2028820",
       "status": "success",
-      "payload": {"source": "cache", "bytes": 34016719, "sha256": "a03b08561b2f7233f3ac48c08825199d37ed801cfa8264151e04b6f7c92f187f"},
+      "payload": {"source": "s3", "bytes": 34016719, "sha256": "a03b08561b2f7233f3ac48c08825199d37ed801cfa8264151e04b6f7c92f187f", "etag": "89d0255e8d9b262f4f0ec26bcf53ae20", "last_modified": "2024-03-31T15:36:42Z", "fetched_at": "2026-11-17T23:02:28Z"},
       "n_unitigs": 1277362,
       "n_anchors": 220,
       "subgraph_nodes": 747,
@@ -90,7 +91,7 @@
       "hit_pass_cap": false,
       "variants": {"depth": 180.0, "floor": 5.0, "forks": 11, "biallelic": 4, "recovered": 0, "beyond_cap": 0, "indels": 0, "no_rejoin": 1, "not_substitution": 0, "over_indel_cap": 2, "frameshifting": 1, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 180.0, "floor": 5.0, "unitigs": 747, "unitigs_kept": 479, "unpruned_span": [0, 1275], "pruned_span": [0, 1275]},
-      "timing": {"stream": 0.017, "parse": 0.735, "anchor": 0.000, "extract": 0.152, "align": 0.041, "stitch": 0.000, "phase": 0.000, "total": 0.929}
+      "timing": {"stream": 11.440, "parse": 0.768, "anchor": 0.000, "extract": 0.164, "align": 0.043, "stitch": 0.000, "phase": 0.000, "total": 0.976}
     }
   ]
 }

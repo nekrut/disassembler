@@ -277,9 +277,23 @@ pub struct Payload {
     /// S3 `Last-Modified`, normalised to `YYYY-MM-DDTHH:MM:SSZ`. Omitted rather than stored
     /// raw when it cannot be parsed, so the field has one format or none.
     pub last_modified: Option<String>,
-    /// When this run read the object from S3. Not set for a cache hit, where the bytes may
-    /// predate the run by any amount and `run.started` is the only honest clock.
+    /// When the object was read from S3.
+    ///
+    /// Set on a cache hit too, from the sidecar, since 0.2.0: that is the clock that says how
+    /// old the bytes are, which is the question a warm run actually raises. Absent for a cache
+    /// entry written before sidecars existed, where nothing records it.
     pub fetched_at: Option<String>,
+    /// What `--revalidate` found, when it ran. `None` means it did not.
+    ///
+    /// - `current`: the bucket confirmed the cached object (HTTP 304).
+    /// - `replaced`: the bucket serves different bytes now, and these are the new ones.
+    /// - `refetched`: nothing recorded what the cached bytes were a copy of, so they were
+    ///   downloaded again unconditionally rather than trusted.
+    /// - `unavailable`: the check could not be made, and the cached bytes were used anyway.
+    ///
+    /// `replaced` is the one worth alerting on: it is a silent substitution made visible, and
+    /// it means an earlier run of the same command analysed different data.
+    pub revalidated: Option<&'static str>,
 }
 
 impl Payload {
@@ -322,6 +336,113 @@ impl Payload {
             sha256: Some(hex),
             ..Self::default()
         })
+    }
+}
+
+/// What a cache entry records about the object it was downloaded from.
+///
+/// A cached file carries the digest of its own bytes, which says they are intact but not what
+/// they are a copy of. Logan's `u/` objects are mutable, so without this a warm run cannot
+/// name the bucket object its bytes came from, and `--revalidate` has no `ETag` to send.
+///
+/// Written beside the object as `<name>.provenance`, one `key value` per line. Not JSON,
+/// because the walker deliberately carries no serde (see `Cargo.toml`) and hand-parsing JSON
+/// to read back something it hand-wrote is a liability for no gain. Unknown keys are ignored
+/// on read, so a later version may add fields without stranding an existing cache.
+///
+/// Every value this holds is digits, hex, or an ISO 8601 timestamp, none of which contain
+/// whitespace. A value that somehow does is dropped on write rather than written as a line
+/// that would not read back the way it went in.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Sidecar {
+    pub bytes: Option<u64>,
+    /// Digest of the object this describes. A sidecar whose digest does not match the file
+    /// beside it is describing bytes that have since been replaced, and is ignored.
+    pub sha256: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub fetched_at: Option<String>,
+}
+
+impl Sidecar {
+    pub const SCHEMA: u32 = 1;
+
+    pub fn to_text(&self) -> String {
+        let mut out = format!("schema {}\n", Self::SCHEMA);
+        let mut put = |k: &str, v: &str| {
+            if !v.is_empty() && !v.chars().any(char::is_whitespace) {
+                out.push_str(k);
+                out.push(' ');
+                out.push_str(v);
+                out.push('\n');
+            }
+        };
+        if let Some(b) = self.bytes {
+            put("bytes", &b.to_string());
+        }
+        for (k, v) in [
+            ("sha256", &self.sha256),
+            ("etag", &self.etag),
+            ("last_modified", &self.last_modified),
+            ("fetched_at", &self.fetched_at),
+        ] {
+            if let Some(v) = v {
+                put(k, v);
+            }
+        }
+        out
+    }
+
+    /// Parse, keeping whatever is legible. A sidecar is provenance, not a gate: a line that
+    /// does not parse costs that one field, never the cache entry.
+    pub fn from_text(text: &str) -> Self {
+        let mut out = Self::default();
+        for line in text.lines() {
+            let Some((k, v)) = line.trim_end().split_once(' ') else {
+                continue;
+            };
+            match k {
+                "bytes" => out.bytes = v.parse().ok(),
+                "sha256" => out.sha256 = Some(v.to_string()),
+                "etag" => out.etag = Some(v.to_string()),
+                "last_modified" => out.last_modified = Some(v.to_string()),
+                "fetched_at" => out.fetched_at = Some(v.to_string()),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Whether this describes the bytes that were actually read back.
+    pub fn describes(&self, sha256: Option<&str>) -> bool {
+        match (&self.sha256, sha256) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Payload {
+    /// The provenance worth persisting beside a cached object.
+    pub fn sidecar(&self) -> Sidecar {
+        Sidecar {
+            bytes: self.bytes,
+            sha256: self.sha256.clone(),
+            etag: self.etag.clone(),
+            last_modified: self.last_modified.clone(),
+            fetched_at: self.fetched_at.clone(),
+        }
+    }
+
+    /// Adopt a sidecar's provenance onto a payload read from the cache.
+    ///
+    /// Only the fields a cache hit cannot otherwise know: `bytes` and `sha256` stay as they
+    /// were measured from the file, because those are facts about the bytes in hand and the
+    /// sidecar is only believed at all when it agrees with them.
+    pub fn adopt(&mut self, s: &Sidecar) {
+        self.etag = s.etag.clone();
+        self.last_modified = s.last_modified.clone();
+        self.fetched_at = s.fetched_at.clone();
     }
 }
 
@@ -1201,6 +1322,69 @@ impl AccessionResult {
 
 #[cfg(test)]
 mod tests {
+
+    /// The sidecar format must survive a round trip, and a later version's extra keys.
+    ///
+    /// It is hand-written and hand-parsed, so the round trip is the only thing standing
+    /// between a cache's provenance and a quiet misread. Unknown keys are ignored rather
+    /// than fatal so a cache written by a later walker still reads here.
+    #[test]
+    fn a_sidecar_round_trips_and_tolerates_keys_it_does_not_know() {
+        use super::Sidecar;
+        let full = Sidecar {
+            bytes: Some(34_016_719),
+            sha256: Some("a".repeat(64)),
+            etag: Some("d2dd288b238c3c88b46acdcd78860dce".into()),
+            last_modified: Some("2024-03-31T17:38:36Z".into()),
+            fetched_at: Some("2026-11-17T22:08:24Z".into()),
+        };
+        assert_eq!(Sidecar::from_text(&full.to_text()), full);
+
+        // Absent fields stay absent rather than becoming empty strings.
+        let bare = Sidecar { sha256: Some("b".repeat(64)), ..Default::default() };
+        let back = Sidecar::from_text(&bare.to_text());
+        assert_eq!(back, bare);
+        assert_eq!(back.etag, None);
+
+        // A key from a later version, and a line that is not a pair at all.
+        let text = format!("{}compression zstd-19\ngarbage\n", full.to_text());
+        assert_eq!(Sidecar::from_text(&text), full);
+
+        // The schema line is written, and is not mistaken for one of the fields.
+        assert!(full.to_text().starts_with("schema 1\n"));
+    }
+
+    /// A value with whitespace in it is dropped rather than written unreadably.
+    ///
+    /// Every real value here is digits, hex or an ISO 8601 timestamp, so this cannot happen
+    /// with data from S3. It is enforced anyway because the format's one rule is that a line
+    /// is a key, a space, and the rest: a value containing a space would read back short and
+    /// silently wrong, which is worse than a field that is simply absent.
+    #[test]
+    fn a_sidecar_value_that_would_not_read_back_is_not_written() {
+        use super::Sidecar;
+        let bad = Sidecar {
+            etag: Some("two words".into()),
+            sha256: Some("c".repeat(64)),
+            ..Default::default()
+        };
+        let text = bad.to_text();
+        assert!(!text.contains("two words"), "{text}");
+        let back = Sidecar::from_text(&text);
+        assert_eq!(back.etag, None, "dropped, not mangled");
+        assert_eq!(back.sha256, bad.sha256, "and the good fields survive");
+    }
+
+    /// A sidecar only speaks for bytes whose digest it carries.
+    #[test]
+    fn a_sidecar_describes_only_the_digest_it_names() {
+        use super::Sidecar;
+        let s = Sidecar { sha256: Some("d".repeat(64)), ..Default::default() };
+        assert!(s.describes(Some(&"d".repeat(64))));
+        assert!(!s.describes(Some(&"e".repeat(64))));
+        assert!(!s.describes(None), "unknown bytes are not a match");
+        assert!(!Sidecar::default().describes(Some(&"d".repeat(64))), "and neither is silence");
+    }
     use super::*;
 
     /// Every outcome is deliberately either a negative or a failure.
