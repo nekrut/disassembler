@@ -1264,6 +1264,46 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A row read by id must still be that row after `collect` re-indexes by slot.
+    ///
+    /// `collect` keeps only the neighbourhood's rows and indexes them by slot, but the
+    /// pipeline expands the neighbourhood a second time when pruning is rejected, and that
+    /// runs after `collect`. Indexing `offsets` by id there walks off the end of an array
+    /// that now holds one row per retained node rather than one per unitig: on a
+    /// 5,000-accession run all 8 accessions that reached that path panicked, and an id small
+    /// enough to land inside the shorter array would have silently returned another unitig's
+    /// edges. The neighbourhood here is deliberately sparse so slot and id cannot coincide.
+    #[test]
+    fn a_row_read_by_id_still_reads_that_row_after_collect() {
+        let mut fa = String::new();
+        for i in 0..5_000u32 {
+            fa.push_str(&format!(">T_{i} ka:f:5.0"));
+            for j in 0..(i % 4) + 1 {
+                fa.push_str(&format!(" L:+:{}:-", (i * 7 + j * 13) % 5_000));
+            }
+            fa.push_str("\nACGTACGTACGT\n");
+        }
+
+        let before = scan(&"T".to_string(), cursor(&fa), u64::MAX, &mut ()).expect("in memory");
+        assert!(before.spool.is_none(), "the in-memory rows are the ones that broke");
+
+        let wanted: Vec<UnitigId> = (0..5_000u32).step_by(97).collect();
+        let g = scan(&"T".to_string(), cursor(&fa), u64::MAX, &mut ()).expect("in memory");
+        let after = collect(g, cursor(&fa), &wanted, u64::MAX).expect("collect");
+        assert!(
+            after.nodes.len() * 10 < after.n_unitigs,
+            "the fixture must leave slot and id far apart, or indexing by id passes by luck"
+        );
+
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for &id in &wanted {
+            before.edges_by_id_into(id, &mut a).expect("row before collect");
+            after.edges_by_id_into(id, &mut b).expect("row after collect");
+            assert_eq!(a, b, "unitig {id} reads differently after collect");
+            assert_eq!(after.edges(id), b.as_slice(), "and must agree with edges()");
+        }
+    }
+
     /// The spool files are unlinked at creation, so a run leaves nothing to clean up.
     #[test]
     fn spilling_leaves_no_files_behind() {

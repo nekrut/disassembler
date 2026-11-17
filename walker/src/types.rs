@@ -559,23 +559,34 @@ impl UnitigGraph {
         &self.targets[self.offsets[i] as usize..self.offsets[i + 1] as usize]
     }
 
-    /// Neighbours of `id` into `buf`, while the graph still holds every unitig's row.
+    /// Neighbours of `id` into `buf`, whether the rows are indexed by id or by slot.
     ///
-    /// Valid between `parse::scan` and `parse::collect`, which is exactly the window
-    /// `extract::expand` runs in. Fills a caller-owned buffer rather than returning a slice
-    /// because the rows may be on disk; pass the same buffer back each time.
+    /// Between `parse::scan` and `parse::collect` the graph holds a row per unitig and `id`
+    /// indexes the arrays directly. After `collect` only the neighbourhood's rows survive and
+    /// they are indexed by slot, so the id has to go through `nodes`. Rows are kept whole in
+    /// both states, so the row this returns is the same one either way.
     ///
-    /// After `collect` the arrays are indexed by slot and this would read the wrong row, so it
-    /// says so rather than returning plausible edges.
+    /// Both states are reachable. `pipeline` expands the neighbourhood a second time when
+    /// pruning is rejected, and that runs after `collect`: indexing by id there read a
+    /// slot-indexed array, which is shorter than the id space by the whole of the accession.
+    /// On a 5,000-accession run all 8 accessions that reached it panicked, and an id that
+    /// happened to land inside the shorter array would have silently returned another
+    /// unitig's edges instead.
+    ///
+    /// Fills a caller-owned buffer rather than returning a slice because the rows may be on
+    /// disk; pass the same buffer back each time.
     pub fn edges_by_id_into(&self, id: UnitigId, buf: &mut Vec<u32>) -> std::io::Result<()> {
-        debug_assert!(
-            self.nodes.is_empty() || self.nodes.len() == self.n_unitigs,
-            "edges_by_id_into after collect: the adjacency is indexed by slot now, use edges()"
-        );
         match &self.spool {
             Some(s) => s.edges_into(id, buf),
             None => {
-                let i = id as usize;
+                // `nodes` is empty exactly while every row is still held, which is also the
+                // state `parse::shrink_adjacency` reads the graph in while rebuilding it.
+                // Once it is populated it is the id -> slot mapping.
+                let i = if self.nodes.is_empty() {
+                    id as usize
+                } else {
+                    self.expect_slot(id, "edges")
+                };
                 buf.clear();
                 buf.extend_from_slice(
                     &self.targets[self.offsets[i] as usize..self.offsets[i + 1] as usize],
