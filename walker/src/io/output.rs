@@ -816,6 +816,12 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
             // f64 precision, 17 digits of it, which is noise in a diff and is finer than the
             // alignment it came from.
             write!(w, ", \"cov\": {:.4}", h.cov)?;
+            // What `--min-cov` gated on, and the interval it measured (WA-05). `cov` above is
+            // the walked length over the reference length, which an indel moves; these two
+            // are the alignment's own footprint on the reference, and they are what decided
+            // whether this record exists at all.
+            write!(w, ", \"ref_cov\": {:.4}", h.ref_cov)?;
+            write!(w, ", \"ref_span\": [{}, {}]", h.ref_span.0, h.ref_span.1)?;
             write!(w, ", \"pident\": {:.4}", h.pident)?;
             write!(w, ", \"pident_inherited\": {}", h.pident_inherited)?;
             write!(w, ", \"nodes\": {}", h.nodes)?;
@@ -878,14 +884,20 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
         for (i, c) in r.candidates.iter().enumerate() {
             let num = |x: Option<f64>| x.map_or("null".to_string(), |v| v.to_string());
             let int = |x: Option<usize>| x.map_or("null".to_string(), |v| v.to_string());
+            let span = |x: Option<(usize, usize)>| {
+                x.map_or("null".to_string(), |(a, b)| format!("[{a}, {b}]"))
+            };
             writeln!(
                 w,
                 "        {{\"record_id\": \"{}\", \"pool_index\": {}, \"cov\": {}, \
-                 \"pident\": {}, \"length\": {}, \"nodes\": {}, \"path_len\": {}, \
-                 \"num_matches\": {}, \"aln_len\": {}, \"selected\": {}}}{}",
+                 \"ref_cov\": {}, \"ref_span\": {}, \"pident\": {}, \"length\": {}, \
+                 \"nodes\": {}, \"path_len\": {}, \"num_matches\": {}, \"aln_len\": {}, \
+                 \"selected\": {}}}{}",
                 esc(&c.record_id),
                 c.pool_index,
                 num(c.cov),
+                num(c.ref_cov),
+                span(c.ref_span),
                 num(c.pident),
                 int(c.length),
                 int(c.nodes),
@@ -1806,6 +1818,8 @@ mod vcf_tests {
             id: "h".into(),
             seq: seq.to_vec(),
             cov: 1.0,
+            ref_cov: 1.0,
+            ref_span: (0, seq.len()),
             pident: 100.0,
             pident_inherited: false,
             nodes: 1,
@@ -2200,6 +2214,8 @@ mod identity_label_tests {
             id: id.into(),
             seq: b"ACGT".to_vec(),
             cov: 1.0,
+            ref_cov: 1.0,
+            ref_span: (0, 4),
             pident: 98.1,
             pident_inherited: inherited,
             nodes: 1,
@@ -2517,6 +2533,8 @@ mod identity_label_tests {
                 pool_index: 0,
                 pident: Some(97.5),
                 cov: Some(0.62),
+                ref_cov: Some(0.64),
+                ref_span: Some((0, 2420)),
                 length: Some(2350),
                 nodes: Some(120),
                 path_len: Some(4500),
@@ -2529,6 +2547,8 @@ mod identity_label_tests {
                 pool_index: 1,
                 pident: Some(99.6),
                 cov: Some(0.99),
+                ref_cov: Some(0.99),
+                ref_span: Some((0, 3800)),
                 length: Some(3800),
                 nodes: Some(160),
                 path_len: Some(4600),

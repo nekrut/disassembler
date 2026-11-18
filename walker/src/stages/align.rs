@@ -777,6 +777,7 @@ mod tests {
             };
             let hap = crate::types::Haplotype {
                 id: name.into(), seq: vec![], cov: 1.0,
+                ref_cov: 1.0, ref_span: (0, 300),
                 pident: matches as f64 / 300.0 * 100.0,
                 pident_inherited: false, nodes: 1, mean_ka: 100.0, vaf: 1.0, anchor_used: None,
             };

@@ -861,8 +861,31 @@ impl GafPath {
 pub struct Haplotype {
     pub id: String,
     pub seq: Vec<u8>,
-    /// Fraction of the reference covered.
+    /// Length of this haplotype over the length of the reference.
+    ///
+    /// **Not what `--min-cov` gates on**, and not a fraction of the reference: an insertion
+    /// in the sample pushes it above 1.0 and a deletion below, because it measures what was
+    /// walked. See `ref_cov`, which is the fraction the flag's name promises and the number
+    /// the gate uses. Both are published because they answer different questions: this one
+    /// says how much sequence came out, `ref_cov` says how much of the reference was found.
     pub cov: f64,
+    /// Fraction of the reference the alignment spans: `(query_end - query_start) / ref_len`.
+    ///
+    /// WA-05. This is what `--min-cov` gates on, and what the flag has always been documented
+    /// as meaning. Until 0.2.0 the gate used `cov` instead, which measures the walked length,
+    /// so an indel in the sample moved the decision: on a 300 nt gene at the default 0.85, a
+    /// sample carrying the whole gene with a 60 nt in-frame deletion scored 0.80 and was
+    /// published as `no_path`, "the gene is not here", while an alignment that reached only
+    /// reference base 240 but walked a 20 nt insertion scored 0.867 and was published as a
+    /// primary. The first biases presence calls against deletion alleles, which is the
+    /// opposite of what a gene-presence gate should do.
+    pub ref_cov: f64,
+    /// The reference interval the alignment covers, GAF columns 3 and 4, end exclusive.
+    ///
+    /// Published so `ref_cov` can be checked and so a short alignment says *where* it was
+    /// short: a walk that stops 60 bases from the 3' end is a different finding from one
+    /// missing 60 bases in the middle, and the fraction alone cannot tell them apart.
+    pub ref_span: (usize, usize),
     /// Identity of the GraphAligner alignment that produced this path: `num_matches /
     /// aln_len` from the GAF.
     ///
@@ -993,9 +1016,18 @@ pub struct CandidateReport {
     /// `num_matches / aln_len * 100`, same as [`Haplotype::pident`]. `None` when this
     /// reference produced no GAF row (i.e. GraphAligner found no alignment for it).
     pub pident: Option<f64>,
-    /// Fraction of the reference length covered by the stitched span. `None` when there
-    /// was no path to stitch.
+    /// Length of the stitched span over the reference length. `None` when there was no path
+    /// to stitch. As on [`Haplotype::cov`], this is the walked length, not the fraction of
+    /// the reference that was found; `ref_cov` is that.
     pub cov: Option<f64>,
+    /// Fraction of the reference this candidate's alignment spans, which is what `--min-cov`
+    /// gates on (WA-05). `None` when this reference produced no GAF row.
+    ///
+    /// Present even when `cov` is `None`, because a candidate rejected by the gate has no
+    /// stitched span but does have an alignment, and this is the number that rejected it.
+    pub ref_cov: Option<f64>,
+    /// The reference interval the alignment covers, GAF columns 3 and 4, end exclusive.
+    pub ref_span: Option<(usize, usize)>,
     /// Length of the stitched span in bases. `None` when there was no path.
     pub length: Option<usize>,
     pub nodes: Option<usize>,

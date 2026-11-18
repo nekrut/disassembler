@@ -227,6 +227,12 @@ pub fn stitch(
     let target: Vec<u8> = stitched[start..end.max(start)].to_vec();
 
     let cov = target.len() as f64 / query.seq.len() as f64;
+    // What `--min-cov` actually gates on (WA-05). `cov` above is the walked length, which an
+    // indel in the sample moves in the wrong direction: a deletion makes a gene that is fully
+    // there look absent, and an insertion makes a partial alignment look complete. The
+    // reference span is the fraction of the reference the alignment found, which is what the
+    // flag has always been documented as meaning.
+    let ref_cov = path.query_span() as f64 / query.seq.len() as f64;
 
     // Tripwire for the multi-record-query bug fixed in `align::run`: that published another
     // gene's span under this gene's length and reached cov 2.097. A genuine alignment can
@@ -243,7 +249,7 @@ pub fn stitch(
 
     let pident = path.pident();
 
-    if cov < cfg.min_cov {
+    if ref_cov < cfg.min_cov {
         return Ok(None);
     }
 
@@ -251,6 +257,8 @@ pub fn stitch(
         id: format!("{}_primary", subgraph.accession),
         seq: target,
         cov,
+        ref_cov,
+        ref_span: (path.query_start, path.query_end),
         pident,
         // Set by the caller when it splices a path; `stitch` itself is always handed the
         // path the GAF describes.
@@ -343,6 +351,8 @@ mod tests {
             id: name.into(),
             seq: vec![],
             cov,
+            ref_cov: cov,
+            ref_span: (0, 0),
             pident,
             pident_inherited: false,
             nodes: 1,
@@ -668,6 +678,72 @@ mod tests {
         assert!((h.pident - 95.0).abs() < 1e-12);
         assert_eq!(h.nodes, 1);
         assert_eq!(h.id, "ACC_primary");
+    }
+
+    /// `path`, with the reference span given separately from the walked span.
+    ///
+    /// The ordinary helper ties the two together, which is exactly the assumption WA-05 was
+    /// about: an indel in the sample makes them differ.
+    fn path_spanning(
+        steps: &[(Orient, u32)],
+        len: usize, start: usize, end: usize,
+        qstart: usize, qend: usize,
+    ) -> GafPath {
+        GafPath {
+            steps: steps.iter().map(|&(orient, node)| PathStep { orient, node }).collect(),
+            query_start: qstart, query_end: qend,
+            path_len: len, path_start: start, path_end: end,
+            num_matches: 99, aln_len: 100,
+        }
+    }
+
+    /// WA-05. A sample that carries the whole gene with an in-frame deletion is present, and
+    /// `--min-cov` is documented as the fraction of the reference a primary must cover.
+    ///
+    /// The gate used to measure the walked length instead: a 300 nt gene with a 60 nt
+    /// deletion walks 240 bases, scores 0.80 against the default 0.85 and was published as
+    /// `no_path`, "the gene is not here". That biases presence calls against exactly the
+    /// alleles a deletion study is looking for. The alignment spans the whole reference, so
+    /// the reference coverage is 1.00 and it is kept.
+    #[test]
+    fn a_deletion_does_not_make_a_present_gene_look_absent() {
+        let c = cfg(4, 0.85);
+        let s = sub(vec![1], vec![&"A".repeat(240)]);
+        // Walks 240 bases; the alignment covers reference bases 0..300 of 300.
+        let p = path_spanning(&[(Orient::Forward, 1)], 240, 0, 240, 0, 300);
+        let h = stitch(&c, &anyg(), &p, &s, &q(&"N".repeat(300))).unwrap().expect("kept");
+        assert_eq!(h.seq.len(), 240);
+        assert!((h.cov - 0.8).abs() < 1e-12, "cov still reports the walked length");
+        assert!((h.ref_cov - 1.0).abs() < 1e-12, "the whole reference was found");
+        assert_eq!(h.ref_span, (0, 300));
+    }
+
+    /// The mirror image, and the reason this is a correctness fix rather than a loosening:
+    /// an alignment that reaches only reference base 240 of 300 is 0.80 of the reference
+    /// however much sequence it walked. Walking a 40 nt insertion used to lift it to 0.933
+    /// and publish it as a primary.
+    #[test]
+    fn an_insertion_does_not_make_a_partial_alignment_look_complete() {
+        let c = cfg(4, 0.85);
+        let s = sub(vec![1], vec![&"A".repeat(280)]);
+        let p = path_spanning(&[(Orient::Forward, 1)], 280, 0, 280, 0, 240);
+        assert!(
+            stitch(&c, &anyg(), &p, &s, &q(&"N".repeat(300))).unwrap().is_none(),
+            "0.80 of the reference is below --min-cov 0.85, whatever was walked"
+        );
+    }
+
+    /// The span is reported as the interval, not only as a fraction: a walk that stops 60
+    /// bases from the 3' end is a different finding from one missing 60 in the middle, and
+    /// `ref_cov` alone cannot tell them apart.
+    #[test]
+    fn the_reference_interval_is_published_not_just_the_fraction() {
+        let c = cfg(4, 0.0);
+        let s = sub(vec![1], vec![&"A".repeat(100)]);
+        let p = path_spanning(&[(Orient::Forward, 1)], 100, 0, 100, 40, 160);
+        let h = stitch(&c, &anyg(), &p, &s, &q(&"N".repeat(200))).unwrap().expect("kept");
+        assert_eq!(h.ref_span, (40, 160));
+        assert!((h.ref_cov - 0.6).abs() < 1e-12);
     }
 
     #[test]

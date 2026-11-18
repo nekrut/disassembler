@@ -4,7 +4,7 @@
     "name": "logan-walker",
     "version": "0.1.1",
     "disassembler": null,
-    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/__logan-walker@0.1.0/bin/GraphAligner"}]
+    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/disassembler/bin/GraphAligner"}]
   },
   "inputs": {
     "references": [
@@ -43,9 +43,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-17T23:37:39Z",
-    "wall_seconds": 8.928,
-    "stage_seconds": {"stream": 7.932, "parse": 0.790, "anchor": 0.000, "extract": 0.160, "align": 0.043, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-18T04:13:30Z",
+    "wall_seconds": 10.683,
+    "stage_seconds": {"stream": 9.734, "parse": 0.743, "anchor": 0.000, "extract": 0.150, "align": 0.053, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
@@ -73,7 +73,7 @@
     {
       "acc": "ERR2028820",
       "status": "success",
-      "payload": {"source": "s3", "bytes": 34016719, "sha256": "a03b08561b2f7233f3ac48c08825199d37ed801cfa8264151e04b6f7c92f187f", "etag": "89d0255e8d9b262f4f0ec26bcf53ae20", "last_modified": "2024-03-31T15:36:42Z", "fetched_at": "2026-11-17T23:37:39Z"},
+      "payload": {"source": "s3", "bytes": 34016719, "sha256": "a03b08561b2f7233f3ac48c08825199d37ed801cfa8264151e04b6f7c92f187f", "etag": "89d0255e8d9b262f4f0ec26bcf53ae20", "last_modified": "2024-03-31T15:36:42Z", "fetched_at": "2026-11-18T04:13:30Z"},
       "n_unitigs": 1277362,
       "n_anchors": 220,
       "subgraph_nodes": 747,
@@ -83,7 +83,7 @@
       "depth_saturated": true,
       "snv_sites": 0,
       "reconstructed": [
-        {"haplotype_id": "ERR2028820_primary", "seq_sha256": "a1a952438ec40865c944ccb3dadf0095860f13f4e4a082dbb4416d93c4b1a2e3", "length": 1275, "cov": 1.0000, "pident": 99.5294, "pident_inherited": false, "nodes": 115, "mean_ka": 199.9, "vaf": 1.00}
+        {"haplotype_id": "ERR2028820_primary", "seq_sha256": "a1a952438ec40865c944ccb3dadf0095860f13f4e4a082dbb4416d93c4b1a2e3", "length": 1275, "cov": 1.0000, "ref_cov": 1.0000, "ref_span": [0, 1275], "pident": 99.5294, "pident_inherited": false, "nodes": 115, "mean_ka": 199.9, "vaf": 1.00}
       ],
       "alts": 0,
       "bubbles": 1,
@@ -92,7 +92,7 @@
       "hit_pass_cap": false,
       "variants": {"depth": 180.0, "floor": 5.0, "forks": 11, "biallelic": 4, "recovered": 0, "beyond_cap": 0, "indels": 0, "no_rejoin": 1, "not_substitution": 0, "over_indel_cap": 2, "frameshifting": 1, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 180.0, "floor": 5.0, "unitigs": 747, "unitigs_kept": 479, "unpruned_span": [0, 1275], "pruned_span": [0, 1275]},
-      "timing": {"stream": 7.932, "parse": 0.790, "anchor": 0.000, "extract": 0.160, "align": 0.043, "stitch": 0.000, "phase": 0.000, "total": 0.994}
+      "timing": {"stream": 9.734, "parse": 0.743, "anchor": 0.000, "extract": 0.150, "align": 0.053, "stitch": 0.000, "phase": 0.000, "total": 0.946}
     }
   ]
 }

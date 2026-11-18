@@ -70,7 +70,14 @@ pub struct Config {
     pub min_abund: f32,
     /// Minimum variant allele frequency for a bubble branch.
     pub min_vaf: f64,
-    /// Minimum fraction of the reference a haplotype must cover to be kept.
+    /// Minimum fraction of the reference a haplotype's alignment must span to be kept.
+    ///
+    /// Measured on the **reference span** (`Haplotype::ref_cov`, GAF columns 3 and 4), not on
+    /// the length of what was walked (`Haplotype::cov`). The two differ by exactly the indels
+    /// in the sample, and until 0.2.0 this gated on the second, which moved the decision the
+    /// wrong way: a gene that was entirely present but carried a deletion looked absent, and
+    /// a partial alignment that walked an insertion looked complete. See `Haplotype::ref_cov`
+    /// for the worked numbers (WA-05).
     pub min_cov: f64,
     /// How multi-anchor mode ranks per-reference candidates. See [`PrimaryMetric`].
     ///

@@ -219,6 +219,23 @@ tokens no JSON parser reads.
 alignment. When a haplotype's identity was inherited from the route before an allele was spliced
 in, the header says `inherited_pident=` instead.
 
+**`--min-cov` gates on `ref_cov`, not on `cov`.** They answer different questions and an indel
+separates them: `cov` says how much sequence came out, and `ref_cov` says how much of the
+reference was found, which is what the flag has always been documented as meaning. Both are in
+each record in the summary, with `ref_span`, the reference interval the alignment covers.
+
+Until 0.2.0 the gate used `cov`, so an indel in the sample moved the decision in the wrong
+direction. On a 300 nt gene at the default 0.85, a sample carrying the whole gene with a 60 nt
+in-frame deletion walked 240 bases, scored 0.80 and was reported `no_path`, "the gene is not
+here", which biases presence calls against exactly the alleles a deletion study looks for.
+An alignment that reached only reference base 240 of 300 but walked a 20 nt insertion scored
+0.867 and was published as a primary. Those two now score 1.00 and 0.80 and are decided the
+right way round.
+
+`ref_span` is published as the interval rather than only the fraction because a walk that
+stops 60 bases from the 3' end is a different finding from one missing 60 bases in the middle,
+and the fraction alone cannot tell them apart.
+
 The summary JSON follows the contract in [`summaries.md`](summaries.md), which every stage of
 the suite shares. Eight blocks in a fixed order: `schema`, `tool` (this walker, the
 `disassembler` that invoked it if any, and GraphAligner's version and path), `inputs` (each
@@ -421,7 +438,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
 | `--graphaligner <PATH>` | `GraphAligner` on `PATH` | the GraphAligner executable |
 | `--graphaligner-timeout <SECS>` | `3600` | kill a single GraphAligner call after this many seconds and fail that accession only; `0` waits forever. A stall detector, not a budget: the largest subgraph measured here (34,582 nodes) aligns in 0.47 s |
-| `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover |
+| `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover, measured as the reference span of the alignment (`ref_cov`) and not as the length of what was walked. See [Outputs](#outputs) |
 | `--primary-metric <M>` | `matched` | multi-anchor primary selection: `matched`, `cov`, `pident` or `cov_x_pident` |
 | `--primary-tie-eps <F>` | `0.002` | references scoring within this of the best are treated as tied and the deepest route wins; `0` restores pre-0.2.0 panel-order behaviour (see [Multi-anchor mode](#multi-anchor-mode)) |
 | `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables. The re-aligned result is kept only if it spans as much of the reference as the first, give or take 3 bases: a strict rule refused a prune over one terminal base |
@@ -852,7 +869,7 @@ Each accession ends with one status, printed as it finishes and recorded in the 
 |---|---|---|
 | `success` | a primary haplotype was reconstructed | |
 | `no_anchors` | no unitig shares enough k-mers with the reference: the gene is not there | nothing found |
-| `no_path` | anchors were found, but no alignment through the subgraph covers `--min-cov` of the reference | nothing found |
+| `no_path` | anchors were found, but no alignment through the subgraph spans `--min-cov` of the reference | nothing found |
 | `no_logan_data` | Logan has no unitigs for the accession: the bucket returns 404, or it serves an object that decompresses to nothing (a 55-byte empty zstd frame, which about 0.4% of accessions have) | nothing found |
 | `too_large` | over `--max-size-mb`, so skipped before downloading; or its parsed graph would exceed the per-accession graph budget; or its spooled adjacency will not fit under `--spool-dir` (see [Disk](#disk)) | nothing found |
 | `subgraph_too_large` | the gene's neighbourhood is over `--max-subgraph-nodes` | nothing found |

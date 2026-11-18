@@ -4,7 +4,7 @@
     "name": "logan-walker",
     "version": "0.1.1",
     "disassembler": null,
-    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/__logan-walker@0.1.0/bin/GraphAligner"}]
+    "external": [{"name": "GraphAligner", "version": "GraphAligner bioconda 1.0.17b-", "path": "/home/andrew/miniconda3/envs/disassembler/bin/GraphAligner"}]
   },
   "inputs": {
     "references": [
@@ -43,9 +43,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-17T23:37:48Z",
-    "wall_seconds": 11.972,
-    "stage_seconds": {"stream": 10.622, "parse": 1.076, "anchor": 0.000, "extract": 0.234, "align": 0.036, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-18T04:13:41Z",
+    "wall_seconds": 16.773,
+    "stage_seconds": {"stream": 15.482, "parse": 1.020, "anchor": 0.000, "extract": 0.215, "align": 0.053, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
@@ -73,7 +73,7 @@
     {
       "acc": "SRR12363134",
       "status": "success",
-      "payload": {"source": "s3", "bytes": 48535427, "sha256": "a0c18bb5af9fc7a84e0e2c0e6433fb9bb46d73c4e954b12e6583ab4bbe2b22ed", "etag": "6818293beadb1d53dd73fba79b266183", "last_modified": "2024-03-31T16:12:46Z", "fetched_at": "2026-11-17T23:37:48Z"},
+      "payload": {"source": "s3", "bytes": 48535427, "sha256": "a0c18bb5af9fc7a84e0e2c0e6433fb9bb46d73c4e954b12e6583ab4bbe2b22ed", "etag": "6818293beadb1d53dd73fba79b266183", "last_modified": "2024-03-31T16:12:46Z", "fetched_at": "2026-11-18T04:13:41Z"},
       "n_unitigs": 1949813,
       "n_anchors": 272,
       "subgraph_nodes": 296,
@@ -83,7 +83,7 @@
       "depth_saturated": false,
       "snv_sites": 0,
       "reconstructed": [
-        {"haplotype_id": "SRR12363134_primary", "seq_sha256": "764e6d1a429dcfda48e8904d8b438425aee42833d5fe1a354743e07bf629ce11", "length": 1575, "cov": 1.0000, "pident": 100.0000, "pident_inherited": false, "nodes": 121, "mean_ka": 43.2, "vaf": 1.00}
+        {"haplotype_id": "SRR12363134_primary", "seq_sha256": "764e6d1a429dcfda48e8904d8b438425aee42833d5fe1a354743e07bf629ce11", "length": 1575, "cov": 1.0000, "ref_cov": 1.0000, "ref_span": [0, 1575], "pident": 100.0000, "pident_inherited": false, "nodes": 121, "mean_ka": 43.2, "vaf": 1.00}
       ],
       "alts": 0,
       "bubbles": 0,
@@ -91,7 +91,7 @@
       "minority_rescues": 0,
       "hit_pass_cap": false,
       "prune": {"outcome": "applied", "depth": 42.2, "floor": 5.0, "unitigs": 296, "unitigs_kept": 135, "unpruned_span": [0, 1575], "pruned_span": [0, 1575]},
-      "timing": {"stream": 10.622, "parse": 1.076, "anchor": 0.000, "extract": 0.234, "align": 0.036, "stitch": 0.000, "phase": 0.000, "total": 1.347}
+      "timing": {"stream": 15.482, "parse": 1.020, "anchor": 0.000, "extract": 0.215, "align": 0.053, "stitch": 0.000, "phase": 0.000, "total": 1.289}
     }
   ]
 }

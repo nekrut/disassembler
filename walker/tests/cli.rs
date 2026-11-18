@@ -642,6 +642,53 @@ fn an_offline_miss_with_a_recorded_negative_keeps_its_status() {
     assert!(err.contains("cache miss under --offline"), "{err}");
 }
 
+/// WA-05: `--min-cov` is a gate on the reference span, so a deletion does not make a gene
+/// that is entirely present look absent.
+///
+/// The stand-in reports an alignment covering the whole 63 nt reference while walking only 24
+/// bases, which is what a sample with a 39 nt deletion looks like. Under the old gate that was
+/// `cov` 0.38 against the default 0.85, so the accession was published as `no_path`, "the gene
+/// is not here", and the run exited 1 with nothing found.
+#[test]
+fn a_deletion_still_reconstructs_and_the_summary_says_what_the_gate_measured() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::matching("ref-cov", 1);
+    let ga = f.dir.join("ga_deletion");
+    std::fs::write(&ga, "#!/bin/sh\n\
+         [ \"$1\" = --version ] && { echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }\n\
+         gfa=; reads=; gaf=\n\
+         while [ $# -gt 0 ]; do case \"$1\" in\n\
+           -g) gfa=$2; shift 2 ;; -f) reads=$2; shift 2 ;; -a) gaf=$2; shift 2 ;; *) shift ;;\n\
+         esac; done\n\
+         node=$(awk -F'\\t' '$1==\"S\" && length($3) > m { m = length($3); n = $2 } END { print n }' \"$gfa\")\n\
+         nlen=$(awk -F'\\t' '$1==\"S\" && length($3) > m { m = length($3) } END { print m }' \"$gfa\")\n\
+         qname=$(awk 'sub(/^>/, \"\") { print $1; exit }' \"$reads\")\n\
+         qlen=$(awk '!/^>/ { n += length($0) } END { print n + 0 }' \"$reads\")\n\
+         # Full reference span, short walk: the deletion case.\n\
+         printf '%s\\t%s\\t0\\t%s\\t+\\t>%s\\t%s\\t0\\t24\\t%s\\t%s\\t60\\n' \\\n\
+           \"$qname\" \"$qlen\" \"$qlen\" \"$node\" \"$nlen\" \"$qlen\" \"$qlen\" > \"$gaf\"\n")
+        .unwrap();
+    std::fs::set_permissions(&ga, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = f.cmd_ga("ga_deletion", "cache", &[]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "the gene is present; stderr:\n{stderr}");
+
+    let outdir = f.dir.join("out");
+    let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
+    assert!(recon.contains(">SRRFAKE0_primary"), "{recon}");
+    let seq: String = recon.lines().filter(|l| !l.starts_with('>')).collect();
+    assert_eq!(seq.len(), 24, "the walked haplotype is the short one");
+
+    // Both numbers are published, because they answer different questions and the gate uses
+    // only one of them. Without `ref_cov` a reader sees cov 0.71 beside --min-cov 0.85 and
+    // cannot tell why the record exists.
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
+    assert!(summary.contains("\"cov\": 0.3810"), "{summary}");
+    assert!(summary.contains("\"ref_cov\": 1.0000"), "{summary}");
+    assert!(summary.contains("\"ref_span\": [0, 63]"), "{summary}");
+}
+
 /// `--revalidate` is refused where it cannot do anything, rather than silently ignored.
 ///
 /// A flag that quietly does nothing is worse than one that is rejected: the summary records

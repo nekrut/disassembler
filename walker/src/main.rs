@@ -69,7 +69,10 @@ TUNING:
         --min-vaf <F>             Minimum VAF for an alternative branch [default: 0.10]
         --min-abund-frac <F>      Raise the variant floor to this fraction of gene depth,
                                   median ka:f on the walked path [default: 0.0 = off]
-        --min-cov <F>             Minimum reference coverage [default: 0.85]
+        --min-cov <F>             Minimum fraction of the reference the alignment must span
+                                  [default: 0.85]. The reference span, not the length of what
+                                  was walked: an indel in the sample moves those apart, and
+                                  the summary reports both as ref_cov and cov
         --primary-metric <M>      Multi-anchor primary selection: matched | cov | pident |
                                   cov_x_pident [default: matched, the fraction of the
                                   reference's bases matched]. Ignored in single-anchor mode

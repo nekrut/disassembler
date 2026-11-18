@@ -786,6 +786,14 @@ fn run_one(
                     c.path.as_ref().map(|p| p.pident())
                 }),
                 cov: c.haplotype.as_ref().map(|h| h.cov),
+                // From the path, not from the haplotype, so a candidate the `--min-cov` gate
+                // rejected still reports the number that rejected it (WA-05). `stitch`
+                // returns `None` for those, so `haplotype` is `None` and `cov` is null.
+                ref_cov: c
+                    .path
+                    .as_ref()
+                    .map(|p| p.query_span() as f64 / c.ref_len.max(1) as f64),
+                ref_span: c.path.as_ref().map(|p| (p.query_start, p.query_end)),
                 length: c.haplotype.as_ref().map(|h| h.seq.len()),
                 nodes: c.haplotype.as_ref().map(|h| h.nodes),
                 path_len: c.path.as_ref().map(|p| p.path_len),
