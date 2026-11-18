@@ -83,6 +83,18 @@ record and the VCF and SNV table each gain a row, which is the other half of WV-
 alleles were previously neither corrected nor reported. `ERR2028820` and `SRR12363134` are
 byte-identical through the change; only their summaries moved, for the new fields.
 
+### Schema 2 (2026-11-18)
+
+The three summaries now say `"schema": 2`, and that is the only line that moved; every other
+gated output is byte-identical. The bump is not cosmetic: within a schema version fields are
+only ever added, and 0.2.0 changed the meaning of `n_bubbles` (allele sets, not flank pairs)
+and added a `no_links` status, either of which a schema-1 reader absorbs without noticing. See
+the migration note in `docs/summaries.md`.
+
+The work directory of a clean run holds no `.partial.fasta` or `.journal.jsonl`: WP-06 writes
+both as the run goes and removes them once the real outputs are on disk, so their presence in
+an output directory means a run is in flight or one died there.
+
 ### The bubble fixtures, and one that stopped needing a checksum (2026-11-18)
 
 WG-03, WG-04 and WG-11 changed what `bubbles.json` holds. `ERR2028820` keeps its single bubble

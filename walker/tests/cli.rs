@@ -1287,7 +1287,7 @@ fn the_default_walk_reconstructs_and_writes_every_output() {
 
     let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
     for needle in [
-        "\"schema\": 1",
+        "\"schema\": 2",
         "\"name\": \"logan-walker\"",
         "\"GraphAligner\"",
         "\"SRRFAKE0_primary\"",
@@ -1490,6 +1490,126 @@ fn a_shallow_diamond_beside_a_deep_gene_is_not_reported_as_a_bubble() {
             .contains("\"n_bubbles\": 0"),
         "1% of 15,000x is 150x, and the branches are 6x and 8x"
     );
+}
+
+/// WP-06: a run that is killed leaves the reconstructions it had already made.
+///
+/// Everything a run produces was written after the last accession finished, so a scheduler's
+/// walltime SIGTERM, an OOM kill or a dropped connection at hour eight of a nine-hour shard
+/// threw away every reconstruction and left nothing to resume from. It has happened here
+/// already: a `timeout 1500` killed a 50-accession measurement run at 47 of 50 and wrote
+/// nothing at all.
+///
+/// Four accessions, an aligner that takes a second each, one compute worker: SIGTERM after
+/// the first ones land.
+#[test]
+fn a_killed_run_keeps_the_haplotypes_it_had_already_reconstructed() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::matching("journal", 4);
+    // An aligner that is slow enough that the kill lands mid-cohort.
+    let script = fx.dir.join("ga_slowish");
+    std::fs::write(&script, format!(
+        "#!/bin/sh\n\
+         [ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n\
+         sleep 1\n\
+         exec '{ga}' \"$@\"\n",
+        ga = fx.dir.join("ga_align").display(),
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let outdir = fx.dir.join("out");
+    let partial = outdir.join("q.partial.fasta");
+    let journal = outdir.join("q.journal.jsonl");
+    let mut child = fx
+        .cmd_ga("ga_slowish", "cache", &["-w", "1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Wait for the first accession to be journalled, then kill the run mid-cohort.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        if std::fs::read_to_string(&journal).map(|t| !t.is_empty()).unwrap_or(false) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let ok = Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    assert!(ok.success());
+    wait_or_kill(&mut child, Duration::from_secs(60)).expect("walker ignored SIGTERM");
+
+    // The canonical outputs belong to a run that finished, and this one did not.
+    assert!(!outdir.join("q.summary.json").exists(), "a summary from a killed run");
+    let recon = std::fs::read_to_string(fx.dir.join("out").join("r.fasta")).unwrap_or_default();
+    assert!(!recon.contains(">SRRFAKE"), "the final FASTA was written by a killed run");
+
+    // The salvage is there, and it is the real thing: FASTA records byte-identical to the
+    // ones a finished run writes, and one journal line per accession that got through.
+    let saved = std::fs::read_to_string(&partial).expect("no partial FASTA");
+    let lines = std::fs::read_to_string(&journal).expect("no journal");
+    let n_journal = lines.lines().filter(|l| !l.trim().is_empty()).count();
+    assert!(n_journal >= 1, "journal is empty");
+    assert!(n_journal < 4, "the run was supposed to be killed mid-cohort, not to finish");
+    assert_eq!(saved.matches(">SRRFAKE").count(), n_journal, "{saved}");
+    assert!(saved.contains("_primary cov=1.000 "), "{saved}");
+    for line in lines.lines() {
+        assert!(line.contains("\"status\": \"success\""), "{line}");
+        assert!(line.contains("\"seq_sha256\": \""), "{line}");
+    }
+}
+
+/// The other half: a run that finishes takes its salvage copies away again, so they only
+/// ever mean "a run is in flight, or one died here".
+#[test]
+fn a_finished_run_leaves_no_journal_behind() {
+    let f = Fixture::matching("journal-clean", 2);
+    let out = f.cmd_ga("ga_align", "cache", &[]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let outdir = f.dir.join("out");
+    assert!(outdir.join("q.summary.json").is_file());
+    assert!(!outdir.join("q.partial.fasta").exists(), "partial FASTA survived a clean run");
+    assert!(!outdir.join("q.journal.jsonl").exists(), "journal survived a clean run");
+    // And what it held while the run was going is what the real FASTA holds now.
+    let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
+    assert_eq!(recon.matches(">SRRFAKE").count(), 2, "{recon}");
+}
+
+/// WP-06, the cheap half: an unusable output location is found before the cohort runs, not
+/// after every accession has been fetched and aligned.
+#[test]
+fn an_unusable_out_dir_fails_before_any_accession_is_fetched() {
+    let f = Fixture::matching("badout", 2);
+    // A regular file where --out-dir should be.
+    let blocked = f.dir.join("afile");
+    std::fs::write(&blocked, "not a directory\n").unwrap();
+    let marker = f.dir.join("aligner_ran");
+    let script = f.dir.join("ga_marker");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&script, format!(
+            "#!/bin/sh\n\
+             [ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n\
+             touch '{}'\n\
+             exec '{}' \"$@\"\n",
+            marker.display(),
+            f.dir.join("ga_align").display(),
+        )).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut c = Command::new(BIN);
+    c.env_remove("LOGAN_KEEP_SCRATCH");
+    c.arg("--scratch-dir").arg(f.dir.join("scratch"))
+        .arg("--graphaligner").arg(f.dir.join("ga_marker"))
+        .arg("-l").arg(f.dir.join("accs.txt"))
+        .arg("-q").arg(f.dir.join("q.fasta"))
+        .arg("--unitigs-cache").arg(f.dir.join("cache"))
+        .arg("--offline")
+        .arg("-o").arg(&blocked)
+        .arg("-f").arg(f.dir.join("out").join("r.fasta"));
+    let out = c.output().unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!marker.exists(), "the cohort ran before the output location was checked");
 }
 
 /// WF-12: a lowercase accession is the accession it spells, not a missing one.
@@ -1920,7 +2040,7 @@ fn fetch_only_reports_its_counts_and_exit_code() {
             |e| panic!("--fetch-only must write fetch.summary.json: {e}; stderr:\n{stderr}"),
         );
     for needle in [
-        "\"schema\": 1",
+        "\"schema\": 2",
         "\"name\": \"logan-walker\"",
         // Nothing was reconstructed and GraphAligner never ran, so neither is claimed.
         "\"external\": []",

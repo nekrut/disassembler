@@ -233,6 +233,22 @@ must now span as much of the reference as the unpruned one (see `--prune-frac` b
 | `<out-dir>/<query stem>.skipped.tsv` | always | one row per accession that produced no haplotype: `accession`, `outcome`, `bytes`, `detail`. Written even when empty, so it can be read without first testing whether it exists |
 | `<out-dir>/<ACC>.vcf` | `--emit-vcf` | intra-host SNVs of one accession, written only when it has at least one (a VCF an earlier run left for an accession with none is removed) |
 | `<out-dir>/snvs.tsv` | `--emit-snv-table` | one row per (accession, site, allele) across the run. Rows sharing a `block` come from one alternative haplotype, so they do co-occur |
+| `<out-dir>/<query stem>.partial.fasta` | while a run is in flight | the haplotypes so far, in completion order, byte-identical to the records the final FASTA will hold. Removed when the run finishes writing its outputs |
+| `<out-dir>/<query stem>.journal.jsonl` | while a run is in flight | one line per finished accession: `index`, `acc`, `status`, `haplotypes`, `length`, `seq_sha256`, `error`. Removed when the run finishes |
+
+**What a killed run leaves.** Every file above except the last two is written after the last
+accession finishes, so a walltime SIGTERM, an OOM kill or a dropped connection part way through
+a long shard used to throw away every reconstruction. The two journal files are written and
+flushed as each accession lands, so a run that dies leaves the sequences it had already made
+and a per-accession record of how far it got. They are a salvage, not an output: the
+alternatives, the VCFs, `bubbles.json` and `summary.json` come only from a run that reaches the
+end, and the journal's `acc` column is the list of accessions a rerun can leave out. On a clean
+finish both files are removed, so their presence means a run is in flight or one died here.
+
+The output locations are checked before the cohort starts: an `--out-dir` that cannot be made
+(a regular file of that name) or an `-f` whose parent does not exist fails in a fraction of a
+second rather than after every accession has been fetched and aligned. The probe leaves the
+filesystem as it found it, so `-f` is still written only by a run that finishes.
 
 Allele frequencies at a fork are computed over the branches that **return to the route**. An
 exit that leaves the locus for good, a repeat, a paralog or a contaminant sharing the fork's
@@ -1026,7 +1042,7 @@ Each accession ends with one status, printed as it finishes and recorded in the 
 | `no_logan_data` | Logan has no unitigs for the accession: the bucket returns 404, or it serves an object that decompresses to nothing (a 55-byte empty zstd frame, which about 0.4% of accessions have) | nothing found |
 | `too_large` | over `--max-size-mb`, so skipped before downloading; or its parsed graph would exceed the per-accession graph budget; or its spooled adjacency will not fit under `--spool-dir` (see [Disk](#disk)) | nothing found |
 | `subgraph_too_large` | the gene's neighbourhood is over `--max-subgraph-nodes` | nothing found |
-| `error` | anything else: a network or cache failure, a corrupt file, a cached object that is truncated (a link naming a record the file does not hold, which is what a copy cut at a zstd frame boundary looks like), a GAF row that is not a walk of the graph it was aligned against, GraphAligner crashing, one GraphAligner call passing `--graphaligner-timeout`, or a program on `--graphaligner` that exits 0 without writing a GAF at all (1.0.17b creates the file before it aligns, so that is not an alignment result) | error |
+| `error` | anything else, including an internal panic in a fetch or compute worker (the panic ends that accession and names itself in `detail`, rather than ending the run): a network or cache failure, a corrupt file, a cached object that is truncated (a link naming a record the file does not hold, which is what a copy cut at a zstd frame boundary looks like), a GAF row that is not a walk of the graph it was aligned against, GraphAligner crashing, one GraphAligner call passing `--graphaligner-timeout`, or a program on `--graphaligner` that exits 0 without writing a GAF at all (1.0.17b creates the file before it aligns, so that is not an alignment result) | error |
 
 One bad accession does not stop the run: the others are still walked, and whatever was
 reconstructed is still written. **It does make the run fail, though.** An accession that

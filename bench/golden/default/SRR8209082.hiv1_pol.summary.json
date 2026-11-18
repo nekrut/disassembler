@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "tool": {
     "name": "logan-walker",
     "version": "0.1.1",
@@ -44,9 +44,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-18T17:00:24Z",
-    "wall_seconds": 1.418,
-    "stage_seconds": {"stream": 0.719, "parse": 0.045, "anchor": 0.000, "extract": 0.033, "align": 0.608, "stitch": 0.002, "phase": 0.001},
+    "started": "2026-11-18T18:00:56Z",
+    "wall_seconds": 1.267,
+    "stage_seconds": {"stream": 0.605, "parse": 0.045, "anchor": 0.000, "extract": 0.032, "align": 0.557, "stitch": 0.001, "phase": 0.001},
     "n_records": 1,
     "n_ok": 1
   },
@@ -76,7 +76,7 @@
     {
       "acc": "SRR8209082",
       "status": "success",
-      "payload": {"source": "s3", "bytes": 1861058, "sha256": "8c52ec34f0a599f99871dc719b640fde794e0cd0dbbe0cdc6d469ecad1b8c41d", "etag": "d2dd288b238c3c88b46acdcd78860dce", "last_modified": "2024-03-31T17:38:36Z", "fetched_at": "2026-11-18T17:00:24Z"},
+      "payload": {"source": "s3", "bytes": 1861058, "sha256": "8c52ec34f0a599f99871dc719b640fde794e0cd0dbbe0cdc6d469ecad1b8c41d", "etag": "d2dd288b238c3c88b46acdcd78860dce", "last_modified": "2024-03-31T17:38:36Z", "fetched_at": "2026-11-18T18:00:56Z"},
       "n_unitigs": 81534,
       "n_anchors": 12876,
       "subgraph_nodes": 34582,
@@ -97,7 +97,7 @@
       "minority_left": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 11, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0},
       "variants": {"depth": 16000.0, "floor": 5.0, "forks": 134, "biallelic": 1, "two_allele_sites": 1, "min_site_vaf": 0.6897, "recovered": 1, "beyond_cap": 0, "indels": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 15000.0, "floor": 150.0, "unitigs": 34582, "unitigs_kept": 6946, "unpruned_span": [0, 2738], "pruned_span": [0, 2738]},
-      "timing": {"stream": 0.719, "parse": 0.045, "anchor": 0.000, "extract": 0.033, "align": 0.608, "stitch": 0.002, "phase": 0.001, "total": 0.695}
+      "timing": {"stream": 0.605, "parse": 0.045, "anchor": 0.000, "extract": 0.032, "align": 0.557, "stitch": 0.001, "phase": 0.001, "total": 0.641}
     }
   ]
 }

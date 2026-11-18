@@ -244,7 +244,22 @@ pub fn run_fetch_only(
                     Err(_) => break,
                 };
                 let t = Instant::now();
-                let fetched = fetcher.fetch(index, &accession);
+                // WP-18, as in `fetch_worker`: a panic here would end the run rather than
+                // the accession, and `--fetch-only` is the step whose whole purpose is to
+                // leave a usable cache behind.
+                let fetched = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fetcher.fetch(index, &accession)
+                })) {
+                    Ok(r) => r,
+                    Err(p) => {
+                        let msg =
+                            format!("internal error: the fetch panicked: {}", panic_message(&*p));
+                        eprintln!("[{accession}] {msg}");
+                        let mut out = collected.lock().unwrap();
+                        out.push(AccessionResult::failed(index, accession, msg));
+                        continue;
+                    }
+                };
                 // The lock is taken once and held across the report, which also stops two
                 // workers interleaving a line.
                 let mut out = collected.lock().unwrap();
@@ -295,6 +310,18 @@ fn cached(index: usize, accession: Accession, payload: crate::types::Payload) ->
     let mut r = AccessionResult::empty(index, accession, Outcome::Success, None);
     r.payload = payload;
     r
+}
+
+/// What a caught panic actually said.
+///
+/// WP-18. `catch_unwind` hands back `Box<dyn Any>`, and the compute path used to throw it
+/// away and report "a stage panicked", which says nothing about where. A panic payload is a
+/// `&str` or a `String` in every case the standard macros produce.
+fn panic_message(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// Turn a per-accession error into its result, with the right outcome.
@@ -366,7 +393,12 @@ fn restore_input_order(results: &mut [AccessionResult]) {
 /// multi-anchor mode passes several and the walker unions their canonical k-mers into one
 /// anchor index. The downstream stages are handed the first [`Query`] for now — later phases
 /// of the multi-anchor feature (align/stitch/pick_primary) fan out over the whole pool.
-pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Result<Summary> {
+pub fn run(
+    cfg: &Config,
+    accessions: Vec<Accession>,
+    queries: &[Query],
+    journal: Option<&crate::io::output::Journal>,
+) -> Result<Summary> {
     if queries.is_empty() {
         return Err(crate::error::Error::Usage("no queries supplied".into()));
     }
@@ -431,6 +463,12 @@ pub fn run(cfg: &Config, accessions: Vec<Accession>, queries: &[Query]) -> Resul
             .inspect(|r| {
                 done += 1;
                 report(done, total, r);
+                // WP-06: and to disk, as it lands. Everything else this run writes waits for
+                // the last accession, so without this a kill at hour eight of a nine-hour
+                // shard leaves nothing at all.
+                if let Some(j) = journal {
+                    j.record(r);
+                }
             })
             .collect::<Vec<_>>()
     });
@@ -526,8 +564,24 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
 
 /// Pull accessions, stream them, hand the bytes downstream. Blocks when the queue is full,
 /// which is the backpressure that bounds memory.
-fn fetch_worker(
-    fetcher: &stages::stream::Fetcher,
+/// What `fetch_worker` needs of a fetcher.
+///
+/// WP-18 put a `catch_unwind` around the call; this is how that is testable. The production
+/// implementation is [`stages::stream::Fetcher`] and there is no other, so the trait buys
+/// nothing at run time: it exists so a test can hand the worker a fetcher that panics and
+/// watch the run survive it.
+pub trait Fetch {
+    fn fetch(&self, index: usize, accession: &Accession) -> Result<FetchedUnitigs>;
+}
+
+impl Fetch for stages::stream::Fetcher {
+    fn fetch(&self, index: usize, accession: &Accession) -> Result<FetchedUnitigs> {
+        stages::stream::Fetcher::fetch(self, index, accession)
+    }
+}
+
+fn fetch_worker<F: Fetch + ?Sized>(
+    fetcher: &F,
     work: SharedReceiver<(usize, Accession)>,
     out: SyncSender<FetchedUnitigs>,
     result_tx: std::sync::mpsc::Sender<AccessionResult>,
@@ -538,7 +592,24 @@ fn fetch_worker(
             Err(_) => break, // queue drained
         };
         let t = Instant::now();
-        match fetcher.fetch(index, &accession) {
+        // WP-18. The compute pool has caught its panics since TW-01; this one did not, and a
+        // panic here does not fail one accession, it unwinds the scope and takes the whole
+        // run with it: exit 101, no outputs, and the collector's "no result was produced"
+        // fallback never runs. No reachable panic was found in the shipped fetch path, so
+        // this is defence in depth for the pool that touches the network, zstd and the
+        // filesystem.
+        let fetched = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fetcher.fetch(index, &accession)
+        })) {
+            Ok(r) => r,
+            Err(p) => {
+                let msg = format!("internal error: the fetch panicked: {}", panic_message(&*p));
+                eprintln!("[{accession}] {msg}");
+                let _ = result_tx.send(AccessionResult::failed(index, accession, msg));
+                continue;
+            }
+        };
+        match fetched {
             Ok(mut fetched) => {
                 fetched.fetch_secs = t.elapsed().as_secs_f64();
                 if out.send(fetched).is_err() {
@@ -588,11 +659,13 @@ fn compute_worker(
             run_one(cfg, queries, query_index, fetched)
                 .unwrap_or_else(|e| result_for_error(index, accession, e.to_string(), &e))
         }))
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|p| {
+            // WP-18: say what it was. The payload is the only description of a panic that
+            // reaches the summary, and it was being dropped.
             AccessionResult::failed(
                 index,
                 panic_acc,
-                "internal error: a stage panicked".to_string(),
+                format!("internal error: a stage panicked: {}", panic_message(&*p)),
             )
         });
         result.payload = payload;
@@ -1522,5 +1595,65 @@ mod prune_outcome_tests {
         // Degenerate inputs must not claim a match.
         assert!(!trimmed_copy(b"", unpruned));
         assert!(!trimmed_copy(b"ACGT", b""));
+    }
+}
+
+#[cfg(test)]
+mod fetch_panic_tests {
+    use super::*;
+
+    /// A fetcher that panics for one accession and reports the rest as absent.
+    struct Panicky(&'static str);
+
+    impl Fetch for Panicky {
+        fn fetch(&self, _index: usize, accession: &Accession) -> Result<FetchedUnitigs> {
+            if accession == self.0 {
+                panic!("synthetic fetch panic");
+            }
+            Err(crate::error::Error::NoLoganData {
+                accession: accession.clone(),
+            })
+        }
+    }
+
+    /// WP-18. The compute pool has caught its panics since TW-01, the fetch pool did not,
+    /// and the difference is the whole run: an unwinding fetch thread re-panics in
+    /// `thread::scope`, so `main` exits 101 with no FASTA, no summary and no `skipped.tsv`,
+    /// and the collector never runs. At the scale this release is for, that is hours of
+    /// fetching and alignment for one panic in the pool that touches the network, zstd and
+    /// the filesystem.
+    #[test]
+    fn a_panicking_fetch_fails_its_own_accession_and_the_others_still_land() {
+        let accs = ["SRR1".to_string(), "SRRBOOM".to_string(), "SRR3".to_string()];
+        let work: SharedReceiver<(usize, Accession)> = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for (i, a) in accs.iter().cloned().enumerate() {
+                tx.send((i, a)).unwrap();
+            }
+            Arc::new(Mutex::new(rx))
+        };
+        let (fetch_tx, fetch_rx) = sync_channel::<FetchedUnitigs>(4);
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<AccessionResult>();
+
+        // The panic is caught inside the worker, so this returns normally.
+        fetch_worker(&Panicky("SRRBOOM"), work, fetch_tx, result_tx);
+        drop(fetch_rx);
+
+        let mut results: Vec<AccessionResult> = result_rx.into_iter().collect();
+        results.sort_by_key(|r| r.index);
+        assert_eq!(results.len(), 3, "every accession must come back with a result");
+
+        assert_eq!(results[1].accession, "SRRBOOM");
+        assert_eq!(results[1].outcome, Outcome::Failed);
+        let detail = results[1].error.as_deref().unwrap_or("");
+        assert!(detail.contains("panicked"), "{detail}");
+        // The payload is the only description of a panic that reaches the summary, so it is
+        // carried rather than dropped.
+        assert!(detail.contains("synthetic fetch panic"), "{detail}");
+
+        // And the panic ended one accession, not the pool.
+        for i in [0, 2] {
+            assert_eq!(results[i].outcome, Outcome::NoLoganData, "{:?}", results[i].accession);
+        }
     }
 }

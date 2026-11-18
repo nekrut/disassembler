@@ -25,7 +25,12 @@ import os
 import time
 from pathlib import Path
 
-SCHEMA = 1
+# Bumped to 2 for the 0.2.0 release. Within a version fields are only added, and 0.2.0 did
+# more than add: the walker's `n_bubbles` now counts allele sets rather than the (fork, merge)
+# pairs they were found between, so the same key returns a different number for the same data,
+# and `no_links` is a new `status` value a reader with a closed set does not know. Both are
+# listed under "Migration" in docs/summaries.md.
+SCHEMA = 2
 
 # Fields a consumer must mask before byte-comparing two summaries of the same run.
 VOLATILE = ("run.started", "run.wall_seconds", "run.stage_seconds", "tool.external[].path")

@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "tool": {
     "name": "logan-walker",
     "version": "0.1.1",
@@ -44,9 +44,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-18T16:21:16Z",
-    "wall_seconds": 15.144,
-    "stage_seconds": {"stream": 13.857, "parse": 1.006, "anchor": 0.000, "extract": 0.225, "align": 0.053, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-18T18:00:42Z",
+    "wall_seconds": 14.498,
+    "stage_seconds": {"stream": 13.161, "parse": 1.056, "anchor": 0.000, "extract": 0.226, "align": 0.053, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
@@ -76,7 +76,7 @@
     {
       "acc": "SRR12363134",
       "status": "success",
-      "payload": {"source": "s3", "bytes": 48535427, "sha256": "a0c18bb5af9fc7a84e0e2c0e6433fb9bb46d73c4e954b12e6583ab4bbe2b22ed", "etag": "6818293beadb1d53dd73fba79b266183", "last_modified": "2024-03-31T16:12:46Z", "fetched_at": "2026-11-18T16:21:17Z"},
+      "payload": {"source": "s3", "bytes": 48535427, "sha256": "a0c18bb5af9fc7a84e0e2c0e6433fb9bb46d73c4e954b12e6583ab4bbe2b22ed", "etag": "6818293beadb1d53dd73fba79b266183", "last_modified": "2024-03-31T16:12:46Z", "fetched_at": "2026-11-18T18:00:42Z"},
       "n_unitigs": 1949813,
       "n_anchors": 272,
       "subgraph_nodes": 296,
@@ -95,7 +95,7 @@
       "minority_rescues": 0,
       "hit_pass_cap": false,
       "prune": {"outcome": "applied", "depth": 42.2, "floor": 5.0, "unitigs": 296, "unitigs_kept": 135, "unpruned_span": [0, 1575], "pruned_span": [0, 1575]},
-      "timing": {"stream": 13.857, "parse": 1.006, "anchor": 0.000, "extract": 0.225, "align": 0.053, "stitch": 0.000, "phase": 0.000, "total": 1.285}
+      "timing": {"stream": 13.161, "parse": 1.056, "anchor": 0.000, "extract": 0.226, "align": 0.053, "stitch": 0.000, "phase": 0.000, "total": 1.335}
     }
   ]
 }

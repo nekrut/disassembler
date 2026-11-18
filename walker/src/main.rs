@@ -988,6 +988,11 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // came from is not a frozen input, it is just a directory. Rule 4 of the summary contract
     // applies here as everywhere: the summary is written even when the fetch fails.
     if args.cfg.fetch_only {
+        // WP-06, same reason as the walk below: an `-o` that cannot be made is a fact about
+        // this command, not about the bucket, so find it before downloading a cohort. No
+        // journal here, because the cache entries a fetch writes ARE its durable output: a
+        // killed `--fetch-only` leaves everything it fetched, and rerunning skips it.
+        std::fs::create_dir_all(&args.out_dir).map_err(error::file_err("create", &args.out_dir))?;
         let summary = pipeline::run_fetch_only(&args.cfg, accessions)?;
         let ok = summary.success;
         let negatives = summary.results.iter().filter(|r| r.outcome.is_negative()).count();
@@ -1075,7 +1080,44 @@ fn real_main(mut args: Args) -> error::Result<()> {
         }
     }
 
-    let mut summary = pipeline::run(&args.cfg, accessions, &queries)?;
+    // WP-06, the cheap half: touch the output locations BEFORE the cohort runs. An
+    // unusable `-o` (a regular file of that name) or an `-f` whose parent does not exist
+    // used to be found only after every accession had been fetched and aligned. The probe
+    // leaves the filesystem as it found it: `-f` is created only to see whether it can be,
+    // and removed again if it was not already there, so the canonical FASTA stays something
+    // only a finished run writes.
+    std::fs::create_dir_all(&args.out_dir).map_err(error::file_err("create", &args.out_dir))?;
+    if let Some(parent) = args.out_fasta.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(error::file_err("create", parent))?;
+        }
+    }
+    let fasta_existed = args.out_fasta.exists();
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&args.out_fasta)
+        .map_err(error::file_err("open", &args.out_fasta))?;
+    if !fasta_existed {
+        let _ = std::fs::remove_file(&args.out_fasta);
+    }
+
+    // WP-06, the rest: a journal of what has finished, so a run that is killed leaves its
+    // reconstructions and a list of what it got through. Removed below once the real outputs
+    // are on disk.
+    let journal = io::output::Journal::create(&args.out_dir, &queries[0].name)?;
+    let (partial_fa, journal_jsonl) = journal.paths();
+    // stderr, with the other startup notices. Not stdout: that stream carries the progress
+    // lines a pipeline reads, and a run whose reader goes away ends at its first stdout
+    // write, so putting a startup line there would move when that happens.
+    eprintln!(
+        "[logan-walker] progress is journalled to {} and {}; both are removed when the run \
+         finishes writing its outputs",
+        partial_fa.display(),
+        journal_jsonl.display()
+    );
+
+    let mut summary = pipeline::run(&args.cfg, accessions, &queries, Some(&journal))?;
 
     // ---- OUT of the pipeline ----------------------------------------------
     //
@@ -1084,7 +1126,6 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // last, so one write failure after the compute (a full disk, a directory in the way)
     // threw away the whole shard's per-accession status and timings although every accession
     // had reconstructed. The run still exits non-zero, so the failure is not hidden.
-    std::fs::create_dir_all(&args.out_dir).map_err(error::file_err("create", &args.out_dir))?;
     let mut first_err: Option<error::Error> = None;
     // The run's verdict, reached before any output is written so the summary can state the
     // exit code instead of inferring it from counts, and returned unchanged at the end.
@@ -1142,8 +1183,13 @@ fn real_main(mut args: Args) -> error::Result<()> {
         .map_err(|e| e.at("write", &skipped_path)));
     }
     if let Some(e) = first_err {
+        // The real outputs are incomplete, so the journal is the only complete record of
+        // what this run produced. It stays.
         return Err(e);
     }
+    // Everything the run produces is on disk, so the salvage copies have nothing left to
+    // say. WP-06: they exist only while a run is in flight, or after one died.
+    journal.discard();
 
     crate::outln!(
         "[logan-walker] {}/{} accessions reconstructed",

@@ -16,7 +16,7 @@ use crate::error::Result;
 use crate::pipeline::Summary;
 use crate::types::{AccessionResult, Outcome, Payload, Query, Strand, Timing};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn outcome_str(o: Outcome) -> &'static str {
@@ -83,34 +83,128 @@ pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
     let mut w = create(path)?;
     for r in &summary.results {
         for h in &r.haplotypes {
-            // anchor_used is emitted only when set (multi-anchor mode). Single-anchor
-            // runs keep the header byte-identical to the pre-multi-anchor shape so all
-            // golden fixtures diff clean.
-            let anchor_suffix = anchor_suffix(h);
-            // Emitted only above one site: one two-allele site is a variant, two are a
-            // phasing problem, and a flag that fires on every heterozygous accession would be
-            // ignored within a week.
-            let mixed = if h.two_allele_sites >= 2 { " mixed=1" } else { "" };
-            writeln!(
-                w,
-                ">{} cov={:.3} {}={:.1} nodes={} ka={:.1} vaf={:.2} min_vaf={:.3}{}{}",
-                h.id,
-                h.cov,
-                if h.pident_inherited { "inherited_pident" } else { "pident" },
-                h.pident,
-                h.nodes,
-                h.mean_ka,
-                h.vaf,
-                h.min_site_vaf,
-                mixed,
-                anchor_suffix,
-            )?;
-            w.write_all(&h.seq)?;
-            w.write_all(b"\n")?;
+            w.write_all(haplotype_record(h).as_bytes())?;
         }
     }
     w.flush()?;
     Ok(())
+}
+
+/// What a killed run leaves behind (WP-06).
+///
+/// Everything a run produces used to be written after the last accession finished: the FASTA,
+/// `summary.json`, `skipped.tsv`, the VCFs. A scheduler's walltime SIGTERM, an OOM kill or a
+/// dropped connection at hour eight of a nine-hour shard therefore threw away every
+/// reconstruction, and there was nothing to resume from. It has happened in this project
+/// already: a `timeout 1500` killed a 50-accession measurement run at 47 of 50 and wrote
+/// nothing.
+///
+/// So each result is also appended, as it lands, to two files in `--out-dir`:
+///
+/// - `<query stem>.partial.fasta`, the haplotypes, byte-identical to the records the final
+///   FASTA will hold, in **completion order** rather than input order;
+/// - `<query stem>.journal.jsonl`, one line per accession with its status and the numbers
+///   needed to tell what happened and what is left to do.
+///
+/// Both are removed when the run finishes and writes its real outputs, so they exist only
+/// while a run is in flight or after one died. They are a salvage, not an output: the
+/// alternatives, the VCFs, `bubbles.json` and `summary.json` are produced only by a run that
+/// reaches the end, and the journal says which accessions a rerun can skip.
+///
+/// Each record is written and flushed as it arrives. That is enough for a killed process,
+/// which is the case this exists for; a machine that loses power can still lose the tail.
+pub struct Journal {
+    fasta: std::cell::RefCell<std::fs::File>,
+    lines: std::cell::RefCell<std::fs::File>,
+    fasta_path: PathBuf,
+    lines_path: PathBuf,
+}
+
+impl Journal {
+    /// Open (and truncate) the two files beside the run's other outputs.
+    ///
+    /// Truncating matters: a `.partial.fasta` left by an earlier run that died in this same
+    /// `--out-dir` would otherwise have this run's records appended to it, and the salvage
+    /// would be two runs deep with nothing saying so (the WV-17 hazard).
+    pub fn create(out_dir: &Path, stem: &str) -> Result<Journal> {
+        let fasta_path = out_dir.join(format!("{stem}.partial.fasta"));
+        let lines_path = out_dir.join(format!("{stem}.journal.jsonl"));
+        let open = |p: &Path| {
+            std::fs::File::create(p).map_err(crate::error::file_err("create", p))
+        };
+        Ok(Journal {
+            fasta: std::cell::RefCell::new(open(&fasta_path)?),
+            lines: std::cell::RefCell::new(open(&lines_path)?),
+            fasta_path,
+            lines_path,
+        })
+    }
+
+    /// Append one accession's result. Errors are reported once and then ignored: the journal
+    /// is insurance, and a full disk must not take down a run that is otherwise fine.
+    pub fn record(&self, r: &AccessionResult) {
+        let mut fasta = self.fasta.borrow_mut();
+        for h in &r.haplotypes {
+            let _ = fasta.write_all(haplotype_record(h).as_bytes());
+        }
+        let _ = fasta.flush();
+
+        let hap = r.haplotype.as_ref();
+        let line = format!(
+            "{{\"index\": {}, \"acc\": \"{}\", \"status\": \"{}\", \"haplotypes\": {}, \
+             \"length\": {}, \"seq_sha256\": {}, \"error\": {}}}\n",
+            r.index,
+            esc(&r.accession),
+            outcome_str(r.outcome),
+            r.haplotypes.len(),
+            hap.map_or(0, |h| h.seq.len()),
+            hap.map_or("null".to_string(), |h| format!("\"{}\"", seq_sha256(&h.seq))),
+            r.error.as_deref().map_or("null".to_string(), |e| format!("\"{}\"", esc(e))),
+        );
+        let mut lines = self.lines.borrow_mut();
+        let _ = lines.write_all(line.as_bytes());
+        let _ = lines.flush();
+    }
+
+    /// Remove both files. Called once the run's real outputs are on disk.
+    pub fn discard(self) {
+        let _ = std::fs::remove_file(&self.fasta_path);
+        let _ = std::fs::remove_file(&self.lines_path);
+    }
+
+    /// Where the salvage is, for the message a dying run cannot print.
+    pub fn paths(&self) -> (&Path, &Path) {
+        (&self.fasta_path, &self.lines_path)
+    }
+}
+
+/// One haplotype as it appears in the FASTA: header line, sequence line, both newline ended.
+///
+/// Shared by [`write_fasta`] and the crash journal (WP-06), so a run that is killed leaves
+/// records byte-identical to the ones a finished run would have written. `anchor=` is emitted
+/// only in multi-anchor mode, which keeps single-anchor output byte-identical to the
+/// pre-multi-anchor shape and every golden fixture diffing clean.
+pub fn haplotype_record(h: &crate::types::Haplotype) -> String {
+    // Emitted only above one site: one two-allele site is a variant, two are a phasing
+    // problem, and a flag that fires on every heterozygous accession would be ignored within
+    // a week.
+    let mixed = if h.two_allele_sites >= 2 { " mixed=1" } else { "" };
+    let mut out = format!(
+        ">{} cov={:.3} {}={:.1} nodes={} ka={:.1} vaf={:.2} min_vaf={:.3}{}{}\n",
+        h.id,
+        h.cov,
+        if h.pident_inherited { "inherited_pident" } else { "pident" },
+        h.pident,
+        h.nodes,
+        h.mean_ka,
+        h.vaf,
+        h.min_site_vaf,
+        mixed,
+        anchor_suffix(h),
+    );
+    out.push_str(&String::from_utf8_lossy(&h.seq));
+    out.push('\n');
+    out
 }
 
 /// Recovered second alleles, one record per biallelic site.
@@ -1068,7 +1162,11 @@ pub fn write_skipped(summary: &Summary, path: &Path) -> Result<()> {
 pub fn write_summary(summary: &Summary, run: &RunInfo, path: &Path) -> Result<()> {
     let mut w = create(path)?;
     writeln!(w, "{{")?;
-    writeln!(w, "  \"schema\": 1,")?;
+    // Schema 2 from 0.2.0. See `summary::SCHEMA` in the Python package, which this must
+    // agree with, and the migration note in docs/summaries.md: `n_bubbles` changed meaning
+    // (allele sets, not flank pairs) and `no_links` is a new status value, neither of which
+    // a schema-1 reader can absorb.
+    writeln!(w, "  \"schema\": 2,")?;
     write_tool(&mut w, run)?;
     write_inputs(&mut w, run)?;
     write_settings(&mut w, run)?;
@@ -2402,7 +2500,9 @@ mod identity_label_tests {
         std::fs::remove_file(&p).ok();
         for want in [
             // The contract's block order and the provenance in them.
-            "\"schema\": 1",
+            // Schema 2 from 0.2.0: `n_bubbles` changed meaning and `no_links` is a new
+            // status, so a schema-1 reader would misread this file rather than fail on it.
+            "\"schema\": 2",
             "\"name\": \"logan-walker\"",
             concat!("\"version\": \"", env!("CARGO_PKG_VERSION"), "\""),
             "\"name\": \"GraphAligner\", \"version\": \"GraphAligner bioconda 1.0.17b-0\", \

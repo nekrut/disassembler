@@ -48,7 +48,7 @@ about 67 MB of it duplicate FASTA.
 
 ```jsonc
 {
-  "schema": 1,
+  "schema": 2,
 
   "tool": {
     "name": "logan-walker",
@@ -239,6 +239,19 @@ is a thing to test; it does not stay on by default.
 renamed and never removed, and a consumer that does not recognise a field ignores it. A change
 that breaks a reader increments `schema`.
 
+**0.2.0 writes schema 2.** Almost everything it changed was additive, but two changes are not,
+and the version exists to say so:
+
+- the walker's `n_bubbles`, and the per-record `bubbles` count, now count **allele sets**
+  rather than the (fork, merge) pairs an allele set was found between, so the same key returns
+  a different number for the same accession (`SRR8209082`: 3,632 under schema 1, 0 under
+  schema 2, after the floor change that went with it);
+- `no_links` is a new value of `status`, and a reader that switches over a closed set of
+  statuses does not know it.
+
+A schema-1 reader therefore keeps parsing a schema-2 summary and draws the wrong conclusion
+from it, which is the case the version number is for.
+
 Summaries are byte-comparable between runs once the volatile fields are masked:
 `run.started`, `run.wall_seconds` and `run.stage_seconds`, plus `tool.external[].path`.
 `bench/check_golden.sh` masks exactly those and gates the rest.
@@ -271,6 +284,23 @@ per stage, each naming that stage's own summary file:
 
 A composite's `run.status` is the worst of its stages'. This is the only place a summary points
 at another summary, and it points by relative path so the set can be moved together.
+
+## Migration from schema 1 (0.2.0)
+
+- **`n_bubbles` and `records[].bubbles` count allele sets.** One two-allele site is one
+  record however many pairs of flanks it sits between, and each record lists them under
+  `flanks`. The gate also became depth-relative and moved after the prune, so the counts fall
+  on deep samples whatever a reader does with them. Comparisons of bubble counts across
+  schema versions are meaningless; within a version they are now a diversity signal rather
+  than a property of local topology.
+- **`status` can be `no_links`**: the unitig object carried no `L:` adjacency at all, so
+  nothing could be walked across unitigs. It is a negative like `no_path`, not an error, and
+  it is counted in `discards.accessions.no_links`.
+- Additive, listed here because consumers ask: `records[].variants` gained
+  `two_allele_sites` and `min_site_vaf`; `cohort` gained `mixed` and `bias_uncorrected`;
+  `records[]` gained `abundance_missing` (written only when non-zero), `majority_corrections`
+  and `minority_rescues`; haplotypes gained `ref_cov` and `ref_span`; `settings` gained
+  `prune_min_abund`.
 
 ## Migration from the 0.1.x summaries
 
