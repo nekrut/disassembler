@@ -67,11 +67,30 @@ such as `panels/sarscov2_spike_11strains.fa`:
 The choice matters for more than the tag: GraphAligner walks the graph differently against
 each reference, so the primary's sequence depends on which reference wins.
 
+**Ambiguous reference bases never count as matched.** GraphAligner treats `N` as matching any
+base, and each IUPAC code as matching every base it stands for, so a reference padded with `N`
+would score as though it had matched bases it does not have, beat the genuinely nearest
+reference, and then drive pruning, majority correction, the alternatives and every VCF
+coordinate. From 0.2.0 the walker subtracts the ambiguous bases in the aligned window from the
+match count before anything ranks on it. The correction is exact for an ambiguous base aligned
+as a match and conservative otherwise, so it never overstates identity. This matters for the
+shipped panel: in `queries/master_planetary_targets.fasta`, `ebola_gp_var2` is 42% ambiguous
+and `zika_ns5_var3` is 24%.
+
+**Tied references are decided by depth, not by panel order.** When a sample holds two strains
+that each match a panel record, both candidates score the same and before 0.2.0 the record
+listed first in the file won, so a 5% strain could be published as the primary while the 95%
+strain left no trace: `--prefer-majority` cannot repair it, because it skips a fork whose
+taken branch is below `--min-vaf`. References scoring within `--primary-tie-eps` (default
+0.002, measured as a fraction of the metric) of the best are now treated as tied, and the
+deepest route among them wins. Equal depths keep the old order, so a true tie still goes to
+the first reference in the pool. `--primary-tie-eps 0` restores the pre-0.2.0 behaviour.
+
 `--primary-metric` choices:
 
 | metric | ranks by | trade-off |
 |---|---|---|
-| `matched` (default) | the fraction of the reference's own bases the alignment matched, then identity | never above 1.0; a reference loses for every base of its own the walk misses or mismatches |
+| `matched` (default) | the fraction of the reference's own bases the alignment matched, then identity | never above 1.0; a reference loses for every base of its own the walk misses or mismatches, **and for every ambiguous base it carries** (see below) |
 | `cov` | walked length / reference length, then identity | not capped at 1.0, so a reference shorter than the sample's gene (one with a deletion the sample lacks) beats an exact match |
 | `pident` | identity, then coverage | can prefer a truncated walk that matches its reference cleanly over a full-length one |
 | `cov_x_pident` | coverage x identity | inherits `cov`'s bias toward shorter references |
@@ -332,6 +351,7 @@ Options that are on by default are turned off with a `--no-…` form.
 | `--graphaligner <PATH>` | `GraphAligner` on `PATH` | the GraphAligner executable |
 | `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover |
 | `--primary-metric <M>` | `matched` | multi-anchor primary selection: `matched`, `cov`, `pident` or `cov_x_pident` |
+| `--primary-tie-eps <F>` | `0.002` | references scoring within this of the best are treated as tied and the deepest route wins; `0` restores pre-0.2.0 panel-order behaviour (see [Multi-anchor mode](#multi-anchor-mode)) |
 | `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables. The re-aligned result is kept only if it spans as much of the reference as the first, give or take 3 bases: a strict rule refused a prune over one terminal base |
 | `--no-prefer-majority` | | keep the reference-matching allele on the primary at two-allele sites |
 

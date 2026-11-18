@@ -810,7 +810,14 @@ pub struct GafPath {
     pub path_start: usize,
     /// GAF column 9.
     pub path_end: usize,
-    /// GAF column 10, residue matches. Also the field the best row is chosen by.
+    /// GAF column 10, residue matches, **less the ambiguous reference bases in the aligned
+    /// window**. Also the field the best row is chosen by.
+    ///
+    /// GraphAligner counts `N` as matching any base and each IUPAC code as matching every
+    /// base it stands for, so the raw column rewards a reference for the bases it does not
+    /// pin down. `align::discount_ambiguous_matches` subtracts them once, immediately after
+    /// the GAF is parsed, so every later consumer (`matched`, `pident`, the prune pass, the
+    /// candidate report) sees the same corrected number.
     pub num_matches: usize,
     /// GAF column 11, alignment block length. `pident = num_matches / aln_len`.
     pub aln_len: usize,

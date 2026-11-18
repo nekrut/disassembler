@@ -511,7 +511,7 @@ fn write_settings(w: &mut impl Write, run: &RunInfo) -> Result<()> {
     let c = run.cfg;
     // Everything that changes which accessions are processed or what they produce. Workers,
     // timeouts and paths change neither, and are left out.
-    let settings: [(&str, String); 25] = [
+    let settings: [(&str, String); 26] = [
         ("k", c.k.to_string()),
         ("graph_k", c.graph_k.to_string()),
         ("min_shared_kmers", c.min_shared_kmers.to_string()),
@@ -520,6 +520,7 @@ fn write_settings(w: &mut impl Write, run: &RunInfo) -> Result<()> {
         ("max_size_mb", (c.max_compressed_bytes / (1024 * 1024)).to_string()),
         ("min_cov", jf(c.min_cov)),
         ("primary_metric", format!("\"{}\"", c.primary_metric.as_str())),
+        ("primary_tie_eps", jf(c.primary_tie_eps)),
         ("prune_frac", jf(c.prune_frac)),
         ("prefer_majority", c.prefer_majority.to_string()),
         ("min_abund", jf(c.min_abund as f64)),

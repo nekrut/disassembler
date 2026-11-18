@@ -797,7 +797,7 @@ fn run_one(
     } else {
         Vec::new()
     };
-    let winner = stages::stitch::pick_primary(candidates, cfg.primary_metric);
+    let winner = stages::stitch::pick_primary(candidates, cfg.primary_metric, cfg.primary_tie_eps);
     // Alternative-haplotype recovery is `stages::variants`: it corrects the consensus to the
     // majority allele and emits second alleles at biallelic sites. See that module for why it
     // replaced the upstream `detour` engine (gap rate and VAF labelling).

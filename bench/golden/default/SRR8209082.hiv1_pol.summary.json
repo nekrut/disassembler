@@ -21,6 +21,7 @@
     "max_size_mb": 4096,
     "min_cov": 0.85,
     "primary_metric": "matched",
+    "primary_tie_eps": 0.002,
     "prune_frac": 0.01,
     "prefer_majority": true,
     "min_abund": 5.0,
@@ -42,9 +43,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-17T23:03:02Z",
-    "wall_seconds": 1.363,
-    "stage_seconds": {"stream": 0.728, "parse": 0.045, "anchor": 0.000, "extract": 0.034, "align": 0.527, "stitch": 0.004, "phase": 0.014},
+    "started": "2026-11-17T23:38:00Z",
+    "wall_seconds": 1.289,
+    "stage_seconds": {"stream": 0.640, "parse": 0.048, "anchor": 0.000, "extract": 0.033, "align": 0.522, "stitch": 0.005, "phase": 0.014},
     "n_records": 1,
     "n_ok": 1
   },
@@ -72,7 +73,7 @@
     {
       "acc": "SRR8209082",
       "status": "success",
-      "payload": {"source": "s3", "bytes": 1861058, "sha256": "8c52ec34f0a599f99871dc719b640fde794e0cd0dbbe0cdc6d469ecad1b8c41d", "etag": "d2dd288b238c3c88b46acdcd78860dce", "last_modified": "2024-03-31T17:38:36Z", "fetched_at": "2026-11-17T23:03:02Z"},
+      "payload": {"source": "s3", "bytes": 1861058, "sha256": "8c52ec34f0a599f99871dc719b640fde794e0cd0dbbe0cdc6d469ecad1b8c41d", "etag": "d2dd288b238c3c88b46acdcd78860dce", "last_modified": "2024-03-31T17:38:36Z", "fetched_at": "2026-11-17T23:38:00Z"},
       "n_unitigs": 81534,
       "n_anchors": 12876,
       "subgraph_nodes": 34582,
@@ -92,7 +93,7 @@
       "minority_left": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 10, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0},
       "variants": {"depth": 16000.0, "floor": 5.0, "forks": 136, "biallelic": 1, "recovered": 1, "beyond_cap": 0, "indels": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 15000.0, "floor": 150.0, "unitigs": 34582, "unitigs_kept": 6901, "unpruned_span": [0, 2738], "pruned_span": [0, 2738]},
-      "timing": {"stream": 0.728, "parse": 0.045, "anchor": 0.000, "extract": 0.034, "align": 0.527, "stitch": 0.004, "phase": 0.014, "total": 0.627}
+      "timing": {"stream": 0.640, "parse": 0.048, "anchor": 0.000, "extract": 0.033, "align": 0.522, "stitch": 0.005, "phase": 0.014, "total": 0.625}
     }
   ]
 }

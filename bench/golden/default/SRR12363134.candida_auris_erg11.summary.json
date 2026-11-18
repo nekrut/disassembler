@@ -21,6 +21,7 @@
     "max_size_mb": 4096,
     "min_cov": 0.85,
     "primary_metric": "matched",
+    "primary_tie_eps": 0.002,
     "prune_frac": 0.01,
     "prefer_majority": true,
     "min_abund": 5.0,
@@ -42,9 +43,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-17T23:02:41Z",
-    "wall_seconds": 21.403,
-    "stage_seconds": {"stream": 20.063, "parse": 1.061, "anchor": 0.000, "extract": 0.241, "align": 0.036, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-17T23:37:48Z",
+    "wall_seconds": 11.972,
+    "stage_seconds": {"stream": 10.622, "parse": 1.076, "anchor": 0.000, "extract": 0.234, "align": 0.036, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
@@ -72,7 +73,7 @@
     {
       "acc": "SRR12363134",
       "status": "success",
-      "payload": {"source": "s3", "bytes": 48535427, "sha256": "a0c18bb5af9fc7a84e0e2c0e6433fb9bb46d73c4e954b12e6583ab4bbe2b22ed", "etag": "6818293beadb1d53dd73fba79b266183", "last_modified": "2024-03-31T16:12:46Z", "fetched_at": "2026-11-17T23:02:41Z"},
+      "payload": {"source": "s3", "bytes": 48535427, "sha256": "a0c18bb5af9fc7a84e0e2c0e6433fb9bb46d73c4e954b12e6583ab4bbe2b22ed", "etag": "6818293beadb1d53dd73fba79b266183", "last_modified": "2024-03-31T16:12:46Z", "fetched_at": "2026-11-17T23:37:48Z"},
       "n_unitigs": 1949813,
       "n_anchors": 272,
       "subgraph_nodes": 296,
@@ -90,7 +91,7 @@
       "minority_rescues": 0,
       "hit_pass_cap": false,
       "prune": {"outcome": "applied", "depth": 42.2, "floor": 5.0, "unitigs": 296, "unitigs_kept": 135, "unpruned_span": [0, 1575], "pruned_span": [0, 1575]},
-      "timing": {"stream": 20.063, "parse": 1.061, "anchor": 0.000, "extract": 0.241, "align": 0.036, "stitch": 0.000, "phase": 0.000, "total": 1.338}
+      "timing": {"stream": 10.622, "parse": 1.076, "anchor": 0.000, "extract": 0.234, "align": 0.036, "stitch": 0.000, "phase": 0.000, "total": 1.347}
     }
   ]
 }

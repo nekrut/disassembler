@@ -123,13 +123,28 @@ pub struct Candidate {
 ///
 /// `stitch` already returns `None` for a candidate whose coverage fell below `min_cov`,
 /// so an under-covered reference is filtered out before it can win regardless of metric.
+/// Candidates within `tie_eps` of the best score are treated as tied and the **deepest** of
+/// them wins, by `Haplotype::mean_ka`. Without that, a sample holding two strains that each
+/// equal a panel record gives two candidates scoring 1.0 and pident 100, and the record
+/// listed first in the panel wins: a 5% strain can be published as `_primary`, taking its
+/// `anchor=` tag and every VCF coordinate with it, while the 95% strain leaves no trace.
+/// Nothing downstream repairs that, because `prefer_majority` skips a fork whose taken branch
+/// is below `--min-vaf`, so a 5% route is never moved to the 95% one.
+///
+/// The band is measured on the metric's own value, normalised to a fraction (pident is
+/// divided by 100) so one `tie_eps` means the same thing whichever metric is in use.
+/// `tie_eps = 0` disables the depth tie-break entirely and restores the pre-0.2.0 ordering,
+/// including for exact ties.
+///
 /// Every metric falls back to `pool_index` as the final tie-break so the first reference
-/// in the anchor pool wins on a true tie, which keeps primary selection stable.
+/// in the anchor pool wins on a true tie, which keeps primary selection stable. Depth is
+/// compared with a stable sort, so candidates of equal depth keep that order too.
 ///
 /// Returns `None` when no reference produced a stitchable haplotype.
 pub fn pick_primary(
     candidates: Vec<Candidate>,
     metric: PrimaryMetric,
+    tie_eps: f64,
 ) -> Option<(String, GafPath, Haplotype)> {
     let mut with_haps: Vec<(usize, String, GafPath, Haplotype, f64)> = candidates
         .into_iter()
@@ -164,6 +179,22 @@ pub fn pick_primary(
         };
         primary.then(a.0.cmp(&b.0))
     });
+    // The metric's own value, as a fraction, so one `tie_eps` means the same for each.
+    let key = |c: &(usize, String, GafPath, Haplotype, f64)| match metric {
+        PrimaryMetric::Matched => c.4,
+        PrimaryMetric::Cov => c.3.cov,
+        PrimaryMetric::Pident => c.3.pident / 100.0,
+        PrimaryMetric::CovXPident => c.3.cov * c.3.pident / 100.0,
+    };
+    if tie_eps > 0.0 {
+        if let Some(first) = with_haps.first() {
+            let best = key(first);
+            // The list is already sorted by the metric, so the band is a prefix.
+            let n = with_haps.iter().take_while(|c| best - key(c) <= tie_eps).count();
+            // Stable, so equal depths keep the metric-then-pool order decided above.
+            with_haps[..n].sort_by(|a, b| cmpf(a.3.mean_ka, b.3.mean_ka));
+        }
+    }
     with_haps.into_iter().next().map(|(_, name, p, h, _)| (name, p, h))
 }
 
@@ -330,7 +361,7 @@ mod tests {
 
     #[test]
     fn pick_primary_returns_none_on_empty_pool() {
-        assert!(pick_primary(vec![], PrimaryMetric::Cov).is_none());
+        assert!(pick_primary(vec![], PrimaryMetric::Cov, 0.0).is_none());
     }
 
     #[test]
@@ -342,7 +373,7 @@ mod tests {
             path: None,
             haplotype: None,
         };
-        assert!(pick_primary(vec![none_cand], PrimaryMetric::Cov).is_none());
+        assert!(pick_primary(vec![none_cand], PrimaryMetric::Cov, 0.0).is_none());
     }
 
     #[test]
@@ -352,7 +383,7 @@ mod tests {
             cand("high", 1, 0.80, 99.5),
             cand("mid", 2, 0.55, 99.5),
         ];
-        let (name, _, hap) = pick_primary(cs, PrimaryMetric::Cov).unwrap();
+        let (name, _, hap) = pick_primary(cs, PrimaryMetric::Cov, 0.0).unwrap();
         assert_eq!(name, "high");
         assert!((hap.cov - 0.80).abs() < 1e-9);
     }
@@ -363,7 +394,7 @@ mod tests {
             cand("weaker", 0, 0.80, 98.5),
             cand("stronger", 1, 0.80, 99.9),
         ];
-        let (name, _, _) = pick_primary(cs, PrimaryMetric::Cov).unwrap();
+        let (name, _, _) = pick_primary(cs, PrimaryMetric::Cov, 0.0).unwrap();
         assert_eq!(name, "stronger");
     }
 
@@ -375,7 +406,7 @@ mod tests {
             cand("second", 5, 0.60, 99.0),
             cand("first",  1, 0.60, 99.0),
         ];
-        let (name, _, _) = pick_primary(cs, PrimaryMetric::Cov).unwrap();
+        let (name, _, _) = pick_primary(cs, PrimaryMetric::Cov, 0.0).unwrap();
         assert_eq!(name, "first");
     }
 
@@ -391,7 +422,7 @@ mod tests {
             path: None,
             haplotype: None,
         });
-        let (name, _, _) = pick_primary(cs, PrimaryMetric::Cov).unwrap();
+        let (name, _, _) = pick_primary(cs, PrimaryMetric::Cov, 0.0).unwrap();
         assert_eq!(name, "valid", "None candidates must not win by having pool_index 0");
     }
 
@@ -406,8 +437,8 @@ mod tests {
             cand("xbb15", 0, 0.99, 99.6),
             cand("jn1",   1, 0.71, 99.9),
         ];
-        assert_eq!(pick_primary(cs(), PrimaryMetric::Cov).unwrap().0, "xbb15");
-        assert_eq!(pick_primary(cs(), PrimaryMetric::Pident).unwrap().0, "jn1");
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Cov, 0.0).unwrap().0, "xbb15");
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Pident, 0.0).unwrap().0, "jn1");
     }
 
     /// Cov-x-pident is a joint score, so a small identity gap can be overridden by a
@@ -421,14 +452,14 @@ mod tests {
             cand("xbb15", 0, 0.99, 99.6),
             cand("jn1",   1, 0.71, 99.9),
         ];
-        assert_eq!(pick_primary(cs, PrimaryMetric::CovXPident).unwrap().0, "xbb15");
+        assert_eq!(pick_primary(cs, PrimaryMetric::CovXPident, 0.0).unwrap().0, "xbb15");
 
         // Now a case where jn1 has enough of an identity edge that the joint score flips.
         let cs = vec![
             cand("xbb15", 0, 0.71, 90.0),
             cand("jn1",   1, 0.70, 99.9),
         ];
-        assert_eq!(pick_primary(cs, PrimaryMetric::CovXPident).unwrap().0, "jn1");
+        assert_eq!(pick_primary(cs, PrimaryMetric::CovXPident, 0.0).unwrap().0, "jn1");
     }
 
     #[test]
@@ -440,9 +471,58 @@ mod tests {
         ];
         for m in [PrimaryMetric::Matched, PrimaryMetric::Cov, PrimaryMetric::Pident,
                   PrimaryMetric::CovXPident] {
-            assert_eq!(pick_primary(cs.clone(), m).unwrap().0, "first",
+            assert_eq!(pick_primary(cs.clone(), m, 0.002).unwrap().0, "first",
                 "metric {m:?} must still fall back to pool order");
         }
+    }
+
+    /// `cand_m` with a route depth, which is what breaks a tie from 0.2.0 on.
+    fn cand_ka(name: &str, pool_index: usize, num_matches: usize, ref_len: usize,
+               ka: f64) -> Candidate {
+        let mut c = cand_m(name, pool_index, 1.0, 100.0, num_matches, ref_len);
+        if let Some(h) = c.haplotype.as_mut() {
+            h.mean_ka = ka;
+        }
+        c
+    }
+
+    /// Two strains that each match a panel record exactly: the deeper route wins, and the
+    /// answer does not depend on which record the panel happens to list first.
+    ///
+    /// This is the co-infection and wastewater case. Both candidates score 1.0 matched and
+    /// pident 100, so before 0.2.0 panel order decided, and a 5% strain could be published as
+    /// `_primary` with its `anchor=` tag and every VCF coordinate. Nothing downstream
+    /// repaired it: `prefer_majority` skips a fork whose taken branch is under `--min-vaf`,
+    /// so a 5% route was never moved to the 95% one.
+    #[test]
+    fn matched_tie_goes_to_the_deeper_route_not_panel_order() {
+        for (a, b) in [((0, 500.0), (1, 9500.0)), ((0, 9500.0), (1, 500.0))] {
+            let (shallow, deep) = if a.1 < b.1 { (a, b) } else { (b, a) };
+            let cs = vec![
+                cand_ka("shallow", shallow.0, 900, 900, shallow.1),
+                cand_ka("deep", deep.0, 900, 900, deep.1),
+            ];
+            let got = pick_primary(cs, PrimaryMetric::Matched, 0.002).unwrap().0;
+            assert_eq!(got, "deep", "panel order must not decide between tied references");
+        }
+        // Off, the pre-0.2.0 behaviour: the first in the panel wins, whatever its depth.
+        let cs = vec![
+            cand_ka("shallow", 0, 900, 900, 500.0),
+            cand_ka("deep", 1, 900, 900, 9500.0),
+        ];
+        assert_eq!(pick_primary(cs, PrimaryMetric::Matched, 0.0).unwrap().0, "shallow");
+    }
+
+    /// Depth breaks ties and nothing else. A deeper but less similar reference must not
+    /// displace one the sample actually matches, or the tie-break would become the metric.
+    #[test]
+    fn a_deeper_but_worse_matching_reference_still_loses() {
+        let cs = vec![
+            // 0.98 against 1.00, two orders of magnitude outside the 0.002 band.
+            cand_ka("deep_but_98pc", 0, 882, 900, 9500.0),
+            cand_ka("exact", 1, 900, 900, 100.0),
+        ];
+        assert_eq!(pick_primary(cs, PrimaryMetric::Matched, 0.002).unwrap().0, "exact");
     }
 
     /// The case that made `Matched` the default. The sample carries the full 1,200 nt gene.
@@ -457,8 +537,8 @@ mod tests {
             cand_m("short", 0, 1200.0 / 1191.0, 1191.0 / 1200.0 * 100.0, 1191, 1191),
             cand_m("exact", 1, 1.0, 100.0, 1200, 1200),
         ];
-        assert_eq!(pick_primary(cs(), PrimaryMetric::Cov).unwrap().0, "short");
-        assert_eq!(pick_primary(cs(), PrimaryMetric::Matched).unwrap().0, "exact");
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Cov, 0.0).unwrap().0, "short");
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Matched, 0.0).unwrap().0, "exact");
     }
 
     /// `Pident` can prefer a truncated walk that matches its reference cleanly (measured:
@@ -470,8 +550,8 @@ mod tests {
             cand_m("full", 0, 0.999, 99.1, 3784, 3822),
             cand_m("truncated", 1, 0.919, 99.4, 3492, 3822),
         ];
-        assert_eq!(pick_primary(cs(), PrimaryMetric::Pident).unwrap().0, "truncated");
-        assert_eq!(pick_primary(cs(), PrimaryMetric::Matched).unwrap().0, "full");
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Pident, 0.0).unwrap().0, "truncated");
+        assert_eq!(pick_primary(cs(), PrimaryMetric::Matched, 0.0).unwrap().0, "full");
     }
 
     #[test]

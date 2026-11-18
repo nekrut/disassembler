@@ -10,8 +10,13 @@ shipped in 0.1.0 with three defective records and none of the test suite noticed
     frame. It was the chosen anchor for 4,071 of the 9,448 primaries in the 20,000-accession
     walker run.
   - `Omicron_BA2` and `Omicron_XBB15` carried 268 and 477 Ns, from dropouts in the source
-    genomes. A run of Ns anchors nothing (no k-mer over it can match) and counts against
-    identity, which made XBB.1.5 a poor anchor precisely where it was picked most often.
+    genomes. A run of Ns anchors nothing, because no k-mer over it can match.
+
+    What it does to identity was stated backwards here until 0.2.0, and the mistake was worth
+    more than the record: GraphAligner counts `N` as matching ANY base, so an N-laden record
+    used to be *rewarded*, beating the genuinely nearest reference wherever the sample differs
+    inside the N window (review finding WA-02). The walker now subtracts ambiguous bases from
+    the match count, so Ns do cost identity, which is what this file always claimed.
 
 Each check below is one of those failures. The frame checks apply to any CDS panel; the
 ambiguity checks apply because an anchor is matched by exact k-mers.
@@ -21,6 +26,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PANEL_DIR = REPO_ROOT / "panels"
+QUERY_DIR = REPO_ROOT / "queries"
 STOPS = {"TAA", "TAG", "TGA"}
 
 
@@ -72,6 +78,31 @@ class TestShippedPanels(unittest.TestCase):
                 with self.subTest(panel=path.name, record=rec_id):
                     bad = sorted({c for c in seq} - set("ACGT"))
                     self.assertEqual(bad, [], f"non-ACGT character(s) {bad}")
+
+    def test_shipped_queries_do_not_gain_new_ambiguity(self):
+        """Query panels are references too, and ambiguity in them is a weak anchor.
+
+        Not a hard ban, because two shipped records are already heavily ambiguous and
+        replacing them is a data decision, not a test one. Since WA-02 their ambiguity no
+        longer wins them the primary, so they are tolerable; what this stops is a NEW one
+        arriving unnoticed, which is how the spike panel's Ns got in.
+        """
+        known = {"ebola_gp_var2", "zika_ns5_var3"}
+        offenders = {}
+        files = sorted(QUERY_DIR.rglob("*.fasta"))
+        self.assertTrue(files, f"no query FASTA found under {QUERY_DIR}")
+        for path in files:
+            for rid, _desc, seq in read_fasta(path):
+                if not seq:
+                    continue
+                amb = sum(1 for c in seq if c not in "ACGT")
+                if amb / len(seq) > 0.05 and rid not in known:
+                    offenders[f"{path.name}:{rid}"] = f"{amb}/{len(seq)}"
+        self.assertEqual(
+            offenders, {},
+            "new heavily ambiguous query record(s); an N anchors nothing and the record is a "
+            "weak reference even though WA-02 stopped it scoring free matches",
+        )
 
     def test_record_ids_are_unique_within_a_panel(self):
         # Multi-anchor mode keys each candidate on the record id, and GraphAligner names a

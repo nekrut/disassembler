@@ -21,6 +21,7 @@
     "max_size_mb": 4096,
     "min_cov": 0.85,
     "primary_metric": "matched",
+    "primary_tie_eps": 0.002,
     "prune_frac": 0.01,
     "prefer_majority": true,
     "min_abund": 5.0,
@@ -42,9 +43,9 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-17T23:02:28Z",
-    "wall_seconds": 12.418,
-    "stage_seconds": {"stream": 11.440, "parse": 0.768, "anchor": 0.000, "extract": 0.164, "align": 0.043, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-17T23:37:39Z",
+    "wall_seconds": 8.928,
+    "stage_seconds": {"stream": 7.932, "parse": 0.790, "anchor": 0.000, "extract": 0.160, "align": 0.043, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
@@ -72,7 +73,7 @@
     {
       "acc": "ERR2028820",
       "status": "success",
-      "payload": {"source": "s3", "bytes": 34016719, "sha256": "a03b08561b2f7233f3ac48c08825199d37ed801cfa8264151e04b6f7c92f187f", "etag": "89d0255e8d9b262f4f0ec26bcf53ae20", "last_modified": "2024-03-31T15:36:42Z", "fetched_at": "2026-11-17T23:02:28Z"},
+      "payload": {"source": "s3", "bytes": 34016719, "sha256": "a03b08561b2f7233f3ac48c08825199d37ed801cfa8264151e04b6f7c92f187f", "etag": "89d0255e8d9b262f4f0ec26bcf53ae20", "last_modified": "2024-03-31T15:36:42Z", "fetched_at": "2026-11-17T23:37:39Z"},
       "n_unitigs": 1277362,
       "n_anchors": 220,
       "subgraph_nodes": 747,
@@ -91,7 +92,7 @@
       "hit_pass_cap": false,
       "variants": {"depth": 180.0, "floor": 5.0, "forks": 11, "biallelic": 4, "recovered": 0, "beyond_cap": 0, "indels": 0, "no_rejoin": 1, "not_substitution": 0, "over_indel_cap": 2, "frameshifting": 1, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 180.0, "floor": 5.0, "unitigs": 747, "unitigs_kept": 479, "unpruned_span": [0, 1275], "pruned_span": [0, 1275]},
-      "timing": {"stream": 11.440, "parse": 0.768, "anchor": 0.000, "extract": 0.164, "align": 0.043, "stitch": 0.000, "phase": 0.000, "total": 0.976}
+      "timing": {"stream": 7.932, "parse": 0.790, "anchor": 0.000, "extract": 0.160, "align": 0.043, "stitch": 0.000, "phase": 0.000, "total": 0.994}
     }
   ]
 }

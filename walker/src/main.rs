@@ -72,6 +72,12 @@ TUNING:
         --primary-metric <M>      Multi-anchor primary selection: matched | cov | pident |
                                   cov_x_pident [default: matched, the fraction of the
                                   reference's bases matched]. Ignored in single-anchor mode
+        --primary-tie-eps <F>     Treat references scoring within this of the best as tied and
+                                  give the primary to the deepest route [default: 0.002]. On a
+                                  mixed sample two strains can each match a panel record
+                                  exactly, and without this the one listed first in the panel
+                                  wins, so a 5% strain can be published as the primary. 0
+                                  restores the pre-0.2.0 panel-order behaviour
         --min-shared-kmers <N>    Anchor threshold, validated 1..=5 [default: 3]
         --max-size-mb <N>         Maximum compressed SRA size in MB [default: 4096, which
                                   refuses 0.16% of Logan accessions; 1024 refused 2.26%]. Costs
@@ -259,6 +265,9 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             }
             "--min-cov" => {
                 args.cfg.min_cov = finite_in("--min-cov", &value()?, 0.0, 1.0)?;
+            }
+            "--primary-tie-eps" => {
+                args.cfg.primary_tie_eps = finite_in("--primary-tie-eps", &value()?, 0.0, 1.0)?;
             }
             "--primary-metric" => {
                 let raw = value()?;
@@ -1061,7 +1070,8 @@ mod flag_tests {
         // Flags that need a value get a plausible one; the rest are bare.
         let value_for = |flag: &str| -> Option<&'static str> {
             match flag {
-                "--min-cov" | "--min-vaf" | "--prune-frac" | "--min-abund-frac" => Some("0.5"),
+                "--min-cov" | "--min-vaf" | "--prune-frac" | "--min-abund-frac"
+                | "--primary-tie-eps" => Some("0.5"),
                 "--min-abund" => Some("5"),
                 "--max-alts" | "--max-alt-indel" | "--alt-max-detour" | "--hops"
                 | "--min-shared-kmers" | "--max-size-mb" | "-w" | "--workers"

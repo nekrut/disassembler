@@ -472,6 +472,19 @@ pub struct Config {
     /// A cache miss becomes a hard error naming the missing accession, rather than a silent
     /// download. Off by default; opt in for reproducibility runs or air-gapped hosts.
     pub offline: bool,
+    /// How close two references must score before route depth decides between them.
+    ///
+    /// In multi-anchor mode a sample holding two strains that each equal a panel record gives
+    /// two candidates at the same score, and before 0.2.0 the one listed first in the panel
+    /// won. A 5% strain could therefore be published as `_primary`, carrying its `anchor=`
+    /// tag and every VCF coordinate, with the 95% strain absent from the output entirely and
+    /// the result depending silently on panel order.
+    ///
+    /// Candidates within this much of the best score are treated as tied and the deepest of
+    /// them wins. Measured on the metric's own value as a fraction, so 0.002 is two parts in
+    /// a thousand whichever `--primary-metric` is in use. `0` turns the depth tie-break off
+    /// and restores the pre-0.2.0 ordering.
+    pub primary_tie_eps: f64,
     /// Confirm each cache hit against the bucket before using it.
     ///
     /// Logan's `u/` objects are mutable and unversioned, so a warm cache can serve bytes the
@@ -833,6 +846,7 @@ impl Default for Config {
             unitigs_cache: None,
             spool_dir: None,
             offline: false,
+            primary_tie_eps: 0.002,
             revalidate: false,
             fetch_only: false,
         }

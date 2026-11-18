@@ -259,7 +259,52 @@ pub fn run(
         let _ = std::fs::remove_file(&query_fa);
     }
     let expects: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
-    parse_gaf_multi(&bytes, &expects)
+    let mut map = parse_gaf_multi(&bytes, &expects)?;
+    discount_ambiguous_matches(&mut map, queries);
+    Ok(map)
+}
+
+/// Take ambiguous reference bases back out of GAF column 10.
+///
+/// GraphAligner counts column 10 with `characterMatch`, whose `ambiguousMatch` returns true
+/// for `N` against any base, and for R/Y/K/M/S/W/B/D/H/V against each of their member bases
+/// (`GraphAlignerCommon.h` in 1.0.17b). Every `N` in a reference is therefore a guaranteed
+/// match, so a reference padded with `N` scores as if it had matched bases it does not have.
+///
+/// That inflates `pident` everywhere, and in multi-anchor mode it decides the wrong thing: a
+/// reference with a run of `N` beats the genuinely nearest reference wherever the sample
+/// differs inside the `N` window, and the winner then drives pruning, majority correction,
+/// the alternatives and every VCF coordinate. `queries/master_planetary_targets.fasta` has
+/// records with 659 `N` (`zika_ns5_var3`) and 862 `N`/`Y` (`ebola_gp_var2`), so this is the
+/// shipped panel, not a hypothetical one.
+///
+/// Corrected here, once, immediately after parsing, so the first pass, the prune pass,
+/// `matched`, `pident` and the candidate report all see the same corrected number.
+///
+/// The count is exact for an ambiguous base aligned as a match, and conservative otherwise:
+/// one placed in an insertion, or an IUPAC code that genuinely mismatched, was not counted in
+/// column 10 to begin with, so subtracting it understates rather than overstates identity.
+/// Understating is the safe direction here, because the number decides which reference wins.
+fn discount_ambiguous_matches(
+    map: &mut std::collections::HashMap<String, GafPath>,
+    queries: &[Query],
+) {
+    for q in queries {
+        let Some(p) = map.get_mut(q.record_id.as_str()) else {
+            continue;
+        };
+        // The window comes from GAF columns written by another program. A row naming a span
+        // outside the reference is malformed, and slicing on it would panic; there is nothing
+        // to discount in that case, so leave the row as it is rather than take down the run.
+        let Some(window) = q.seq.get(p.query_start..p.query_end) else {
+            continue;
+        };
+        let ambiguous = window
+            .iter()
+            .filter(|b| !matches!(b, b'A' | b'C' | b'G' | b'T'))
+            .count();
+        p.num_matches = p.num_matches.saturating_sub(ambiguous);
+    }
 }
 
 /// Parse a GAF and keep the best alignment for every expected reference name.
@@ -520,6 +565,97 @@ mod tests {
         std::fs::write(&ga, "#!/bin/sh\nexit 3\n").unwrap();
         assert!(version(&bin).is_err(), "a binary that does not run is found at startup");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ambiguous reference bases must not count as matched.
+    ///
+    /// GraphAligner's `ambiguousMatch` makes every `N` a guaranteed match against any base,
+    /// so a reference padded with `N` scores as if it had matched bases it does not have.
+    /// The repository's own panel carries such records.
+    #[test]
+    fn ambiguous_reference_bases_are_taken_back_out_of_the_match_count() {
+        // 300 nt, 120 of them N in the middle, exactly the shape the review reproduced.
+        let mut seq = vec![b'A'; 300];
+        seq[90..210].fill(b'N');
+        let q = Query {
+            name: "panel".into(),
+            record_id: "refN".into(),
+            seq,
+            path: std::path::PathBuf::from("/dev/null"),
+            n_records: 2,
+        };
+        let path = |matches: usize, start: usize, end: usize| GafPath {
+            steps: vec![PathStep { orient: Orient::Forward, node: 1 }],
+            query_start: start,
+            query_end: end,
+            path_len: 1,
+            path_start: 0,
+            path_end: 1,
+            num_matches: matches,
+            aln_len: 300,
+        };
+
+        // The whole reference aligned: GraphAligner reports 300 matches, 120 of them free.
+        let mut map = HashMap::from([("refN".to_string(), path(300, 0, 300))]);
+        super::discount_ambiguous_matches(&mut map, std::slice::from_ref(&q));
+        assert_eq!(map["refN"].num_matches, 180, "the 120 N must not count");
+
+        // Only the clean prefix aligned: nothing to discount.
+        let mut map = HashMap::from([("refN".to_string(), path(90, 0, 90))]);
+        super::discount_ambiguous_matches(&mut map, std::slice::from_ref(&q));
+        assert_eq!(map["refN"].num_matches, 90);
+
+        // A row naming a span past the end of the reference is malformed. There is nothing to
+        // discount and nothing to panic over; slicing it would have done the latter.
+        let mut map = HashMap::from([("refN".to_string(), path(300, 0, 10_000))]);
+        super::discount_ambiguous_matches(&mut map, std::slice::from_ref(&q));
+        assert_eq!(map["refN"].num_matches, 300, "left alone, not panicked on");
+
+        // Never below zero, however many ambiguous bases the window holds.
+        let mut map = HashMap::from([("refN".to_string(), path(5, 0, 300))]);
+        super::discount_ambiguous_matches(&mut map, std::slice::from_ref(&q));
+        assert_eq!(map["refN"].num_matches, 0);
+    }
+
+    /// An N-laden reference must stop beating the genuinely nearest one.
+    ///
+    /// The review's reproduction: `refN` is `refA` with 120 N over positions 90-209 and the
+    /// sample differs from `refA` at 6 sites inside that window. Uncorrected, `refN` scores
+    /// 300 matches to `refA`'s 294 and wins the primary, taking `anchor=` and every VCF
+    /// coordinate with it.
+    #[test]
+    fn an_n_padded_reference_no_longer_wins_the_primary() {
+        use crate::stages::stitch::{pick_primary, Candidate};
+        let cand = |name: &str, pool: usize, matches: usize| {
+            let path = GafPath {
+                steps: vec![PathStep { orient: Orient::Forward, node: 1 }],
+                query_start: 0, query_end: 300,
+                path_len: 1, path_start: 0, path_end: 1,
+                num_matches: matches, aln_len: 300,
+            };
+            let hap = crate::types::Haplotype {
+                id: name.into(), seq: vec![], cov: 1.0,
+                pident: matches as f64 / 300.0 * 100.0,
+                pident_inherited: false, nodes: 1, mean_ka: 100.0, vaf: 1.0, anchor_used: None,
+            };
+            Candidate {
+                record_id: name.into(), pool_index: pool, ref_len: 300,
+                path: Some(path), haplotype: Some(hap),
+            }
+        };
+        // What GraphAligner reports, with the N window counted as matched.
+        let uncorrected = vec![cand("refA", 0, 294), cand("refN", 1, 300)];
+        assert_eq!(
+            pick_primary(uncorrected, crate::config::PrimaryMetric::Matched, 0.002).unwrap().0,
+            "refN",
+            "this is the defect: without the discount the N-padded record wins"
+        );
+        // After `discount_ambiguous_matches` takes the 120 N back out of refN's count.
+        let corrected = vec![cand("refA", 0, 294), cand("refN", 1, 180)];
+        assert_eq!(
+            pick_primary(corrected, crate::config::PrimaryMetric::Matched, 0.002).unwrap().0,
+            "refA"
+        );
     }
 
     // ---- parse_gaf_multi (multi-anchor) ----
