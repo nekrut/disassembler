@@ -50,7 +50,7 @@ printf '%s\t%s\t0\t%s\t+\t>%s\t%s\t0\t%s\t%s\t%s\t60\n' \
 // by `the_bubble_fixture_has_the_geometry_it_claims`.
 //
 // The minority branch is the reference-matching one on purpose: that is the reference-bias case
-// `variants::prefer_majority` exists to correct (docs/issue_intra_accession_variance_lost.md).
+// `variants::prefer_majority` exists to correct (docs/notes/intra_accession_variance.md).
 const BUBBLE_QUERY: &str = "CACGATACAATAAGAGTAGTGATTGGCCAGTTGTGATTGTAGGAACCCATGCCTGCCTGAACCTACAACTCCTGAGACTGGAGATCCCGCACAGCCTCGATCAGACGGTGCCTAGTCCAAG";
 const BUBBLE_MAJORITY: &str = "CACGATACAATAAGAGTAGTGATTGGCCAGTTGTGATTGTAGGAACCCATGCCTGCCTGAGCCTACAACTCCTGAGACTGGAGATCCCGCACAGCCTCGATCAGACGGTGCCTAGTCCAAG";
 const BUBBLE_N0: &str = "CACGATACAATAAGAGTAGTGATTGGCCAGTTGTGATTGTAGGAACCCATGCCTGCCTGA";

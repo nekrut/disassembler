@@ -15,7 +15,7 @@ At the time of this study, `logan-walker` defaulted to **$k = 31$** and **$min\_
 
 ### Key Takeaways:
 1. **The $k \ge 19$ Specificity Wall**: For any $k \ge 19$ ($k \in [19, 21, 25, 27, 31]$), the background false positive rate across the entire 4.64 Mbp bacterial genome is **identically zero ($FP = 0$)**, even with $min\_shared\_kmers = 1$.
-2. **The $k = 15$ Noise Snowball**: Decreasing $k$ to 15 causes spurious background matches. At $k = 15$ and $min\_shared\_kmers = 1$, 22 false positive anchors are detected in `bla_kpc`. Crucially, because Stage 4 runs a 5-hop BFS, these 22 false anchors snowball into **295 background unitigs** in the subgraph (a 13.4x noise amplification), nearly tripping the 1% whole-graph safety guard (`subgraph_fraction_guard = 0.01`, 300 nodes).
+2. **The $k = 15$ Noise Snowball**: Decreasing $k$ to 15 causes spurious background matches. At $k = 15$ and $min\_shared\_kmers = 1$, 22 false positive anchors are detected in `bla_kpc`. Crucially, because Stage 4 runs a 5-hop BFS, these 22 false anchors snowball into **295 background unitigs** in the subgraph (a 13.4x noise amplification), nearly tripping the 1% whole-graph safety guard the walker carried at the time (300 nodes).
 3. **The $k = 31$ Sensitivity Cliff at 85% Identity**: Under uniform/codon mutations, $k = 31$ loses almost all sensitivity below 85% sequence identity:
    - At 90% identity, $k = 31$ achieves 96% gene recovery (assisted by 5-hop BFS bridging).
    - At 85% identity, $k = 31$ gene recovery **crashes to 24%** (anchor recall drops to 7.0%).
@@ -23,7 +23,7 @@ At the time of this study, `logan-walker` defaulted to **$k = 31$** and **$min\_
 4. **The Sweet-Spot: $k = 21, min\_shared\_kmers = 3$**:
    - **Zero false positives** in 30,000 background unitigs ($FP = 0$, SNR = $\infty$).
    - Extends 100% gene recovery down to **80% identity** under uniform mutations (vs 85% for $k=31$).
-   - Under realistic protein evolution where catalytic motifs are conserved (e.g. active site loops), $k = 21$ maintains **96–100% gene recovery all the way down to 60% identity** (whereas $k = 31$ drops to 48%).
+   - Under realistic protein evolution where catalytic motifs are conserved (e.g. active site loops), $k = 21$ maintains **96 to 100% gene recovery all the way down to 60% identity** (whereas $k = 31$ drops to 48%).
 
 ---
 
@@ -143,10 +143,17 @@ In real microbial enzymes, mutations are not uniformly distributed. Active sites
 1. **Shift Default $k$ to 21 for Divergent Variant Discovery**:
    - `k = 21`, `min_shared_kmers = 3`.
    - Extends gene detection from 90% down to **80% identity** under uniform mutations (recovery rate at 85% identity: 24% $\to$ 100%).
-   - Retains **96–100% recovery down to 60% identity** on natural homolog families with conserved active site motifs.
+   - Retains **96 to 100% recovery down to 60% identity** on natural homolog families with conserved active site motifs.
    - **Zero background false positives** ($FP = 0$) across the 4.64 Mb bacterial genome.
 2. **Avoid $k \le 15$ for Default Unfiltered Anchoring**:
    - $k = 15$ introduces spurious hits that expand exponentially under 5-hop BFS (generating up to ~300 false background nodes).
 3. **Adaptive Fallback in `anchor.rs`**:
    - Primary: `k = 27, min_shared_kmers = 3`.
    - Fallback (if 0 anchors): `k = 21, min_shared_kmers = 3`.
+
+**What was adopted, as of 2026-11-18.** Recommendations 1 and 2 are the current defaults:
+`-k 21` and `--min-shared-kmers 3` (`walker/src/config.rs`). Recommendation 3 was not adopted;
+anchoring runs at one $k$. The 1% whole-graph guard this study measured against has since been
+retired in favour of a density guard, `--subgraph-nodes-per-base-guard`, which is 3 unitigs per
+reference base; `--max-subgraph-nodes` is the hard refusal. Nothing else in the study depends on
+that guard.

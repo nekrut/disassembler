@@ -19,7 +19,7 @@ absolute divergence from an already-promoted representative, not whether it came
 different accession. It is **not** an intra-host SNV tool: sequences that differ by a base or
 two are below the resolution any usable sketch can distinguish. To keep intra-host single-SNV
 variation, use the walker's `--emit-vcf` / `--emit-snv-table` instead (see
-[`vcf_example.md`](vcf_example.md)).
+[`examples/vcf_example.md`](examples/vcf_example.md)).
 
 ## Running it
 
@@ -37,13 +37,29 @@ disassembler sieve -i out/zika/reconstructed.fasta -o out/zika/sieved.fasta \
 | `--sieve` | | off | enable the stage |
 | `--sieve-threshold <F>` | `--threshold` | `0.005` | novelty threshold tau. A sequence is promoted only if `1 - maxJaccard >= tau` against the promoted set, so a **higher** tau collapses **more** |
 | `--sieve-sketch <M>` | `--sketch` | `256` | MinHash sketch size. Novelty finer than `1/M` cannot be resolved |
-| `--sieve-min-len <N>` | `--min-len` | the walker's `--min-cov` times the shortest reference record | minimum sequence length. It follows the walker's own coverage gate (0.85 by default, or whatever is passed to the walker after `--`), because anything the walker published is a reconstruction this step is not meant to judge: it thins near-duplicates. Until 0.2.0 it was a flat 95%, so every haplotype between 85% and 95% of the reference was dropped here although the walker and the MSA both accept it, which is exactly the walk that stops short of a terminus or the sample with a real in-frame deletion. The shortest record, because in multi-anchor mode each primary is reconstructed against its own reference, and no margin on top, because `cov` is measured against the winning anchor, which is at least that long |
+| `--sieve-min-len <N>` | `--min-len` | a fraction of the shortest reference record (below) | minimum sequence length |
 | `--sieve-max-gap-frac <F>` (`from-lexicmap` only) | `--max-gap-frac` | `0.05`; derived in `from-lexicmap` (below) | the largest share of a sequence that may be gaps (`-`) or other non-ACGT characters |
 | `--sieve-bin <PATH>` | `--sieve-bin` | discovered | path to `l1_pipeline_serial` (from `PATH`, or a build in `extern/kmer-diversity-sieve`) |
 
-The atomic `sieve` takes the reference through `--ref`, used only to derive `--min-len` from its
-shortest record. The input and `--ref` can be gzip-compressed; the wrapper decompresses the input
-into the deduplicated copy it hands the binary, which reads only plain FASTA. `reconstruct` and `from-kmindex` derive it from every `-q` record.
+The reference is used only to derive `--min-len`, and which fraction of it depends on what the
+cohort came from:
+
+| route | default `--min-len` |
+|---|---|
+| `reconstruct`, `from-kmindex` | `min(0.85, --min-cov)` of the shortest `-q` record, following the walker's own coverage gate |
+| `disassembler sieve`, `from-lexicmap` | 95% of the shortest `--ref` record |
+
+The composites follow the walker because anything the walker published is a reconstruction this
+step is not meant to re-judge: it thins near-duplicates, and a flat 95% drops every haplotype
+between the walker's gate and 95% although the walker and the MSA both accept it, which is
+exactly the walk that stops short of a terminus or the sample with a real in-frame deletion. It
+is the shortest record because in multi-anchor mode each primary is reconstructed against its
+own reference, and there is no margin on top because `cov` is measured against the winning
+anchor, which is at least that long. The atomic `sieve` and `from-lexicmap` have no walker gate
+to follow, so pass `--min-len` explicitly on a cohort the walker produced.
+
+The input and `--ref` can be gzip-compressed; the wrapper decompresses the input into the
+deduplicated copy it hands the binary, which reads only plain FASTA.
 
 ### Before the sieve runs
 
@@ -100,7 +116,7 @@ one virus collapses to about one representative.
 
 The divergence a threshold resolves is roughly
 
-```
+```text
 d ~ tau / (2k)
 ```
 
@@ -127,7 +143,7 @@ collapse. Sweep tau on your own data before trusting a setting, and expect the s
 only when the cohort is large enough for the MSA and tree to dominate the run time.
 
 The full calibration study, with the measured transition curves and the reproduction commands,
-is in [`issue_sieve_calibration.md`](issue_sieve_calibration.md).
+is in [`notes/sieve_calibration.md`](notes/sieve_calibration.md).
 
 ## Outputs
 
@@ -136,26 +152,22 @@ is in [`issue_sieve_calibration.md`](issue_sieve_calibration.md).
 | `<output>.fasta` | the promoted haplotypes |
 | `<output>.summary.json` | the run, in the shared format of [`summaries.md`](summaries.md) |
 
-The summary is new in 0.2.0. Before it, this stage produced no machine-readable output at all:
-the dedup counts, the completeness-gate drops and the promotion rate went to stdout and nowhere
-else, so a wrapping workflow could not tell a sieve that admitted everything from one that
-dropped most of its input. `discards.records` now carries `exact_duplicates`,
-`shorter_than_min_len`, `too_gappy` and `not_promoted`, `cohort` carries the admission rate,
-and `records[]` names each promoted haplotype by id and sequence hash. It is written on every
-exit path, including the failures.
+`discards.records` carries `exact_duplicates`, `shorter_than_min_len`, `too_gappy` and
+`not_promoted`, `cohort` carries the admission rate, and `records[]` names each promoted
+haplotype by id and sequence hash. The summary is written on every exit path, including the
+failures, and is new in 0.2.0: before it, this stage produced no machine-readable output at all.
 
+## Limits and behaviour worth knowing
 
-## Limits and behaviour worth knowing (0.2.0)
-
-**Admission is off.** The binary has a second gate besides novelty: after a warm-up it rejects
-a record whose count of never-seen k-mers is a statistical outlier, and a rejected record is
-never sketched, promoted or added to the k-mer table, so the rest of its clade goes with it.
-The wrapper used to arm that gate at 2,000 records. It no longer does. The cut-off it imposed
-was not a property of the biology but of the file: the band is `mean + 5*sd` over the running
-singleton counts, and the first record alone contributes about fifty times what a later one
-does, so there was no divergence a user could stay under. Measured on one 2,100-record cohort,
-a lineage 3% divergent placed after record 2,000 was dropped and the same lineage placed first
-was kept. Deduplication is now a speed-up and a memory saving, not a correctness fix.
+**The binary's admission gate is disarmed.** It has a second gate besides novelty: after a
+warm-up it rejects a record whose count of never-seen k-mers is a statistical outlier, and a
+rejected record is never sketched, promoted or added to the k-mer table, so the rest of its
+clade goes with it. The wrapper does not arm it, because the cut-off it imposes is a property
+of the file rather than of the biology: the band is `mean + 5*sd` over the running singleton
+counts, and the first record alone contributes about fifty times what a later one does, so
+there is no divergence a user can stay under. Measured on one 2,100-record cohort, a lineage 3%
+divergent placed after record 2,000 was dropped and the same lineage placed first was kept.
+Deduplication is therefore a speed-up and a memory saving, not a correctness fix.
 
 **Headers are not shown to the binary.** It buckets novelty by a month parsed from `|YYYY-MM`
 in the header, so twelve copies of one sequence dated in twelve different months all survived,

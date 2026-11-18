@@ -32,7 +32,7 @@
 //! off such a branch when the other side holds an outright majority of the fork, which is the
 //! path-selection fix the paragraph above called for rather than a reporting change. What it
 //! declines to move, and why, is counted in `minority_left` in `summary.json`.
-//! `docs/issue_intra_accession_variance_lost.md` covers the defect itself.
+//! `docs/notes/intra_accession_variance.md` covers the defect itself.
 //!
 //! # Why one variant per record
 //!

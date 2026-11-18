@@ -264,7 +264,7 @@ pub fn write_alts(summary: &Summary, path: &Path) -> Result<()> {
 /// Full per-bubble detail: fork, merge, and every branch with orientation, coverage and VAF.
 ///
 /// With only a bubble count, a reported quasispecies figure could not be checked by anyone.
-/// See `docs/issue_intra_accession_variance_lost.md`.
+/// See `docs/notes/intra_accession_variance.md`.
 pub fn write_bubbles(summary: &Summary, path: &Path) -> Result<()> {
     let mut w = create(path)?;
     writeln!(w, "[")?;
@@ -1241,7 +1241,7 @@ pub fn write_vcfs(
 ) -> Result<()> {
     std::fs::create_dir_all(out_dir)?;
 
-    // The filename is the accession, which `docs/vcf_example.md` documents and the committed
+    // The filename is the accession, which `docs/examples/vcf_example.md` documents and the committed
     // examples rely on. `read_accession_list` drops duplicates, so each path is written once.
     for (r, rows) in summary.results.iter().zip(sites) {
         let path = out_dir.join(format!("{}.vcf", r.accession));

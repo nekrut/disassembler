@@ -279,6 +279,15 @@ pub fn protected_route_nodes(
 ) -> Result<std::collections::HashSet<UnitigId>> {
     let mut protected = std::collections::HashSet::new();
     let mut row: Vec<u32> = Vec::new();
+    // A sibling the extracted neighbourhood does not hold is not an alternative the aligner
+    // could have taken: it is not in the GFA that was handed to it. `edges` deliberately
+    // returns whole rows, targets outside the neighbourhood included, so every sibling has to
+    // be checked for membership before its abundance is read. Reading it unchecked panicked on
+    // exactly the accessions this protection exists for, the ones tangled enough that a 5-hop
+    // neighbourhood stops short of some route unitig's siblings.
+    let sibling_survives = |graph: &UnitigGraph, t: UnitigId| -> bool {
+        graph.has(t) && survives(graph.abundance_of(t), floor)
+    };
     let read = |graph: &UnitigGraph, id: UnitigId, row: &mut Vec<u32>| -> Result<()> {
         graph.edges_by_id_into(id, row).map_err(|e| Error::Parse {
             accession: graph.accession.clone(),
@@ -304,7 +313,7 @@ pub fn protected_route_nodes(
                     .iter()
                     .map(|&p| crate::stages::parse::unpack_edge(p))
                     .any(|(t, s, _)| {
-                        s == src_fwd && t != step.node && survives(graph.abundance_of(t), floor)
+                        s == src_fwd && t != step.node && sibling_survives(graph, t)
                     });
             }
         }
@@ -322,7 +331,7 @@ pub fn protected_route_nodes(
                     .iter()
                     .map(|&p| crate::stages::parse::unpack_edge(p))
                     .any(|(t, s, _)| {
-                        s == src_fwd && t != step.node && survives(graph.abundance_of(t), floor)
+                        s == src_fwd && t != step.node && sibling_survives(graph, t)
                     });
             }
         }
@@ -1258,6 +1267,42 @@ mod depth_tests {
         // And the predicate the prune and its reported count share honours it.
         assert!(!kept_by_prune(&thin, 1, 10.0, &Default::default()));
         assert!(kept_by_prune(&thin, 1, 10.0, &protected));
+    }
+
+    /// A sibling outside the extracted neighbourhood is not an alternative, and asking the
+    /// graph for its abundance used to panic the accession.
+    ///
+    /// `edges` returns whole rows on purpose, so a route unitig at the edge of the
+    /// neighbourhood has siblings the graph does not hold. The aligner never saw them, since
+    /// they are not in the GFA, so they cannot be the choice this protection is looking for.
+    /// Treating them as absent protects the unitig, which is the conservative direction: the
+    /// prune keeps a unitig it might have dropped rather than cutting the route in two.
+    #[test]
+    fn a_sibling_outside_the_neighbourhood_does_not_panic_and_is_not_an_alternative() {
+        // 0 -> 1 -> 2 is the route; 3 is a deep sibling of 1, reachable from 0 by the same
+        // end, and is left out of the collected neighbourhood.
+        const FA: &str = ">T_0 ka:f:100.0   L:+:1:+  L:+:3:+\nACGTACGTACGT\n\
+                          >T_1 ka:f:1.0   L:-:0:-  L:+:2:+\nACGTACGTACGT\n\
+                          >T_2 ka:f:100.0   L:-:1:-\nACGTACGTACGT\n\
+                          >T_3 ka:f:100.0   L:-:0:-\nACGTACGTACGT\n";
+        let cursor = || Box::new(std::io::Cursor::new(FA.as_bytes().to_vec())) as Box<dyn std::io::Read>;
+        let skeleton = parse::scan(&"T".into(), cursor(), u64::MAX, &mut ()).expect("scan");
+        let sub = parse::collect(skeleton, cursor(), &[0, 1, 2], u64::MAX).expect("collect");
+        assert!(!sub.has(3), "unitig 3 must be outside the neighbourhood for this test");
+
+        let protected = protected_route_nodes(&sub, &steps(&[0, 1, 2]), 10.0).unwrap();
+        assert!(
+            protected.contains(&1),
+            "a sibling the neighbourhood does not hold is not a choice the aligner had: {protected:?}"
+        );
+
+        // The same graph with unitig 3 retained does see the alternative, so the rule above
+        // is about membership and not about having quietly stopped looking at siblings.
+        let whole = parse::build(&"T".into(), cursor(), u64::MAX).unwrap();
+        assert!(
+            protected_route_nodes(&whole, &steps(&[0, 1, 2]), 10.0).unwrap().is_empty(),
+            "with the sibling retained, unitig 1 is a droppable error branch"
+        );
     }
 
     /// A route whose every unitig clears the floor protects nothing: there is nothing at risk.

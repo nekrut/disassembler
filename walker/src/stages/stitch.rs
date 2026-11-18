@@ -973,7 +973,7 @@ mod tests {
 /// Full-chain comparison against the committed golden fixture. This is the end-to-end
 /// concordance check: fetch through stitch, in Rust. The fixture was first captured under
 /// GraphAligner 1.0.20 and recaptured under 1.0.17b on 2026-10-18, which
-/// added the final base that 1.0.19+ clips (docs/issue_graphaligner_end_clipping.md). Run it
+/// added the final base that 1.0.19+ clips (docs/notes/graphaligner_end_clipping.md). Run it
 /// with GraphAligner 1.0.17b on PATH.
 ///
 /// ```text

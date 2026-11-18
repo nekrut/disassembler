@@ -24,12 +24,12 @@
 # 1.0.20. All three fixtures were recaptured from the Rust walker under 1.0.17b on 2026-10-18,
 # which gives the two gated ones their final base (bench/golden/README.md).
 #
-# SRR8209082 (HIV-1 pol) is reported but NOT gated. Its 26k-node subgraph is ~a third of the
-# whole graph, so its unpruned route depends on the anchoring implementation and on the
+# SRR8209082 (HIV-1 pol) is reported but NOT gated here. Its 34,582-node neighbourhood is 42% of
+# the whole graph, so its unpruned route depends on the anchoring implementation and on the
 # GraphAligner version (1.0.17b and 1.0.20 take different routes), and GraphAligner is not
 # deterministic on a graph that size with more than one thread. It is therefore not
 # byte-reproducible across implementations. See the Reproducibility section of docs/walker.md
-# and docs/issue_intra_accession_variance_lost.md. Its primary is stabilised by the default
+# and docs/notes/intra_accession_variance.md. Its primary is stabilised by the default
 # pruning, which this old-behaviour gate turns off on purpose.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.."; pwd)"
@@ -69,7 +69,7 @@ fi
 # Record the aligner version with the result. The fixtures are version-dependent: 1.0.19+
 # clips the query's final base, so these goldens (captured under 1.0.17b, which aligns end to
 # end) FAIL on 1.0.19 and 1.0.20 by exactly that base. Without this line a green gate does not
-# say which behaviour it green-lit. See docs/issue_graphaligner_end_clipping.md.
+# say which behaviour it green-lit. See docs/notes/graphaligner_end_clipping.md.
 running="$(GraphAligner --version 2>&1 | head -n 1)"
 echo "using $running at $(command -v GraphAligner)"
 captured="$(cat "$ROOT/bench/golden/GRAPHALIGNER_VERSION" 2>/dev/null)"

@@ -94,8 +94,8 @@ pub struct Config {
     /// Second-pass prune: drop unitigs below this fraction of the gene's own depth, then
     /// realign. `0.0` disables it and restores the previous behaviour exactly.
     ///
-    /// **Defaults to 0.01**, on the strength of a 200-accession panel run (section 16 of
-    /// `docs/issue_intra_accession_variance_lost.md`). Run three ways on one build, pruning
+    /// **Defaults to 0.01**, on the strength of a 200-accession panel run (section 6 of
+    /// `docs/notes/intra_accession_variance.md`). Run three ways on one build, pruning
     /// never changed whether an accession reconstructed, 187 of 200 in every arm, so it
     /// carries no risk of losing a result. What it does carry:
     ///

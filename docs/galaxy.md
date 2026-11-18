@@ -50,24 +50,7 @@ A job that reconstructs nothing fails unless `--allow-empty` is set, so a workfl
 whether an empty shard is a soft or a hard failure. `--allow-empty` accepts only accessions where
 nothing was found (no Logan data, over the size cap, no anchors, no path); a job in which every
 accession errored fails with exit code 3 regardless (see
-[`walker.md`](walker.md#exit-status)).
-
-## Workflows
-
-Three workflows are planned, one per composite:
-
-```
-from-kmindex:   kmindex_query -> harvest -> stratify (optional) -> walker (scattered)
-                -> sieve (optional) -> msa
-from-lexicmap:  LexicMap search -> lexicmap -> sieve (optional) -> msa
-reconstruct:    accession list -> walker (scattered) -> sieve (optional) -> msa
-```
-
-Command-line flags become workflow choices: `--sieve` is whether the sieve step is connected,
-and `--skip-tree` is where the workflow stops. `--skip-harvest` becomes a choice of entry point
-(start from an accession list instead of a kmindex collection). For cohorts, `snvs.tsv` is the
-scalable variant output; a merged multi-sample VCF can be built with the IUC `bcftools merge`
-tool from the walker's per-accession VCFs.
+[`walker_reference.md`](walker_reference.md#exit-status)).
 
 ### Scatter
 
@@ -83,16 +66,5 @@ Downstream, the IUC **Collapse Collection** tool concatenates the per-job FASTAs
 or MSA. With one accession per job, either set `--allow-empty` or filter failed datasets before
 collapsing.
 
-## Open questions
-
-- **Splitting `msa`.** The disassembler-specific part of `msa` is the reference-guided,
-  in-frame preparation; MAFFT and FastTree already have well-maintained IUC tools. Splitting it
-  into a preparation tool plus the IUC tools would make each step inspectable and turn
-  `--skip-tree` into simply not connecting FastTree. That needs a preparation-only mode in the
-  CLI first, so `disassembler_msa` is one tool for now.
-- **A dedicated Logan Galaxy instance.** usegalaxy.org charges user storage and rate-limits
-  API calls. A dedicated instance would make `fetch` worth wrapping and could allow a larger
-  default `--max-size-mb`.
-- **Metadata.** At SARS-CoV-2 scale a random subset of millions of candidates is not very
-  informative; joining SRA metadata (date, platform, country) before stratifying would make
-  it so. That belongs in the workflow, not in disassembler.
+The workflows that will tie these tools together, and the questions still open about them, are
+in [`notes/galaxy_plan.md`](notes/galaxy_plan.md).

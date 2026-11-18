@@ -871,9 +871,9 @@ fn real_main(mut args: Args) -> error::Result<()> {
             gb(args.cfg.max_compressed_resident_bytes_for(n)),
         )
     };
-    // Two decimals, because the number this prints is now routinely under 1 GB: at the
-    // defaults it is 1.18, and one decimal made the total read 0.1 next to a graph term of
-    // 0.15, which looks like an arithmetic error rather than a rounding one.
+    // Two decimals, because the number this prints is routinely under 1 GB: at the defaults
+    // it is 1.24, and one decimal made the total read 0.1 next to a graph term of 0.16,
+    // which looks like an arithmetic error rather than a rounding one.
     eprintln!(
         "[logan-walker] memory bound: {buffer_clause}{graph_clause}; {:.2} GB worst case. \
          Excludes GraphAligner, the scratch GFA and the output buffers.",
@@ -1058,7 +1058,7 @@ fn real_main(mut args: Args) -> error::Result<()> {
     if !version.contains("1.0.17b") {
         eprintln!(
             "[warn] the walker is validated against GraphAligner 1.0.17b; 1.0.19 and later \
-             clip the query's last base (docs/issue_graphaligner_end_clipping.md)"
+             clip the query's last base (docs/notes/graphaligner_end_clipping.md)"
         );
     }
     args.cfg.graphaligner_bin = bin.to_string_lossy().into_owned();

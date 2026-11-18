@@ -29,7 +29,7 @@ blastn -query <gene>.fasta -db <ACC>.db \
   -outfmt '6 sseqid pident length qstart qend' -evalue 1e-6 -max_target_seqs 2000 > <ACC>.tsv
 ```
 
-Then measure, from the BLAST hits at &ge; 90% identity: the longest single contiguous
+Then measure, from the BLAST hits at 90% identity or better: the longest single contiguous
 alignment, the largest fraction of the gene any single contig covers, and how many contig
 fragments it takes to tile the gene. Compare against the walker primary
 (`logan-walker -a <ACC> -q <gene>.fasta --no-emit-alts`) on the same accession.
@@ -41,9 +41,9 @@ fragments it takes to tile the gene. Compare against the walker primary
 ## Result: Zika NS5 (deep, internally diverse)
 
 The gene is **not assembled as a contig in any of the nine.** Max contig length in these sets
-is 4.5&ndash;6 kb, so the contigs are long enough to hold a 2.7 kb gene &mdash; they just don't.
+is 4.5 to 6 kb, so the contigs are long enough to hold a 2.7 kb gene; they just don't.
 
-| accession | longest &ge;90% contig fragment | best single contig covers | walker primary |
+| accession | longest 90%-identity contig fragment | best single contig covers | walker primary |
 |---|---|---|---|
 | SRR6251963 | 636 nt | 7.0% | 2,708 nt, 99.8% |
 | SRR6251966 | 636 nt | 8.3% | 2,708 nt, 99.8% |
@@ -57,39 +57,39 @@ is 4.5&ndash;6 kb, so the contigs are long enough to hold a 2.7 kb gene &mdash; 
 
 No single contig holds more than 8% of NS5; for six of nine, the longest contiguous piece is
 under 100 nt. The fragments do collectively tile the gene (union coverage 100%), but it takes
-~50&ndash;63 of them &mdash; which is exactly the naive coordinate stitching that the parent
+about 50 to 63 of them, which is exactly the naive coordinate stitching that the parent
 project measured at 87% chimeric. The walker reconstructed the full 2,708 nt as one connected
 sequence for all nine.
 
 ## Control: C. auris ERG11 (clonal)
 
-| accession | longest &ge;90% contig fragment | best single contig covers |
+| accession | longest 90%-identity contig fragment | best single contig covers |
 |---|---|---|
 | ERR899743 | 1,575 nt (whole gene) | 100.0% (pid 99.9%) |
 | SRR12363134 | 1,575 nt (whole gene) | 100.0% (pid 100.0%) |
 
 The clonal gene comes out of the contigs as one clean full-length contig. So the fragmentation
-above is not a Logan-contig artifact &mdash; contigs hold a full-length gene fine when the
+above is not a Logan-contig artifact: contigs hold a full-length gene fine when the
 sample is homogeneous at that locus.
 
 ---
 
 ## What causes it
 
-Intra-host diversity. The Zika samples carry dense low-frequency variation (12&ndash;32 on-path
+Intra-host diversity. The Zika samples carry dense low-frequency variation (12 to 32 on-path
 bubbles per accession), and the assembler breaks at nearly every bubble it cannot cleanly pop.
 The unitig graph retains every branch, and `GraphAligner` threads one reference-guided path
 straight through the bubble field. So the preservation of variation is what lets the walker
 reconstruct the full-length **consensus** at all, on precisely the samples where the assembler
-fails &mdash; even though primary-only mode then discards the individual variant calls.
+fails, even though primary-only mode then discards the individual variant calls.
 
 ## Costs and when contigs win
 
-Contigs are 15&ndash;33&times; smaller than unitigs (2&ndash;7 MB vs hundreds of MB here). For
+Contigs are 15 to 33 times smaller than unitigs (2 to 7 MB against hundreds of MB here). For
 a clonal target that assembles cleanly, pulling the contig is cheaper and equivalent, and the
 smaller file also dodges the size cap that dropped `SRR6252011`. The unitig walk earns its cost
 on diverse samples and by keeping the intra-host variation recoverable
 (`--emit-alts`, `--emit-vcf`); on clonal ones a contig pull would do.
 
-See [`issue_intra_accession_variance_lost.md`](issue_intra_accession_variance_lost.md) for the
+See [`intra_accession_variance.md`](intra_accession_variance.md) for the
 related finding on how the primary itself is chosen.

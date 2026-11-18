@@ -44,7 +44,7 @@ GraphAligner -g single.gfa -f q.fa -a out.gaf -x dbg -t 1
 
 Under 1.0.20 this prints `End-to-end alignments: 0 (0bp)` and writes a single GAF row:
 
-```
+```text
 q	1275	0	1274	+	>1	1275	0	1274	1274	1274	60	NM:i:0	AS:f:1274	dv:f:0	id:f:1	cg:Z:1274=
 ```
 
@@ -98,7 +98,7 @@ is the correct half-open GAF span. The removed Python walker did the identical
 `SRR12363134` against `queries/markers/candida_auris_erg11.fasta` (1,575 nt), with
 `LOGAN_KEEP_SCRATCH=1` to retain the subgraph and GAF:
 
-```
+```text
 qlen=1575  qstart=0  qend=1574      query span 1574 of 1575
 plen=1594  pstart=9  pend=1583      path span  1574, with 11 bases of path left over
 ```
@@ -106,7 +106,7 @@ plen=1594  pstart=9  pend=1583      path span  1574, with 11 bases of path left 
 The path continues eleven bases past where the alignment stops, so the sequence was in the graph
 the whole time. Rebuilding the stitched path by hand from the retained GFA:
 
-```
+```text
 stitched[9:1583]  = 1,574 nt, what the walker emits today
 stitched[9:1584]  = 1,575 nt, byte-identical to the previously committed panel sequence
 ```
@@ -126,13 +126,14 @@ logan-walker -l erg11_5.txt -q queries/markers/candida_auris_erg11.fasta -o out 
   --prune-frac 0.0 --no-prefer-majority --no-emit-alts
 ```
 
-```
+```text
 ERR899743  SRR12363134  SRR14253779  SRR19738638  SRR19738642
 5/5 byte-identical to the earlier panel
 ```
 
-Under 1.0.20, then the pinned version, the same command gives 0/50 byte-identical, with all 50 exactly one base
-short. Sixteen of the fifty additionally differ by 1 to 3 substitutions, and all sixteen reduce to
+Under 1.0.20, then the pinned version, the same command gives 0/50 byte-identical, with all 50
+exactly one base short. Sixteen of the fifty additionally differ by 1 to 3 substitutions, and
+all sixteen reduce to
 the trailing base alone once `--prune-frac 0.0 --no-prefer-majority` is applied, so those
 substitutions are the current defaults working as designed and are not part of this issue.
 
@@ -260,9 +261,9 @@ Pin `graphaligner ==1.0.17b` in the `logan-walker` recipe and in `environment.ym
 - Costs accepted: environments with disassembler resolve to Python 3.11 or 3.12 with `libzlib`
   1.2.13, and 1.0.17b lacks the corner-case fixes that 1.0.18 made.
 
-**Revisit when** a GraphAligner release fixes the regression (move to it); when Python 3.13 or later,
-or a dependency that needs `libzlib` 1.3 or later, becomes necessary (switch to 1.0.20 plus option
-3); or when a reconstruction shows the 5' 64 bp artifact.
+**Revisit when** a GraphAligner release fixes the regression (move to it); when Python 3.13 or
+later, or a dependency that needs `libzlib` 1.3 or later, becomes necessary (switch to 1.0.20
+plus option 3); or when a reconstruction shows the 5' 64 bp artifact.
 
 **Done 2026-10-18:** `bench/golden/` recaptured under 1.0.17b. The two gated primaries are the
 previous fixtures plus their final base, and the gate now fails under 1.0.20 by exactly that base.
@@ -273,6 +274,6 @@ moved to Python 3.12, BLAST 2.16.0 and zstd 1.5.6, because `python=3.13`, `blast
 
 **Still to do:** report the regression upstream with the section 2 reproduction.
 
-Related: [`walker.md`](walker.md#reproducibility) on why `SRR8209082` is reported but not
-gated, and [`issue_intra_accession_variance_lost.md`](issue_intra_accession_variance_lost.md)
+Related: [`../walker.md`](../walker.md#reproducibility) on why `SRR8209082` is reported but not
+gated, and [`intra_accession_variance.md`](intra_accession_variance.md)
 for the pruning and majority-preference defaults that account for the substitutions in section 6.

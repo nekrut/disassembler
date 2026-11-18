@@ -1,22 +1,24 @@
 # Path walking selects the reference-matching minority allele
 
-**Status:** diagnosed 2026-09-11, corrected in two stages, and **not fully closed**. The first
-fix has been on by default since 2026-09-12, when the competing `detour` engine was also
-retired. It was incomplete twice over, and both gaps were found by the PR #13 review:
+**Status:** diagnosed 2026-09-11, corrected in stages, and **not fully closed**. The three
+options below have been on by default since 2026-09-12, when the competing `detour` engine was
+also retired. A gap in the first of them was closed on 2026-11-15: the majority correction was
+discarded unless the aligner's row spanned the whole stitched path, which no real row does, so
+under default flags it almost never ran.
 
-- **WV-01** (fixed 2026-11-15): the correction was discarded unless the aligner's row spanned
-  the whole stitched path, which no real row does, so with default flags it almost never ran.
-- **WV-02** (fixed 2026-11-15): a fork whose walked branch was itself below `--min-vaf` was
-  skipped as "the error-branch case" and left to `--prune-frac`. Pruning is 1% of gene depth
-  and that gate was 10% of the fork, so a branch between the two was neither pruned, nor
-  corrected, nor reported. The route now moves off such a branch when the other side holds an
-  outright majority of its fork.
+One case is deliberately left alone. A fork whose walked branch is itself below `--min-vaf` is
+not corrected: pruning removes branches under 1% of the gene's depth and the majority
+correction skips alternatives under 10% of their fork, so a branch between the two is neither
+pruned nor corrected. Moving the route off it is `--rescue-minority`, and it is **off by
+default**, because on a 5,000-accession slice the correction loop did not converge with it on,
+making 97,068 corrections against 470.
 
-What remains is reported rather than silent: `minority_left` in `summary.json` counts the forks
-where `_primary` still carries the rarer allele, with the reason for each.
+What is left is reported rather than silent: `minority_left` in `summary.json` counts the forks
+where `_primary` still carries the rarer allele, with the reason for each, and
+`cohort.accessions_with_minority_sites` carries the run total.
 
-Why the walker has these three options, what bias they correct, and what they change on real data.
-Every flag and default is in the CLI reference, [walker.md](walker.md).
+Why the walker has these options, what bias they correct, and what they change on real data.
+Every flag and default is in [`../walker_reference.md`](../walker_reference.md).
 
 | flag | default | effect |
 |---|---|---|
@@ -27,7 +29,7 @@ Every flag and default is in the CLI reference, [walker.md](walker.md).
 Related: `--no-indel-alts`, `--max-alt-indel` (default 30), `--allow-frameshift-alts` (off),
 `--alt-max-detour` (default 100), `--min-abund-frac` (default 0.0, off). The pre-fix behaviour is
 `--prune-frac 0.0 --no-prefer-majority --no-emit-alts`, the flags
-[bench/check_golden.sh](../bench/check_golden.sh) runs under.
+[bench/check_golden.sh](../../bench/check_golden.sh) runs under.
 
 ## 1. The finding
 
@@ -50,7 +52,7 @@ The orientation convention was checked against the path itself: reading `L:s1:t:
 a real oriented edge, and flipping the target strand scores **0 of 1278**. Alternatives were built
 by splicing each untaken branch back into the path and scored with `blastn` against the reference
 CDS, the test the pipeline applies to its own output. Every figure is byte-stable across repeat
-runs and two hash seeds (see [bench/golden/README.md](../bench/golden/README.md) on hash order).
+runs and two hash seeds (see [bench/golden/README.md](../../bench/golden/README.md) on hash order).
 
 ## 3. Where the loss happens
 
@@ -62,7 +64,7 @@ VAF >= 10%, the `--min-abund` and `--min-vaf` defaults). That finds 58 credible 
 `blastn` identity 98.028% to 98.174% against the primary's 98.174%. They pass every gate the
 primary passes. What separates them is coverage, in the wrong direction:
 
-```
+```text
 discarded branch better supported than the branch walked        49 / 50
 discarded branch is the majority allele (VAF >= 0.5)            49 / 50
 discarded branch carries >= 90% of local coverage               49 / 50
@@ -80,7 +82,7 @@ the divergence dN/dS is computed from.
 
 One case in full, path index 1236 near the 3' end of *pol*:
 
-```
+```text
 fork (54954,-), reached from (54872,-)
   branch (13182,+)  ka:f     18.9  VAF 0.002   len 35
   branch (54790,+)  ka:f  12000.0  VAF 0.997   len 31
@@ -99,7 +101,7 @@ reconverge one step later. Of the 58 credible forks, 8 fail the VAF gate (the wa
 well under 1%), 50 reconverge further out, and 0 are reported. Conversely, none of the 14 bubbles
 found on `SRR8209082` has its fork on the walked path, since most of a 5-hop neighbourhood is not
 the gene. For intra-host variants, read `alt_haplotypes.fasta` or the `--emit-vcf` output
-([vcf_example.md](vcf_example.md)), not `bubbles.json`.
+([vcf_example.md](../examples/vcf_example.md)), not `bubbles.json`.
 
 ## 4. It depends on the sample
 
@@ -124,7 +126,7 @@ route in two, and GraphAligner then reports the pieces as separate alignments. O
 (SARS-CoV-2 spike, 1,700x) the pruned alignment covered reference bases 424-3821 instead of
 0-3821, and the primary lost 425 nt while still passing `--min-cov`.
 
-```
+```text
 SRR8209082 (HIV-1 pol, 14,500x)   nodes  aligns    cov   min ka:f  under 1% of depth
   unpruned                        34582     3    0.9996      2.0        118
   1% floor (145x)                  6930     1    0.9993    147.5          2
@@ -165,7 +167,7 @@ length rules, so an indel site can be corrected too. `--no-indel-alts` restores 
 
 ### 5.4 What it recovers
 
-```
+```text
                           depth   primary                       alternatives recovered
 ERR2028820  PfCRT          180x   1274 nt, byte-identical                 0
 ERR899743   ERG11          230x   1574 nt, byte-identical                 0
@@ -177,7 +179,7 @@ SRR6007473  Ebola GP    25,000x   2030 nt, cov 0.9995, 100.00% id        13   VA
 Clonal isolates are untouched; every viral alternative is full length and gapless. Pruning also
 improved the consensus where the bias had been worst: Zika coverage 0.9974 to 0.9996 and identity
 99.08% to 99.82%, Ebola to a 100.00% match. Lengths one base short of the reference are GraphAligner
-clipping the final base ([issue_graphaligner_end_clipping.md](issue_graphaligner_end_clipping.md)).
+clipping the final base ([graphaligner_end_clipping.md](graphaligner_end_clipping.md)).
 
 ## 6. Panel run: 200 accessions, three arms
 
@@ -191,7 +193,7 @@ anchoring and the Rust port, not pruning; the arms agreeing accession for access
 **Pruning removes the noise calls.** Alternatives fall from 540 across 91 accessions to 311 across
 69. Measured against each sample's own gene depth:
 
-```
+```text
 support of each alternative     <1% of depth    1-5%       >=5%
   no prune                        94 (17.4%)   19 (3.5%)  427 (79.1%)
   pruned                          10 ( 3.2%)    9 (2.9%)  292 (93.9%)
@@ -245,7 +247,7 @@ which refused 14 accessions that otherwise reconstruct. The default is now 1 GB 
 A second implementation of the same recovery, the `detour` engine, was run against the current
 variant stage over the whole panel at equal cost. With pruning on:
 
-```
+```text
                                         variants        detour
 alternatives emitted                    267 / 64 acc    269 / 59 acc
   of those, two alleles genuinely       267 (100%)      131 (48.7%)

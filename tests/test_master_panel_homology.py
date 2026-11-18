@@ -2,8 +2,8 @@
 """test_master_panel_homology.py -- every `<gene>_varN` in the master target file must
 actually be a variant of its `<gene>_reference`.
 
-DD-05. The file follows the `<gene>_reference` + `<gene>_varN` convention of
-`panels/README.md`, and a user cuts a group out of it as a multi-anchor panel
+The file follows the `<gene>_reference` + `<gene>_varN` convention documented in
+`queries/README.md`, and a user cuts a group out of it as a multi-anchor panel
 (`grep -A1 '^>candida_auris_erg11_'`). Two groups were not alleles at all:
 `candida_auris_erg11_var1..9` were other CDSs of the same contig (an F-box protein, a
 tRNA adenylyltransferase, an NADH kinase, Bud22p), and `p_infestans_avr3a_var1..9` were

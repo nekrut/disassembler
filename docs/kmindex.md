@@ -44,10 +44,13 @@ Outputs, written to `-o`:
 | `<target>.accessions.txt` | every accession the query returned for that target, by containment score, highest first |
 | `<target>.scores.json` | `{"target": ..., "scores": {accession: containment score}}` |
 | `UNION.accessions.txt` | the union across all targets |
-| `summary.json` | per-target counts and maximum score |
+| `harvest.summary.json` | per-target counts and maximum score, in the shared format of [`summaries.md`](summaries.md) |
 
 A target is one record of the kmindex query, named by the first word of its FASTA header, so a
-multi-record query gives one set of files per record.
+multi-record query gives one set of files per record. That word becomes a filename, so it is
+sanitised first: a `phiX174` prefix is stripped, path separators become `_`, and leading or
+trailing dots and spaces are removed. A target whose name is empty after that, or is `.` or
+`..`, is skipped and counted rather than writing a dotfile or a path outside `-o`.
 
 ## `disassembler stratify`
 
@@ -78,19 +81,19 @@ By default it reads every file in the `-o` directory and uses the score files am
 `--scores PATH` (repeatable) names files or directories instead, plain or gzip-compressed.
 `--target NAME` stratifies only that target. A score file written before 0.1.1, or by hand, is a
 bare `{accession: score}` with no target inside; name it with `--scores NAME=FILE`, or with
-`--target` when it is the only one. Finding no score file is an error, where it used to print a
-warning and exit 0.
+`--target` when it is the only one. Finding no score file at all is an error.
 
 Outputs, per target, next to the harvest files: `<target>.bins.txt` (the merged list, by score,
 highest first) and `<target>.bins.json` (per-bin requested, available and selected counts, and
-the accession lists), plus a combined `bins_summary.json`. The list feeds straight into
+the accession lists), plus a combined `stratify.summary.json`. The list feeds straight into
 `disassembler reconstruct -l <target>.bins.txt`.
 
 If download volume is the real constraint, sampling by count is the wrong lever. Unitig file
-sizes are very skewed: across 45 randomly sampled accessions the median was 0.6 MB, the mean
-17.6 MB and the largest 595 MB, and the top 10% of files carried 90% of the bytes. The walker's
-`--max-size-mb` targets the bytes directly, by rejecting an accession on its `Content-Length`
-before downloading anything.
+sizes are very skewed: in a 57,000-accession sample of the bucket the median object is 3.4 MB
+and the mean 94 MB, so a handful of accessions carry most of the bytes (the distribution is
+tabulated in [`walker.md`](walker.md#choosing-the-size-cap)). The walker's `--max-size-mb`
+targets the bytes directly, by rejecting an accession on its `Content-Length` before
+downloading anything.
 
 ## `disassembler from-kmindex`
 
@@ -117,8 +120,9 @@ did**: harvest writes a file per target it found, and a re-run into a directory 
 earlier harvest used to pick up the old `<target>.accessions.txt` and reconstruct the previous
 collection's accessions with exit 0. The run now says which targets the harvest found, and
 harvest removes the per-target files of targets it no longer has. Under `--skip-harvest` there
-is no new harvest to check against, so a hand-made cohort still works as before. `--harvest-workers` is harvest's `--download-workers`. The
-walker, sieve and MSA options are the same as `reconstruct`'s (see
+is no new harvest to check against, so a hand-made cohort still works as before.
+`--harvest-workers` is harvest's `--download-workers`. The walker, sieve and MSA options are
+the same as `reconstruct`'s (see
 [`codon_msa.md`](codon_msa.md#disassembler-reconstruct)). For a run that never touches the
 network, harvest from `--shards-dir` (or `--skip-harvest`) and walk with `--offline` and a
 pre-filled `--unitigs-cache`:
@@ -129,10 +133,9 @@ disassembler from-kmindex --skip-harvest --cohort-dir out/zika_ns5/cohort \
     --unitigs-cache cache/ --offline
 ```
 
-Before 0.1.1, `from-kmindex` crashed in every harvest with an `AttributeError` (it did not pass
-harvest's `--shards-dir` setting), and it required the two Galaxy IDs even with
-`--skip-harvest`. Command lines written for that, with placeholder IDs, still run: under
-`--skip-harvest` the IDs are ignored with a warning. With `--score-bin`, `from-kmindex` passes its
+`--skip-harvest` no longer needs the two Galaxy IDs, and a command line written when it did,
+with placeholder IDs, still runs: they are ignored with a warning. With `--score-bin`,
+`from-kmindex` passes its
 `--target` to `stratify`, so a hand-made score file in the older shape works without a target
 inside. After a fresh harvest it also names that harvest's own score file rather than letting
 stratify scan the directory, which would have binned an earlier run's scores too; under

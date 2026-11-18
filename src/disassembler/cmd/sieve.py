@@ -5,7 +5,7 @@ lineage-level reducer: on defaults tuned to gene scale (tau=0.005, sketch=256) i
 collapses a cohort of ~identical lineages while preserving topology; the sieve
 binary's own defaults (tau=0.15, sketch=64) target archive-scale collapse and reduce
 a gene-scale cohort to ~1 representative. See docs/sieve.md and
-docs/issue_sieve_calibration.md.
+docs/notes/sieve_calibration.md.
 
 Both the CLI and the composite pipelines call `sieve_run(...)`, which removes exact
 duplicates first and reports what the binary's completeness gate will drop.

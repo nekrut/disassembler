@@ -131,8 +131,8 @@ run rather than leaving an earlier run's cohort to be aligned as this one's.
 With more than one reference record, from several `-q` or one multi-record file, the walker
 runs in multi-anchor mode, and `reconstruct` says which record the MSA aligns against (the
 first record of the first `-q`, unless `--msa-reference` names another). The sieve's default
-`--min-len` is 95% of the shortest reference record, because each primary is reconstructed
-against its own anchor.
+`--min-len` is taken from the shortest reference record, because each primary is reconstructed
+against its own anchor; see [`sieve.md`](sieve.md).
 
 Each run removes `reconstructed.sieved.fasta` from an earlier run, since it no longer matches the
 reconstruction the walker has just rewritten; with `--sieve`, this run's is written again.
@@ -141,8 +141,8 @@ reconstruction the walker has just rewritten; with `--sieve`, this run's is writ
 ### When some accessions error
 
 The walker exits 4 when some accessions errored and others reconstructed (see
-[`walker.md`](walker.md#exit-status)). `reconstruct` does not stop there. The haplotypes that
-were produced are real, so the sieve, MSA and tree all run on them, and `reconstruct` then
+[`walker_reference.md`](walker_reference.md#exit-status)). `reconstruct` does not stop there.
+The haplotypes that were produced are real, so the sieve, MSA and tree all run on them, and it
 exits 4 itself. Discarding a whole cohort's alignment and tree because one accession in
 thousands hit a network error would contradict the walker's own rule that one bad accession
 does not stop the run, and the run still reports failure, which is the part a scheduler reads.
@@ -192,15 +192,16 @@ cohorts where it bites are the ones with an internal hole, which is what tiling 
 
 In `from-lexicmap`, `--msa-min-cov` defaults to `0.70` or the cohort's coverage gate minus
 0.05, whichever is lower (`0.45` with `--include-partials`), so the MSA keeps the rows lexicmap
-admitted. Before 0.1.1 the gate measured row length, which every LexicMap row passes, so it
-never filtered this route at all.
+admitted. The gate measures covered bases rather than row length, which every LexicMap row
+passes by construction.
 
 ## A worked cohort
 
 On the nine-accession Zika NS5 cohort, this step produced a 10-taxon codon alignment (reference
 plus nine primaries) of 903 codons with zero internal stops, and FastTree collapsed the
 identical sequences into zero-length clusters, the expected shape for a consensus-clonal set.
-The intra-host SNP side of the same cohort is in [`vcf_example.md`](vcf_example.md).
+The intra-host SNP side of the same cohort is in
+[`examples/vcf_example.md`](examples/vcf_example.md).
 
 ## What it is not
 
@@ -208,7 +209,7 @@ The intra-host SNP side of the same cohort is in [`vcf_example.md`](vcf_example.
 (`alt_haplotypes.fasta`) are deliberately kept out: each would enter as an independent taxon and
 inflate apparent diversity, and two records from one sample are not two independent
 observations. The intra-host signal has its own outputs (`--emit-vcf`, `--emit-snv-table`); see
-[`vcf_example.md`](vcf_example.md).
+[`examples/vcf_example.md`](examples/vcf_example.md).
 
 ## Summary output
 

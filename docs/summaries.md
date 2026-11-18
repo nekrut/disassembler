@@ -145,7 +145,7 @@ happened" from "this version did not measure it".
 ### `cohort`
 
 Population statistics over whatever the stage produced: quantiles, counts of distinct outputs,
-diversity, a top-N preview. Omitted by a stage with no population to describe.
+diversity. Omitted by a stage with no population to describe.
 
 ### `records`
 
@@ -187,15 +187,15 @@ produces different results with no detectable difference in any output.
 |---|---|
 | run-level blocks | O(1), about 2 KB |
 | `records[]` | O(units of work), 1 KB each |
-| `cohort.top_n` | bounded by `--summary-top-n`, default 10 |
 | anything O(variants), O(unitigs), O(HSPs), O(bubbles) | **not in the summary** |
 
 Measured on a real walker record (ERR2028820 against PfCRT, with the variant, prune, timing
 and payload sub-objects all populated): **about 1.3 KB**, against roughly 4.9 KB for the same
 record in 0.1.1. `payload` accounts for about 170 bytes of that when every member is present,
-and about 30 when the bytes came from a cache. A record that produced nothing is far smaller, because a sub-object that did not run is
-omitted rather than written as null, and in a cohort like `bench/hiv1_50.txt` most records are
-of that kind. A 20,000-accession walker run therefore lands near 23 MB against 130 MB.
+and about 30 when the bytes came from a cache. A record that produced nothing is far smaller,
+because a sub-object that did not run is omitted rather than written as null, and in a cohort
+like `bench/hiv1_50.txt` most records are of that kind. A 20,000-accession walker run therefore
+lands near 23 MB against 130 MB.
 
 Sequences are identified by `seq_sha256` (lowercase hex, sha256 of the uppercase sequence with
 no header and no line breaks). This answers every question the old `seq` field was used for:
@@ -252,9 +252,20 @@ and the version exists to say so:
 A schema-1 reader therefore keeps parsing a schema-2 summary and draws the wrong conclusion
 from it, which is the case the version number is for.
 
-Summaries are byte-comparable between runs once the volatile fields are masked:
-`run.started`, `run.wall_seconds` and `run.stage_seconds`, plus `tool.external[].path`.
-`bench/check_golden.sh` masks exactly those and gates the rest.
+Summaries are byte-comparable between runs once the volatile fields are masked.
+`bench/mask_summary.py`, which `bench/check_golden.sh` runs before diffing, replaces:
+
+- `tool.version`, `tool.disassembler` and each `tool.external[].path`;
+- `inputs.source.id` and `inputs.source.kind`;
+- `run.started`, `run.wall_seconds` and `run.stage_seconds`;
+- per record, `timing` and `wall_seconds`, and in `payload` the `source`, `etag`,
+  `last_modified` and `fetched_at`.
+
+Everything else is gated. `payload.bytes` and `payload.sha256` are deliberately not masked,
+because they are the input the run consumed and must not move; neither is
+`payload.revalidated`. Masking `tool.version` is what makes the fixtures survive a version
+bump, so the gate does not catch a version regression on its own; the version floor in
+`src/disassembler/resolve.py` is what does.
 
 ## Per-stage instantiation
 
@@ -262,7 +273,7 @@ Summaries are byte-comparable between runs once the volatile fields are masked:
 |---|---|---|---|
 | `harvest` | one target | score quantiles | `failed`, `empty`, `bad_target` |
 | `stratify` | one target | selection rate | under-filled bins |
-| `walker` | one accession | cov and pident quantiles, distinct primaries, singleton rate | fetch failures, `no_logan_data`, `too_large`, and the full variant rejection breakdown |
+| `walker` | one accession | cov and pident quantiles, distinct primaries, singleton rate | three groups: `accessions` (eight outcomes), `alleles` (seven reasons an alternative was rejected) and `minority_sites` (nine reasons the primary still carries the rarer allele) |
 | `lexicmap` | one accession (the former ledger row) | tiers, quantiles, entropy (raw, full-coverage and folded), top N | `malformed`, `other_query`, `qlen_mismatch`, and the flagged tiers |
 | `sieve` | one output haplotype | dedup ratio, admission rate | dedup drops, completeness-gate drops, table saturation |
 | `msa` | one row | rows in and out, length agreement | rows dropped or lengthened by MAFFT |

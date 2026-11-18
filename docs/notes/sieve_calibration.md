@@ -4,7 +4,7 @@
 topology measurements. `disassembler` now defaults to `--sieve-threshold 0.005 --sieve-sketch 256`
 (`--threshold` and `--sketch` on `disassembler sieve`) instead of the sieve binary's own
 archive-scale defaults; the sieve binary is unchanged. `--sieve` itself remains off by default.
-For the user-facing summary, see [`sieve.md`](sieve.md).
+For the user-facing summary, see [`../sieve.md`](../sieve.md).
 
 This record was written against the original single-script driver, `disassemble.py`, which the
 `disassembler` CLI has since replaced; the sieve flags kept their names in the composites.
@@ -77,7 +77,7 @@ Defaults, from `l1_pipeline.c`:
 An isolated SNV destroys up to `k` k-mers in each sequence. For a sequence of `K` k-mers with `s`
 substitutions:
 
-```
+```text
 J = (K - k*s) / (K + k*s)          novelty = 1 - J  ~  2*k*d
 ```
 
@@ -97,7 +97,7 @@ it is simply pointed at the wrong divergence.
 Reference plus one mutant at a controlled number of SNVs, 20 independent mutants per cell,
 reporting the fraction of trials in which the two were kept apart. `tau = 0.15`.
 
-```
+```text
  sketch |     5    10    15    20    25    30    40    60   SNVs
         |  0.2%  0.4%  0.6%  0.7%  0.9%  1.1%  1.5%  2.2%   divergence
      64 |  0.00  0.00  0.45  0.65  1.00  0.95  1.00  1.00
@@ -114,7 +114,7 @@ biology. Raising the sketch narrows the zone.
 
 Length independence, same settings, fraction kept apart:
 
-```
+```text
  gene nt |   0.2   0.3   0.4   0.5   0.6   0.8   1.0   1.5   % divergence
      900 |  0.00  0.17  0.42  0.42  0.50  1.00  1.00  1.00
     2709 |  0.00  0.00  0.08  0.17  0.75  0.92  1.00  1.00
@@ -130,7 +130,7 @@ All three transition in the same 0.3 to 0.8% band, as the algebra requires.
 Nine reconstructed Zika NS5 primaries (`SRR6251963`, `6251966`, `6251967`, `6251969`, `6251973`,
 `6251979`, `6251984`, `6251992`, `6251993`), 2,708 nt:
 
-```
+```text
 9 haplotypes -> 4 UNIQUE sequences
   4 accessions   identical        SRR6251973 / 79 / 92 / 93
   3 accessions   identical        SRR6251963 / 66 / 69
@@ -138,7 +138,7 @@ Nine reconstructed Zika NS5 primaries (`SRR6251963`, `6251966`, `6251967`, `6251
   1 accession    16 SNVs apart    SRR6251984
 ```
 
-```
+```text
 pairwise SNVs  min 0, median 5, max 16
 pairwise %div  min 0.00%, median 0.18%, max 0.59%
 pairs at or above the 0.5% boundary   4 of 36
@@ -151,7 +151,7 @@ separation in the cohort reaches the sieve's boundary at all, and it lands in th
 
 ## 6. Which lineage dies, and at what threshold
 
-```
+```text
 tau = 0.005  ->  SRR6251963, SRR6251973, SRR6251984      3 of 4
 tau = 0.02   ->  SRR6251963, SRR6251973, SRR6251984      3 of 4
 tau = 0.04   ->  SRR6251963, SRR6251984                  2 of 4
@@ -177,7 +177,7 @@ it.
 
 Raising the sketch, at `tau = 0.005`:
 
-```
+```text
 sketch   64  ->  3 of 4 unique    (floor 0.0156 novelty)
 sketch  256  ->  4 of 4           (floor 0.0039)
 sketch 1024  ->  4 of 4           (floor 0.0010)
@@ -195,7 +195,7 @@ Varying `k` from 9 to 31 changes nothing at that setting, so `k` is not the leve
 near-duplicates stop being compared at all. On a synthetic 1,000-sequence cohort built from 8
 lineages:
 
-```
+```text
 sketch   64  ->  kept 8     correct
 sketch  256  ->  kept 8     correct
 sketch 1024  ->  kept 41    leaking near-duplicates
@@ -224,7 +224,7 @@ problem from keeping every distinct haplotype in a cohort of nine.
 The cost is negligible and the behaviour is correct when the cohort genuinely has lineage
 structure. Synthetic cohort, 8 lineages separated by more than 1% divergence, `tau = 0.15`:
 
-```
+```text
      N   sieve s   kept   MSA+tree full   MSA+tree sieved       net
    100      0.05      8            2.72            1.08     +1.59
    400      0.11      8           24.78            1.08    +23.60
@@ -242,7 +242,7 @@ So the sieve is worth keeping. It is the gene-scale regime that sits outside its
 
 The sieve binary accepts eleven flags:
 
-```
+```text
 --emit-promoted --input --k --limit --max-n-frac --min-len
 --outlier-sd --sketch --threads --threshold --warmup
 ```
@@ -263,7 +263,7 @@ without the flag is byte-for-byte the same as before. `--k`, `--threads`, `--lim
 **Change (0.1.1):** the hardcoded `--max-n-frac 0.05` is now `--max-gap-frac` on the atomic
 `sieve` and `--sieve-max-gap-frac` in `from-lexicmap`, where it defaults to a value derived
 from the cohort's coverage gate, and the wrapper removes exact duplicates before every sieve
-run rather than only in `from-lexicmap`. See [`sieve.md`](sieve.md#before-the-sieve-runs).
+run rather than only in `from-lexicmap`. See [`../sieve.md`](../sieve.md#before-the-sieve-runs).
 
 ## 10. Options considered
 
@@ -287,7 +287,7 @@ the full tree on those tips.
 
 Zika NS5, 36 reconstructions from PRJNA362728, median pairwise divergence ~0.18%, 12 unique:
 
-```
+```text
 tau     sketch  promoted  RF/RFmax
 0.005   64      6         0.67       old wrapper default: too coarse, loses structure
 0.005   256    10         0.00       new wrapper defaults: topology-preserving
@@ -298,7 +298,7 @@ tau     sketch  promoted  RF/RFmax
 HIV-1 pol, 17 reconstructions adjacent to SRR8209082, median pairwise divergence 2-3%, 17
 unique:
 
-```
+```text
 tau     sketch  promoted  RF/RFmax
 0.005   64     17         0.00       everyone passes: sieve is a no-op
 0.005   256    17         0.00       everyone passes: sieve is a no-op

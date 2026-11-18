@@ -109,40 +109,46 @@ not its name, so a Galaxy `dataset_<id>.dat` works either way, and so does a pip
 
 ## Documentation
 
+[`docs/README.md`](docs/README.md) is the index. In short:
+
 How to use it:
 
-- [`docs/walker.md`](docs/walker.md): what `logan-walker` does, multi-anchor mode, outputs,
-  offline caching, memory, and the full option reference
+- [`docs/walker.md`](docs/walker.md): what `logan-walker` does, how to run it, multi-anchor
+  mode and offline caching, with every flag, output and exit code in
+  [`docs/walker_reference.md`](docs/walker_reference.md)
 - [`docs/kmindex.md`](docs/kmindex.md): `harvest`, `stratify` and `from-kmindex`
 - [`docs/lexicmap.md`](docs/lexicmap.md): the LexicMap route
 - [`docs/sieve.md`](docs/sieve.md): diversity thinning and how to choose its threshold
 - [`docs/codon_msa.md`](docs/codon_msa.md): the codon MSA and tree, and `reconstruct`
-- [`docs/vcf_example.md`](docs/vcf_example.md): intra-host SNVs on a Zika cohort, from VCF to
-  the long table and DuckDB
+- [`docs/examples/vcf_example.md`](docs/examples/vcf_example.md): intra-host SNVs on a Zika
+  cohort, from VCF to the long table and DuckDB
+- [`docs/summaries.md`](docs/summaries.md): the summary JSON every stage writes, and its
+  schema versioning
+- [`docs/troubleshooting.md`](docs/troubleshooting.md): failure modes by symptom
 - [`docs/galaxy.md`](docs/galaxy.md) and [`docs/packaging.md`](docs/packaging.md): Galaxy
   tools, Bioconda packages and releases
 
 Why it works the way it does:
 
-- [`docs/contigs_vs_unitigs.md`](docs/contigs_vs_unitigs.md): why the walker uses unitigs
-  rather than Logan's contigs
-- [`docs/issue_intra_accession_variance_lost.md`](docs/issue_intra_accession_variance_lost.md):
+- [`docs/notes/contigs_vs_unitigs.md`](docs/notes/contigs_vs_unitigs.md): why the walker uses
+  unitigs rather than Logan's contigs
+- [`docs/notes/intra_accession_variance.md`](docs/notes/intra_accession_variance.md):
   the reference-matching minority allele bias, the pruning and majority-preference defaults
   that correct it, and what they still leave behind
-- [`docs/issue_graphaligner_end_clipping.md`](docs/issue_graphaligner_end_clipping.md): why
+- [`docs/notes/graphaligner_end_clipping.md`](docs/notes/graphaligner_end_clipping.md): why
   GraphAligner is pinned to 1.0.17b
-- [`docs/issue_sieve_calibration.md`](docs/issue_sieve_calibration.md): the sieve calibration
+- [`docs/notes/sieve_calibration.md`](docs/notes/sieve_calibration.md): the sieve calibration
   study
 - [`bench/`](bench/README.md): the golden concordance gate and the k-mer sensitivity simulation
 
 ## Repository layout
 
-```
+```text
 src/disassembler/   the Python package and the `disassembler` CLI (cmd/ holds one module per command)
 walker/             logan-walker, the Rust walker (see walker/README.md)
 extern/             kmer-diversity-sieve, as a git submodule
-queries/            reference CDSs
-panels/             multi-strain reference panels for multi-anchor runs
+queries/            reference CDSs (see queries/README.md)
+panels/             multi-strain reference panels for multi-anchor runs (see panels/README.md)
 bench/              golden fixtures and gate, k-mer sensitivity simulation, accession lists
 docs/               user and design documentation
 tests/              Python tests

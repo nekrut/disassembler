@@ -2,7 +2,7 @@
 
 `disassembler lexicmap` turns a [LexicMap](https://github.com/IndexThePlanet/LexicMap) search of
 a reference CDS against Logan into a codon-checked cohort: one tiled sequence per accession,
-sorted into four tiers, with the clean full-length sequences collapsed into unique haplotypes.
+sorted into six tiers, with the clean full-length sequences collapsed into unique haplotypes.
 `disassembler from-lexicmap` adds the optional sieve and the codon MSA and tree.
 
 This route is fast, because it never downloads unitig graphs, but it reconstructs a projection
@@ -14,8 +14,9 @@ variants and VCFs, use the walker route ([`walker.md`](walker.md)).
 LexicMap indexes Logan's **contigs**, not the unitig graph the walker uses. On internally diverse
 samples the assembler breaks a gene at every bubble it cannot pop, so the gene is spread across
 many short contigs: on Zika NS5 it takes about 50 contig fragments, the longest under 100 nt, to
-cover the gene (see [`contigs_vs_unitigs.md`](contigs_vs_unitigs.md)). LexicMap reports each
-contig as its own HSP, so a gene split 55/45 across two contigs fails any single-row filter such
+cover the gene (see [`notes/contigs_vs_unitigs.md`](notes/contigs_vs_unitigs.md)). LexicMap
+reports each contig as its own HSP, so a gene split 55/45 across two contigs fails any
+single-row filter such
 as `qcovHSP >= 80%`, even though together they cover all of it.
 
 ## What it does
@@ -83,25 +84,25 @@ as `qcovHSP >= 80%`, even though together they cover all of it.
    |---|---|---|
    | 1 | `CLEAN_FULL_LENGTH` | coverage at least `--min-cov` (100% under `--require-full-length`), at most `--max-internal-stops` premature stops, no frameshift, no conflicting HSPs |
    | 2 | `CLEAN_PARTIAL` | coverage at least `--min-cov-partial`, same stop, frameshift and conflict rules |
+   | 3 | `FLAGGED_PREMATURE_STOPS` | covered and in frame, but more than `--max-internal-stops` premature stops, with their codon positions |
    | 4 | `LOW_COVERAGE_FRAGMENT` | coverage below `--min-cov-partial` |
    | 5 | `FLAGGED_FRAMESHIFT` | covered, but out of frame for 30 or more bases; the indels are listed in the `indels` column |
-   | 3 | `FLAGGED_PREMATURE_STOPS` | covered and in frame, but more than `--max-internal-stops` premature stops, with their codon positions |
    | 6 | `FLAGGED_MIXED_HSPS` | covered, in frame and without premature stops, but the accession's own HSPs disagree about at least one base; the positions are in the `conflict_sites` column |
 
-   The rules are applied in that order, so coverage decides first: an accession with too little
-   of the gene tiled is a fragment whatever its frame and stop codons look like, and the two
-   flagged tiers mean "covered well enough to judge, and broken". Through 0.1.1-dev the frame
-   and stop rules came first, which made both flagged tiers mostly fragments: on the
-   SARS-CoV-2 strict pass, 61,897 of the 64,034 accessions reported as frameshifted were
-   fragments at a median coverage of 0.18, where a real shift cannot be told from a gap in the
-   tiling. The conflict rule is judged last, so an accession with both a premature stop and
-   conflicting HSPs is reported as the stop. `--allow-frameshift-alts` waives the frameshift
-   rule and `--allow-mixed` the conflict rule, each waiving only its own tier; the stop rule
-   still applies. Frameshifts are common in practice and mostly not biology: hits from
-   divergent relatives, 1-nt deletions in homopolymers in Nanopore and PacBio runs, and, more
-   rarely, real frameshift alleles. `flagged.tsv` lists them with their positions. The frame is
-   judged against the reference, so a reference that is itself a pseudogene makes every intact
-   sample look frameshifted; use an intact allele as the reference.
+   The rules are applied in the order coverage, frameshift, premature stops, conflicting HSPs,
+   which is not tier order. Coverage deciding first is what makes the flagged tiers mean
+   "covered well enough to judge, and broken": an accession with too little of the gene tiled
+   is a fragment whatever its frame and stop codons look like, and a real frameshift cannot be
+   told from a gap in the tiling. On the SARS-CoV-2 strict pass, judging frame first would put
+   61,897 of 64,034 frameshift calls at a median coverage of 0.18. The conflict rule is judged
+   last, so an accession with both a premature stop and conflicting HSPs is reported as the
+   stop. `--allow-frameshift-alts` waives the frameshift rule and `--allow-mixed` the conflict
+   rule, each waiving only its own tier; the stop rule still applies. Frameshifts are common in
+   practice and mostly not biology: hits from divergent relatives, 1-nt deletions in
+   homopolymers in Nanopore and PacBio runs, and, more rarely, real frameshift alleles. The
+   ledger lists them with their positions. The frame is judged against the reference, so a
+   reference that is itself a pseudogene makes every intact sample look frameshifted; use an
+   intact allele as the reference.
 5. **Collapses haplotypes.** Tier 1 sequences are collapsed into unique haplotypes as they
    stream. Memory grows with the number of distinct haplotypes and, far more slowly, with the
    number of accessions: roughly 100 bytes each for the contiguity check, plus one sequence
@@ -164,9 +165,7 @@ columns* in Galaxy) so that `qseq` and `sseq` are present. It can come from:
 
 Any of them can be plain or gzip-compressed; gzip is detected from the content, not the name.
 A zstd-compressed table is refused with a message, so decompress it first
-(`zstd -dc hits.tsv.zst | disassembler lexicmap -f - ...`). Before 0.1.1, gzip was only
-recognised in a local file, a pipe lost its contents to that check, and a queued Galaxy dataset
-exited 0 having written nothing.
+(`zstd -dc hits.tsv.zst | disassembler lexicmap -f - ...`).
 
 All rows for one accession must be contiguous in the input; `lexicmap` stops with an error
 naming the accession if one reappears later.
@@ -192,8 +191,7 @@ disassembler from-lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.
 
 `-o` is an output prefix: `-o out/hiv1_pol` writes `out/hiv1_pol.*`. An existing directory, or
 a path ending in `/`, writes `<dir>/<reference stem>.*`, as `--out-dir <dir>` does whether or not
-the directory exists yet. (Before 0.1.1, `--out-dir` was another spelling of `-o`, so a directory
-that did not exist yet was taken as a prefix.) `from-lexicmap -o DIR` writes the lexicmap files as
+the directory exists yet. `from-lexicmap -o DIR` writes the lexicmap files as
 `DIR/lexicmap.*` and the MSA and tree alongside. `DIR/lexicmap` must therefore not itself be a
 directory: lexicmap would write inside it as `DIR/lexicmap/<reference stem>.*` while the
 composite went on reading `DIR/lexicmap.clean.accessions.fasta`, which with an earlier run's
@@ -273,8 +271,8 @@ and a tier 2 row more.
 
 Indels are written in a 1-based, HGVS-like notation: `685_686insT` (T inserted between
 reference positions 685 and 686), `2316_2321del`, `709del`, with `(edge)` appended to an
-untrusted one. They appear in the `indels` column of the ledger and `flagged.tsv`, as
-`indels=...` in the FASTA headers, and among the `nt_mutations` of the haplotype table. Because
+untrusted one. They appear in the `indels` column of the ledger, as `indels=...` in the FASTA
+headers, and among the `nt_mutations` of the haplotype table. Because
 an insertion has no column, two haplotypes in `clean.msa.fasta` can have identical rows; their
 headers and the haplotype table tell them apart.
 
@@ -292,8 +290,9 @@ gate default to values derived from the cohort's own coverage gate, and from the
 row, so neither stage drops rows for coverage that lexicmap already accepted. The MSA stage
 runs with `--aligned`, because this cohort is already on the reference grid: the rows are
 written into the alignment as they are, rather than being re-placed by MAFFT, which could move
-a base across an uncovered stretch (see [`codon_msa.md`](codon_msa.md#lexicmap-cohorts)). That second floor
-is what makes the promise true for a long in-frame deletion: lexicmap counts a trusted deletion
+a base across an uncovered stretch (see [`codon_msa.md`](codon_msa.md#lexicmap-cohorts)). That
+second floor is what makes the promise true for a long in-frame deletion: lexicmap counts a
+trusted deletion
 as covered with no limit, while the row keeps `-` there.
 
 Each run removes the sieved cohorts an earlier run left in `-o`, since they no longer match the
@@ -324,6 +323,7 @@ and also removes an earlier run's MSA and tree.
 | `--samples-per-haplotype <N>` | `10` | representative accessions per haplotype in the TSV |
 | `--max-records <N>` | | stop after N input rows (for previews); the accession in progress is finished, so the last row of a preview is not mis-tiered |
 | `--no-a2m` | off | skip the A2M output |
+| `--cohort-ledger` | off | also write `<prefix>.cohort_ledger.tsv`, one row per accession |
 | `--allow-empty` | off | exit 0 when the clean cohort is empty (non-zero otherwise) |
 
 For a strict clean cohort, use `--require-full-length --min-pident 95 --max-internal-stops 0`.
