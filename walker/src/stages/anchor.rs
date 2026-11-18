@@ -442,7 +442,7 @@ fn shared(a: &[u64], b: &[u64]) -> usize {
 ///
 /// 1%. Strains of one gene share far more than this (the SARS-CoV-2 spike panel is one group
 /// at any threshold up to 50%), and unrelated genes share far less: two random coding
-/// sequences share none, and the 160-record, 25-gene master target file splits into 49
+/// sequences share none, and the 142-record, 25-gene master target file splits into 31
 /// groups. The gap is wide enough that the exact value does not matter much, and low enough
 /// that a divergent but legitimate panel is not split.
 pub const GROUP_MIN_SHARE: f64 = 0.01;
@@ -462,7 +462,7 @@ pub const GROUP_MIN_SHARE: f64 = 0.01;
 /// Returned groups are sorted, each ascending by index, so the warning text is deterministic.
 ///
 /// Cost is one k-mer list per reference and a merge per pair. The widest panel in the
-/// repository is 160 records, which is 12,720 merges of about 1,500 k-mers each.
+/// repository is 142 records, which is about 10,000 merges of about 1,500 k-mers each.
 pub fn reference_groups(k: usize, seqs: &[&[u8]], min_share: f64) -> Vec<Vec<usize>> {
     let n = seqs.len();
     let kmers: Vec<Vec<u64>> = seqs.iter().map(|s| canonical_kmers(k, s)).collect();
@@ -607,6 +607,9 @@ mod group_tests {
                 let seqs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
                 let groups = reference_groups(21, &seqs, GROUP_MIN_SHARE);
                 eprintln!("master_planetary_targets.fasta: {} records, {} groups", recs.len(), groups.len());
+                // DD-05 removed 18 records that were other genes of the reference's own
+                // contig; the file is 142 records in 31 groups.
+                assert_eq!((recs.len(), groups.len()), (142, 31));
                 assert!(
                     groups.len() > 1,
                     "the master target file is a catalogue of different genes, not a -q panel"

@@ -20,6 +20,7 @@ cohort's own coverage gate, so neither stage silently drops rows lexicmap admitt
 from __future__ import annotations
 
 import argparse
+import math
 import time
 import sys
 from pathlib import Path
@@ -47,6 +48,55 @@ from disassembler import summary as summary_io
 # deletion counts as covered but is '-' in the row, and an assembly can carry an N, so a row
 # can have slightly fewer real bases than its coverage says.
 GATE_MARGIN = 0.05
+
+
+def _cohort_shape(path):
+    """Records in the cohort, and the largest share of non-ACGT in any one of them.
+
+    One pass, where the records were already being counted. The second number is what
+    keeps the derived sieve and MSA gates from dropping a row lexicmap itself admitted
+    (PC-03).
+    """
+    n = 0
+    worst = 0.0
+    seq: list[str] = []
+
+    def close():
+        nonlocal worst
+        if not seq:
+            return
+        row = "".join(seq)
+        if row:
+            bad = sum(1 for c in row if c.upper() not in "ACGT")
+            worst = max(worst, bad / len(row))
+        seq.clear()
+
+    with path.open() as fh:
+        for line in fh:
+            if line.startswith(">"):
+                close()
+                n += 1
+            else:
+                seq.append(line.strip())
+    close()
+    return n, worst
+
+
+def _derived_gap_limit(gate, worst_gap):
+    """The sieve's non-ACGT allowance, never below the cohort's own worst row.
+
+    PC-03. lexicmap counts a trusted deletion as covered with no limit, and leaves `-` in
+    the row where it was. The derived allowance was a flat `1 - gate + 0.05`, so a clean,
+    full-length row whose in-frame deletion exceeded 5% of the reference (45 nt in 900)
+    was dropped by the sieve's completeness gate, with exit 0 and a `6 -> 5 haplotypes`
+    line that reads as thinning. Both the module docstring here and `docs/lexicmap.md`
+    promised that neither stage drops rows for coverage lexicmap already accepted. Indel
+    alleles are often the thing a study is after.
+
+    Rounded UP, so the limit can never land a hair below the row that set it.
+    """
+    limit = max(1.0 - gate + GATE_MARGIN, worst_gap)
+    return min(1.0, math.ceil(limit * 1e6) / 1e6)
 
 
 def cohort_coverage_gate(args) -> float:
@@ -190,7 +240,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                               "or other non-ACGT characters exceeds this. Default: 1 - the "
                               "cohort's coverage gate + 0.05 (0.25 at the default --min-cov "
                               "0.80, 0.05 with --require-full-length, 0.55 with "
-                              "--include-partials), so the sieve does not drop rows for the "
+                              "--include-partials), and never below the largest non-ACGT "
+                              "share in the cohort, so the sieve does not drop rows for the "
                               "coverage lexicmap already accepted.")
     g_sieve.add_argument("--sieve-bin", default=None,
                          help="Explicit path to the kmer-diversity-sieve l1_pipeline_serial "
@@ -203,7 +254,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                     "`disassembler msa -h`.",
     )
     g_msa.add_argument("--mafft-threads", type=positive_int, default=8,
-                       help="Thread count for MAFFT in the MSA stage (default: 8).")
+                       help="Accepted for compatibility and ignored: a lexicmap cohort is "
+                            "already on the reference grid, so the MSA stage runs with "
+                            "--aligned and does not call MAFFT at all (PC-01).")
     g_msa.add_argument("--msa-min-cov", type=fraction, default=None,
                        help="Minimum fraction of the reference a row must cover in A/C/G/T "
                             "bases to enter the MSA. Default: 0.70, or the cohort's coverage "
@@ -278,6 +331,20 @@ def _run(args, stages) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = out_dir / "lexicmap"
 
+    # PC-04. `lexicmap` turns a prefix that is an existing DIRECTORY into `<dir>/<ref>.*`,
+    # so its cohort would land inside `out/lexicmap/` while this composite goes on reading
+    # `out/lexicmap.clean.accessions.fasta`. With an earlier run's file at that path, the
+    # MSA and the tree are built from the old cohort and reported as this run's.
+    if prefix.is_dir():
+        print(f"from-lexicmap: {prefix} is a directory, so lexicmap would write inside it "
+              f"rather than at {prefix}.*. Remove it or choose another --out-dir.",
+              file=sys.stderr)
+        return 1
+    # And the cohorts this run is about to read are removed first, so that a lexicmap run
+    # which exits 0 without writing one cannot be mistaken for a cohort.
+    for sfx in (".clean.accessions.fasta", ".clean_expanded.accessions.fasta"):
+        Path(f"{prefix}{sfx}").unlink(missing_ok=True)
+
     if args.sieve and not resolve_sieve(args.sieve_bin):
         # PL-27: the composites exited 1 where the stage they wrap exits 127.
         print(not_found_message("sieve", "from-lexicmap"), file=sys.stderr)
@@ -301,6 +368,13 @@ def _run(args, stages) -> int:
             print(f"[from-lexicmap] warn: {', '.join(sieve_inert)} set but --sieve is "
                   f"off, so these values are inert. Add --sieve to make them take effect.",
                   file=sys.stderr)
+
+    # PC-01: the MSA stage runs with --aligned here, so there is no MAFFT to give threads to.
+    if args.mafft_threads != 8:
+        print(f"[from-lexicmap] warn: --mafft-threads {args.mafft_threads} is inert. A "
+              f"lexicmap cohort is already on the reference grid, so the MSA stage takes "
+              f"the rows as they are rather than re-placing them with MAFFT.",
+              file=sys.stderr)
 
     # ---- 1/3 lexicmap ------------------------------------------------------
     print(f"[from-lexicmap] 1/3 lexicmap -> {prefix}.*", flush=True)
@@ -351,7 +425,7 @@ def _run(args, stages) -> int:
     aln = out_dir / f"{stem}_codon_msa.fasta"
     tree = out_dir / f"{stem}_fasttree.nwk"
 
-    n_cohort = sum(1 for line in cohort.open() if line.startswith(">"))
+    n_cohort, worst_gap = _cohort_shape(cohort)
     print(f"[from-lexicmap] cohort: {n_cohort} sequences from {cohort.name}", flush=True)
     if n_cohort == 0:
         # lexicmap's own check counts full-length and partial sequences together, so a cohort
@@ -379,9 +453,10 @@ def _run(args, stages) -> int:
         # 22% of a default cohort and 34% of a SARS-CoV-2 spike cohort lexicmap had admitted.
         max_gap_frac = args.sieve_max_gap_frac
         if max_gap_frac is None:
-            max_gap_frac = round(min(1.0, 1.0 - gate + GATE_MARGIN), 6)
+            max_gap_frac = _derived_gap_limit(gate, worst_gap)
         print(f"[from-lexicmap] 2/3 sieve: --max-gap-frac {max_gap_frac} "
-              f"(cohort coverage gate {gate})", flush=True)
+              f"(cohort coverage gate {gate}, worst row {worst_gap:.4f} non-ACGT)",
+              flush=True)
         t0 = time.time()
         rc = summary_io.stage_entry(stages, "sieve", t0, sieve_cmd.sieve_run(
             cohort, sieved,
@@ -404,7 +479,16 @@ def _run(args, stages) -> int:
           f"--out-tree {tree}", flush=True)
     msa_min_cov = args.msa_min_cov
     if msa_min_cov is None:
-        msa_min_cov = round(min(0.70, gate - GATE_MARGIN), 6)
+        # PC-03, the same floor from the other side: the MSA's gate is a minimum share of
+        # ACGT, so it must not ask for more than the cohort's worst row has.
+        msa_min_cov = min(round(min(0.70, gate - GATE_MARGIN), 6),
+                          math.floor((1.0 - worst_gap) * 1e6) / 1e6)
+    # PC-01. lexicmap writes every base at the reference position its HSP gives it and `-`
+    # where no HSP reached, so this cohort IS an alignment on the reference grid. Handing it
+    # to MAFFT discarded those gaps and placed the bases again, and where several placements
+    # score the same it slides bases across an uncovered stretch or a deletion: the codon MSA
+    # and the tree could then disagree with lexicmap's own haplotype table and ledger, with
+    # exit 0 and the identity check passing.
     msa_ns = stage_args(
         msa_cmd,
         ref=args.ref,
@@ -413,6 +497,7 @@ def _run(args, stages) -> int:
         out_tree=str(tree),
         mafft_threads=args.mafft_threads,
         msa_min_cov=msa_min_cov,
+        aligned=True,
     )
     t0 = time.time()
     rc = summary_io.stage_entry(stages, "msa", t0, msa_cmd.run(msa_ns),

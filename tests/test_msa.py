@@ -77,6 +77,75 @@ class TestMsaCoverageGate(unittest.TestCase):
                     rows[rid] = rows.get(rid, "") + line.strip()
         return rc, out.getvalue() + err.getvalue(), rows
 
+    def _msa_aligned(self, records, ref_records=None, min_cov=0.70):
+        """`msa --aligned`, with MAFFT removed from PATH so a call to it would fail."""
+        ref = self.work / "ref.fasta"
+        inp = self.work / "in.fasta"
+        aln = self.work / "aln_grid.fasta"
+        aln.unlink(missing_ok=True)
+        _write(ref, ref_records or [("ref", REF)])
+        _write(inp, records)
+        from disassembler.stage import stage_args
+        ns = stage_args(
+            self.msa, ref=str(ref), input=str(inp), out_aln=str(aln),
+            out_tree=str(self.work / "tree.nwk"), mafft_threads=1, msa_min_cov=min_cov,
+            aligned=True,
+        )
+        out, err = io.StringIO(), io.StringIO()
+        mafft = self.work / "bin" / "mafft"
+        hidden = mafft.with_suffix(".hidden")
+        mafft.rename(hidden)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = self.msa.run(ns)
+        finally:
+            hidden.rename(mafft)
+        rows = None
+        if aln.is_file():
+            rows, rid = {}, None
+            for line in aln.read_text().splitlines():
+                if line.startswith(">"):
+                    rid = line[1:].strip()
+                else:
+                    rows[rid] = rows.get(rid, "") + line.strip()
+        return rc, out.getvalue() + err.getvalue(), rows
+
+    def test_aligned_rows_are_published_exactly_as_given(self):
+        """PC-01. A lexicmap row carries every base at the reference position its HSP gave
+        it, and `-` where no HSP reached, so the cohort is already an alignment. MAFFT
+        discards those gaps and places the bases again, and where several placements score
+        the same it slides bases across the uncovered stretch: on real HIV-1 pol rows a
+        C1416G call moved to T1424C, taking a codon with it. `--aligned` takes the rows.
+        """
+        # Two HSPs with a hole between them, and a substitution just before the hole.
+        hole = REF[:60] + "T" + "-" * 6 + REF[67:]
+        rc, log, rows = self._msa_aligned([("full", REF), ("holed", hole)], min_cov=0.5)
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(rows["holed"], hole, "the row was re-placed, not taken as given")
+        self.assertEqual(rows["full"], REF)
+        self.assertEqual(list(rows), ["Reference", "full", "holed"])
+        self.assertIn("MAFFT is not run", log)
+
+    def test_aligned_refuses_a_row_that_is_not_on_the_grid(self):
+        """The one thing `--aligned` must not do is take a row that is not on the grid and
+        publish it as an alignment: the length check exists because nothing else would
+        catch it."""
+        rc, log, rows = self._msa_aligned([("full", REF), ("short", REF[:-9])], min_cov=0.5)
+        self.assertEqual(rc, 1, log)
+        self.assertIn("are not 102 nt", log)
+        self.assertIn("short (93 nt)", log)
+        self.assertIsNone(rows, "nothing may be written when a row is off the grid")
+
+    def test_aligned_keeps_the_coverage_gate_and_the_identity_check(self):
+        """Everything except the placement is unchanged: a row under the coverage gate is
+        still dropped before the alignment."""
+        rc, log, rows = self._msa_aligned([
+            ("full", REF),
+            ("thin", REF[:30] + "-" * 72),  # 29% of the reference in bases
+        ])
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(list(rows), ["Reference", "full"])
+
     def _aligned_ids(self, records, min_cov=0.70):
         rc, log, rows = self._msa(records, min_cov=min_cov)
         self.assertEqual(rc, 0, log)

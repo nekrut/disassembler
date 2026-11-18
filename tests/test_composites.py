@@ -154,6 +154,45 @@ class TestFromKmindex(_Stubs):
         self.assertEqual(aln.count(">"), 3, "reference plus two primaries")
         self.assertTrue((self.out / "gene_fasttree.nwk").is_file())
 
+    def test_a_target_with_no_hits_in_this_harvest_is_refused(self):
+        """PC-05. The cohort is picked by file name, and harvest writes a file per target
+        of this run. Re-running into the same -o with a collection in which --target has
+        no hits found the previous run's file and reconstructed the previous collection's
+        accessions, with exit 0 and a summary listing only the new targets.
+        """
+        rc, log = _run(self._argv("--shards-dir", str(self.shards), "--skip-tree"))
+        self.assertEqual(rc, 0, log)
+        old_cohort = (self.out / "cohort" / "gene.accessions.txt").read_text()
+        self.assertIn("SRR1", old_cohort)
+
+        # A second collection that has a different target entirely.
+        other = self.work / "shards2"
+        other.mkdir()
+        (other / "dataset_1.dat").write_text(
+            json.dumps({"idx": {"HA": {"SRR9": 0.9}}}))
+        rc, log = _run(self._argv("--shards-dir", str(other), "--skip-tree"))
+        self.assertEqual(rc, 1, log)
+        self.assertIn("has no hits in the harvest", log)
+        self.assertIn("HA", log, "the message names what the harvest did find")
+        # And the stale cohort is gone, so a third run cannot pick it up either.
+        self.assertFalse((self.out / "cohort" / "gene.accessions.txt").exists())
+        self.assertFalse((self.out / "cohort" / "gene.scores.json").exists())
+
+    def test_a_target_with_no_hits_is_refused_under_score_bins_too(self):
+        """The same hazard through `<target>.bins.txt`: stratify scanned the whole cohort
+        directory, so a stale `<target>.scores.json` was binned as well."""
+        rc, log = _run(self._argv("--shards-dir", str(self.shards), "--skip-tree",
+                                  "--score-bin", "0.0:1.01:10"))
+        self.assertEqual(rc, 0, log)
+        other = self.work / "shards2"
+        other.mkdir()
+        (other / "dataset_1.dat").write_text(
+            json.dumps({"idx": {"HA": {"SRR9": 0.9}}}))
+        rc, log = _run(self._argv("--shards-dir", str(other), "--skip-tree",
+                                  "--score-bin", "0.0:1.01:10"))
+        self.assertEqual(rc, 1, log)
+        self.assertIn("has no hits in the harvest", log)
+
     def test_score_bins_feed_the_bins_list(self):
         rc, log = _run(self._argv("--shards-dir", str(self.shards),
                                   "--score-bin", "0.5:1.01:5", "--skip-tree"))
@@ -245,6 +284,43 @@ class TestReconstruct(_Stubs):
         self.assertEqual(rc, 0, log)
         self.assertEqual((out / "gene_codon_msa.fasta").read_text().count(">"), 3)
 
+    def test_a_walker_that_writes_nothing_does_not_align_an_earlier_runs_cohort(self):
+        """PC-04. The reconstruction is found by a fixed name, and nothing checked that
+        this run wrote it. A walker flag that makes the walker exit 0 without writing `-f`
+        (`--fetch-only`, `-h`, `--version`) therefore left the composite aligning whatever
+        an earlier run had put at that path, reporting it as this run's, with exit 0.
+        """
+        out = self.work / "out"
+        out.mkdir()
+        stale = out / "reconstructed.fasta"
+        stale.write_text(">OLD1_primary\n" + REF + "\n>OLD2_primary\n" + REF + "\n")
+        # A walker that answers --version and otherwise does nothing at all.
+        quiet = self.work / "quiet_walker.sh"
+        quiet.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1" = --version ]; then echo "logan-walker 0.1.1"; exit 0; fi\n'
+            "exit 0\n"
+        )
+        quiet.chmod(0o755)
+        rc, log = _run(["reconstruct", "-a", "SRR1", "-q", str(self.ref),
+                        "-o", str(out), "--walker-bin", str(quiet)])
+        self.assertEqual(rc, 1, log)
+        self.assertIn("wrote no", log)
+        self.assertFalse((out / "gene_codon_msa.fasta").exists(),
+                         "an MSA of the old cohort was built")
+        self.assertFalse(stale.exists(), "the stale handoff survived the run")
+
+    def test_walker_flags_that_skip_the_reconstruction_are_refused(self):
+        """PC-04, the clearer half: each of these has a better form of its own, and
+        `docs/codon_msa.md` invites any walker flag after `--`."""
+        out = self.work / "out"
+        for flag in ("--fetch-only", "-h", "--help", "-V", "--version"):
+            rc, log = _run(["reconstruct", "-a", "SRR1", "-q", str(self.ref),
+                            "-o", str(out), "--walker-bin", str(self.walker), "--", flag])
+            self.assertEqual(rc, 1, f"{flag}: {log}")
+            self.assertIn("cannot be passed through", log)
+            self.assertIn(flag, log)
+
     def test_skip_tree_removes_an_earlier_runs_derived_outputs(self):
         # A full run, then --skip-tree into the same directory: the earlier MSA, tree and
         # sieved copy no longer match the reconstruction the walker has just rewritten.
@@ -301,10 +377,147 @@ class TestReconstruct(_Stubs):
         self.assertEqual(rc, 0, log)
         self.assertIn("multi-anchor: 2 references. The MSA aligns against the first record of "
                       "the first -q (gene in", log)
-        self.assertEqual(seen["min_len"], int(9 * 0.95), "95% of the shortest reference")
+        # PC-02: the walker's own gate, not a flat 95%. The walker publishes a primary
+        # from 0.85 of the reference, so thinning at 0.95 removed haplotypes both
+        # neighbouring stages accept.
+        self.assertEqual(seen["min_len"], int(9 * 0.85),
+                         "the walker's --min-cov over the shortest reference")
+
+    def test_the_sieve_gate_follows_a_passed_through_min_cov(self):
+        """PC-02. `-- --min-cov 0.6` widens what the walker publishes, and the sieve's
+        completeness gate has to widen with it or it removes exactly the rows that flag
+        was passed to keep."""
+        import sys
+        from disassembler.cmd import sieve
+        panel = self.work / "panel.fasta"
+        panel.write_text(f">gene\n{REF}\n")
+        seen = {}
+
+        def fake_sieve(src, dst, **kw):
+            seen.update(kw)
+            Path(dst).write_text(Path(src).read_text())
+            return 0
+
+        real = sieve.sieve_run
+        sieve.sieve_run = fake_sieve
+        try:
+            rc, log = _run(["reconstruct", "-a", "SRR1", "-q", str(panel),
+                            "-o", str(self.work / "out"), "--walker-bin", str(self.walker),
+                            "--sieve", "--sieve-bin", sys.executable,
+                            "--", "--min-cov", "0.6"])
+        finally:
+            sieve.sieve_run = real
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(seen["min_len"], int(len(REF) * 0.6))
+        # An explicit --sieve-min-len still wins: this is a default, not a clamp.
+        seen.clear()
+        sieve.sieve_run = fake_sieve
+        try:
+            rc, log = _run(["reconstruct", "-a", "SRR1", "-q", str(panel),
+                            "-o", str(self.work / "out2"), "--walker-bin", str(self.walker),
+                            "--sieve", "--sieve-bin", sys.executable,
+                            "--sieve-min-len", "3"])
+        finally:
+            sieve.sieve_run = real
+        self.assertEqual(rc, 0, log)
+        self.assertEqual(seen["min_len"], 3)
 
 
 class TestFromLexicmap(_Stubs):
+
+    def test_the_cohort_reaches_the_msa_unmoved(self):
+        """PC-01. lexicmap writes each base at the reference position its HSP gives it, so
+        the cohort is already an alignment. It used to go through MAFFT anyway, which
+        discards the gaps and places the bases again; where several placements score the
+        same, a SNV slides across an uncovered stretch and the codon MSA and tree disagree
+        with lexicmap's own haplotype table, at exit 0.
+
+        The MAFFT stub on PATH here concatenates whatever it is given, so a run that still
+        called it would pass a naive row-count check. This asserts the rows themselves.
+        """
+        table = self.work / "hits.tsv"
+        # One full-length hit and one with a hole: HSPs 1-3 and 7-12, a deletion between.
+        table.write_text(
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            f"SRR10\t100.0\t100.0\t1\t12\t{REF}\t{REF}\n"
+            f"SRR11\t100.0\t25.0\t1\t3\t{REF[:3]}\t{REF[:3]}\n"
+            f"SRR11\t100.0\t50.0\t7\t12\t{REF[6:]}\t{REF[6:]}\n"
+        )
+        out = self.work / "out"
+        rc, log = _run(["from-lexicmap", "-q", str(self.ref), "-f", str(table),
+                        "-o", str(out), "--msa-min-cov", "0.5"])
+        self.assertEqual(rc, 0, log)
+        self.assertIn("MAFFT is not run", log)
+
+        def rows(path):
+            out_rows, rid = {}, None
+            for line in Path(path).read_text().splitlines():
+                if line.startswith(">"):
+                    rid = line[1:].split()[0]
+                else:
+                    out_rows[rid] = out_rows.get(rid, "") + line.strip()
+            return out_rows
+
+        cohort = rows(out / "lexicmap.clean.accessions.fasta")
+        msa = rows(out / "gene_codon_msa.fasta")
+        for rid, seq in cohort.items():
+            self.assertEqual(msa[rid], seq,
+                             f"{rid} moved between the cohort and the MSA")
+
+    def test_a_lexicmap_directory_in_the_way_is_refused_not_worked_around(self):
+        """PC-04. `lexicmap` turns a prefix that is an existing directory into
+        `<dir>/<ref>.*`, so the cohort lands inside `out/lexicmap/` while this composite
+        goes on reading `out/lexicmap.clean.accessions.fasta`. With an earlier run's file
+        at that path, the MSA and tree were built from the old cohort, with exit 0.
+
+        The shape that gets a user here is `disassembler lexicmap --out-dir results/lexicmap`
+        followed by `from-lexicmap -o results`.
+        """
+        table = self.work / "hits.tsv"
+        table.write_text(
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            f"SRR10\t100.0\t100.0\t1\t12\t{REF}\t{REF}\n"
+        )
+        out = self.work / "out"
+        out.mkdir()
+        (out / "lexicmap").mkdir()
+        stale = out / "lexicmap.clean.accessions.fasta"
+        stale.write_text(f">OLD1\n{REF}\n")
+        rc, log = _run(["from-lexicmap", "-q", str(self.ref), "-f", str(table),
+                        "-o", str(out)])
+        self.assertEqual(rc, 1, log)
+        self.assertIn("is a directory", log)
+        self.assertFalse((out / "gene_codon_msa.fasta").exists())
+
+    def test_a_cohort_this_run_did_not_write_is_not_aligned(self):
+        """PC-04, the other half: the cohort files this run reads are removed before
+        lexicmap runs, so one left by an earlier run cannot stand in for this run's.
+
+        lexicmap is stubbed to the exact shape that caused it: exit 0 having written no
+        cohort, which is what a prefix-is-a-directory run does.
+        """
+        from disassembler.cmd import lexicmap as lexicmap_cmd
+        table = self.work / "hits.tsv"
+        table.write_text(
+            "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
+            f"SRR10\t100.0\t100.0\t1\t12\t{REF}\t{REF}\n"
+        )
+        out = self.work / "out"
+        out.mkdir()
+        stale = out / "lexicmap.clean.accessions.fasta"
+        stale.write_text(f">OLD1\n{REF}\n>OLD2\n{REF}\n")
+        real = lexicmap_cmd.run
+        lexicmap_cmd.run = lambda ns: 0
+        try:
+            rc, log = _run(["from-lexicmap", "-q", str(self.ref), "-f", str(table),
+                            "-o", str(out)])
+        finally:
+            lexicmap_cmd.run = real
+        self.assertEqual(rc, 1, log)
+        self.assertIn("not found", log)
+        msa = out / "gene_codon_msa.fasta"
+        self.assertFalse(msa.exists() and "OLD1" in msa.read_text(),
+                         "the old cohort was aligned as if it were this run's")
 
     def test_table_to_tree(self):
         table = self.work / "hits.tsv"

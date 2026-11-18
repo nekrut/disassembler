@@ -17,6 +17,7 @@ Accession-list selection after stratify:
 from __future__ import annotations
 
 import argparse
+import json
 import time
 import sys
 from pathlib import Path
@@ -262,6 +263,25 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=run)
 
 
+def _harvested_targets(summary_path):
+    """The targets the harvest just written to this directory found, or None if that
+    cannot be read.
+
+    None rather than an empty set when the file is missing or unparseable: an unreadable
+    summary is not evidence that a target had no hits, and the caller must not turn it
+    into a refusal (PC-05).
+    """
+    try:
+        doc = json.loads(summary_path.read_text())
+    except Exception:
+        return None
+    if isinstance(doc.get("records"), list):
+        return {r.get("target") for r in doc["records"] if isinstance(r, dict)}
+    if isinstance(doc, dict):
+        return {k for k, v in doc.items() if k != "_union" and isinstance(v, dict)}
+    return None
+
+
 def run(args) -> int:
     """Run the stages, then write the manifest that ties their summaries together."""
     stages: list[dict] = []
@@ -359,14 +379,33 @@ def _run(args, stages) -> int:
                                     cohort_dir / "harvest.summary.json")
         if rc != 0:
             return rc
+        # PC-05. The cohort is picked by file name, and harvest writes a file per target of
+        # THIS run. Re-running into the same -o with a collection in which --target has no
+        # hits used to find the previous run's file and reconstruct the previous
+        # collection's accessions, with exit 0 and a summary listing only the new targets.
+        # In a fresh -o the same command fails, which is what made it a re-run hazard.
+        # Harvest now also removes the earlier run's per-target files, so this names what
+        # happened rather than reporting a file that is merely missing.
+        harvested = _harvested_targets(cohort_dir / "harvest.summary.json")
+        if harvested is not None and args.target not in harvested:
+            names = ", ".join(sorted(t for t in harvested if t)) or "none"
+            print(f"from-kmindex: target {args.target!r} has no hits in the harvest in "
+                  f"{cohort_dir} (targets: {names}).", file=sys.stderr)
+            return 1
 
     # ---- 2/3 stratify (optional) ------------------------------------------
     if args.score_bins:
+        # PC-05. With a directory to scan, stratify bins every `*.scores.json` in it,
+        # including an earlier harvest's. After a harvest of this run's own, name the file
+        # instead. Under --skip-harvest the directory scan stays, because a hand-made
+        # cohort is exactly what that flag is for (`docs/kmindex.md`).
         stratify_ns = stage_args(
             stratify_cmd,
             out_dir=str(cohort_dir),
             target=args.target,
             score_bins=args.score_bins,
+            scores=(None if args.skip_harvest
+                    else [str(cohort_dir / f"{args.target}.scores.json")]),
         )
         print(f"[from-kmindex] 2/3 stratify -> {cohort_dir}", flush=True)
         t0 = time.time()

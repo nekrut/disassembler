@@ -224,6 +224,46 @@ class TestHarvestLocal(unittest.TestCase):
         self.assertTrue((self.out / "UNION.accessions.txt").is_file())
         self.assertTrue((self.out / "harvest.summary.json").is_file())
 
+    def test_json_vec_hits_harvest_the_same_as_plain_json(self):
+        """GX-07. kmindex writes a hit two ways and the Galaxy tool offers both.
+
+        `--format json` gives the ratio; `--format json_vec` gives
+        `{"R": ratio, "P": [positions]}` under the same output datatype. Every
+        json_vec value failed `float()` and was dropped by a bare `continue`, so the
+        whole run harvested nothing and still exited 0, reporting "0 unique SRA runs
+        across 0 targets".
+        """
+        self._write_shard("vec.json", {"idx": {"pfcrt": {
+            "SRR1": {"R": 0.4, "P": [1, 2, 3]},
+            "SRR2": {"R": 0.9, "P": [7]},
+        }}})
+        per_target = hk.harvest_local(self.shards, self.out)
+        self.assertEqual(dict(per_target["pfcrt"]), {"SRR1": 0.4, "SRR2": 0.9})
+
+        # The same hits as plain json give the same cohort, which is the point: the
+        # two formats differ in shape, not in content.
+        other = Path(self._tmp.name) / "plain"
+        other.mkdir()
+        (other / "plain.json").write_text(
+            json.dumps({"idx": {"pfcrt": {"SRR1": 0.4, "SRR2": 0.9}}}))
+        plain = hk.harvest_local(other, Path(self._tmp.name) / "out2")
+        self.assertEqual(dict(per_target["pfcrt"]), dict(plain["pfcrt"]))
+
+    def test_hits_that_are_not_numbers_at_all_are_refused_not_harvested_as_nothing(self):
+        """GX-07. A format whose hits this cannot read is an unreadable input, not an
+        empty collection, and the difference has to reach the exit code."""
+        self._write_shard("odd.json", {"idx": {"pfcrt": {"SRR1": {"score": 0.4}}}})
+        with self.assertRaises(RuntimeError) as cm:
+            hk.harvest_local(self.shards, self.out)
+        self.assertIn("numeric", str(cm.exception))
+
+    def test_a_genuinely_empty_shard_set_is_still_a_clean_harvest(self):
+        """The other side of it: nothing was dropped to get to zero, so zero stands."""
+        self._write_shard("empty.json", {"idx": {"q": {}}})
+        per_target = hk.harvest_local(self.shards, self.out)
+        self.assertEqual(dict(per_target), {})
+        self.assertTrue((self.out / "harvest.summary.json").is_file())
+
     def test_gzipped_shard_files_are_read_whatever_they_are_called(self):
         import gzip
         import json as _json

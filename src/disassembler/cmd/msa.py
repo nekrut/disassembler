@@ -336,9 +336,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "Intended for walker output, which is per-accession reconstructions in their own "
             "coordinates. MAFFT does not reverse-complement, so each row is oriented to the "
             "reference by shared 15-mers first, and the alignment is checked for identity to "
-            "the reference after. lexicmap output is already on the reference grid; under "
-            "lexicmap --require-full-length its only gaps are in-frame deletions, and rows "
-            "without one come through MAFFT unchanged. See docs/codon_msa.md."
+            "the reference after. lexicmap output is ALREADY on the reference grid: pass "
+            "--aligned for it and MAFFT is skipped, because re-placing those bases can move "
+            "a SNV across an uncovered stretch. See docs/codon_msa.md."
         ),
     )
     p.add_argument("--ref", "-r", required=True, help="Reference in-frame CDS FASTA")
@@ -354,7 +354,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                    help="Write only the alignment. FastTree is then neither looked up nor "
                         "run, so an alignment can be produced on a machine that does not "
                         "have it. Exactly one of --out-tree and --no-tree is required.")
-    p.add_argument("--mafft-threads", type=positive_int, default=8, help="MAFFT threads")
+    p.add_argument("--aligned", action="store_true",
+                   help="The input rows are already on the reference grid, one character "
+                        "per reference position, as a lexicmap cohort is. MAFFT is not run "
+                        "or looked up: it would discard the input's gaps and place the "
+                        "bases again, which moves SNVs across an uncovered stretch or a "
+                        "deletion. A row of any other length is an error. Every other check "
+                        "(coverage gate, identity, codon QC, the tree) is unchanged.")
+    p.add_argument("--mafft-threads", type=positive_int, default=8,
+                   help="MAFFT threads (ignored with --aligned, which does not run MAFFT)")
     p.add_argument("--msa-min-cov", type=fraction, default=0.70,
                    help="Minimum coverage to enter the MSA: a sequence's A/C/G/T bases, as a "
                         "fraction of the reference length (default 0.70). Gaps ('-') and N "
@@ -428,6 +436,35 @@ def run(args) -> int:
     return rc
 
 
+def _run_mafft(args, mafft_bin, clean_input_p, clean_ref_p, tmp_aln) -> int:
+    """Place the cleaned rows against the reference with MAFFT. Returns 0, or 1 having
+    reported the failure.
+
+    Pulled out of `_run` when `--aligned` gave it a second way to produce the alignment
+    (PC-01), so the two paths are visibly alternatives rather than a flag read in the
+    middle of a long function.
+    """
+    print("[*] Running MAFFT --keeplength --addfragments...")
+    mafft_cmd = [
+        mafft_bin,
+        "--auto",
+        "--keeplength",
+        # PM-11: without this MAFFT lower-cases its output, so the codon MSA was the one
+        # lower-case file in the pipeline while the docs claimed rows came through
+        # unchanged, and soft-masking tools saw a fully masked alignment.
+        "--preservecase",
+        "--thread", str(args.mafft_threads),
+        "--addfragments", str(clean_input_p),
+        str(clean_ref_p),
+    ]
+    with open(tmp_aln, "w") as fh:
+        res = subprocess.run(mafft_cmd, stdout=fh, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        print(f"MAFFT failed: {res.stderr}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _run(args, state) -> int:
     from Bio import SeqIO  # imported lazily so `disassembler --help` does not need biopython
 
@@ -450,31 +487,38 @@ def _run(args, state) -> int:
     if out_tree is not None:
         out_tree.parent.mkdir(parents=True, exist_ok=True)
 
+    # PC-01: `--aligned` says the rows are already on the reference grid, so there is no
+    # MAFFT to find and no MAFFT release to refuse.
+    aligned_in = bool(getattr(args, "aligned", False))
+    mafft_bin = None
     fasttree_bin = None
     try:
-        mafft_bin = find_bin("mafft")
+        if not aligned_in:
+            mafft_bin = find_bin("mafft")
         if want_tree:
             fasttree_bin = find_bin("fasttree", "FastTree")
-        state["mafft_bin"] = str(mafft_bin)
+        state["mafft_bin"] = str(mafft_bin) if mafft_bin else None
         state["fasttree_bin"] = str(fasttree_bin) if fasttree_bin else None
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
     # PM-17: refuse a MAFFT release known to break --addfragments, before any work.
-    try:
-        check_mafft(mafft_bin)
-    except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+    if mafft_bin is not None:
+        try:
+            check_mafft(mafft_bin)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
     # PM-16: nothing recorded which MAFFT or FastTree produced the result, although the
     # published recipe leaves MAFFT unpinned, so two installs could give different files
     # with nothing in either output naming the tools.
-    state["mafft_version"] = tool_version(mafft_bin, "--version")
+    state["mafft_version"] = tool_version(mafft_bin, "--version") if mafft_bin else None
     state["fasttree_version"] = tool_version(fasttree_bin, "-expert") if fasttree_bin else None
     print(f"[*] tools: disassembler {__version__}; "
-          f"MAFFT {state['mafft_version'] or 'unknown'}"
+          + (f"MAFFT {state['mafft_version'] or 'unknown'}" if mafft_bin
+             else "no MAFFT (--aligned: rows are already on the reference grid)")
           + (f"; FastTree {state['fasttree_version'] or 'unknown'}" if fasttree_bin else ""))
 
     # A missing, zstd-compressed or binary input ends in one line, not a traceback.
@@ -542,13 +586,23 @@ def _run(args, state) -> int:
         rep_of = {}          # oriented sequence -> the id MAFFT is given for it
         input_acgt = {}      # alignment id -> A/C/G/T in the row as it went in
         kept_raw, kept_seq, kept_flipped = [], [], []
+        off_grid = []
         for raw_id, raw_seq in input_records:
             seq = raw_seq.upper()
             # Count bases, not characters: a lexicmap row is reference-length with '-'
             # where no HSP reached, so its length passed this gate whatever its coverage.
             if real_bases(seq) < ref_len * args.msa_min_cov:
                 continue
-            strand = orientation(seq, fwd_kmers, rev_kmers, fallback)
+            if aligned_in:
+                # PC-01. Already on the grid: every base is at the reference position its
+                # HSP put it at, so there is nothing to orient and nothing to place. A row
+                # of another length is not on this grid, and silently aligning it would be
+                # the defect this mode exists to avoid, so it is named and the run stops.
+                if len(seq) != ref_len:
+                    off_grid.append((raw_id, len(seq)))
+                strand = 1
+            else:
+                strand = orientation(seq, fwd_kmers, rev_kmers, fallback)
             if strand < 0:
                 seq = revcomp(seq)
                 flipped += 1
@@ -558,6 +612,16 @@ def _run(args, state) -> int:
             kept_seq.append(seq)
             kept_flipped.append(strand < 0)
             retained += 1
+
+        if off_grid:
+            shown = ", ".join(f"{rid} ({n} nt)" for rid, n in off_grid[:5])
+            more = f" and {len(off_grid) - 5} more" if len(off_grid) > 5 else ""
+            state["error"] = f"{len(off_grid)} row(s) are not on the reference grid"
+            print(f"Error: --aligned says the input is already on the reference grid, but "
+                  f"{len(off_grid)} row(s) are not {ref_len} nt: {shown}{more}. Drop "
+                  f"--aligned to align them, or give a reference of the right length.",
+                  file=sys.stderr)
+            return 1
 
         # PM-26: ids are assigned over the surviving rows at once, so one that is already
         # clean and unique keeps itself whatever order it arrived in.
@@ -616,27 +680,26 @@ def _run(args, state) -> int:
         with open(clean_ref_p, "w") as fh:
             fh.write(f">Reference\n{str(ref_rec.seq).upper()}\n")
 
-        print("[*] Running MAFFT --keeplength --addfragments...")
-        mafft_cmd = [
-            mafft_bin,
-            "--auto",
-            "--keeplength",
-            # PM-11: without this MAFFT lower-cases its output, so the codon MSA was the one
-            # lower-case file in the pipeline while the docs claimed rows came through
-            # unchanged, and soft-masking tools saw a fully masked alignment.
-            "--preservecase",
-            "--thread", str(args.mafft_threads),
-            "--addfragments", str(clean_input_p),
-            str(clean_ref_p),
-        ]
-
-        with open(tmp_aln, "w") as fh:
-            res = subprocess.run(mafft_cmd, stdout=fh, stderr=subprocess.PIPE, text=True)
-
-        if res.returncode != 0:
-            print(f"MAFFT failed: {res.stderr}", file=sys.stderr)
-            return 1
-
+        if aligned_in:
+            # PC-01. The rows are the alignment. MAFFT would discard their gaps and place
+            # the bases again, and where several placements score the same it slides bases
+            # across an uncovered stretch or a deletion: on a reference HIV-1 pol with two
+            # gap-free HSPs around an internal hole, a C1416G call moved to T1424C and a
+            # codon with it. In synthetic 200-row cohorts, 27 to 39% of rows with an
+            # internal hole changed. So they are written out as they came.
+            print("[*] --aligned: the input is already on the reference grid, so it is "
+                  "written as the alignment (MAFFT is not run).")
+            with open(tmp_aln, "w") as fh:
+                fh.write(f">Reference\n{str(ref_rec.seq).upper()}\n")
+                written = set()
+                for clean, seq in zip(ids, kept_seq):
+                    rep = rep_of[seq]
+                    if rep == clean and rep not in written:
+                        fh.write(f">{clean}\n{seq}\n")
+                        written.add(rep)
+        else:
+            if _run_mafft(args, mafft_bin, clean_input_p, clean_ref_p, tmp_aln) != 0:
+                return 1
         # Checked before the rename, so a failed check never replaces a good alignment.
         distinct = list(SeqIO.parse(tmp_aln, "fasta"))
         # PM-06: nothing used to check that MAFFT returned the records it was given, so a
@@ -646,7 +709,8 @@ def _run(args, state) -> int:
         if (not distinct or distinct[0].id != "Reference"
                 or len(distinct) != len(rep_of) + 1
                 or any(rep not in by_id for _c, rep in rows)):
-            print(f"Error: MAFFT returned {len(distinct)} records, expected the reference "
+            who = "the grid writer" if aligned_in else "MAFFT"
+            print(f"Error: {who} returned {len(distinct)} records, expected the reference "
                   f"plus {len(rep_of)} sequences", file=sys.stderr)
             return 1
 
@@ -659,8 +723,12 @@ def _run(args, state) -> int:
             aligned_recs.append(SeqRecord(by_id[rep].seq, id=clean, name=clean,
                                           description=""))
 
-        print(f"[*] MAFFT aligned {len(rep_of)} distinct rows into {len(aligned_recs)} "
-              f"records. Checking what --keeplength did to them...")
+        if aligned_in:
+            print(f"[*] {len(rep_of)} distinct rows taken as given into {len(aligned_recs)} "
+                  f"records. Checking they are on the grid...")
+        else:
+            print(f"[*] MAFFT aligned {len(rep_of)} distinct rows into {len(aligned_recs)} "
+                  f"records. Checking what --keeplength did to them...")
         for r in aligned_recs:
             if len(r.seq) != ref_len:
                 print(

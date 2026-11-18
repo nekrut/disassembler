@@ -29,6 +29,14 @@ In local mode, every regular file directly in `--shards-dir` is read as a shard,
 name (hidden files are skipped). A file that is not valid JSON counts as a failed shard and is
 named in the log. Shards, local or fetched from Galaxy, can be gzip-compressed.
 
+Both of kmindex's hit shapes are read: `--format json` writes the containment ratio directly,
+and `--format json_vec` writes `{"R": ratio, "P": [positions]}` for the same hit. The Galaxy
+`kmindex_query` tool offers both under one output datatype, and a json_vec run used to harvest
+nothing and still exit 0, reporting "0 unique SRA runs across 0 targets". A shard whose hit
+values are neither shape is now counted, warned about, and, if nothing numeric was read at all,
+fails the harvest rather than reporting an empty cohort. A genuinely empty shard set is still a
+clean harvest of nothing.
+
 Outputs, written to `-o`:
 
 | file | contents |
@@ -104,7 +112,12 @@ The shards come from exactly one of three places:
 | `--skip-harvest` | none: reuses an earlier harvest in `--cohort-dir` |
 
 Harvest output goes to `--cohort-dir` (default `<out-dir>/cohort`), and `--target` picks which
-target's list is reconstructed. `--harvest-workers` is harvest's `--download-workers`. The
+target's list is reconstructed. **It must be among the targets of the harvest this run just
+did**: harvest writes a file per target it found, and a re-run into a directory holding an
+earlier harvest used to pick up the old `<target>.accessions.txt` and reconstruct the previous
+collection's accessions with exit 0. The run now says which targets the harvest found, and
+harvest removes the per-target files of targets it no longer has. Under `--skip-harvest` there
+is no new harvest to check against, so a hand-made cohort still works as before. `--harvest-workers` is harvest's `--download-workers`. The
 walker, sieve and MSA options are the same as `reconstruct`'s (see
 [`codon_msa.md`](codon_msa.md#disassembler-reconstruct)). For a run that never touches the
 network, harvest from `--shards-dir` (or `--skip-harvest`) and walk with `--offline` and a
@@ -121,7 +134,9 @@ harvest's `--shards-dir` setting), and it required the two Galaxy IDs even with
 `--skip-harvest`. Command lines written for that, with placeholder IDs, still run: under
 `--skip-harvest` the IDs are ignored with a warning. With `--score-bin`, `from-kmindex` passes its
 `--target` to `stratify`, so a hand-made score file in the older shape works without a target
-inside.
+inside. After a fresh harvest it also names that harvest's own score file rather than letting
+stratify scan the directory, which would have binned an earlier run's scores too; under
+`--skip-harvest` the scan stays.
 
 ## Scale
 

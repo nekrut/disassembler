@@ -166,7 +166,7 @@ and `bla_NDM` comes back with one of them and exit 0. The walker checks the pool
 grouping references that share at least 1% of their canonical 21-mers, and warns when there is
 more than one group, naming them. It warns rather than refuses, because a deliberately
 divergent panel also splits and only the user knows which was meant. `queries/master_planetary_targets.fasta`
-is a catalogue, not a panel: its 160 records fall into 49 groups, and it should be used one
+is a catalogue, not a panel: its 142 records fall into 31 groups, and it should be used one
 gene at a time.
 
 **Ambiguous reference bases never count as matched.** GraphAligner treats `N` as matching any

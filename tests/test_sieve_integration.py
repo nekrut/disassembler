@@ -418,10 +418,14 @@ class TestFromLexicmapGates(unittest.TestCase):
         self.work = Path(tempfile.mkdtemp())
         self.seen = {}
 
+        # Gap-free by default, so these tests see the gates the COHORT GATE derives.
+        # PC-03 gave the derived values a floor at the cohort's own worst row, which a
+        # fixture full of gaps would hide; `self.rows` lets one test exercise that floor.
+        self.rows = [("a", "ACGTAC"), ("b", "ACGTAG")]
+
         def fake_lexicmap(ns):
             for name in ("clean", "clean_expanded"):
-                _write(Path(f"{ns.out_prefix}.{name}.accessions.fasta"),
-                       [("a", "ACGTAC"), ("b", "ACG---")])
+                _write(Path(f"{ns.out_prefix}.{name}.accessions.fasta"), self.rows)
             return 0
 
         def fake_sieve(src, dst, **kw):
@@ -473,6 +477,30 @@ class TestFromLexicmapGates(unittest.TestCase):
     def test_explicit_values_win(self):
         seen = self._run("--sieve-max-gap-frac", "0.1", "--msa-min-cov", "0.9")
         self.assertEqual((seen["max_gap_frac"], seen["msa_min_cov"]), (0.1, 0.9))
+
+    def test_a_long_deletion_lexicmap_admitted_is_not_dropped_by_the_derived_gates(self):
+        """PC-03. lexicmap counts a trusted deletion as covered with no limit and leaves
+        `-` in the row. The derived allowance was a flat 5% over the gate, so a clean,
+        full-length row whose in-frame deletion exceeded 5% of the reference was dropped
+        by the sieve's completeness gate, with exit 0 and a line that reads as thinning.
+        Both this module's docstring and `docs/lexicmap.md` promised the opposite.
+        """
+        # Two thirds of this row is a deletion lexicmap trusted: far past the 5% margin.
+        self.rows = [("a", "ACGTACGTAC"), ("deleted", "ACG-------")]
+        seen = self._run("--require-full-length")
+        self.assertGreaterEqual(
+            seen["max_gap_frac"], 0.7,
+            "the sieve must not be told to drop the worst row in the cohort")
+        self.assertLessEqual(
+            seen["msa_min_cov"], 0.3,
+            "nor must the MSA gate ask for more ACGT than that row has")
+
+    def test_the_floor_only_ever_loosens_the_derived_gates(self):
+        """A cohort whose rows are cleaner than the gate expects leaves the derived
+        values where the gate put them: the floor is a floor, not a recalculation."""
+        self.rows = [("a", "ACGTAC"), ("b", "ACGTAG")]
+        seen = self._run()
+        self.assertEqual((seen["max_gap_frac"], seen["msa_min_cov"]), (0.25, 0.70))
 
 
 class TestSieveAdmissionAndHeaders(unittest.TestCase):

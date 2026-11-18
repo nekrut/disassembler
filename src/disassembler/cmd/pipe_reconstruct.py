@@ -164,8 +164,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                          help="MinHash sketch size m (default 256, gene-scale). Caps the "
                               "resolution of the novelty estimator at 1/m.")
     g_sieve.add_argument("--sieve-min-len", type=positive_int, default=None,
-                         help="Minimum sequence length gate for the sieve "
-                              "(default: auto = 95%% of the shortest -q record's length).")
+                         help="Minimum sequence length gate for the sieve (default: auto = "
+                              "the walker's own --min-cov, 0.85 unless you pass another "
+                              "after --, times the shortest -q record's length, so the "
+                              "sieve does not drop reconstructions the walker published).")
     g_sieve.add_argument("--sieve-bin", default=None,
                          help="Explicit path to the kmer-diversity-sieve l1_pipeline_serial "
                               "binary (auto-discovered otherwise).")
@@ -254,6 +256,49 @@ COMPOSITE_OWNED_WALKER_FLAGS = {
     "--query": "use the composite's own -q/--query (repeatable for multi-anchor)",
 }
 
+# PC-04. Not owned by the composite, but they make the walker exit 0 WITHOUT writing its
+# `-f`, which used to leave the composite aligning whatever was already at that path. Each
+# has a better form of its own, so they are refused by name rather than tolerated.
+WALKER_FLAGS_WITH_NO_OUTPUT = {
+    "--fetch-only": "it makes the walker exit without writing a reconstruction, and this "
+                    "composite needs one. To warm a cache, run `disassembler fetch` or "
+                    "`disassembler walker --fetch-only`",
+    "-h": "it prints the walker's help instead of running it; "
+          "run `disassembler walker -h`",
+    "--help": "it prints the walker's help instead of running it; "
+              "run `disassembler walker --help`",
+    "-V": "it prints the walker's version instead of running it; "
+          "run `disassembler walker --version`",
+    "--version": "it prints the walker's version instead of running it; "
+                 "run `disassembler walker --version`",
+}
+
+
+# The walker's own default `--min-cov` (walker/src/config.rs). The sieve's completeness
+# gate is derived from it so the two stages cannot disagree about which reconstructions
+# count as complete (PC-02).
+WALKER_DEFAULT_MIN_COV = 0.85
+
+
+def _walker_min_cov(extra: list[str]) -> float:
+    """The `--min-cov` the walker will actually use, given the passthrough.
+
+    The last occurrence wins, as it does in the walker's own argument parser, and the
+    walker accepts only the two-token form, never `--min-cov=X`. An unparseable or
+    out-of-range value is left to the walker to reject; this returns the default so the
+    sieve gate does not become the thing that fails first.
+    """
+    cov = WALKER_DEFAULT_MIN_COV
+    for i, tok in enumerate(extra):
+        if tok == "--min-cov" and i + 1 < len(extra):
+            try:
+                v = float(extra[i + 1])
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= v <= 1.0:
+                cov = v
+    return cov
+
 
 def _scrub_walker_passthrough(extra: list[str]) -> str | None:
     """Return an error message if `extra` re-sets a composite-owned walker flag."""
@@ -266,6 +311,11 @@ def _scrub_walker_passthrough(extra: list[str]) -> str | None:
             return (
                 f"{head} is set by the composite and cannot be overridden through "
                 f"`--`. {COMPOSITE_OWNED_WALKER_FLAGS[head]}."
+            )
+        if head in WALKER_FLAGS_WITH_NO_OUTPUT:
+            return (
+                f"{head} cannot be passed through `--`: "
+                f"{WALKER_FLAGS_WITH_NO_OUTPUT[head]}."
             )
     return None
 
@@ -450,6 +500,11 @@ def _run(args, stages) -> int:
     walker_argv += list(raw_extra)
 
     print(f"[reconstruct] 1/2 walker: {' '.join(walker_argv)}", flush=True)
+    # PC-04. The reconstruction is found by a fixed name and nothing checked that THIS run
+    # wrote it, so in an --out-dir holding an earlier run the composite reported
+    # "reconstructed N haplotype(s)" and built an MSA and a tree from the old cohort, with
+    # exit 0, presented as this run's. Removing it first makes the check below real.
+    recon.unlink(missing_ok=True)
     t0 = time.time()
     rc = summary_io.stage_entry(
         stages, "walker", t0,
@@ -472,7 +527,14 @@ def _run(args, stages) -> int:
               f"still exit {rc}. The accessions that failed are listed in {skipped}.",
               file=sys.stderr)
 
-    n_recon = sum(1 for line in recon.open() if line.startswith(">")) if recon.is_file() else 0
+    # PC-04: the file was removed before the walker ran, so its absence here means the
+    # walker exited 0 without writing one. That is not "nothing was reconstructed", it is
+    # "that was not a reconstruction run", and it used to be indistinguishable from a run
+    # whose output an earlier run had left behind.
+    if not recon.is_file():
+        return _die(f"logan-walker exited {rc} but wrote no {recon}; nothing to align. "
+                    f"A walker flag passed after `--` can do this.")
+    n_recon = sum(1 for line in recon.open() if line.startswith(">"))
     print(f"[reconstruct] reconstructed {n_recon} haplotype(s) -> {recon}", flush=True)
     if n_recon == 0:
         return _die("no haplotypes reconstructed; nothing to align.")
@@ -489,15 +551,29 @@ def _run(args, stages) -> int:
     # ---- optional sieve ----------------------------------------------------
     msa_input = recon
     if args.sieve and not args.skip_tree:
-        # The default --sieve-min-len is 95% of the shortest walker reference: each primary
-        # was reconstructed against its own anchor, which need not be the MSA reference.
+        # The default --sieve-min-len follows the WALKER's own coverage gate, over the
+        # shortest reference: each primary was reconstructed against its own anchor, which
+        # need not be the MSA reference.
+        #
+        # PC-02: it used to be a flat 95%, while the walker publishes a primary from 85% of
+        # the reference and the MSA stage admits a row with 70% of it in ACGT. Every
+        # haplotype between those two numbers was removed here, at a step documented as
+        # near-duplicate thinning, with exit 0 and no line in the summary: a walk that did
+        # not reach a terminus, or a sample with a real in-frame deletion, which are the
+        # divergent lineages thinning exists to keep. `from-lexicmap` already derives its
+        # gates from the gate upstream of it; this did not.
+        #
+        # No margin is added: `cov` is measured against the winning anchor, which is at
+        # least as long as the shortest reference, so this cannot be stricter than the
+        # walker was.
         min_len = args.sieve_min_len
         if min_len is None:
             rid, length = min(references, key=lambda r: r[1])
-            min_len = int(length * 0.95)
-            if len(references) > 1:
-                print(f"[reconstruct] sieve --min-len {min_len}: 95% of the shortest "
-                      f"reference ({rid}, {length} nt).", flush=True)
+            frac = min(WALKER_DEFAULT_MIN_COV, _walker_min_cov(raw_extra))
+            min_len = int(length * frac)
+            print(f"[reconstruct] sieve --min-len {min_len}: {frac:.2f} of the shortest "
+                  f"reference ({rid}, {length} nt), which is the walker's own --min-cov.",
+                  flush=True)
         t0 = time.time()
         rc = summary_io.stage_entry(
             stages, "sieve", t0,

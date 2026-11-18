@@ -135,14 +135,25 @@ def fetch_shard(item, base_url, sess):
 
 
 def _merge_payload(d, per_target):
-    """Fold one shard payload into per_target in place. Returns the count of
-    target names that were skipped as unusable (dict key / filename).
+    """Fold one shard payload into per_target in place. Returns
+    `(n_bad_target, n_unparsed)`: target names skipped as unusable (dict key /
+    filename), and hit values that were not a number.
 
     Pulled out of harvest_collection so the local-files path can reuse the
     exact same merge semantics. Malformed-payload handling stays at the call
     site, where it is wired to the per-mode failure counter.
+
+    GX-07: kmindex writes a hit value two ways. `--format json` gives the ratio
+    directly, `--format json_vec` gives `{"R": ratio, "P": [positions]}`, and the
+    Galaxy `kmindex_query` tool offers both under one output datatype. Every
+    json_vec value failed `float()` and was dropped by a bare `continue`, so a
+    whole run harvested nothing and still exited 0, reporting "0 unique SRA runs
+    across 0 targets". The ratio is the same number in both shapes, so it is
+    unwrapped here rather than refused, and anything still unparseable is counted
+    instead of vanishing.
     """
     n_bad_target = 0
+    n_unparsed = 0
     for shard, q in d.items():
         if not isinstance(q, dict):
             continue
@@ -154,17 +165,73 @@ def _merge_payload(d, per_target):
                 n_bad_target += 1
                 continue
             for acc, score in hits.items():
+                if isinstance(score, dict) and "R" in score:
+                    score = score["R"]
                 try:
                     sc = float(score)
-                except Exception:
+                except (TypeError, ValueError):
+                    n_unparsed += 1
                     continue
                 if sc > per_target[clean_target].get(acc, 0.0):
                     per_target[clean_target][acc] = sc
-    return n_bad_target
+    return n_bad_target, n_unparsed
+
+
+def _refuse_if_nothing_was_numeric(per_target, n_unparsed):
+    """GX-07. Hits were read and none of them was a number: that is an unreadable
+    input, not an empty collection.
+
+    A genuinely empty shard set (`{"idx": {"q": {}}}`) is still a clean, successful
+    harvest of nothing, because nothing was dropped to get there. What this refuses is
+    the case where every value was rejected: kmindex run with a format whose hit shape
+    this does not know, or a file that is not kmindex output at all. Before, both came
+    out as "0 unique SRA runs across 0 targets" and exit 0, and the green job hid which
+    had happened.
+    """
+    if n_unparsed and not any(per_target.values()):
+        raise RuntimeError(
+            f"none of the {n_unparsed} hit value(s) read were numeric, so no cohort "
+            f"was harvested. kmindex writes the ratio directly with --format json and "
+            f'as {{"R": ratio, "P": [...]}} with --format json_vec; both are read. '
+            f"Check the format these shards were written in."
+        )
+
+
+def _drop_earlier_targets(out_dir, targets):
+    """Remove the per-target files of a previous harvest into this directory.
+
+    PC-05. Harvest writes `<target>.accessions.txt` and `<target>.scores.json` for this
+    run's targets only, and left an earlier run's beside them. A composite that picks its
+    cohort by name then found the old file and reconstructed the old collection's
+    accessions, reporting it as the new collection's result.
+
+    Only files whose name round-trips through `safe_target_name` are removed, so this
+    never deletes something it did not write, and only when a previous summary says they
+    were targets of a harvest into this directory.
+    """
+    prev = out_dir / "harvest.summary.json"
+    if not prev.is_file():
+        return
+    try:
+        doc = json.loads(prev.read_text())
+    except Exception:
+        return
+    # Under the summary contract each target is a row in `records`; the pre-0.2.0 shape
+    # was a bare map of target to {n, max_score} with a `_union` pseudo-entry. Read either,
+    # because a directory can hold a harvest written by an older build.
+    if isinstance(doc.get("records"), list):
+        earlier = [r.get("target") for r in doc["records"] if isinstance(r, dict)]
+    else:
+        earlier = [k for k, v in doc.items() if k != "_union" and isinstance(v, dict)]
+    for t in earlier:
+        if not isinstance(t, str) or t in targets or safe_target_name(t) != t:
+            continue
+        for sfx in (".accessions.txt", ".scores.json", ".bins.txt"):
+            (out_dir / f"{t}{sfx}").unlink(missing_ok=True)
 
 
 def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target,
-                   failure_noun="shard", started=None, source=None):
+                   failure_noun="shard", started=None, source=None, n_unparsed=0):
     """Emit the per-target accession lists, union, and summary.
 
     `failure_noun` is just a label for the human-facing message so the local-files
@@ -172,6 +239,7 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
     """
     all_union = set()
     summary = {}
+    _drop_earlier_targets(out_dir, set(per_target))
     for target, acc_dict in sorted(per_target.items()):
         # PH-01: by score, highest first, **ties broken by accession**. Python's sort is
         # stable, so sorting on the score alone left tied accessions in dict insertion
@@ -221,7 +289,11 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
             n_ok=sum(1 for v in summary.values() if v["n"] > 0),
         ),
         discards={f"{failure_noun}s": {"failed": n_failed, "empty": n_empty},
-                  "targets": {"unusable_name": n_bad_target}},
+                  "targets": {"unusable_name": n_bad_target},
+                  # GX-07: hit values that were neither a number nor a json_vec
+                  # `{"R": ratio, "P": [...]}`. Non-zero means some hits were read
+                  # and dropped, which used to happen in silence.
+                  "hits": {"non_numeric_score": n_unparsed}},
         cohort={"union": len(all_union), "targets": len(summary),
                 "max_score": summary_io.quantiles(
                     [v["max_score"] for v in summary.values()])},
@@ -237,6 +309,14 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
     if n_bad_target:
         print(f"[!] {n_bad_target} target name(s) were unusable as a key or filename "
               f"and were skipped.", file=sys.stderr)
+    # GX-07. A shard whose hit values are not numbers is not an empty collection, and
+    # harvesting nothing from it must not read as "this collection has no hits".
+    if n_unparsed:
+        print(f"[!] {n_unparsed} hit value(s) were not numeric and were skipped. "
+              f"kmindex writes the ratio directly with --format json and as "
+              f'{{"R": ratio, "P": [...]}} with --format json_vec; both are read. '
+              f"Another format, or a file that is not kmindex output, gives this.",
+              file=sys.stderr)
 
     print(f"\n[{'!' if n_failed else '✓'}] Harvest complete: {len(all_union)} unique "
           f"SRA runs across {len(per_target)} targets"
@@ -274,6 +354,7 @@ def harvest_local(shards_dir, out_dir):
     n_failed = 0
     n_empty = 0
     n_bad_target = 0
+    n_unparsed = 0
     start_t = time.time()
 
     for i, path in enumerate(shard_files, start=1):
@@ -298,7 +379,9 @@ def harvest_local(shards_dir, out_dir):
             n_empty += 1
             continue
         try:
-            n_bad_target += _merge_payload(d, per_target)
+            bad, unparsed = _merge_payload(d, per_target)
+            n_bad_target += bad
+            n_unparsed += unparsed
         except Exception as e:
             n_failed += 1
             print(f"    [!] shard {path.name} payload unusable "
@@ -307,13 +390,14 @@ def harvest_local(shards_dir, out_dir):
 
     _write_outputs(per_target, out_dir, len(shard_files), n_failed, n_empty,
                    n_bad_target, failure_noun="shard file", started=start_t,
-                   source=("file", str(shards_dir)))
+                   source=("file", str(shards_dir)), n_unparsed=n_unparsed)
 
     if shard_files and n_failed == len(shard_files):
         raise RuntimeError(
             f"all {len(shard_files)} shard files failed to parse (last error "
             f"above); no cohort was harvested."
         )
+    _refuse_if_nothing_was_numeric(per_target, n_unparsed)
     return per_target
 
 
@@ -366,6 +450,7 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
     n_failed = 0
     n_empty = 0
     n_bad_target = 0
+    n_unparsed = 0
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[*] Streaming and merging shard JSONs across {max_workers} threads...",
@@ -400,7 +485,9 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
                 # One malformed shard must not tear down the executor and lose the
                 # whole run.
                 try:
-                    n_bad_target += _merge_payload(d, per_target)
+                    bad, unparsed = _merge_payload(d, per_target)
+                    n_bad_target += bad
+                    n_unparsed += unparsed
                 except Exception as e:
                     n_failed += 1
                     print(f"    [!] shard payload unusable "
@@ -412,7 +499,8 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
 
     _write_outputs(per_target, out_dir, len(items), n_failed, n_empty, n_bad_target,
                    failure_noun="shard", started=start_t,
-                   source=("galaxy", f"{base_url}#collection={coll_id}"))
+                   source=("galaxy", f"{base_url}#collection={coll_id}"),
+                   n_unparsed=n_unparsed)
 
     # A run that fetched nothing has produced no cohort. Saying so is the
     # difference between a downstream stage refusing to start and one silently
@@ -422,6 +510,7 @@ def harvest_collection(coll_id, history_id, base_url, api_key, out_dir, max_work
             f"all {len(items)} shard fetches failed (last error above); "
             f"no cohort was harvested. Check the Galaxy API key and the collection id."
         )
+    _refuse_if_nothing_was_numeric(per_target, n_unparsed)
     return per_target
 
 

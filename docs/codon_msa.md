@@ -121,6 +121,13 @@ Any other walker flag goes after a literal `--`, for example
 walker's `-f` (so later stages can find the FASTA) and keeps `-t` at 1 (GraphAligner is not
 reproducible with more threads).
 
+Five flags are refused there, because each makes the walker exit 0 without writing a
+reconstruction for the next stage to align: `--fetch-only`, `-h`, `--help`, `-V` and
+`--version`. Use `disassembler fetch` or `disassembler walker --fetch-only` to warm a cache,
+and `disassembler walker -h` or `--version` for the walker's own help. The composite also
+removes the reconstruction before the walker runs, so a walker that writes nothing fails the
+run rather than leaving an earlier run's cohort to be aligned as this one's.
+
 With more than one reference record, from several `-q` or one multi-record file, the walker
 runs in multi-anchor mode, and `reconstruct` says which record the MSA aligns against (the
 first record of the first `-q`, unless `--msa-reference` names another). The sieve's default
@@ -160,15 +167,28 @@ versus the walker's `-t` (GraphAligner).
 ## LexicMap cohorts
 
 `disassembler lexicmap` writes its clean cohort on the reference's coordinate grid already
-(see [`lexicmap.md`](lexicmap.md#outputs)). With `--require-full-length`, every row is
-reference-length and its only gaps are in-frame deletions (whole codons of `-`). Rows without a
-deletion come through MAFFT with the same sequence, character for character: on three cohorts
-of 27 to 14,594 sequences, re-running MAFFT reproduced them. MAFFT wraps its output at 60
-columns, so the file is not a byte copy of the input, and `--preservecase` keeps the case
-(without it, which is how 0.1.x ran, the codon MSA was the one lower-case file in the
-pipeline). With the default `--min-cov 0.80`, rows can also carry `-`
-at uncovered reference positions, and MAFFT may place gaps differently. `from-lexicmap` runs `msa` in both cases so that
-both routes produce the same output shape.
+(see [`lexicmap.md`](lexicmap.md#outputs)): every base sits at the reference position its HSP
+gives it, and `-` marks a position no HSP reached. **That cohort is an alignment, so `msa`
+takes it as one.** `from-lexicmap` passes `--aligned`, and `msa --aligned` writes the rows out
+unchanged rather than calling MAFFT at all. The run is about twice as fast, and
+`--mafft-threads` is inert there (the run says so).
+
+Running MAFFT over those rows was wrong, not merely redundant. It discards the input's gaps and
+places the bases again, and wherever several placements score the same it can slide bases
+across an uncovered stretch or a deletion. On a reference HIV-1 pol with two gap-free HSPs
+around an internal hole, a `C1416G` call came out of the MSA as `T1424C`, a different codon and
+a different amino acid, while the haplotype table still reported `C1416G`, with exit 0 and the
+identity check passing. In synthetic 200-row cohorts, 27 to 39% of rows with an internal hole
+changed; rows truncated only at their ends never did.
+
+A row that is not reference-length is an error under `--aligned`, not something to re-place
+silently: the mode's whole premise is that the input grid is the output grid. Every other check
+is unchanged, including the coverage gate, the identity check, the codon QC and the tree.
+
+With `--require-full-length` every row is reference-length and its only gaps are in-frame
+deletions (whole codons of `-`). Such rows did come through MAFFT unchanged, character for
+character, on three cohorts of 27 to 14,594 sequences, which is why this went unnoticed: the
+cohorts where it bites are the ones with an internal hole, which is what tiling is for.
 
 In `from-lexicmap`, `--msa-min-cov` defaults to `0.70` or the cohort's coverage gate minus
 0.05, whichever is lower (`0.45` with `--include-partials`), so the MSA keeps the rows lexicmap

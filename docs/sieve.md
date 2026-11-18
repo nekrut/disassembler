@@ -37,7 +37,7 @@ disassembler sieve -i out/zika/reconstructed.fasta -o out/zika/sieved.fasta \
 | `--sieve` | | off | enable the stage |
 | `--sieve-threshold <F>` | `--threshold` | `0.005` | novelty threshold tau. A sequence is promoted only if `1 - maxJaccard >= tau` against the promoted set, so a **higher** tau collapses **more** |
 | `--sieve-sketch <M>` | `--sketch` | `256` | MinHash sketch size. Novelty finer than `1/M` cannot be resolved |
-| `--sieve-min-len <N>` | `--min-len` | 95% of the shortest reference record | minimum sequence length. The 5% margin is there because reconstructions are often a few bases shorter than the reference; the shortest record, because in multi-anchor mode each primary is reconstructed against its own reference |
+| `--sieve-min-len <N>` | `--min-len` | the walker's `--min-cov` times the shortest reference record | minimum sequence length. It follows the walker's own coverage gate (0.85 by default, or whatever is passed to the walker after `--`), because anything the walker published is a reconstruction this step is not meant to judge: it thins near-duplicates. Until 0.2.0 it was a flat 95%, so every haplotype between 85% and 95% of the reference was dropped here although the walker and the MSA both accept it, which is exactly the walk that stops short of a terminus or the sample with a real in-frame deletion. The shortest record, because in multi-anchor mode each primary is reconstructed against its own reference, and no margin on top, because `cov` is measured against the winning anchor, which is at least that long |
 | `--sieve-max-gap-frac <F>` (`from-lexicmap` only) | `--max-gap-frac` | `0.05`; derived in `from-lexicmap` (below) | the largest share of a sequence that may be gaps (`-`) or other non-ACGT characters |
 | `--sieve-bin <PATH>` | `--sieve-bin` | discovered | path to `l1_pipeline_serial` (from `PATH`, or a build in `extern/kmer-diversity-sieve`) |
 
@@ -71,8 +71,13 @@ haplotypes in a SARS-CoV-2 spike cohort, all rows lexicmap had already accepted.
 | `--include-partials` | `--min-cov-partial` (`0.50`) | `0.55` |
 
 The extra 0.05 leaves room for in-frame deletions, which count as covered but are `-` in the
-row. To run the atomic `sieve` on a LexicMap cohort, set `--max-gap-frac` the same way. Either
-way, the log says how many sequences the gate dropped, and for which reason.
+row, **and the derived value is never set below the cohort's own worst row**. lexicmap counts a
+trusted deletion as covered with no limit, so a clean, full-length row whose deletion is longer
+than 5% of the gene (45 nt in 900) used to be dropped here, by a step documented as
+near-duplicate thinning, with exit 0 and a `6 -> 5 haplotypes` line. Indel alleles are often
+what a cohort is for. The run prints the worst row's share beside the gate it derived. To run
+the atomic `sieve` on a LexicMap cohort, set `--max-gap-frac` the same way. Either way, the log
+says how many sequences the gate dropped, and for which reason.
 
 Keeping partial rows has a cost. The sieve compares k-mer sets, so a partial row looks novel
 next to a full-length one it otherwise matches, and is rarely thinned. On the FKS1 cohort above,

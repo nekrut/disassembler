@@ -125,7 +125,7 @@ pub fn version(bin: &Path) -> Result<String> {
 /// handing the whole file to GraphAligner undoes that: it aligns every record, and
 /// `parse_gaf` used to take the best-scoring row across all of them. `stitch` then sliced
 /// with that row's coordinates while dividing by the *selected* record's length, so a
-/// 160-record panel such as `queries/master_planetary_targets.fasta` produced another gene's
+/// 142-record panel such as `queries/master_planetary_targets.fasta` produced another gene's
 /// path published under the first gene's name, at a coverage above 1.0.
 ///
 /// Every reference in `queries` is therefore written out as its own `>record_id` record in a

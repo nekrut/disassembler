@@ -76,10 +76,13 @@ disassembler from-lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.
 ```
 
 `queries/` holds reference CDSs to start from: PfCRT, HIV-1 *pol*, 26 marker genes under
-`queries/markers/`, and `master_planetary_targets.fasta`, a 160-record catalogue spanning 25
+`queries/markers/`, and `master_planetary_targets.fasta`, a 142-record catalogue spanning 25
 genes. The catalogue is a place to take a reference from, not a `-q` panel: the walker keeps
 one primary per accession, so a pool of different genes reports only one of them. Pass
 references that are strains of a single gene, as `panels/sarscov2_spike_11strains.fa` is.
+Its `candida_auris_erg11` and `p_infestans_avr3a` groups are reference-only: the records that
+stood there as `var1..9` were other genes from the same contig, not alleles, and were removed
+rather than replaced (`tests/test_master_panel_homology.py` checks the rest).
 
 ## Commands
 

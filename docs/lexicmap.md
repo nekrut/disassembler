@@ -194,7 +194,11 @@ disassembler from-lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.
 a path ending in `/`, writes `<dir>/<reference stem>.*`, as `--out-dir <dir>` does whether or not
 the directory exists yet. (Before 0.1.1, `--out-dir` was another spelling of `-o`, so a directory
 that did not exist yet was taken as a prefix.) `from-lexicmap -o DIR` writes the lexicmap files as
-`DIR/lexicmap.*` and the MSA and tree alongside.
+`DIR/lexicmap.*` and the MSA and tree alongside. `DIR/lexicmap` must therefore not itself be a
+directory: lexicmap would write inside it as `DIR/lexicmap/<reference stem>.*` while the
+composite went on reading `DIR/lexicmap.clean.accessions.fasta`, which with an earlier run's
+file at that path meant aligning the old cohort. `from-lexicmap` refuses that case, and removes
+the cohort files it is about to read before lexicmap runs.
 
 ## Outputs
 
@@ -284,8 +288,13 @@ Runs `lexicmap`, then (with `--sieve`) the sieve, then `msa`, on
 `--include-partials`. It takes every `lexicmap` option, the `--sieve-*` options (see
 [`sieve.md`](sieve.md)), and `--mafft-threads` / `--msa-min-cov` for the MSA stage (see
 [`codon_msa.md`](codon_msa.md#lexicmap-cohorts)). The sieve's gap limit and the MSA's coverage
-gate default to values derived from the cohort's own coverage gate, so neither stage drops rows
-for coverage that lexicmap already accepted.
+gate default to values derived from the cohort's own coverage gate, and from the cohort's worst
+row, so neither stage drops rows for coverage that lexicmap already accepted. The MSA stage
+runs with `--aligned`, because this cohort is already on the reference grid: the rows are
+written into the alignment as they are, rather than being re-placed by MAFFT, which could move
+a base across an uncovered stretch (see [`codon_msa.md`](codon_msa.md#lexicmap-cohorts)). That second floor
+is what makes the promise true for a long in-frame deletion: lexicmap counts a trusted deletion
+as covered with no limit, while the row keeps `-` there.
 
 Each run removes the sieved cohorts an earlier run left in `-o`, since they no longer match the
 cohorts lexicmap has just rewritten; with `--sieve`, this run's is written again. An empty cohort
