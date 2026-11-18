@@ -232,7 +232,7 @@ def _stage_code(rc: int) -> int:
 
 
 def _die(msg: str, code: int = 1) -> int:
-    # `code` so a missing binary can exit 127 here as it does in the stage (PL-27). The
+    # `code` so a missing binary can exit 127 here as it does in the stage. The
     # message already names the command, so it is not prefixed twice.
     print(msg if msg.startswith("reconstruct: ") else f"reconstruct: {msg}", file=sys.stderr)
     return code
@@ -256,7 +256,7 @@ COMPOSITE_OWNED_WALKER_FLAGS = {
     "--query": "use the composite's own -q/--query (repeatable for multi-anchor)",
 }
 
-# PC-04. Not owned by the composite, but they make the walker exit 0 WITHOUT writing its
+# Not owned by the composite, but they make the walker exit 0 WITHOUT writing its
 # `-f`, which used to leave the composite aligning whatever was already at that path. Each
 # has a better form of its own, so they are refused by name rather than tolerated.
 WALKER_FLAGS_WITH_NO_OUTPUT = {
@@ -276,7 +276,7 @@ WALKER_FLAGS_WITH_NO_OUTPUT = {
 
 # The walker's own default `--min-cov` (walker/src/config.rs). The sieve's completeness
 # gate is derived from it so the two stages cannot disagree about which reconstructions
-# count as complete (PC-02).
+# count as complete.
 WALKER_DEFAULT_MIN_COV = 0.85
 
 
@@ -431,9 +431,9 @@ def _run(args, stages) -> int:
 
     _walker = resolve_walker(args.walker_bin)
     if not _walker:
-        # PL-27: the same message the `walker` stage prints, and the same exit code.
+        # The same message the `walker` stage prints, and the same exit code.
         return _die(not_found_message("walker", "reconstruct"), EX_TOOL_NOT_FOUND)
-    # PK-01: refuse an old walker in the preflight, before the fetch and the walk.
+    # Refuse an old walker in the preflight, before the fetch and the walk.
     _ver_err = walker_version_error(_walker)
     if _ver_err:
         return _die(_ver_err)
@@ -500,7 +500,7 @@ def _run(args, stages) -> int:
     walker_argv += list(raw_extra)
 
     print(f"[reconstruct] 1/2 walker: {' '.join(walker_argv)}", flush=True)
-    # PC-04. The reconstruction is found by a fixed name and nothing checked that THIS run
+    # The reconstruction is found by a fixed name and nothing checked that THIS run
     # wrote it, so in an --out-dir holding an earlier run the composite reported
     # "reconstructed N haplotype(s)" and built an MSA and a tree from the old cohort, with
     # exit 0, presented as this run's. Removing it first makes the check below real.
@@ -527,7 +527,7 @@ def _run(args, stages) -> int:
               f"still exit {rc}. The accessions that failed are listed in {skipped}.",
               file=sys.stderr)
 
-    # PC-04: the file was removed before the walker ran, so its absence here means the
+    # The file was removed before the walker ran, so its absence here means the
     # walker exited 0 without writing one. That is not "nothing was reconstructed", it is
     # "that was not a reconstruction run", and it used to be indistinguishable from a run
     # whose output an earlier run had left behind.
@@ -555,13 +555,11 @@ def _run(args, stages) -> int:
         # shortest reference: each primary was reconstructed against its own anchor, which
         # need not be the MSA reference.
         #
-        # PC-02: it used to be a flat 95%, while the walker publishes a primary from 85% of
-        # the reference and the MSA stage admits a row with 70% of it in ACGT. Every
-        # haplotype between those two numbers was removed here, at a step documented as
-        # near-duplicate thinning, with exit 0 and no line in the summary: a walk that did
-        # not reach a terminus, or a sample with a real in-frame deletion, which are the
-        # divergent lineages thinning exists to keep. `from-lexicmap` already derives its
-        # gates from the gate upstream of it; this did not.
+        # Not a flat 95%: the walker publishes a primary from 85% of the reference and the
+        # MSA admits a row with 70% of it in ACGT, so a flat gate here removes every
+        # haplotype in between at a step documented as near-duplicate thinning, with exit 0
+        # and no line in the summary. Those are the walks that stop short of a terminus and
+        # the samples with a real in-frame deletion.
         #
         # No margin is added: `cov` is measured against the winning anchor, which is at
         # least as long as the shortest reference, so this cannot be stricter than the

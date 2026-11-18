@@ -20,7 +20,7 @@
 //! quasispecies claim cannot be audited from the output at all.
 //!
 //! IN   UnitigGraph, Subgraph
-//! OUT  Vec<Bubble>
+//! OUT  `Vec<Bubble>`
 
 use crate::config::Config;
 use crate::error::Result;
@@ -47,8 +47,7 @@ use std::collections::HashMap;
 /// Two consequences. A plain chain `x <- u -> y` reads as a two-way fork. And because Logan
 /// writes every edge into both endpoints' headers, `u -> v` and `v -> u` are the same edge
 /// seen twice, so both "branches" appear to lead back to `u`, which is then reported as its
-/// own merge node. Measured: `fork == merge` on 93.1% of `ERR2028820`'s 202 bubbles and
-/// 58.5% of `SRR8209082`'s 11,825.
+/// own merge node: on an unoriented graph `fork == merge` on 93.1% of `ERR2028820`'s bubbles.
 ///
 /// Here the graph is over *oriented* nodes, `(unitig, strand)`. An edge in `u`'s header is
 /// the traversal `(u, s1) -> (t, s2)`; the reverse traversal `(t, !s2) -> (u, !s1)` arrives
@@ -68,13 +67,10 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
 
 /// [`phase`] with the coverage an allele must carry given explicitly.
 ///
-/// WG-03. The gate used to be `cfg.min_abund` alone, an absolute 5x, and the stage ran before
-/// the alignment, so it was applied to the neighbourhood as extracted. On a 15,000x sample
-/// that admits anything carried by a handful of erroneous reads, anywhere near the gene:
-/// `SRR8209082` reported **3,632 bubbles whose strongest allele was at most 66x**, a median of
-/// 11.9x, none of them above 0.5% of the gene's depth, while the real second population at
-/// 3,600x was not among them. A reader taking `bubbles.json` for quasispecies evidence was
-/// reading sequencing error.
+/// An absolute `cfg.min_abund` will not do. On a 15,000x sample a flat 5x admits anything
+/// carried by a handful of erroneous reads anywhere near the gene: `SRR8209082` yields 3,632
+/// bubbles whose strongest allele is at most 66x, a median of 11.9x, none above 0.5% of the
+/// gene's depth, while its real second population at 3,600x is not among them.
 ///
 /// The caller passes the floor the rest of the run is using, which is depth-relative, so what
 /// counts as an allele here is what counts as one in the prune and the variant stages. A run
@@ -120,7 +116,7 @@ pub fn phase_with_floor(
         (subgraph.nodes[i], s)
     };
 
-    // WG-04: keyed on the mirror-canonical allele set, so one set is one record however many
+    // Keyed on the mirror-canonical allele set, so one set is one record however many
     // flank pairs it sits between.
     let mut by_alleles: std::collections::BTreeMap<Vec<u32>, Bubble> = Default::default();
     for fork in 0..(n * 2) {
@@ -145,9 +141,9 @@ pub fn phase_with_floor(
             continue;
         }
         // Sorted for a deterministic emission order, which a hash-ordered map would not give.
-        // NOT to pick a single winner: this used to take `reconverged[0]` and discard the
-        // rest, so a fork with several reconvergence points reported one bubble and silently
-        // lost the others, in every orientation, before the dedup below was even reached.
+        // NOT to pick a single winner: taking `reconverged[0]` alone reports one bubble per
+        // fork and silently loses the others, in every orientation, before the dedup below
+        // is reached.
         reconverged.sort_unstable();
 
         for &merge in &reconverged {
@@ -175,10 +171,10 @@ pub fn phase_with_floor(
             }
 
             // Only the exits that actually reach THIS merge are alleles of this bubble.
-            // `total` and `kept` used to iterate every exit from the fork, so a third branch
-            // heading somewhere else was published as an allele of a bubble it is not part
-            // of, and its coverage diluted the real branches' VAFs, which can push a true
-            // minority allele under `min_vaf` and suppress the bubble via `kept.len() < 2`.
+            // Iterating every exit from the fork instead publishes a third branch heading
+            // somewhere else as an allele of a bubble it is not part of, and its coverage
+            // dilutes the real branches' VAFs, which can push a true minority allele under
+            // `min_vaf` and suppress the bubble via `kept.len() < 2`.
             // `out[b]` is sorted and deduped above, so this is a binary search.
             let in_bubble: Vec<u32> = branches
                 .iter()
@@ -189,7 +185,7 @@ pub fn phase_with_floor(
                 continue;
             }
 
-            // WG-11. The alleles must be two different unitigs, and neither may be a flank.
+            // The alleles must be two different unitigs, and neither may be a flank.
             // The reconvergence test excludes only the fork's own oriented node, so a unitig
             // end linking to both strands of one neighbour (an inverted repeat) produced a
             // "bubble" whose two alleles are the same unitig at 0.5 each, and a self-looping
@@ -234,7 +230,7 @@ pub fn phase_with_floor(
                 continue;
             }
             kept.sort_by_key(|a| (a.node, a.strand));
-            // WV-03: measured over every in-bubble branch, including the ones the gates
+            // Measured over every in-bubble branch, including the ones the gates
             // dropped, because the total these VAFs divide by was summed over all of them.
             let ka_saturated = in_bubble
                 .iter()
@@ -243,7 +239,7 @@ pub fn phase_with_floor(
             let (fork_id, fork_strand) = unlocal(f);
             let (merge_id, merge_strand) = unlocal(merge);
 
-            // WG-04. The alleles identify the bubble; the flanks are where it was found. The
+            // The alleles identify the bubble; the flanks are where it was found. The
             // key is mirror-canonical so that a set and its reverse complement, which are the
             // same two sequences read from the other end, cannot be two records.
             let key = {
@@ -287,7 +283,7 @@ mod tests {
     fn build(fa: &str) -> UnitigGraph {
         parse::build(&"T".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap()
     }
-    /// A config and the guard that removes its scratch directory (TW-10). Every test binds
+    /// A config and the guard that removes its scratch directory. Every test binds
     /// the guard as `_d`; dropping it early would delete the GFA the test is still reading.
     fn cfg() -> (Config, crate::scratch::TestDir) {
         let d = crate::scratch::TestDir::new("phase");
@@ -370,7 +366,7 @@ mod tests {
         }
     }
 
-    /// WG-03. The same diamond is noise beside a deep gene and a variant beside a shallow
+    /// The same diamond is noise beside a deep gene and a variant beside a shallow
     /// one, and only a depth-relative floor can tell them apart.
     #[test]
     fn a_shallow_diamond_beside_a_deep_gene_is_not_an_allele() {
@@ -405,7 +401,7 @@ mod tests {
         cleanup(&sub2);
     }
 
-    /// WG-11. A unitig end linking to BOTH strands of one neighbour is an inverted repeat,
+    /// A unitig end linking to BOTH strands of one neighbour is an inverted repeat,
     /// not a two-allele site: the "two alleles" are one sequence and its reverse complement,
     /// and the VAFs would split one unitig's coverage in half against itself.
     #[test]
@@ -423,7 +419,7 @@ mod tests {
         assert!(b.is_empty(), "one unitig cannot be two alleles ({} bubbles)", b.len());
     }
 
-    /// WG-11. A unitig that is both an allele and the merge is a loop, not a choice between
+    /// A unitig that is both an allele and the merge is a loop, not a choice between
     /// two sequences.
     #[test]
     fn a_unitig_that_is_both_allele_and_flank_is_not_a_bubble() {
@@ -448,8 +444,8 @@ mod tests {
         }
     }
 
-    /// A plain diamond is still a bubble: the WG-11 filter must reject the degenerate shapes
-    /// and nothing else.
+    /// A plain diamond is still a bubble: the filter must reject the degenerate shapes and
+    /// nothing else.
     #[test]
     fn the_filter_leaves_an_ordinary_diamond_alone() {
         let (c, _d) = cfg();
@@ -468,11 +464,10 @@ mod tests {
 
     /// A fork with two reconvergence points keeps both, now as flanks of one bubble.
     ///
-    /// The loop used to sort `reconverged` and take element 0, so every reconvergence point
-    /// but the smallest was discarded before the dedup was even reached. WG-04 then changed
-    /// what "both" means: the same two alleles between two pairs of flanks is one site with
-    /// two ways through it, not two sites, and counting it twice is what made `n_bubbles`
-    /// track local topology instead of the sample.
+    /// Taking only the smallest reconvergence point discards the rest before the dedup is
+    /// reached. The same two alleles between two pairs of flanks is one site with two ways
+    /// through it, not two sites, and counting it twice makes `n_bubbles` track local
+    /// topology instead of the sample.
     #[test]
     fn a_fork_with_two_merges_keeps_both_as_flanks_of_one_bubble() {
         let (c, _d) = cfg();
@@ -510,7 +505,7 @@ mod tests {
     /// the first site links to each allele of the second because the unitigs between them are
     /// shorter than a k-mer.
     ///
-    /// WG-04: four (fork, merge) pairs, two allele sets. The old count of four was the
+    /// Four (fork, merge) pairs, two allele sets. The old count of four was the
     /// clearest case of the inflation, because nothing about the sample changed between the
     /// two SNPs: only the distance between them.
     #[test]
@@ -658,10 +653,10 @@ mod tests {
         let g = build(">T_0 ka:f:9.0\nACGT\n");
         let sub = Subgraph {
             accession: "T".into(), nodes: vec![], seqs: vec![],
-            // Not `/dev/null`, which this used to be. `owns_gfa: false` already stops Drop
-            // touching it, but a path with nothing special about it means that if that guard
-            // is ever lost again the blast radius is a name under /tmp rather than the
-            // system's null device. `phase` never opens the GFA for an empty node list.
+            // Deliberately not `/dev/null`. `owns_gfa: false` already stops Drop touching
+            // it, but an ordinary path means that if that guard is ever lost the blast radius
+            // is a name under /tmp rather than the system's null device. `phase` never opens
+            // the GFA for an empty node list.
             gfa_path: PathBuf::from("/tmp/logan-phase-test-nonexistent.gfa"), n_edges: 0,
             owns_gfa: false,
         };
@@ -669,7 +664,7 @@ mod tests {
     }
 
     /// Two diamonds in a chain, asserted literally: the whole bubble list, not a filtered
-    /// view of it (TW-06).
+    /// view of it.
     ///
     /// Every other fixture here searches the result for the one bubble it cares about, so an
     /// extra bubble, a duplicated mirror direction or a branch attached to the wrong fork
@@ -723,7 +718,7 @@ mod tests {
         }
     }
 
-    /// A diamond whose surviving direction is the reverse strand (TW-06).
+    /// A diamond whose surviving direction is the reverse strand.
     ///
     /// `(0,-) -> {(1,+), (2,+)} -> (3,-)`: the fork and merge are both reverse ends, and the
     /// two branches are entered forward. The dedup keeps the lexicographically smaller
@@ -757,7 +752,7 @@ mod tests {
         );
     }
 
-    /// Two tandem-repeat shapes, neither of which is a bubble (TW-06).
+    /// Two tandem-repeat shapes, neither of which is a bubble.
     ///
     /// Logan collapses a tandem array into one unitig carrying a self-loop, so the repeat
     /// unit has out-degree two off one end: on to itself, and on out of the array. The
@@ -858,7 +853,7 @@ mod phase_real {
             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd, u64::MAX).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();
-            // `write_gfa` no longer creates a missing scratch directory (WF-17),
+            // `write_gfa` no longer creates a missing scratch directory,
             // so a test that names its own creates it, as a run does.
             cfg.scratch_dir = std::env::temp_dir().join(format!("logan_phase_real_{}", std::process::id()));
             std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
@@ -911,7 +906,7 @@ mod phase_diagnostic {
     #[test]
     #[ignore]
     fn shows_why_the_count_drops() {
-        // TW-11: say SKIP rather than returning in silence. The golden CI job fails on any
+        // Say SKIP rather than returning in silence. The golden CI job fails on any
         // `SKIP:` line, so a diagnostic that quietly does nothing looked like a pass.
         let Ok(dir) = std::env::var("LOGAN_TEST_DIR") else {
             eprintln!("SKIP: set LOGAN_TEST_DIR");
@@ -930,7 +925,7 @@ mod phase_diagnostic {
             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd, u64::MAX).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();
-            // `write_gfa` no longer creates a missing scratch directory (WF-17),
+            // `write_gfa` no longer creates a missing scratch directory,
             // so a test that names its own creates it, as a run does.
             cfg.scratch_dir = std::env::temp_dir().join(format!("logan_diag_{}", std::process::id()));
             std::fs::create_dir_all(&cfg.scratch_dir).unwrap();

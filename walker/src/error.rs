@@ -28,9 +28,9 @@ pub enum Error {
     ///
     /// Two routes reach it, and they are the same fact. The bucket returns **404**, or it
     /// serves an object that decompresses to **nothing**: Logan publishes a 55-byte zstd
-    /// frame, valid and empty, for accessions it assembled nothing from, and 0.4% of a random
-    /// 5,000 sampled on 2026-11-16 were exactly that. The second used to be a parse error, so
-    /// a cohort of a few thousand accessions reported a score of failures it had not had.
+    /// frame, valid and empty, for accessions it assembled nothing from, about 0.4% of the
+    /// bucket. Treating the second as a parse error reports a cohort of failures it has not
+    /// had.
     NoLoganData { accession: String },
     /// Over `--max-size-mb`: skipped by the user's own size cap, not a failure.
     ///

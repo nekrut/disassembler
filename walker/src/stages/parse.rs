@@ -1,8 +1,7 @@
-//! Step 2: single streaming pass over the unitig file.
+//! Step 2: two streaming passes over the unitig file.
 //!
-//! Builds a compact CSR rather than unbounded dicts keyed by every unitig in the accession
-//! before the anchors are consulted at all. Those dicts were the memory defect behind the
-//! 21.3 GB out-of-memory event: measured ~700 bytes per unitig, against ~114 bytes on disk.
+//! Builds a compact CSR rather than dicts keyed by every unitig in the accession, which cost
+//! about 700 bytes per unitig against ~114 bytes on disk.
 //!
 //! A record looks like:
 //!
@@ -13,15 +12,14 @@
 //!
 //! `L:` tokens reference the bare integer id, not the accession-prefixed one. Edges are
 //! bidirected and each edge appears in *both* endpoints' headers, which is what the strand
-//! bits are for. Dropping them is what makes bubble detection mistake one edge read twice
-//! for a reconvergence.
+//! bits are for. Dropping them makes bubble detection mistake one edge read twice for a
+//! reconvergence.
 //!
 //! # Two passes, not one
 //!
-//! Until 0.2.0 this was one pass that built the whole CSR, and `build` below still is. The
-//! production path is now `scan` then `collect`, because almost all of that CSR was thrown
-//! away: `extract::expand` keeps the anchor neighbourhood, which is 747 of 1,277,362 unitigs
-//! for `ERR2028820`, and everything downstream touches only those.
+//! `build` below is the single-pass form, kept for tests. The production path is `scan` then
+//! `collect`, because almost all of a full CSR is thrown away: `extract::expand` keeps the
+//! anchor neighbourhood, 747 of 1,277,362 unitigs for `ERR2028820`.
 //!
 //! * `scan` reads adjacency and nothing else, feeding each record's bases to a [`RecordSink`]
 //!   as they stream past. `stages::anchor::Scanner` is that sink, so anchoring costs no
@@ -30,10 +28,9 @@
 //! * `collect` decodes a second time and keeps sequence and abundance for those ids only,
 //!   stopping once the last one is past.
 //!
-//! The second decode is not a cost in practice: pass 1 no longer packs 2-bit sequence or
-//! stores abundance for every unitig, and one light decode measures about 0.25 s per 146 MB
-//! of text. What it buys is the per-unitig data, 21.5 of the 33.5 bytes per unitig the old
-//! graph held.
+//! The second decode is cheap, about 0.25 s per 146 MB of text, because pass 1 packs no 2-bit
+//! sequence and stores no abundance. What it buys is 21.5 of the 33.5 bytes per unitig a
+//! single-pass graph holds.
 //!
 //! No regex. The cost of parsing this format is the data structure, not the tokenizer.
 //!
@@ -113,12 +110,9 @@ fn base_code(b: u8, record: u64) -> std::result::Result<u8, String> {
 /// A decode that produced no unitig records: absent data, or a file the walker cannot read.
 ///
 /// An **empty** stream is a property of the data, not a failure of the run. Logan publishes a
-/// 55-byte zstd frame, a valid frame with nothing in it, for accessions it assembled nothing
-/// from: 20 of a random 5,000 sampled from the bucket on 2026-11-16 were exactly that, 0.4%.
-/// The walker used to call that a parse error, which told a scheduler the run had broken over
-/// something it should treat exactly as it treats a 404. It is now `NoLoganData`, the same
-/// negative the 404 path returns, because it is the same fact about the same accession
-/// arriving by a different route.
+/// 55-byte zstd frame, valid and holding nothing, for accessions it assembled nothing from,
+/// about 0.4% of the bucket. That is `NoLoganData`, the same negative the 404 path returns,
+/// because it is the same fact arriving by a different route.
 ///
 /// A stream that had **content** but no `>` record stays an error. That is a malformed file
 /// rather than an absent one, and collapsing the two would hide a real defect: the first is
@@ -219,10 +213,10 @@ pub fn scan_in<S: RecordSink>(
     // The ceiling warning used to scan the stored abundances. Nothing stores them here, so the
     // maximum is tracked as it streams past and the warning is unchanged.
     let mut max_abundance = 0.0f32;
-    // WG-02: records carrying neither `ka:f:` nor `km:f:`. Pass 1 is where this is countable,
+    // Records carrying neither `ka:f:` nor `km:f:`. Pass 1 is where this is countable,
     // because pass 2 only reads the neighbourhood's records.
     let mut abundance_missing: u64 = 0;
-    // WG-10: the largest link target seen. Compared against the record count at the end,
+    // The largest link target seen. Compared against the record count at the end,
     // where the count is finally known. Tracked as rows are appended rather than scanned at
     // the end, because `targets` is a flush buffer once adjacency spills.
     let mut max_target: u32 = 0;
@@ -361,7 +355,7 @@ pub fn scan_in<S: RecordSink>(
         seq_offset: Vec::new(),
         spool,
         abundance_missing,
-        // WG-07. The running count, not `targets.len()`: once adjacency spills, the Vec is a
+        // The running count, not `targets.len()`: once adjacency spills, the Vec is a
         // flush buffer that gets cleared, and on a spilled accession it is empty here.
         n_links: n_targets,
     })
@@ -530,7 +524,7 @@ fn shrink_adjacency(graph: &mut UnitigGraph) -> std::io::Result<()> {
     Ok(())
 }
 
-/// WV-03. `KA_CEILING` is empirical, read off three cached accessions, not something Logan
+/// `KA_CEILING` is empirical, read off three cached accessions, not something Logan
 /// publishes in a schema. If a file ever carries a higher value the constant is wrong and
 /// every saturation flag drawn from it is wrong with it, so say so loudly rather than
 /// silently under-flagging.
@@ -545,7 +539,7 @@ fn warn_ka_ceiling(accession: &Accession, max_abundance: f32) {
     }
 }
 
-/// WG-10. A link whose target is past the last record the file holds.
+/// A link whose target is past the last record the file holds.
 ///
 /// Logan objects are several concatenated zstd frames, and a copy cut exactly at a frame
 /// boundary decodes **without error**: zstd has no idea more frames were meant to follow. The
@@ -568,7 +562,7 @@ fn truncated_error(accession: &Accession, target: u32, n_unitigs: u64) -> Error 
     }
 }
 
-/// WG-02. A file whose records carry no abundance tag parses cleanly and reconstructs, but
+/// A file whose records carry no abundance tag parses cleanly and reconstructs, but
 /// with every depth-based stage inert: the prune floor is 0 so nothing is pruned, no fork has
 /// a majority to correct towards, no branch clears `--min-abund`, and the VCF is empty. None
 /// of that is an error, and before 0.2.0 the only trace was `mean_ka: 0.0` in a summary nobody
@@ -589,7 +583,7 @@ struct Header {
     abundance: f32,
     /// Whether the record carried an abundance tag at all, `ka:f:` or its `km:f:` alias.
     ///
-    /// WG-02: a record with neither keeps abundance 0, which is indistinguishable from a real
+    /// A record with neither keeps abundance 0, which is indistinguishable from a real
     /// zero and silently disables every depth-based stage. `scan` and `build` count these;
     /// `header_light` leaves the flag false when it was not asked for an abundance, because
     /// pass 2 does not count anything.
@@ -598,7 +592,7 @@ struct Header {
 
 /// Whether this header field is an abundance tag.
 ///
-/// WG-02. Logan's `Unitigs.md` says that "in some large accessions, the `ka:f:[xx]` field is
+/// Logan's `Unitigs.md` says that "in some large accessions, the `ka:f:[xx]` field is
 /// replaced by `km:f:[xx]` ... consider that they are the same information". Reading only
 /// `ka:f:` left every unitig of such an accession at abundance 0, which is an error nowhere:
 /// the prune, the majority correction, bubble detection and the variant stages all simply
@@ -611,7 +605,7 @@ fn is_abundance_tag(f: &[u8]) -> bool {
 
 /// The value of an abundance tag, rejecting what cannot be a coverage.
 ///
-/// WV-15: `parse::<f32>()` accepts `inf` and `nan`, and both then flow into every VAF, the
+/// `parse::<f32>()` accepts `inf` and `nan`, and both then flow into every VAF, the
 /// prune floor and `summary.json`, where they are written as bare tokens no JSON parser
 /// accepts. A negative abundance is equally meaningless. One definition, so the three decodes
 /// of a file cannot disagree about which values it holds.
@@ -630,21 +624,15 @@ fn abundance_value(f: &[u8], id: u32, bad: &impl Fn(String) -> Error) -> Result<
 
 /// `collect`'s header reader: the id always, the abundance only when asked, the links never.
 ///
-/// `header` parses every field, because pass 1 needs every field. Pass 2 needs almost none of
-/// them: the adjacency is already built, so the links are parsed and dropped, and a record
-/// pass 2 is going to skip does not need its abundance either. On `ERR2028820` that is
-/// 1,277,362 abundances and 2,582,206 links parsed for nothing on the second decode. Measured
-/// over 20 cached copies of it at `-w 1`, dropping them took `collect` from 4.36 s to 2.97 s,
-/// and over a 48-accession cohort of 9.76 GB at `-w 8` from 94.9 s to 62.3 s, 34% either way,
-/// with pass 1 unchanged and every output byte identical.
+/// `header` parses every field because pass 1 needs every field. Pass 2 needs almost none:
+/// the adjacency is already built, and a record pass 2 will skip needs no abundance. Dropping
+/// them takes `collect` down by about 34%.
 ///
 /// **What pass 2 therefore stops validating**, and why that is safe: `header` rejects a
 /// malformed link and a non-finite, negative or unparseable `ka:f:`. Pass 1 ran those checks
-/// over the same bytes, from the same `Compressed` handle, which is either a `Vec` in memory
-/// or an open file descriptor; neither can change between the two decodes. A file that would
-/// fail them has already failed in `scan`, so `collect` can never be the pass that sees it
-/// first. The id rules are kept here, because those are what make a disagreement between the
-/// two decodes detectable at all.
+/// over the same bytes, from the same `Compressed` handle, which neither decode can change,
+/// so a file that would fail them has already failed in `scan`. The id rules stay here,
+/// because they are what makes a disagreement between the two decodes detectable.
 fn header_light(
     line: &[u8],
     expected_id: u64,
@@ -801,9 +789,8 @@ fn csr_bytes(
 /// doubling of the budget rather than exactly at it, which is why the printed bound says
 /// "up to".
 ///
-/// 4096 and not something larger: the cadence has to be short enough that the check actually
-/// runs. At 65,536 a graph of fewer than about 32,000 records was never measured at all, so
-/// the budget silently did not apply to it. The cost is six `capacity()` reads per 4096 lines.
+/// Short enough that the check actually runs: at 65,536 a graph of fewer than about 32,000
+/// records would never be measured at all. The cost is six `capacity()` reads per 4096 lines.
 const BUDGET_CHECK_EVERY: u64 = 1 << 12;
 
 pub fn build(
@@ -829,7 +816,6 @@ pub fn build(
     let mut total_bases: u64 = 0;
     // As in `scan_in`: absent data and unreadable data are different outcomes.
     let mut bytes_read: u64 = 0;
-    // WG-02, as in `scan_in`.
     let mut abundance_missing: u64 = 0;
     let mut in_record = false;
     let mut iters: u64 = 0;
@@ -1032,10 +1018,11 @@ mod tests {
         Box::new(std::io::Cursor::new(s.as_bytes().to_vec()))
     }
 
-    /// WG-10. A Logan object is several concatenated zstd frames, and a copy cut exactly at a
+    /// A Logan object is several concatenated zstd frames, and a copy cut exactly at a
     /// frame boundary decodes **without error**: zstd sees a complete frame and stops. The
-    /// graph that comes out is smaller and internally plausible, so the accession used to come
-    /// back `no_anchors` or with a partial gene and nothing saying half the file was missing.
+    /// graph that comes out is smaller and internally plausible, so without a check the
+    /// accession comes back `no_anchors` or with a partial gene and nothing says half the
+    /// file was missing.
     ///
     /// The links give it away, because ids are dense and sequential: a link to a record the
     /// file does not hold can only mean records are missing.
@@ -1079,7 +1066,7 @@ mod tests {
         }
     }
 
-    /// WG-07. A file with no `L:` token anywhere parses into a graph with no adjacency. That
+    /// A file with no `L:` token anywhere parses into a graph with no adjacency. That
     /// is legal input and the parser keeps accepting it, because a gene inside a single
     /// unitig needs no edge; what changed is that the count survives to the pipeline, which
     /// reports `no_links` rather than the biological negative `no_path`.
@@ -1103,7 +1090,7 @@ mod tests {
         );
     }
 
-    /// WG-02. Logan documents `km:f:` as an alias of `ka:f:` "in some large accessions", and
+    /// Logan documents `km:f:` as an alias of `ka:f:` "in some large accessions", and
     /// the parser read only the first. A file using the alias parsed cleanly with every
     /// abundance at 0, which is not an error anywhere downstream: it is a 0x gene, so the
     /// prune floor collapses, no fork has a majority, nothing clears `--min-abund`, and the
@@ -1128,8 +1115,8 @@ mod tests {
         assert_eq!(b.abundance, two.abundance, "pass 2 must read the alias too");
     }
 
-    /// The alias is validated exactly as `ka:f:` is: WV-15's non-finite and negative values
-    /// are rejected rather than flowing into the floor, the VAFs and `summary.json`.
+    /// The alias is validated exactly as `ka:f:` is: non-finite and negative values are
+    /// rejected rather than flowing into the floor, the VAFs and `summary.json`.
     #[test]
     fn a_bad_km_f_value_is_refused_like_a_bad_ka_f() {
         for bad in ["nan", "inf", "-7.5", "x"] {
@@ -1143,7 +1130,7 @@ mod tests {
         }
     }
 
-    /// WG-02's second half: a file carrying neither tag is counted, so the summary can say
+    /// A file carrying neither tag is counted, so the summary can say
     /// that the depth-based stages ran against zeros rather than against a 0x gene.
     #[test]
     fn records_with_no_abundance_tag_are_counted_not_guessed() {
@@ -1551,9 +1538,8 @@ mod tests {
 
     /// A spool directory that cannot be written is a warning, not a failed accession.
     ///
-    /// Spilling is an optimisation. Turning an unwritable temp directory into a hard failure
-    /// would make the walker refuse work it used to do, which is a worse outcome than using
-    /// the memory it used to use.
+    /// Spilling is an optimisation, so an unwritable temp directory degrades to memory rather
+    /// than refusing the work.
     #[test]
     fn an_unusable_spool_directory_falls_back_to_memory() {
         let mut fa = String::new();
@@ -1577,14 +1563,11 @@ mod tests {
     /// An empty Logan object is absent data, not a broken run; an unreadable one is not.
     ///
     /// Logan serves a 55-byte zstd frame, valid and holding nothing, for accessions it
-    /// assembled nothing from. 20 of a random 5,000 sampled from the bucket on 2026-11-16
-    /// were exactly that, and every one of them used to be reported as `error`, which is what
-    /// a scheduler reads as "this run broke" and what `--allow-empty` refuses to forgive. It
-    /// is the same fact as a 404 and now gets the same outcome.
+    /// assembled nothing from, about 0.4% of the bucket. Reporting that as `error` is what a
+    /// scheduler reads as "this run broke", and what `--allow-empty` refuses to forgive.
     ///
-    /// The second half is what keeps that from being a blanket excuse. A stream that carried
-    /// bytes but no `>` record is a file the walker could not read, which is a defect worth
-    /// surfacing, so it stays an `error` and says how many bytes it saw.
+    /// The second half keeps that from being a blanket excuse: a stream that carried bytes
+    /// but no `>` record is a file the walker could not read, so it stays an `error`.
     #[test]
     fn an_empty_unitig_file_is_absent_data_and_a_contentful_one_without_records_is_not() {
         // "   \n" is deliberately not here: a line of spaces survives the newline trim and

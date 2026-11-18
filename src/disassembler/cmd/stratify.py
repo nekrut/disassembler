@@ -7,21 +7,13 @@ contributes what it has.
 
 Score files are recognised by content, never by name. `harvest` writes
 `{"target": ..., "scores": {accession: score}}`; stratify reads the files it is
-given, or every file in a directory, and takes the target from inside. A file in
-the shape written before 0.1.1, a bare `{accession: score}`, carries no target,
-so the caller names it (`--scores NAME=FILE`, or `--target` when it is the only
-one). Output files are still named after the target; a name used as a label is
-fine, one used to decide what a file is was not.
+given, or every file in a directory, and takes the target from inside. A bare
+`{accession: score}` carries no target, so the caller names it (`--scores
+NAME=FILE`, or `--target` when it is the only one). Output files are named after
+the target: a name is fine as a label, not as the way to decide what a file is.
 
 The phiX174 Illumina spike-in is filtered upstream in `harvest` by target NAME,
 not by score. See `harvest.safe_target_name`.
-
-An earlier `--diversity N` mode also existed (four containment brackets,
-20/30/30/20 quotas with backfill). It was removed because it capped by count
-while download cost is byte-driven, so it was the wrong lever for the download-
-volume problem it was meant to solve; `walker --max-size-mb` gates bytes.
-Calibration-experiment workflows that used `--diversity` can express the same
-shape with four `--score-bin` invocations.
 """
 
 from __future__ import annotations
@@ -126,7 +118,7 @@ def sample_bins_from_scores(scores, bins):
     for lo, hi, n in bins:
         in_range = sorted(
             ((a, s) for a, s in nonzero.items() if in_bin(s, lo, hi)),
-            # PH-01: ties by accession, so which tied accession enters a bin is not
+            # Ties by accession, so which tied accession enters a bin is not
             # decided by the order the shards happened to arrive in.
             key=lambda x: (-x[1], x[0]),
         )
@@ -140,7 +132,7 @@ def sample_bins_from_scores(scores, bins):
             "accessions": [{"acc": a, "score": s} for a, s in selected],
         })
         picks.extend(selected)
-    picks.sort(key=lambda x: (-x[1], x[0]))   # PH-01
+    picks.sort(key=lambda x: (-x[1], x[0]))   # score desc, then accession
     return picks, per_bin
 
 

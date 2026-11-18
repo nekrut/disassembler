@@ -39,9 +39,8 @@ conda install -c conda-forge -c bioconda disassembler
 This installs the `disassembler` CLI together with `logan-walker`, `kmer-diversity-sieve`,
 GraphAligner, MAFFT and FastTree. See [`docs/packaging.md`](docs/packaging.md).
 
-**Galaxy:** the tools are under review in
-[galaxyproject/tools-iuc#8800](https://github.com/galaxyproject/tools-iuc/pull/8800). See
-[`docs/galaxy.md`](docs/galaxy.md).
+**Galaxy:** six tool wrappers are being contributed to the IUC, to publish on the Tool Shed as
+`suite_disassembler`. See [`docs/galaxy.md`](docs/galaxy.md) for what each one wraps.
 
 **From source:**
 
@@ -75,14 +74,54 @@ disassembler reconstruct -l candidates/zika_ns5.bins.txt -q queries/markers/zika
 disassembler from-lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.tsv.gz -o out/hiv1_pol
 ```
 
-`queries/` holds reference CDSs to start from: PfCRT, HIV-1 *pol*, 26 marker genes under
-`queries/markers/`, and `master_planetary_targets.fasta`, a 142-record catalogue spanning 25
-genes. The catalogue is a place to take a reference from, not a `-q` panel: the walker keeps
-one primary per accession, so a pool of different genes reports only one of them. Pass
-references that are strains of a single gene, as `panels/sarscov2_spike_11strains.fa` is.
-Its `candida_auris_erg11` and `p_infestans_avr3a` groups are reference-only: the records that
-stood there as `var1..9` were other genes from the same contig, not alleles, and were removed
-rather than replaced (`tests/test_master_panel_homology.py` checks the rest).
+`queries/` holds reference CDSs to start from: PfCRT, HIV-1 *pol* and 26 marker genes under
+`queries/markers/`. **One gene per `-q`**: the walker keeps one primary per accession, so a
+pool holding two different genes reports only one of them. Several references are fine when
+they are strains of the same gene, as `panels/sarscov2_spike_11strains.fa` is. See
+[`queries/README.md`](queries/README.md) and [`panels/README.md`](panels/README.md).
+
+## What comes out
+
+A walk writes the primary haplotype per accession, the intra-host alternatives, the bubbles,
+a row per accession that produced nothing, and a summary; `--emit-vcf` and `--emit-snv-table`
+add the variant tables. The headers carry the numbers you need to decide whether to trust a
+record:
+
+```text
+>SRR8209082_primary cov=1.000 pident=97.5 nodes=2479 ka=16859.3 vaf=1.00 min_vaf=0.690
+>SRR8209082_alt1 cov=1.000 inherited_pident=97.5 nodes=2479 vaf=0.310 alt_kaf=3600.0 primary_vaf=0.690 fork=49624+ alt_node=49763+ detour=31 dlen=+0 span=1
+```
+
+`min_vaf=0.690` says the rarest allele this sequence carries was 69% of its fork, so the
+primary is the majority at every site it passed. A clonal isolate reads `min_vaf=1.000`, and a
+primary that combines alleles from two or more unlinked sites is tagged ` mixed=1`. (`vaf=` on
+a primary is the constant 1.0 that earlier releases carried; `min_vaf=` is the measured one.)
+The `alt1` record is the 31% allele at that same fork, written as its own full-length sequence
+rather than as a coordinate.
+
+`--emit-snv-table` writes one row per (accession, site, allele), which is the form that scales
+to a cohort:
+
+```text
+gene      pos   ref  alt  accession   af      ka_alt  ka_ref  fork   ka_saturated  block
+hiv1_pol  2451  G    A    SRR8209082  0.3103  3600.0  8000.0  49624  0
+```
+
+Every stage also writes a `summary.json` to the same contract
+([`docs/summaries.md`](docs/summaries.md)), so a workflow can branch on the outcome without
+parsing logs:
+
+```json
+{"acc": "SRR8209082", "status": "success", "subgraph_fraction": 0.424142,
+ "provisional": true, "bias_uncorrected": false, "snv_sites": 1, "alts": 1,
+ "prune": {"outcome": "applied", "depth": 15000.0, "floor": 150.0,
+           "unitigs": 34582, "unitigs_kept": 6946}}
+```
+
+`provisional: true` here means the gene's neighbourhood is unusually tangled (42% of this
+accession's whole graph), which is the walker saying the walk was ambiguous rather than that it
+failed. A worked cohort, from VCFs to a site-by-accession matrix, is in
+[`docs/examples/vcf_example.md`](docs/examples/vcf_example.md).
 
 ## Commands
 

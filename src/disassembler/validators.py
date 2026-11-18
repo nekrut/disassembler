@@ -165,7 +165,7 @@ FILE_STEM_LIMIT = 200
 def file_safe_name(name, limit: int = FILE_STEM_LIMIT) -> str:
     """A record or target name reduced to one safe path component. `""` when nothing is left.
 
-    PL-10. `lexicmap` interpolated the reference FASTA's record id straight into an output
+    `lexicmap` interpolated the reference FASTA's record id straight into an output
     path (`msa/{ref_name}`, or `<out-dir>/{ref_name}`), unsanitised. Real ids break on that:
     `hCoV-19/Wuhan/WIV04/2019|EPI_ISL_402124|...` and `A/California/07/2009(H1N1)` exit with
     ENOENT before a single row is read, and an id over about 220 bytes fails with ENAMETOOLONG.

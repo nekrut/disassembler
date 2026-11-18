@@ -1,9 +1,7 @@
 """The summary contract, shared by every Python stage.
 
-One writer, so the stages cannot drift apart. Before 0.2.0 each stage wrote its own JSON and
-no two agreed: the walker carried full provenance and no cohort statistics, `lexicmap` carried
-cohort statistics and no provenance at all, and `harvest` carried neither. The rules, the block
-order and the reasoning are in `docs/summaries.md`; this module is that document in code, and
+One writer, so the stages cannot drift apart. The rules, the block order and the reasoning
+are in `docs/summaries.md`; this module is that document in code, and
 `walker/src/io/output.rs` is the same contract on the Rust side.
 
 Blocks, always in this order: `schema`, `tool`, `inputs`, `settings`, `run`, `discards`,
@@ -61,7 +59,7 @@ def quantiles(values) -> dict | None:
     def at(q: float) -> float:
         """Linear interpolation between the two neighbouring order statistics.
 
-        PL-15. This used to be `v[round((n - 1) * q)]`, which with banker's rounding returned
+        This used to be `v[round((n - 1) * q)]`, which with banker's rounding returned
         one of the two middle values of an even cohort, sometimes the lower and sometimes the
         upper. The p50s drive lexicmap's divergent-regime call, so coverages of 0.55 and 0.65
         (true median 0.60) reported 0.55 and `divergent`, while 0.50/0.55/0.65/0.70 reported
@@ -86,7 +84,7 @@ def quantiles(values) -> dict | None:
 def quantiles_from_counts(counts, scale: float = 1.0) -> dict | None:
     """`quantiles` over a multiset given as {value: how many}, each value times `scale`.
 
-    PL-24. A stage that streams millions of records cannot keep one Python float per record
+    A stage that streams millions of records cannot keep one Python float per record
     just to report five quantiles; where the values are small integers, such as how many
     reference positions an accession covered, a Counter is bounded by the range instead and
     is exact. The result has to agree with `quantiles` on the same multiset, including the

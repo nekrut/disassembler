@@ -33,8 +33,9 @@ a Galaxy tool can depend on only the piece it runs.
 
 An `osx-64` `logan-walker` would pass its own CI, since on its own it can take Python 3.9, and
 still leave `disassembler` unsatisfiable on macOS. macOS returns once an equivalent
-protobuf-free `osx-64` GraphAligner 1.0.17b build exists. Before enabling a platform, check that
-it solves:
+protobuf-free `osx-64` GraphAligner 1.0.17b build exists. The `kmer-diversity-sieve` recipe
+skips macOS too, by choice: it is packaged for `disassembler`, which cannot be installed there.
+Before enabling a platform, check that it solves:
 
 ```bash
 conda create --dry-run --platform osx-64 -c conda-forge -c bioconda disassembler
@@ -52,9 +53,9 @@ conda create --dry-run --platform osx-64 -c conda-forge -c bioconda disassembler
   matters: re-testing with a plain `--add` does not reproduce it. `environment.yml`, the recipe
   and the Galaxy `msa` tool all pin `mafft >=7.526`, and `msa` runs `mafft --version` before any
   work and refuses 7.525 by name.
-- **kmer-diversity-sieve 0.1.0** is upstream commit `70022da`, because upstream has no tagged
-  releases. The recipe overrides the Makefile's `-march=native`, so the binary runs on any
-  x86-64 machine; the portable build gives byte-identical output on the test fixture.
+- **kmer-diversity-sieve 0.1.0** is upstream tag `v0.1.0` (commit `70022da`). The recipe
+  overrides the Makefile's `-march=native`, so the binary runs on any x86-64 machine; the
+  portable build gives byte-identical output on the test fixture.
 
 The walker floor is enforced at run time as well as by the recipe: the package runs
 `logan-walker --version` before using it and refuses anything below `MIN_WALKER_VERSION`
@@ -70,6 +71,8 @@ recipe floor together.
 - `logan-walker`'s version is in `walker/Cargo.toml`; `logan-walker --version` prints it.
 - The two have separate tag series, `v<version>` for `disassembler` and
   `logan-walker-v<version>` for the walker. The Bioconda recipes download those tags' tarballs.
+- `kmer-diversity-sieve` is tagged `v<version>` in its own repository, and its recipe downloads
+  that tag's tarball.
 - `disassembler` depends on a minor version range of each binary: the walker at
   `>=<current minor>,<next minor>`, the sieve at `>=0.1.0,<0.2`.
 
@@ -83,9 +86,22 @@ recipe floor together.
    runs in CI on pushes to `main` and on release tags (`.github/workflows/golden.yml`); record
    the URL of a green run, because a local run leaves no record.
 3. Tag the release commit `v<version>`, and `logan-walker-v<version>` if the walker changed.
-4. Open the Bioconda recipe PR in the same sitting as the tag, so the autobump bot's
-   version-only PR does not merge first and ship the release with the previous recipe body.
-   Check every line of the recipe, not just the version:
+4. Update the Bioconda recipes. Bioconda's autobump bot opens a pull request for a new tag
+   that changes only the version and checksum, and it merges unreviewed after three days if CI
+   passes. The three recipes are set up differently:
+
+   - `disassembler` has the bot switched off (`extra: autobump: enable: False`), because its
+     run dependencies and walker floor change between releases. Nothing is published until you
+     open the recipe PR yourself.
+   - `logan-walker` and `kmer-diversity-sieve` leave the bot on. A `logan-walker-v<version>`
+     tag here, or a `v<version>` tag in the sieve's repository, is published by the bot without
+     further action. That is right when only the source changed. If the recipe body has to
+     change as well (a different GraphAligner pin, build flags, a renamed binary), open your own
+     PR in the same sitting as the tag, before the bot's merges.
+
+   Any edit to a recipe whose current build is already published needs a build number bump,
+   even a comment-only edit; Bioconda's linter rejects it otherwise. For a recipe PR you write
+   by hand, check every line, not just the version:
 
    - `version`, and the `sha256` of the **GitHub tag tarball** rather than a `git archive`:
      `curl -sL https://github.com/nekrut/disassembler/archive/refs/tags/<tag>.tar.gz | sha256sum`
@@ -95,7 +111,7 @@ recipe floor together.
    - run dependencies equal to `pyproject.toml`'s `[project] dependencies`, plus the binaries
      the subcommands shell out to, and nothing else
    - `mafft >=7.526`
-   - the sieve commit equals the `extern/kmer-diversity-sieve` submodule pin
+   - the sieve version's tag points at the `extern/kmer-diversity-sieve` submodule pin
      (`git ls-tree HEAD extern/kmer-diversity-sieve`)
 5. Bump `main` to the next development version (`__version__ = "<next>.dev0"`, and the walker's
    `Cargo.toml` if it moved), so builds from `main` stop claiming the released version.

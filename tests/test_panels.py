@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """test_panels.py -- every reference panel shipped in panels/ must be a usable CDS panel.
 
-The panels are data, not code, so nothing else checks them. `panels/sarscov2_spike_11strains.fa`
-shipped in 0.1.0 with three defective records and none of the test suite noticed:
+The panels are data, not code, so nothing else checks them, and the shipped spike panel has
+carried defective records of both kinds these checks exist for:
 
-  - `Delta_B16172` was one base short of a codon boundary, because the record was copied from
-    GenBank with its one IUPAC ambiguity code deleted rather than resolved. That shifted its
-    frame from codon 95 onward, so a reconstruction anchored on it inherited a broken reading
-    frame. It was the chosen anchor for 4,071 of the 9,448 primaries in the 20,000-accession
-    walker run.
-  - `Omicron_BA2` and `Omicron_XBB15` carried 268 and 477 Ns, from dropouts in the source
-    genomes. A run of Ns anchors nothing, because no k-mer over it can match.
-
-    What it does to identity was stated backwards here until 0.2.0, and the mistake was worth
-    more than the record: GraphAligner counts `N` as matching ANY base, so an N-laden record
-    used to be *rewarded*, beating the genuinely nearest reference wherever the sample differs
-    inside the N window (review finding WA-02). The walker now subtracts ambiguous bases from
-    the match count, so Ns do cost identity, which is what this file always claimed.
+  - A record one base short of a codon boundary, from a GenBank copy whose IUPAC ambiguity
+    code was deleted rather than resolved. That shifts the frame from codon 95 onward, so
+    every reconstruction anchored on it inherits a broken reading frame.
+  - Records carrying hundreds of Ns from dropouts in the source genome. A run of Ns anchors
+    nothing, because no k-mer over it can match, and GraphAligner counts `N` as matching ANY
+    base, so without a correction an N-laden record is *rewarded*, beating the genuinely
+    nearest reference wherever the sample differs inside the N window. The walker subtracts
+    ambiguous bases from the match count, so Ns do cost identity.
 
 Each check below is one of those failures. The frame checks apply to any CDS panel; the
 ambiguity checks apply because an anchor is matched by exact k-mers.
@@ -83,7 +78,7 @@ class TestShippedPanels(unittest.TestCase):
         """Query panels are references too, and ambiguity in them is a weak anchor.
 
         Not a hard ban, because two shipped records are already heavily ambiguous and
-        replacing them is a data decision, not a test one. Since WA-02 their ambiguity no
+        replacing them is a data decision, not a test one. Their ambiguity no
         longer wins them the primary, so they are tolerable; what this stops is a NEW one
         arriving unnoticed, which is how the spike panel's Ns got in.
         """
@@ -101,7 +96,7 @@ class TestShippedPanels(unittest.TestCase):
         self.assertEqual(
             offenders, {},
             "new heavily ambiguous query record(s); an N anchors nothing and the record is a "
-            "weak reference even though WA-02 stopped it scoring free matches",
+            "weak reference even though ambiguous bases no longer score free matches",
         )
 
     def test_record_ids_are_unique_within_a_panel(self):
@@ -125,7 +120,7 @@ class TestShippedPanels(unittest.TestCase):
                 seen.setdefault(seq, rec_id)
 
 
-# DD-01 and DD-02. Two records of the SARS-CoV-2 spike panel named a lineage they were not.
+# Two records of the SARS-CoV-2 spike panel once named a lineage they were not.
 # `Omicron_EG51` was the spike of a 2020 B.1.2 genome, one base (D614G) from Wuhan, and
 # `Omicron_BA5` was a BA.2 nanoluciferase reporter clone. The sequences were faithful copies
 # of what their headers cited; the citations were the wrong genomes. Nothing in the suite
@@ -214,7 +209,7 @@ def protein_changes(wuhan_aa: str, query_aa: str) -> list:
 
 
 class TestSpikePanelLineages(unittest.TestCase):
-    """What each spike panel record IS, not merely that it is a usable CDS (DD-01, DD-02)."""
+    """What each spike panel record IS, not merely that it is a usable CDS."""
 
     PANEL = PANEL_DIR / "sarscov2_spike_11strains.fa"
 
@@ -251,7 +246,7 @@ class TestSpikePanelLineages(unittest.TestCase):
                 self.assertIn("lineage=", desc)
 
     def test_no_two_records_are_near_duplicates(self):
-        # DD-01's shipped `Omicron_EG51` differed from `Wuhan_Hu1_ref` by ONE base, so any
+        # A shipped `Omicron_EG51` once differed from `Wuhan_Hu1_ref` by ONE base, so any
         # D614G sample matched it better than Wuhan and was published as a 2023 variant.
         # An anchor panel whose members are one base apart cannot distinguish them.
         K = 21

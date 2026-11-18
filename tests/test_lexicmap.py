@@ -54,7 +54,7 @@ class TestLexicMapStreamer(unittest.TestCase):
 
         # Straight at `tile_accession_hsps`: the `merge_accession_hsps` wrapper these two
         # tests used existed only for them, and a test-only entry point is one more thing
-        # that can agree with the tests while the production path does not (PL-28).
+        # that can agree with the tests while the production path does not.
         tiling = lms.tile_accession_hsps(
             [hsp1, hsp2], ref_len=12, min_pident=60.0, min_coverage=0.80
         )
@@ -133,7 +133,7 @@ class TestLexicMapStreamer(unittest.TestCase):
         self.assertEqual(breakdown["flagged"], 2)
         # Counted but never recorded before 0.2.0.
         # The whole dict, not a subset: a row that is dropped has to be counted somewhere,
-        # and a new reason for dropping one has to appear here too (PL-14, PL-20).
+        # and a new reason for dropping one has to appear here too.
         self.assertEqual(summary["discards"]["rows"], {
             "malformed": 0, "other_query": 0, "qlen_mismatch": 0,
             "too_few_columns": 0, "inconsistent_qseq": 0})
@@ -450,7 +450,7 @@ class TestMutationClassification(unittest.TestCase):
 
     def test_complex_is_gone_and_missense_is_reported(self):
         # qseq is the REFERENCE over the span, sseq the sample: these fixtures used to
-        # put the mutant in both, which is what PL-20 found nothing was checking.
+        # put the mutant in both, which nothing else checks.
         rows = "SRR010\t100.0\t100.0\t1\t12\tATGGCTGAATAA\tATGGGTGAATAA\n"
         self.assertEqual(self._classes(rows, "mis"), ["Missense"])
 
@@ -763,7 +763,7 @@ class TestGalaxyDataset(unittest.TestCase):
 
     def test_a_queued_dataset_is_a_temporary_failure_not_a_success(self):
         # Galaxy's own `Dataset.non_ready_states`. `paused` and `deferred` were in this list
-        # and are not states that become `ok` on their own (PL-23).
+        # and are not states that become `ok` on their own.
         for state in ("queued", "running", "new", "upload", "setting_metadata"):
             rc, err = self.run_with_state(state)
             self.assertEqual(rc, lms.EX_TEMPFAIL, state)
@@ -872,7 +872,7 @@ class TestCoverageTakesPrecedence(unittest.TestCase):
 
 
 class TestCoverageIndependentHaplotypes(unittest.TestCase):
-    """PL-02: diversity must not move when an accession's contigs stop short.
+    """Diversity must not move when an accession's contigs stop short.
 
     Tier 1 rows are collapsed on the whole reference-length row, which carries `-` at every
     untiled position, and with the default `--min-cov 0.80` a tier 1 row can be a fifth `-`.
@@ -985,7 +985,7 @@ CDS300 = "ATG" + "GCT" * 98 + "TAA"
 
 
 class TestMixedHsps(unittest.TestCase):
-    """PL-01: an accession whose own HSPs disagree is reported, not quietly resolved.
+    """An accession whose own HSPs disagree is reported, not quietly resolved.
 
     Logan leaves an unpopped SNP bubble as two separate contigs. Both 61 nt branches clear
     LexicMap's default `-l 50 -i 70`, and the reference branch is 100% identical while the
@@ -1108,7 +1108,7 @@ CDS120 = "ATG" + "GCT" * 38 + "TAA"
 
 
 class TestIndelsAcrossOverlappingHsps(unittest.TestCase):
-    """PL-06 and PL-07: an indel seen by two contigs is judged by both of them.
+    """An indel seen by two contigs is judged by both of them.
 
     Adjacent Logan contigs overlap by k-1 = 30 nt, which is exactly the window in which an
     indel can sit 10 bases from one contig's end and deep inside the next.
@@ -1168,7 +1168,7 @@ class TestIndelsAcrossOverlappingHsps(unittest.TestCase):
         self.assertEqual(rec["status"], "CLEAN_PARTIAL", "74 of 120 positions tiled")
 
     def test_an_edge_deletion_does_not_hide_a_base_another_contig_supplied(self):
-        # PL-07's fixture: the higher-identity contig closes with a forced 1-nt gap inside
+        # The higher-identity contig closes with a forced 1-nt gap inside
         # the overlap, which is the C. auris case. The gap entered the per-position contest
         # like a base and stayed even after being ruled an artefact, so the row showed '-',
         # coverage was 59/60, and the accession became a haplotype of its own.
@@ -1198,7 +1198,7 @@ class TestIndelsAcrossOverlappingHsps(unittest.TestCase):
 
 
 class TestGeneticCodeAndReferenceChecks(unittest.TestCase):
-    """PL-04, PL-05, PL-09: what the reference is, and which code reads it."""
+    """What the reference is, and which code reads it."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1292,7 +1292,7 @@ class TestGeneticCodeAndReferenceChecks(unittest.TestCase):
         self.assertTrue(s["settings"]["reference_terminal_stop"])
 
     def test_a_non_coding_reference_is_not_frameshifted(self):
-        # PL-09: for an rRNA, ITS or UTR marker the stop scan was already off and the
+        # For an rRNA, ITS or UTR marker the stop scan was already off and the
         # NonCoding_* classes already existed, but any accession with a 1 nt indel lasting 30
         # bases was still filed FLAGGED_FRAMESHIFT, so that allele could never be clean.
         ref = "".join("ACGT"[(i * 7) % 4] for i in range(100))   # 100 nt, not a multiple of 3
@@ -1306,7 +1306,7 @@ class TestGeneticCodeAndReferenceChecks(unittest.TestCase):
 
 
 class TestReferenceWhitespaceAndNaming(unittest.TestCase):
-    """PL-08 and PL-10: what a reference file may contain, and what its id may name."""
+    """What a reference file may contain, and what its id may name."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1400,7 +1400,7 @@ class TestReferenceWhitespaceAndNaming(unittest.TestCase):
 
 
 class TestQuantilesAndRegime(unittest.TestCase):
-    """PL-15 and PL-16: what the median is, and what "no data" is called."""
+    """What the median is, and what "no data" is called."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1472,7 +1472,7 @@ class TestQuantilesAndRegime(unittest.TestCase):
 
 
 class TestFrameSpanAndCoverageGates(unittest.TestCase):
-    """PL-17, PL-18, PL-19: what counts as out of frame, as covered, and as the gate."""
+    """What counts as out of frame, as covered, and as the gate."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1526,7 +1526,7 @@ class TestFrameSpanAndCoverageGates(unittest.TestCase):
         return json.loads(Path(f"{prefix}.summary.json").read_text())
 
     def test_an_accession_with_nothing_tiled_is_a_fragment_at_any_threshold(self):
-        # PL-18: with both coverage gates at 0, which the Galaxy wrapper allows, an accession
+        # With both coverage gates at 0, which the Galaxy wrapper allows, an accession
         # whose HSPs all failed --min-pident became CLEAN_PARTIAL, and its all-gap row became
         # a WT_partial haplotype counted in the frequencies and the entropy.
         alt = "".join("A" if c != "A" else "C" for c in CDS60)
@@ -1541,7 +1541,7 @@ class TestFrameSpanAndCoverageGates(unittest.TestCase):
         self.assertNotIn("-" * 60, clean, "an all-gap row is not a clean sequence")
 
     def test_require_full_length_is_the_gate_that_min_cov_partial_is_checked_against(self):
-        # PL-19: `--require-full-length --min-cov-partial 0.9` is well formed, because the
+        # `--require-full-length --min-cov-partial 0.9` is well formed, because the
         # tier 1 gate is 1.0, but the check compared against --min-cov and refused it.
         from disassembler.stage import stage_args
         import contextlib, io as _io
@@ -1565,7 +1565,7 @@ class TestFrameSpanAndCoverageGates(unittest.TestCase):
 
 
 class TestRowLoopAndOutputs(unittest.TestCase):
-    """PL-12, PL-13, PL-14, PL-20, PL-21, PL-22: the stream's edges, and what lands on disk."""
+    """The stream's edges, and what lands on disk."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1593,7 +1593,7 @@ class TestRowLoopAndOutputs(unittest.TestCase):
         return json.loads(Path(f"{prefix}.summary.json").read_text())
 
     def test_max_records_finishes_the_accession_it_is_in_the_middle_of(self):
-        # PL-13: the limit was tested after a row joined the open block and the partial block
+        # The limit was tested after a row joined the open block and the partial block
         # was then tiered, so the last accession of a preview was judged from a fraction of
         # its HSPs: a clean three-HSP accession came out LOW_COVERAGE_FRAGMENT. Galaxy
         # exposes this as a "preview" knob, where that is the wrong thing to show.
@@ -1608,7 +1608,7 @@ class TestRowLoopAndOutputs(unittest.TestCase):
         self.assertEqual(rec["status"], "CLEAN_FULL_LENGTH")
 
     def test_a_short_row_is_counted_and_named(self):
-        # PL-14: a silent `continue`, with no counter and no message, unlike every other
+        # A silent `continue`, with no counter and no message, unlike every other
         # skip. A table cut inside its last row demoted its final accession at exit 0.
         text = self.HEADER + self.row("SRR1", 1, 60) + "SRR2\t100.0\t50.0\n"
         s = self.run_text("short", text)
@@ -1621,7 +1621,7 @@ class TestRowLoopAndOutputs(unittest.TestCase):
             self.run_text("cut", text)
 
     def test_a_row_whose_qseq_is_not_the_reference_is_skipped(self):
-        # PL-20: nothing compared qseq with the reference slice it is projected onto, so a
+        # Nothing compared qseq with the reference slice it is projected onto, so a
         # reference carrying the search's query name and length but a different sequence
         # tiled every accession against the wrong sequence at exit 0.
         wrong = "".join("A" if c != "A" else "C" for c in CDS60[:30])
@@ -1638,7 +1638,7 @@ class TestRowLoopAndOutputs(unittest.TestCase):
             self.run_text("wrongref", text)
 
     def test_a_table_without_the_alignment_columns_names_the_flag_to_use(self):
-        # PL-21: a KeyError traceback for the likeliest mistake there is, running
+        # A KeyError traceback for the likeliest mistake there is, running
         # `lexicmap search` without -a/--all.
         text = "sgenome\tpident\tqcovHSP\tqstart\tqend\nSRR1\t100.0\t100.0\t1\t60\n"
         with self.assertRaises(ValueError) as cm:
@@ -1647,7 +1647,7 @@ class TestRowLoopAndOutputs(unittest.TestCase):
         self.assertIn("qseq", str(cm.exception))
 
     def test_the_sort_advice_keeps_the_header_where_it_is(self):
-        # PL-12: the advice used to be a bare `sort`, which sorts the header in with the
+        # The advice used to be a bare `sort`, which sorts the header in with the
         # data; under LC_ALL=C the header goes last and the re-run dies in the schema check.
         text = self.HEADER + self.row("SRR1", 1, 30) + self.row("SRR2", 1, 60) + \
             self.row("SRR1", 31, 60)
@@ -1659,7 +1659,7 @@ class TestRowLoopAndOutputs(unittest.TestCase):
         self.assertIn("-k1,1", msg, "the real column, not a placeholder")
 
     def test_a_failed_run_leaves_nothing_half_written(self):
-        # PL-22: the cohort files were opened under their final names before a row was read.
+        # The cohort files were opened under their final names before a row was read.
         text = self.HEADER + self.row("SRR1", 1, 30) + self.row("SRR2", 1, 60) + \
             self.row("SRR1", 31, 60)
         with self.assertRaises(ValueError):
@@ -1682,7 +1682,7 @@ class TestRowLoopAndOutputs(unittest.TestCase):
 
 
 class TestStreamHandling(unittest.TestCase):
-    """PL-21 and PL-26: a damaged gzip, and whose stdin it is."""
+    """A damaged gzip, and whose stdin it is."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1698,7 +1698,7 @@ class TestStreamHandling(unittest.TestCase):
     def test_a_truncated_gzip_names_the_file_instead_of_raising_eoferror(self):
         # gzip.GzipFile raises EOFError for a truncated member and zlib.error for a corrupt
         # one, and neither is caught by the `except (OSError, ValueError)` that lexicmap,
-        # msa, sieve, stratify, reconstruct and from-lexicmap all use (PL-21).
+        # msa, sieve, stratify, reconstruct and from-lexicmap all use.
         from disassembler.textio import open_text
         blob = gzip.compress(self.table.encode())
         cut = self.dir / "cut.tsv.gz"
@@ -1722,7 +1722,7 @@ class TestStreamHandling(unittest.TestCase):
         self.assertEqual(open_text(ok).read(), self.table)
 
     def test_reading_from_stdin_leaves_the_process_stdin_open(self):
-        # PL-26: the TextIOWrapper around sys.stdin.buffer was neither closed nor detached,
+        # The TextIOWrapper around sys.stdin.buffer was neither closed nor detached,
         # so IOBase.__del__ closed the process's stdin when it was collected and a library
         # caller reading stdin afterwards got "I/O operation on closed file". The CLI never
         # noticed, because fd 0 stays open either way.
@@ -1746,7 +1746,7 @@ CDS126 = "ATG" + "AAACCTCGTGAATTTAATGAAACT" * 5 + "TAA"
 
 
 class TestIndelProteinChanges(unittest.TestCase):
-    """PL-29: a haplotype whose only change is an in-frame indel used to report none.
+    """A haplotype whose only change is an in-frame indel used to report none.
 
     Amino-acid changes were called on the reference-GRID row, where an insertion is absent
     and deleted bases are `-`, and `translate_nt` returns `-` for any codon holding a gap. So
@@ -1843,10 +1843,10 @@ class TestIndelProteinChanges(unittest.TestCase):
 
 
 class TestSharedHelpers(unittest.TestCase):
-    """PL-24 and PL-27: helpers that existed twice, or in a form that could not scale."""
+    """Helpers that existed twice, or in a form that could not scale."""
 
     def test_counted_quantiles_agree_with_the_list_based_ones(self):
-        # PL-24 reports coverage quantiles from a Counter rather than one float per
+        # Coverage quantiles come from a Counter rather than one float per
         # accession. The two have to be the same number: `cohort.cov` is compared between
         # runs and across cohorts.
         import random
@@ -1861,7 +1861,7 @@ class TestSharedHelpers(unittest.TestCase):
         self.assertIsNone(summary_io.quantiles_from_counts(Counter()))
 
     def test_one_galaxy_api_key_implementation(self):
-        # PL-27: `get_galaxy_api_key` existed in both harvest and lexicmap and had drifted.
+        # `get_galaxy_api_key` existed in both harvest and lexicmap and had drifted.
         # harvest's copy took no api_key argument, so --api-key was honoured by one command
         # and quietly ignored by the other.
         from disassembler.cmd import harvest as hv
@@ -1888,7 +1888,7 @@ class TestSharedHelpers(unittest.TestCase):
                     os.environ["GALAXY_API_KEY"] = env
 
     def test_one_message_for_a_missing_binary(self):
-        # PL-27: four hand-written strings. `sieve` said "put it on PATH" without naming the
+        # Four hand-written strings. `sieve` said "put it on PATH" without naming the
         # file it looks for, so a user who installed something called
         # `kmer-diversity-sieve` still failed, and the composites exited 1 where the stages
         # exited 127.
@@ -1906,7 +1906,7 @@ class TestSharedHelpers(unittest.TestCase):
 
     def test_a_missing_sieve_exits_127_from_the_stage_and_the_composite(self):
         # The composite exited 1 where the stage it wraps exits 127, so a caller could not
-        # tell "the tool is missing" from "the data was bad" by status alone (PL-27).
+        # tell "the tool is missing" from "the data was bad" by status alone.
         # `resolve_sieve` is patched rather than pointed at a bad path, because it falls
         # through an unusable --sieve-bin to PATH and then to the checkout, and this machine
         # has the binary built.

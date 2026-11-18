@@ -151,9 +151,9 @@ impl Fetcher {
     /// this layer goes: the walker's own writer cannot leave a short file behind, because the
     /// rename happens only after the body is complete. It is not the only writer, though, and
     /// a directory filled by something else (a staged dataset, a partial copy) can hold one.
-    /// WF-13 catches an entry that is not zstd at all, and WG-10 catches one cut at a frame
-    /// boundary, which decodes cleanly and is caught in `parse` from the links. **The size is
-    /// not trusted**, and that check outlived the reason it was added: see
+    /// The magic-number check catches an entry that is not zstd at all, and one cut at a
+    /// frame boundary decodes cleanly and is caught in `parse` from the links. **The size is
+    /// not trusted**: see
     /// `the_size_cap_decides_the_same_way_wherever_the_bytes_came_from`.
     ///
     /// Returns the compressed bytes only. Decompression is `decoder`'s job, and happens in
@@ -241,11 +241,10 @@ impl Fetcher {
                         detail: format!("cache file is empty: {}", path.display()),
                     });
                 }
-                // WF-13. "Not empty" used to be the whole check, so a proxy's error page
-                // cached under the accession's name failed that accession with `parse
-                // failed: Unknown frame descriptor` on every run, forever, and an online run
-                // never refetched it: the user had to find the file and delete it. Four bytes
-                // say whether this is a zstd stream at all.
+                // "Not empty" is not enough: a proxy's error page cached under the
+                // accession's name fails that accession with `parse failed: Unknown frame
+                // descriptor` on every later run, online ones included, until someone finds
+                // and deletes it. Four bytes say whether this is a zstd stream at all.
                 if !entry_is_zstd(&mut file) {
                     drop(file);
                     self.discard_bad_entry(accession, &path)?;
@@ -306,7 +305,7 @@ impl Fetcher {
                 });
             }
             if self.offline {
-                // WF-03. Not every miss is a failure. `disassembler fetch` writes nothing for
+                // Not every miss is a failure. `disassembler fetch` writes nothing for
                 // an accession Logan has no unitigs for, or one over the cap, because there
                 // is nothing to write; the documented `--offline` run that follows then saw
                 // an ordinary miss and called it an error. The same list and the same flags
@@ -332,7 +331,7 @@ impl Fetcher {
         self.download_recording(index, accession, None)
     }
 
-    /// What to do with a cache entry that is not a zstd stream (WF-13).
+    /// What to do with a cache entry that is not a zstd stream.
     ///
     /// Offline there is nothing to replace it with, so it is refused **by name**: the user
     /// has to be told which file to delete, because the walker will not delete a file it was
@@ -360,7 +359,7 @@ impl Fetcher {
     }
 
     /// `download`, recording a negative in the cache so an `--offline` run can tell a 404
-    /// from a failure (WF-03).
+    /// from a failure.
     ///
     /// Only when there is a cache to record it in, and only for the two outcomes that are
     /// properties of the accession rather than of this run: no Logan data, and over the cap.
@@ -393,7 +392,7 @@ impl Fetcher {
         let url = unitigs_url(accession);
         let mut last: String = String::from("no attempt made");
         // One transfer across all the attempts, so an attempt that was interrupted after
-        // real progress resumes where it stopped rather than starting again (WF-09).
+        // real progress resumes where it stopped rather than starting again.
         let mut xfer = Transfer::new(self.open_sink(accession));
         // Failures that made no progress. `attempt` counts every try, including the free
         // ones, and only guards against a server that dribbles forever.
@@ -538,7 +537,7 @@ impl Fetcher {
             Some(tag) => req.header("If-None-Match", &format!("\"{tag}\"")),
             None => req,
         };
-        // Resume (WF-09). `If-Match` is what makes it safe: without it a resume could staple
+        // Resume. `If-Match` is what makes it safe: without it a resume could staple
         // the tail of a replaced object onto the head of the one we started with, and the
         // Logan objects are mutable (3.1% of a 5,000-key sample were rewritten after the
         // 2024-03 load). A server that does not know the entity answers 412 and we start over.
@@ -598,7 +597,7 @@ impl Fetcher {
                 ));
             }
             // Request timeout and "slow down". The server is asking to be asked again, and
-            // may have said when (WF-07); before 0.2.0 both were permanent on the first try.
+            // may have said when; before 0.2.0 both were permanent on the first try.
             408 | 429 => {
                 return Err(FetchAttempt::Transient(
                     format!("HTTP {status}"),
@@ -674,7 +673,7 @@ impl Fetcher {
         use sha2::Digest;
         let mut buf = vec![0u8; crate::config::DOWNLOAD_BUFFER_BYTES as usize];
         // The object's first four bytes, collected across however many reads it takes, so
-        // the zstd check below is about the object and not about one buffer (WF-13). Only
+        // the zstd check below is about the object and not about one buffer. Only
         // for a transfer that starts at byte 0; a resume already passed it.
         let mut head: Vec<u8> = Vec::with_capacity(4);
         let mut checked_magic = xfer.got > 0;
@@ -709,7 +708,7 @@ impl Fetcher {
                     Box::new(Payload { bytes: None, ..payload.clone() }),
                 ));
             }
-            // WF-13: refuse a body that is not a zstd stream, before it can be renamed into
+            // Refuse a body that is not a zstd stream, before it can be renamed into
             // the cache. A proxy's error page used to be cached under the accession's name
             // and then fail that accession on every run, forever, even online.
             if !checked_magic {
@@ -802,7 +801,7 @@ impl Fetcher {
     /// 1. `--unitigs-cache`, where the bytes are wanted anyway, so the download and the cache
     ///    write are the same write.
     /// 2. `--spool-dir`, as an unlinked file. The run still never holds the object.
-    /// 3. RAM, which is what every download used to do.
+    /// 3. RAM, the fallback when neither is available.
     fn open_sink(&self, accession: &Accession) -> BodySink {
         if let Some(dir) = &self.cache_dir {
             match open_cache_tmp(dir, accession) {
@@ -910,7 +909,7 @@ fn http_date_to_iso8601(s: &str) -> Option<String> {
     Some(format!("{year}-{month:02}-{day}T{time}Z"))
 }
 
-/// Whether a cache entry opens with the zstd magic (WF-13).
+/// Whether a cache entry opens with the zstd magic.
 ///
 /// Reads four bytes and rewinds, so the caller's handle is still at the start for the hash
 /// pass that follows. An unreadable handle is treated as "not zstd": the read that follows
@@ -922,7 +921,7 @@ fn entry_is_zstd(file: &mut std::fs::File) -> bool {
     file.seek(SeekFrom::Start(0)).is_ok() && ok
 }
 
-/// The note recording why an accession is absent from the cache (WF-03).
+/// The note recording why an accession is absent from the cache.
 ///
 /// `<DIR>/<ACC>.unitigs.absent`, one line. Deliberately not the provenance sidecar's format:
 /// that one describes an object that exists, and this one exists because no object does.
@@ -974,7 +973,7 @@ fn read_absent(dir: &Path, accession: &str) -> Option<Absent> {
     Some(Absent::TooLarge(bytes))
 }
 
-/// Update an accession's `.absent` note from what the fetch returned (WF-03).
+/// Update an accession's `.absent` note from what the fetch returned.
 ///
 /// Only the two outcomes that are properties of the accession rather than of this run are
 /// recorded: no Logan data, and over the cap. A success removes any note, because Logan does
@@ -1017,7 +1016,7 @@ fn write_absent(dir: &Path, accession: &str, line: &str) {
 
 /// Bytes an attempt must add for the resume to cost nothing against `--fetch-attempts`.
 ///
-/// WF-09. A connection that dropped after transferring real data has not failed in the way
+/// A connection that dropped after transferring real data has not failed in the way
 /// the attempt budget is counting; it has made progress and been interrupted. Without this, a
 /// 4 GB object on a link that drops every few minutes exhausts six attempts having downloaded
 /// most of it six times.
@@ -1033,11 +1032,11 @@ const MAX_FETCH_ATTEMPTS_EVER: u32 = 1000;
 
 /// Whether `b` opens a zstd stream.
 ///
-/// WF-13. A cache entry used to be accepted on "not empty", and `try_once` cached any 200
-/// body, so a proxy's HTML error page became a cache entry that failed its accession with
-/// `parse failed: Unknown frame descriptor` on every run, forever, even online. Four bytes
-/// settle it: `28 b5 2f fd` is the frame magic, and `184d2a5?` is a skippable frame, which a
-/// legitimate file may begin with.
+/// Accepting a cache entry on "not empty", and caching any 200 body, turns a proxy's HTML
+/// error page into an entry that fails its accession with `parse failed: Unknown frame
+/// descriptor` on every later run, online ones included. Four bytes settle it: `28 b5 2f fd`
+/// is the frame magic, and `184d2a5?` is a skippable frame, which a legitimate file may
+/// begin with.
 fn looks_like_zstd(b: &[u8]) -> bool {
     if b.len() < 4 {
         return false;
@@ -1062,7 +1061,7 @@ fn retry_after<B>(resp: &ureq::http::Response<B>) -> Option<Duration> {
 
 /// How long to wait before attempt `n` (1-based), with jitter.
 ///
-/// WF-07. This was `500 ms * attempt` over three attempts: 1.5 s in total, no jitter. A 60 s
+/// This was `500 ms * attempt` over three attempts: 1.5 s in total, no jitter. A 60 s
 /// network, proxy or DNS interruption therefore discarded one accession per worker every
 /// 1.5 s, which at the default eight workers marks about 320 accessions `error`, and since
 /// 0.2.0 any error makes the run non-zero. Exponential from 1 s, capped at a minute, so the
@@ -1106,7 +1105,7 @@ fn parse_content_range(v: &str) -> Option<(u64, Option<u64>)> {
     Some((start.trim().parse().ok()?, total.trim().parse().ok()))
 }
 
-/// One object's download, carried across attempts so a dropped connection resumes (WF-09).
+/// One object's download, carried across attempts so a dropped connection resumes.
 ///
 /// Before this, a failed attempt threw away everything it had transferred and the next one
 /// issued a bare GET from byte 0. With the default 900 s request timeout that meant any
@@ -1162,7 +1161,7 @@ impl Drop for Transfer {
 /// Whether a failed attempt is worth repeating.
 enum FetchAttempt {
     /// Transport error, 5xx, 408 or 429. Retry, after the server's `Retry-After` when it sent
-    /// one and the backoff otherwise (WF-07).
+    /// one and the backoff otherwise.
     Transient(String, Option<Duration>),
     /// A 4xx other than 404. Retrying cannot help.
     Permanent(String),
@@ -1363,7 +1362,7 @@ fn open_cache_tmp(dir: &Path, accession: &str) -> std::io::Result<BodySink> {
 /// corrupt further in. Truncated or damaged data surfaces as an `io::Error` from `read()`
 /// during `parse::build`. Callers must not treat a short read as a clean end of file.
 ///
-/// **One truncation does not surface here at all** (WG-10). A file cut exactly at a frame
+/// **One truncation does not surface here at all**. A file cut exactly at a frame
 /// boundary is a complete, valid zstd stream of the frames it still has, so every read
 /// succeeds and the decode ends cleanly on what is half an object. Nothing in this layer can
 /// tell that apart from a small accession. `parse` catches it instead, from the links: unitig
@@ -1555,7 +1554,7 @@ mod size_cap_tests {
         f.try_once(0, &acc, url, None, &mut xfer)
     }
 
-    /// A body that is a plausible Logan object: zstd frame magic, then filler (WF-13).
+    /// A body that is a plausible Logan object: zstd frame magic, then filler.
     fn zbody(n: usize) -> Vec<u8> {
         let mut v = vec![0x28, 0xb5, 0x2f, 0xfd];
         v.resize(n.max(4), b'Z');
@@ -1582,7 +1581,7 @@ mod size_cap_tests {
 
     /// A fetcher that talks to the loopback server directly.
     ///
-    /// TW-09. `Fetcher::new` leaves ureq's `Proxy::try_from_env()` in place, which is correct
+    /// `Fetcher::new` leaves ureq's `Proxy::try_from_env()` in place, which is correct
     /// in production. In these tests it means that with `HTTPS_PROXY` set and no `NO_PROXY`
     /// entry for loopback, the request goes to the proxy and both tests fail with "refused at
     /// the cap", which reads like a size-cap regression rather than an environment problem.
@@ -1886,7 +1885,7 @@ mod retry_tests {
         v
     }
 
-    /// A fetcher that talks to the loopback server directly (TW-09: no proxy from the env).
+    /// A fetcher that talks to the loopback server directly, with no proxy from the env.
     fn fetcher(cfg: Config) -> Fetcher {
         let mut f = Fetcher::new(&cfg);
         f.agent = ureq::Agent::new_with_config(
@@ -1965,7 +1964,7 @@ mod retry_tests {
         format!("http://127.0.0.1:{port}/u/X/X.unitigs.fa.zst")
     }
 
-    /// WF-09. A transfer interrupted after real progress continues where it stopped.
+    /// A transfer interrupted after real progress continues where it stopped.
     ///
     /// Before this, every attempt reissued a bare GET from byte 0, so an object whose
     /// per-stream rate fell below size/timeout could never be fetched however many attempts
@@ -2039,7 +2038,7 @@ mod retry_tests {
         );
     }
 
-    /// WF-07. 408 and 429 are transient, and a `Retry-After` is obeyed.
+    /// 408 and 429 are transient, and a `Retry-After` is obeyed.
     ///
     /// They used to fall into the `400..=499` arm and fail the accession on the first try,
     /// so a throttling bucket cost one accession per 429 rather than one pause.
@@ -2087,11 +2086,11 @@ mod retry_tests {
         assert!(a.windows(2).any(|w| w[0] != w[1]), "no jitter at all: {a:?}");
     }
 
-    /// WF-13. A body that is not zstd is refused, and never cached.
+    /// A body that is not zstd is refused, and never cached.
     ///
-    /// A proxy's HTML error page used to be written into the cache under the accession's
-    /// name, where it failed that accession with `parse failed: Unknown frame descriptor` on
-    /// every later run, online runs included, until someone found and deleted the file.
+    /// A proxy's HTML error page must not be written into the cache under the accession's
+    /// name, where it would fail that accession with `parse failed: Unknown frame
+    /// descriptor` on every later run until someone found and deleted the file.
     #[test]
     fn a_body_that_is_not_zstd_is_refused_and_not_cached() {
         let dir = std::env::temp_dir().join(format!("logan-wf13-{}", std::process::id()));
@@ -2153,7 +2152,7 @@ mod retry_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// WF-03. A negative recorded at fetch time keeps its status in the `--offline` run.
+    /// A negative recorded at fetch time keeps its status in the `--offline` run.
     ///
     /// `disassembler fetch` writes nothing for an accession Logan has no unitigs for, so the
     /// documented `--offline` run that follows saw an ordinary cache miss and called it an

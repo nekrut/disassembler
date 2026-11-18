@@ -62,7 +62,7 @@ def auto_min_len(ref: Path) -> int | None:
     return int(length * 0.95)
 
 
-# PM-01: `--warmup` is read with `atoi` and the admission test is `n_mine > warmup`, so a
+# `--warmup` is read with `atoi` and the admission test is `n_mine > warmup`, so a
 # value nothing can exceed disarms the gate. After 2,000 records the binary used to reject a
 # record whose count of never-seen k-mers exceeded `mean + outlier_sd*sqrt(var) + 0.5`, and a
 # rejected record is never sketched, promoted or counted, so the rest of its clade was
@@ -74,16 +74,16 @@ def auto_min_len(ref: Path) -> int | None:
 ADMISSION_OFF_WARMUP = 2 ** 31 - 1
 _REJECT_RE = re.compile(r"REJECT \(error\)\s*:\s*(\d+)")
 
-# PM-02: the promoted set's LSH index is a 2^20-slot open-addressing table that is never
+# The promoted set's LSH index is a 2^20-slot open-addressing table that is never
 # grown, and lookup stops only at an empty slot, so once 2^20 distinct band keys are stored
 # the next lookup of an absent key loops forever at 100% CPU. Each promoted record inserts up
 # to 16 band keys; 65,536 records with fully distinct bands is the worst case, and closer
 # cohorts fill at roughly 150k to 430k promoted. This is upstream's code
 # (github.com/stevenweaver/kmer-diversity-sieve) and is not patched here; the wrapper refuses
-# rather than hanging. See the backlog entry for the upstream fix (grow at half load).
+# rather than hanging. The upstream fix is to grow the table at half load.
 LSH_TABLE_LIMIT = 65536
 
-# PM-08: the per-record k-mer buffer is a fixed 1<<16 entries and is never grown, so k-mers
+# The per-record k-mer buffer is a fixed 1<<16 entries and is never grown, so k-mers
 # past position ~65,550 are dropped without a message and two records identical over their
 # first 65.5 kb are judged near-duplicates. Also upstream's; warned about here.
 SKETCH_LENGTH_LIMIT = 65550
@@ -92,7 +92,7 @@ SKETCH_LENGTH_LIMIT = 65550
 def report_rc(rc: int, what: str, prog: str) -> int:
     """Turn a `subprocess` return code into a message and a shell-style exit status.
 
-    PM-19. A signal death is negative here, and it was printed and returned as is, so the
+    A signal death is negative here, and it was printed and returned as is, so the
     shell saw 252 for SIGILL and 250 for SIGABRT and the message read "exited -4". The sieve
     Makefile builds with `-march=native`, so a binary moved to another CPU dies with SIGILL,
     which is exactly the case the old message hid.
@@ -119,7 +119,7 @@ class DedupReport(NamedTuple):
     headers: list         # the original header line of record i, which the binary never sees
     short: int            # below --min-len, which the binary's completeness gate will drop
     gappy: int            # over --max-gap-frac
-    longest: int = 0      # the longest record, for the sketch-length limit (PM-08)
+    longest: int = 0      # the longest record, for the sketch-length limit
 
 
 def byte_exact_dedup(src: Path, dst: Path, min_len: int = 0,
@@ -132,11 +132,11 @@ def byte_exact_dedup(src: Path, dst: Path, min_len: int = 0,
 
     A later identical copy has novelty 0 and is never promoted, so dropping it loses nothing.
     What duplicates do change is admission: each copy adds a zero to the binary's running
-    singleton-count statistics. That gate is now switched off (PM-01), so dedup is a speed-up
+    singleton-count statistics. That gate is now switched off, so dedup is a speed-up
     and a memory saving, not a correctness fix.
 
     **The records are renumbered `>r0`, `>r1`, ... and the headers returned separately**
-    (PM-04, PM-13). The binary folds a month bucket parsed from `|YYYY-MM` in the header into
+. The binary folds a month bucket parsed from `|YYYY-MM` in the header into
     every LSH band key, so a record was compared only with promoted records of the same
     month: twelve copies of one sequence with `|2021-01-15` ... `|2021-12-15` headers all
     survived, while the same twelve with plain ids collapsed to one. It also selects what to
@@ -144,7 +144,7 @@ def byte_exact_dedup(src: Path, dst: Path, min_len: int = 0,
     emitted when only one had been promoted, and a long `from-lexicmap` header lost its tail.
     Neutral ids remove both, and the wrapper puts the original headers back.
 
-    Sequences are keyed by a 16-byte digest rather than held whole (PM-24): the set used
+    Sequences are keyed by a 16-byte digest rather than held whole: the set used
     about 1 GB at 250,000 gene-length rows, transient but before the binary even starts.
     """
     seen: set[bytes] = set()
@@ -157,7 +157,7 @@ def byte_exact_dedup(src: Path, dst: Path, min_len: int = 0,
         nonlocal n_out, n_empty, short, gappy, longest
         if header is None:
             return
-        # PM-07: the binary strips only \n and \r and counts every other byte as an N, while
+        # The binary strips only \n and \r and counts every other byte as an N, while
         # the wrapper's own predictor stripped all whitespace, so a file with trailing spaces
         # was dropped by the completeness gate while the wrapper predicted no loss at all.
         # Normalise once, here, so both see the same thing.
@@ -169,7 +169,7 @@ def byte_exact_dedup(src: Path, dst: Path, min_len: int = 0,
         if key in seen:
             return
         seen.add(key)
-        # The gate counts measured in the same pass that writes the file (PM-24).
+        # The gate counts measured in the same pass that writes the file.
         if len(seq) > longest:
             longest = len(seq)
         if len(seq) < min_len:
@@ -271,7 +271,7 @@ def sieve_run(
     try:
         output_fasta.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        # PM-20: a path component that is a regular file raises FileExistsError here, which
+        # A path component that is a regular file raises FileExistsError here, which
         # used to leave a traceback.
         print(f"sieve: cannot create the output directory "
               f"{output_fasta.parent}: {e}", file=sys.stderr)
@@ -312,7 +312,7 @@ def sieve_run(
         except OSError:
             pass
 
-    # PM-05, PM-27: the binary runs in a private directory with neutral names. Its shards
+    # The binary runs in a private directory with neutral names. Its shards
     # used to be written beside the user's output and found with
     # `glob(f"{stem}.rank*.fasta")`, unescaped, which deleted `cohort.ranked_by_abundance
     # .fasta` and `cohort.rank1_manual.fasta` before the input was even read, merged any
@@ -322,7 +322,7 @@ def sieve_run(
     try:
         work = Path(tempfile.mkdtemp(prefix=".sieve_", dir=output_fasta.parent))
     except OSError as e:
-        # PM-20: an unwritable or full output directory is the output's problem, not the
+        # An unwritable or full output directory is the output's problem, not the
         # input's, and this is the first thing that touches it.
         print(f"sieve: cannot write beside the output {output_fasta}: {e}", file=sys.stderr)
         emit_summary("failed", error=f"cannot write beside the output: {e}")
@@ -337,7 +337,7 @@ def sieve_run(
             emit_summary("failed", error=f"cannot read the input FASTA: {e}")
             return 1
         except OSError as e:
-            # PM-20: `byte_exact_dedup` both reads the input and writes the scratch copy, so
+            # `byte_exact_dedup` both reads the input and writes the scratch copy, so
             # an unwritable or full output directory was reported as "cannot read the input
             # FASTA", which sends the reader to the wrong file.
             if e.filename and e.filename != str(input_fasta):
@@ -353,7 +353,7 @@ def sieve_run(
             print(f"sieve: {input_fasta} has no sequences.", file=sys.stderr)
             emit_summary("failed", n_in=n_in, error="the input FASTA has no sequences")
             return 1
-        # PM-15: a header-only record is not an exact duplicate, and counting it as one made
+        # A header-only record is not an exact duplicate, and counting it as one made
         # "4 -> 2 records (2 exact duplicates removed)" of two real and two empty records.
         empty_note = f", {rep.n_empty} empty records dropped" if rep.n_empty else ""
         print(f"[sieve] dedup: {n_in} -> {n_unique} records "
@@ -365,7 +365,7 @@ def sieve_run(
                   f"{max_gap_frac:.0%} gaps or other non-ACGT characters (--max-gap-frac)",
                   flush=True)
 
-        # PM-08: the binary's per-record k-mer buffer is a fixed 1<<16 entries and is never
+        # The binary's per-record k-mer buffer is a fixed 1<<16 entries and is never
         # grown, so k-mers past position ~65,550 are dropped silently and two records
         # identical over their first 65.5 kb are judged near-duplicates: one is dropped at
         # exit 0 with nothing on stderr. Upstream's code, so this warns rather than patching.
@@ -375,7 +375,7 @@ def sieve_run(
                   f"(upstream bug, kmer-diversity-sieve): records identical over that "
                   f"prefix are judged near-duplicates whatever follows it.", file=sys.stderr)
 
-        # PM-02: refuse rather than hand the binary an input it will hang on. Only admitted
+        # Refuse rather than hand the binary an input it will hang on. Only admitted
         # records reach the LSH table.
         admitted = n_unique - short - gappy
         if admitted > LSH_TABLE_LIMIT:
@@ -401,7 +401,7 @@ def sieve_run(
             "--emit-promoted", str(emit_prefix),
         ]
         print(f"[sieve] {' '.join(cmd)}", flush=True)
-        # PM-01: the binary reports its rejections on stdout and nothing read them.
+        # The binary reports its rejections on stdout and nothing read them.
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
         sys.stdout.write(proc.stdout)
         sys.stdout.flush()
@@ -423,9 +423,9 @@ def sieve_run(
                          error=msg)
             return 1
 
-        # PM-14: the output used to be opened for writing before anything was counted, so a
+        # The output used to be opened for writing before anything was counted, so a
         # run that promoted nothing left a 0-byte file over the previous result. Staged, and
-        # renamed in only when there is something to publish. PM-13: the binary's own output
+        # renamed in only when there is something to publish. The binary's own output
         # headers are the truncated neutral ids, so the saved originals go back here.
         shards = sorted(work.glob("promoted.rank*.fasta"),
                         key=lambda q: int(q.name[len("promoted.rank"):-len(".fasta")]))
@@ -469,7 +469,7 @@ def sieve_run(
                  short=short, gappy=gappy, records=promoted,
                  error=None if n_out else "promoted 0 haplotypes")
     if n_out == 0:
-        # PM-14: `is_novel` on an empty promoted set returns 1, so zero promoted cannot be a
+        # `is_novel` on an empty promoted set returns 1, so zero promoted cannot be a
         # --threshold problem: every record failed the completeness gate or carries no
         # A/C/G/T 15-mer. The old hint led with the one cause it could not be.
         print(f"sieve: promoted 0 of {n_unique} unique records; {output_fasta} is unchanged. "

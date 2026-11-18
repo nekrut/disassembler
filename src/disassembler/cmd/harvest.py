@@ -44,7 +44,7 @@ ATTEMPTS = 5
 
 
 def get_galaxy_api_key(key_file: str | None = None, api_key: str | None = None) -> str:
-    """The Galaxy API key. One implementation, in `disassembler.galaxy` (PL-27). This copy
+    """The Galaxy API key. One implementation, in `disassembler.galaxy`. This copy
     took no `api_key` argument, so `--api-key` worked for `lexicmap` and not for `harvest`."""
     return galaxy.api_key(api_key, key_file)
 
@@ -82,20 +82,15 @@ RETRY_AFTER_CAP_SECS = 120
 def fetch_shard(item, base_url, sess):
     """Fetch one shard's JSON. Returns None when every attempt failed.
 
-    None, not {}: an exhausted retry loop used to be indistinguishable from a shard
-    that legitimately matched nothing, and nothing counted either. An expired API key
-    therefore produced `Harvest complete: 0 unique SRA runs across 0 targets`, a
-    UNION file holding a single newline, and exit 0.
+    None, not {}: an exhausted retry loop must be distinguishable from a shard that
+    legitimately matched nothing, or an expired API key reports "0 unique SRA runs across 0
+    targets" and exits 0.
 
-    HTTP 429 is special-cased. Galaxy's dataset-display endpoint rate-limits per
-    source IP and returns 429 with a `Retry-After: <seconds>` header (typically
-    30-60 s on usegalaxy.org). The old policy treated 429 as a generic transient
-    and slept the same 0.5/1.0/1.5/2.0 s ladder as any other retry, which was way
-    too short: the retry loop just re-hit the rate limit five times in quick
-    succession, all got 429, and the shard was reported failed. Now we honor
-    Retry-After (capped at RETRY_AFTER_CAP_SECS so a hostile server can not
-    freeze the worker) and consume an attempt, so ATTEMPTS still bounds worst-case
-    per-shard runtime.
+    HTTP 429 is special-cased. Galaxy's dataset-display endpoint rate-limits per source IP
+    and returns `Retry-After: <seconds>`, typically 30-60 s, which the ordinary sub-second
+    backoff ladder is far too short for: every attempt re-hits the limit. Retry-After is
+    honoured, capped at RETRY_AFTER_CAP_SECS so a hostile server cannot freeze the worker,
+    and consumes an attempt so ATTEMPTS still bounds per-shard runtime.
     """
     name, did = item
     url = f"{base_url}/api/datasets/{did}/display"
@@ -139,18 +134,14 @@ def _merge_payload(d, per_target):
     `(n_bad_target, n_unparsed)`: target names skipped as unusable (dict key /
     filename), and hit values that were not a number.
 
-    Pulled out of harvest_collection so the local-files path can reuse the
-    exact same merge semantics. Malformed-payload handling stays at the call
-    site, where it is wired to the per-mode failure counter.
+    Shared with the local-files path so both merge identically. Malformed-payload handling
+    stays at the call site, where it is wired to the per-mode failure counter.
 
-    GX-07: kmindex writes a hit value two ways. `--format json` gives the ratio
-    directly, `--format json_vec` gives `{"R": ratio, "P": [positions]}`, and the
-    Galaxy `kmindex_query` tool offers both under one output datatype. Every
-    json_vec value failed `float()` and was dropped by a bare `continue`, so a
-    whole run harvested nothing and still exited 0, reporting "0 unique SRA runs
-    across 0 targets". The ratio is the same number in both shapes, so it is
-    unwrapped here rather than refused, and anything still unparseable is counted
-    instead of vanishing.
+    Kmindex writes a hit value two ways: `--format json` gives the ratio directly,
+    `--format json_vec` gives `{"R": ratio, "P": [positions]}`, and the Galaxy
+    `kmindex_query` tool offers both under one output datatype. The ratio is the same number
+    in both shapes, so json_vec is unwrapped rather than refused, and anything still
+    unparseable is counted rather than dropped.
     """
     n_bad_target = 0
     n_unparsed = 0
@@ -178,7 +169,7 @@ def _merge_payload(d, per_target):
 
 
 def _refuse_if_nothing_was_numeric(per_target, n_unparsed):
-    """GX-07. Hits were read and none of them was a number: that is an unreadable
+    """Hits were read and none of them was a number: that is an unreadable
     input, not an empty collection.
 
     A genuinely empty shard set (`{"idx": {"q": {}}}`) is still a clean, successful
@@ -200,7 +191,7 @@ def _refuse_if_nothing_was_numeric(per_target, n_unparsed):
 def _drop_earlier_targets(out_dir, targets):
     """Remove the per-target files of a previous harvest into this directory.
 
-    PC-05. Harvest writes `<target>.accessions.txt` and `<target>.scores.json` for this
+    Harvest writes `<target>.accessions.txt` and `<target>.scores.json` for this
     run's targets only, and left an earlier run's beside them. A composite that picks its
     cohort by name then found the old file and reconstructed the old collection's
     accessions, reporting it as the new collection's result.
@@ -241,7 +232,7 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
     summary = {}
     _drop_earlier_targets(out_dir, set(per_target))
     for target, acc_dict in sorted(per_target.items()):
-        # PH-01: by score, highest first, **ties broken by accession**. Python's sort is
+        # By score, highest first, **ties broken by accession**. Python's sort is
         # stable, so sorting on the score alone left tied accessions in dict insertion
         # order, which is shard ARRIVAL order: `as_completed` in API mode, file-name order
         # under --shards-dir. kmindex scores tie in bulk (274,808 accessions score exactly
@@ -290,7 +281,7 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
         ),
         discards={f"{failure_noun}s": {"failed": n_failed, "empty": n_empty},
                   "targets": {"unusable_name": n_bad_target},
-                  # GX-07: hit values that were neither a number nor a json_vec
+                  # Hit values that were neither a number nor a json_vec
                   # `{"R": ratio, "P": [...]}`. Non-zero means some hits were read
                   # and dropped, which used to happen in silence.
                   "hits": {"non_numeric_score": n_unparsed}},
@@ -309,7 +300,7 @@ def _write_outputs(per_target, out_dir, n_items, n_failed, n_empty, n_bad_target
     if n_bad_target:
         print(f"[!] {n_bad_target} target name(s) were unusable as a key or filename "
               f"and were skipped.", file=sys.stderr)
-    # GX-07. A shard whose hit values are not numbers is not an empty collection, and
+    # A shard whose hit values are not numbers is not an empty collection, and
     # harvesting nothing from it must not read as "this collection has no hits".
     if n_unparsed:
         print(f"[!] {n_unparsed} hit value(s) were not numeric and were skipped. "

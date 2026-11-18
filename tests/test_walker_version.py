@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PK-01: this package refuses a logan-walker older than it needs.
+"""This package refuses a logan-walker older than it needs.
 
 The only published 0.1.1 biocontainer, `disassembler:0.1.1--pyhdfd78af_0`, carries
 disassembler 0.1.1 beside **logan-walker 0.1.0**: the recipe floor was `>=0.1.0,<0.2` and the

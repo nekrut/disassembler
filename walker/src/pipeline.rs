@@ -4,11 +4,12 @@
 //!  io::input                                                          io::output
 //!  ─────────                                                          ──────────
 //!  accession list                                              reconstructed.fasta
-//!  reference CDS                                               bubbles.json
+//!  reference CDS                                               alt_haplotypes.fasta
+//!       │                                                      bubbles.json
+//!       │                                                      <ACC>.vcf, snvs.tsv
 //!       │                                                      summary.json
-//!       │                                                            ▲
-//!       ▼                                                            │
-//!  ┌─────────────────────────── pipeline::run ────────────────────────────┐
+//!       ▼                                                            ▲
+//!  ┌─────────────────────────── pipeline::run ────────────────────────┴───┐
 //!  │                                                                      │
 //!  │  work queue (accessions)                                             │
 //!  │       │                                                              │
@@ -19,9 +20,8 @@
 //!  │   └───┬────┘ └───┬────┘        └───┬────┘                            │
 //!  │       └──────────┴─────────────────┘                                 │
 //!  │                  │                                                   │
-//!  │        sync_channel(cfg.channel_capacity)   ◄── BOUNDED, but the     │
-//!  │                  │                              ceiling is NOT just  │
-//!  │                  │                              capacity: see below. │
+//!  │        sync_channel(cfg.channel_capacity)                            │
+//!  │                  │                                                   │
 //!  │                  ▼                                                   │
 //!  │  COMPUTE POOL  cfg.compute_workers (default 8, NOT auto-sized)       │
 //!  │   ┌────────┐ ┌────────┐        ┌────────┐                            │
@@ -29,11 +29,12 @@
 //!  │   └───┬────┘ └───┬────┘        └───┬────┘                            │
 //!  │       │          │                 │                                 │
 //!  │       │   per accession, in order:                                   │
-//!  │       │     stages::parse    -> UnitigGraph (CSR, up to 1.7x compr.) │
+//!  │       │     stages::parse    -> UnitigGraph (CSR, two passes)        │
 //!  │       │     stages::anchor   -> Anchors                              │
 //!  │       │     stages::extract  -> Subgraph + GFA on tmpfs              │
 //!  │       │     stages::align    -> GraphAligner subprocess -> GafPath   │
 //!  │       │     stages::stitch   -> Haplotype                            │
+//!  │       │     stages::variants -> consensus correction, then alts      │
 //!  │       │     stages::phase    -> Vec<Bubble>                          │
 //!  │       │          │                 │                                 │
 //!  │       └──────────┴─────────────────┘                                 │
@@ -45,62 +46,24 @@
 //!
 //! # Why two pools and not one
 //!
-//! Fetch is bandwidth-bound and saturates around 8 concurrent streams at 17.4 MB/s.
-//! Compute is CPU-bound and wants one worker per core. Conflating them behind a single
-//! `--workers` makes `--workers 16` destructive: it multiplies memory 16x while buying no
-//! extra bandwidth.
+//! Fetch is bandwidth-bound and saturates around 8 concurrent streams at 17.4 MB/s. Compute is
+//! CPU-bound and wants one worker per core. Conflating them behind a single `--workers` makes
+//! `--workers 16` destructive: it multiplies memory 16x while buying no extra bandwidth.
 //!
-//! # Why the channel is bounded, and what the bound actually is
+//! # What bounds memory
 //!
-//! Fetch threads block once the queue is full, so a fast network cannot outrun slow compute
-//! and pile up buffers without limit. An unbounded thread pool has no such limit, which is
-//! how a single run reached 21.3 GB and took the machine down with it.
+//! Nothing here scales with the size of an accession. A download streams to disk as it arrives
+//! and the parser spills its adjacency past 4 MiB, so what a compute worker holds is the gene's
+//! neighbourhood: `--max-subgraph-nodes` times about 150 bytes, 0.16 GB at the defaults. The
+//! fetch side holds one 128 KiB stream buffer per in-flight accession.
 //!
-//! This file used to claim the ceiling was "capacity times the largest retained buffer".
-//! **That is wrong, by a factor of five at the defaults.** A compressed buffer is resident in
-//! three places at once, not one:
-//!
-//! ```text
-//!   cfg.channel_capacity     queued in the bounded channel             0
-//! + cfg.fetch_workers        held by a worker blocked in send(),       8
-//!                            after read_to_vec has already returned
-//! + cfg.compute_workers      held by run_one for the whole parse,      8
-//!                            dropped only once the CSR graph exists
-//!                            -----------------------------------------
-//!                            peak concurrent buffers                  16
-//!
-//!   capped by the accession count: a run of n accessions cannot hold
-//!   more than n buffers or more than min(n, W) graphs, and --fetch-only
-//!   holds F buffers and no graphs at all
-//! ```
-//!
-//! `Config::peak_compressed_buffers_for` computes that and
-//! `Config::max_compressed_resident_bytes_for` multiplies it by `--max-size-mb`: at the 1 GB
-//! default cap, **about 16 GB** in compressed buffers. It was 20 GB until the queue depth
-//! went to 0, which is the whole of what a positive depth was costing.
-//!
-//! On top of that sits one `UnitigGraph` per compute worker, which peaks at up to 1.7x the
-//! compressed size of its accession (`Config::GRAPH_PEAK_PER_COMPRESSED_BYTE`; it was taken
-//! to be a fixed ~43 MB), and whatever `read_to_vec` transiently allocates while its `Vec`
-//! grows. `Config::max_resident_bytes_for` adds the graphs: **about 29.6 GB** at the
-//! defaults. The binary prints it at startup for the run it was actually given, so it is
-//! visible before the run rather than after the OOM.
-//!
-//! That 1.7x is a calibration, not an enforced bound, and it was measured one accession per
-//! run. Across many accessions glibc's dynamic mmap threshold rises as freed graph arrays are
-//! returned, so later arrays grow inside the heap and the steady state drifts well above it.
-//! `main::pin_mmap_threshold` pins the threshold at 1 MiB to stop that.
-//!
-//! The bound is worst case, not typical: it assumes every accession sits at the cap, while
-//! `ERR2028820` is 33 MB and the largest of the ERG11 panel is 343 MB. But the cap is what
-//! bounds the run, and raising `--max-size-mb`, `-w` or `--fetch-workers` moves all three
-//! terms at once. That 343 MB panel is already ~6.9 GB in compressed buffers alone.
+//! `Config::max_resident_bytes_for` computes the whole bound and `main` prints it at startup,
+//! so it is visible before the run rather than after an OOM. Raising `-w` or `--fetch-workers`
+//! moves it; raising `--max-size-mb` does not. See `docs/walker_reference.md#memory`.
 //!
 //! # Ordering constraint
 //!
-//! Do not raise concurrency before `stages::parse` produces the bounded CSR. Threads sharing
-//! one heap is what capped the original damage; independent workers at the old ~700 bytes
-//! per unitig would be worse, not better.
+//! Do not raise concurrency before `stages::parse` produces the bounded CSR.
 
 use crate::config::Config;
 use crate::error::Result;
@@ -128,10 +91,10 @@ pub struct Summary {
 
 /// What to do with a depth-based prune, given how many unitigs would survive it.
 ///
-/// Three distinct cases. The one that used to be folded in with "nothing to remove" is
-/// `WouldEmpty`: a floor above every unitig in the subgraph removes the entire search space,
-/// which is not a prune but a silent deletion, and it left the accession with no majority
-/// correction, no alts, no VCF rows and no SNV rows under a log line saying nothing happened.
+/// Three distinct cases. `WouldEmpty` is not "nothing to remove": a floor above every
+/// unitig removes the entire search space, which is a silent deletion rather than a prune,
+/// and leaves the accession with no majority correction, no alts and no VCF rows under a log
+/// line saying nothing happened.
 #[derive(Debug, PartialEq, Eq)]
 enum PruneOutcome {
     /// Every unitig is below the floor. Skip the prune; an unpruned result beats none.
@@ -170,19 +133,13 @@ fn pruned_covers_as_much(unpruned: &GafPath, pruned: &GafPath) -> bool {
     pruned.query_span() + PRUNE_SPAN_TOLERANCE >= unpruned.query_span()
 }
 
-/// Whether the pruned haplotype is the unpruned one with bases trimmed off an end (WA-09).
+/// Whether the pruned haplotype is the unpruned one with bases trimmed off an end.
 ///
-/// `pruned_covers_as_much` allows a pruned realignment to give up `PRUNE_SPAN_TOLERANCE`
-/// reference bases, because a strict rule kept a reference-biased primary over one terminal
-/// codon. But that tolerance was the whole test: a realignment that changed *nothing else*
-/// was accepted and logged as `applied`, which is pure loss. The maintainers' own count says
-/// it happens: of 511 refusals in a 20,000-accession run, 33 gave up three reference bases or
-/// fewer, 21 of them exactly one, and a lost terminal base can be a truncated stop codon.
-///
-/// So the tolerance now buys a shorter result only when the prune actually changed the
-/// haplotype. A strict substring test, not an end-trim test: a prune that removed an interior
-/// unitig cannot leave the rest contiguous and identical, so anything that is still a
-/// substring of the first pass is trimming and nothing else.
+/// `pruned_covers_as_much` lets a pruned realignment give up `PRUNE_SPAN_TOLERANCE` reference
+/// bases, so a realignment that changes nothing else is pure loss, and a lost terminal base
+/// can be a truncated stop codon. The tolerance therefore buys a shorter result only when the
+/// prune changed the haplotype. A substring test rather than an end-trim test: a prune that
+/// removed an interior unitig cannot leave the rest contiguous and identical.
 fn trimmed_copy(pruned: &[u8], unpruned: &[u8]) -> bool {
     pruned.len() < unpruned.len()
         && !pruned.is_empty()
@@ -228,10 +185,9 @@ pub fn run_fetch_only(
 
     let fetcher = stages::stream::Fetcher::new_for(cfg, total);
     let fetcher = &fetcher;
-    // Results, not counts. A fetch-only run used to report three integers to stderr and exit,
-    // so the frozen-input route (`disassembler fetch` into a cache, then `--offline`) left no
-    // record of what it had frozen: the one step whose whole purpose is reproducibility was
-    // the only one that wrote no summary.
+    // Results, not counts: the frozen-input route (`disassembler fetch` into a cache, then
+    // `--offline`) is the one step whose whole purpose is reproducibility, so it has to leave
+    // a record of what it froze.
     let collected: Arc<Mutex<Vec<AccessionResult>>> = Arc::new(Mutex::new(Vec::new()));
 
     std::thread::scope(|scope| {
@@ -244,9 +200,8 @@ pub fn run_fetch_only(
                     Err(_) => break,
                 };
                 let t = Instant::now();
-                // WP-18, as in `fetch_worker`: a panic here would end the run rather than
-                // the accession, and `--fetch-only` is the step whose whole purpose is to
-                // leave a usable cache behind.
+                // A panic here would end the run rather than the accession, and
+                // `--fetch-only` exists to leave a usable cache behind.
                 let fetched = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     fetcher.fetch(index, &accession)
                 })) {
@@ -314,9 +269,8 @@ fn cached(index: usize, accession: Accession, payload: crate::types::Payload) ->
 
 /// What a caught panic actually said.
 ///
-/// WP-18. `catch_unwind` hands back `Box<dyn Any>`, and the compute path used to throw it
-/// away and report "a stage panicked", which says nothing about where. A panic payload is a
-/// `&str` or a `String` in every case the standard macros produce.
+/// `catch_unwind` hands back `Box<dyn Any>`. A payload is a `&str` or a `String` in every
+/// case the standard macros produce; anything else has no description to give.
 fn panic_message(p: &(dyn std::any::Any + Send)) -> &str {
     p.downcast_ref::<&str>()
         .copied()
@@ -380,9 +334,7 @@ fn inherited_floor_config(cfg: &Config, prune: Option<&PruneReport>) -> Option<C
 /// output file is ordered differently from run to run: `summary.json`, the FASTA, the VCFs
 /// and `snvs.tsv` all follow it, and `--sieve` keeps whichever duplicate finished first.
 ///
-/// TW-05: this is a named function so that a unit test can exercise the real thing. The test
-/// that claimed to cover it sorted a vector of its own and never called into the pipeline, so
-/// it passed with the production sort deleted, as did every other test.
+/// A named function so that a unit test can exercise the real sort rather than a copy of it.
 fn restore_input_order(results: &mut [AccessionResult]) {
     results.sort_by_key(|r| r.index);
 }
@@ -463,9 +415,8 @@ pub fn run(
             .inspect(|r| {
                 done += 1;
                 report(done, total, r);
-                // WP-06: and to disk, as it lands. Everything else this run writes waits for
-                // the last accession, so without this a kill at hour eight of a nine-hour
-                // shard leaves nothing at all.
+                // To disk, as it lands. Everything else waits for the last accession, so
+                // without this a run killed part way through leaves nothing at all.
                 if let Some(j) = journal {
                     j.record(r);
                 }
@@ -566,10 +517,8 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
 /// which is the backpressure that bounds memory.
 /// What `fetch_worker` needs of a fetcher.
 ///
-/// WP-18 put a `catch_unwind` around the call; this is how that is testable. The production
-/// implementation is [`stages::stream::Fetcher`] and there is no other, so the trait buys
-/// nothing at run time: it exists so a test can hand the worker a fetcher that panics and
-/// watch the run survive it.
+/// [`stages::stream::Fetcher`] is the only implementation, so this buys nothing at run time.
+/// It exists so a test can hand the worker a fetcher that panics and watch the run survive it.
 pub trait Fetch {
     fn fetch(&self, index: usize, accession: &Accession) -> Result<FetchedUnitigs>;
 }
@@ -592,12 +541,9 @@ fn fetch_worker<F: Fetch + ?Sized>(
             Err(_) => break, // queue drained
         };
         let t = Instant::now();
-        // WP-18. The compute pool has caught its panics since TW-01; this one did not, and a
-        // panic here does not fail one accession, it unwinds the scope and takes the whole
-        // run with it: exit 101, no outputs, and the collector's "no result was produced"
-        // fallback never runs. No reachable panic was found in the shipped fetch path, so
-        // this is defence in depth for the pool that touches the network, zstd and the
-        // filesystem.
+        // An uncaught panic here unwinds the scope and takes the whole run with it: exit
+        // 101, no outputs, and the collector's "no result was produced" fallback never runs.
+        // Defence in depth for the pool that touches the network, zstd and the filesystem.
         let fetched = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             fetcher.fetch(index, &accession)
         })) {
@@ -660,8 +606,7 @@ fn compute_worker(
                 .unwrap_or_else(|e| result_for_error(index, accession, e.to_string(), &e))
         }))
         .unwrap_or_else(|p| {
-            // WP-18: say what it was. The payload is the only description of a panic that
-            // reaches the summary, and it was being dropped.
+            // The payload is the only description of a panic that reaches the summary.
             AccessionResult::failed(
                 index,
                 panic_acc,
@@ -678,21 +623,8 @@ fn compute_worker(
 /// Every compute stage for a single accession, in order. This is the whole per-accession
 /// pipeline in one readable place.
 ///
-/// # Memory shape
-///
-/// `parse::build` consumes the compressed bytes as a stream and returns everything the rest
-/// of the pipeline needs, so the decompressed text (145 MB for `ERR2028820`, ~1.44 GB for the
-/// largest ERG11 accessions) is never held. After the scope below closes, resident state per
-/// worker is one `UnitigGraph`: ~43 MB of arrays for `ERR2028820`, up to 1.7x the
-/// compressed size at peak in general (`Config::GRAPH_PEAK_PER_COMPRESSED_BYTE`).
-///
-/// Peak is therefore roughly `compressed + graph`: measured at 80 MB for the whole process
-/// on `ERR2028820` (33 MB), and 853 MB on `ERR9831160` (348 MB), against ~199 MB for
-/// `ERR2028820` in a design that materialises the decompressed buffer.
-///
-/// For the whole-process ceiling, multiplying this by `cfg.compute_workers` is **not**
-/// enough: compressed buffers are also resident in the channel and in blocked fetch workers.
-/// See the module doc and `Config::peak_compressed_buffers`.
+/// The decompressed text is never held: both parse passes consume it as a stream, so what
+/// stays resident per worker is the gene's neighbourhood. See the module doc for the bound.
 fn run_one(
     cfg: &Config,
     queries: &[Query],
@@ -715,23 +647,21 @@ fn run_one(
     let mut graph = stages::parse::scan_in(
         &fetched.accession,
         stages::stream::decoder(&fetched)?,
-        // The budget the startup line promised: one graph per compute worker at
-        // GRAPH_PEAK_PER_COMPRESSED_BYTE times the size cap. Without it that line is a
-        // calibration from real accessions rather than a limit anything enforces.
+        // The budget the startup line promised. Without it that line is a calibration from
+        // real accessions rather than a limit anything enforces.
         cfg.max_graph_bytes_per_accession(),
         &mut scanner,
         cfg.spool_dir.as_deref(),
         crate::types::SPILL_ADJACENCY_AT,
     )?;
     timing.stream = fetch_secs;
-    // `parse` now covers the anchoring too, and `anchor` is no longer a pass of its own. The
-    // key stays in the contract rather than being dropped, because removing it would make two
-    // schema-1 summaries disagree about which keys exist.
     timing.parse = t.elapsed().as_secs_f64();
+    // Anchoring is fused into pass 1, so it has no time of its own. The key stays in the
+    // contract: dropping it would make two schema-1 summaries disagree about which keys exist.
     timing.anchor = 0.0;
     let n_unitigs = graph.n_unitigs;
-    // WG-02 and WG-07. Read off the graph now: `collect` rewrites the graph down to the
-    // neighbourhood, and both of these are statements about the file.
+    // Read off the graph now: `collect` rewrites it down to the neighbourhood, and both of
+    // these are statements about the file.
     let abundance_missing = graph.abundance_missing;
     let graph_has_links = graph.n_links > 0;
     let anchors = scanner.finish();
@@ -855,10 +785,9 @@ fn run_one(
             let path = gaf_by_ref.remove(q.record_id.as_str());
             let hap = match &path {
                 Some(p) => {
-                    // WA-12. The first point a row from the aligner is believed. A row that
-                    // is not a walk of the GFA we handed out stitches into a sequence anyway,
-                    // and carries the identity the row claims while describing a different
-                    // molecule, so it is refused here rather than published.
+                    // The first point a row from the aligner is believed. A row that is not
+                    // a walk of the GFA we handed out stitches into a clean sequence anyway,
+                    // carrying the identity it claims while describing a different molecule.
                     stages::stitch::check_gaf_walk(cfg, &graph, &subgraph, p).map_err(
                         |detail| crate::error::Error::GraphAligner {
                             accession: graph.accession.clone(),
@@ -894,7 +823,7 @@ fn run_one(
                 }),
                 cov: c.haplotype.as_ref().map(|h| h.cov),
                 // From the path, not from the haplotype, so a candidate the `--min-cov` gate
-                // rejected still reports the number that rejected it (WA-05). `stitch`
+                // rejected still reports the number that rejected it. `stitch`
                 // returns `None` for those, so `haplotype` is `None` and `cov` is null.
                 ref_cov: c
                     .path
@@ -964,12 +893,9 @@ fn run_one(
     //
     // The floor is a fraction of the sample's *own* depth, never below `--prune-min-abund`,
     // so on a shallow isolate the lower bound is the whole rule: `ERR2028820` at 180x gets
-    // 1.8x from the fraction and prunes at 5.0. That is not "nothing is removed", which this
-    // comment used to claim (WG-05): it removes 268 of the neighbourhood's 747 unitigs. What
-    // is measured, and what makes it safe, is that the *haplotype* does not move. At every
-    // setting from 0.01 to 0.05 `ERR2028820` comes back byte-identical, with the same
-    // alignment count and no node dropped from the walked path; the 268 are unitigs hanging
-    // off the route, which is what the prune is for.
+    // 1.8x from the fraction and prunes at 5.0, which still removes 268 of its 747
+    // neighbourhood unitigs. What makes that safe is that the haplotype does not move: those
+    // 268 hang off the route rather than lying on it, which is what the prune is for.
     //
     // # Never a regression
     //
@@ -983,20 +909,12 @@ fn run_one(
             let floor = stages::extract::depth_floor(cfg, depth);
             let before = subgraph.nodes.len();
 
-            // Count survivors before consuming anything. `prune_nodes` takes ownership of the
-            // node and sequence vectors, so a prune that turns out to be unusable cannot be
-            // undone afterwards.
-            //
-            // Three outcomes, and the old code collapsed two of them. It tested
-            // `dropped == 0 || kept_nodes.is_empty()` and, in the second case, assigned the
-            // EMPTY vectors back while logging "nothing to remove". Splitting the empty case
-            // out keeps the unpruned subgraph in that branch, which is the same "never a
-            // regression" rule the failed-realign path applies.
+            // Count survivors before consuming anything: `prune_nodes` takes ownership of
+            // the node and sequence vectors, so an unusable prune cannot be undone afterwards.
             //
             // Route unitigs the floor would remove although the route had no deeper way
-            // round them: a genuinely thin stretch of the gene rather than an error branch
-            // (WP-01). Computed before the count below, because they are part of the
-            // predicate it must agree with.
+            // round them: a genuinely thin stretch of the gene rather than an error branch.
+            // Computed before the count below, which must agree with the same predicate.
             //
             // A failure to read adjacency here is not worth the accession: it means the prune
             // cannot be sized, and an unpruned result is the "never a regression" answer.
@@ -1012,8 +930,8 @@ fn run_one(
                 }
             };
 
-            // The predicate is `extract::kept_by_prune`, the same function `prune_nodes`
-            // calls, so this count cannot drift from the pruning it reports on (TW-06).
+            // `extract::kept_by_prune` is the same predicate `prune_nodes` applies, so this
+            // count cannot drift from the pruning it reports on.
             let surviving = subgraph
                 .nodes
                 .iter()
@@ -1060,13 +978,9 @@ fn run_one(
                 let dropped = before - kept_nodes.len();
                 drop(subgraph);
                 let t = Instant::now();
-                // WP-04. Every step of the second pass used to be `?`, so GraphAligner
-                // aborting or being OOM-killed on the pruned graph, or a full tmpfs during
-                // the second GFA write, turned an accession that was already reconstructed
-                // into `ERROR`: missing from the FASTA, `prune: null` in the summary, and
-                // exit 3 for a one-accession run. That breaks this stage's own contract, that
-                // pruning can improve an accession and cannot break one. The second pass is
-                // now fallible as a whole, and failing it is a refusal like any other.
+                // The second pass is fallible as a whole, so GraphAligner aborting on the
+                // pruned graph or a full tmpfs during the second GFA write refuses the prune
+                // rather than failing an accession that was already reconstructed.
                 type PassTwo = (
                     crate::types::Subgraph,
                     Option<(GafPath, crate::types::Haplotype)>,
@@ -1078,10 +992,9 @@ fn run_one(
                         stages::align::run(cfg, &pruned, std::slice::from_ref(query), &gaf2)?;
                     let second = match gaf2_map.remove(query.record_id.as_str()) {
                         Some(p) => {
-                            // WA-12, on the pruned graph this time. An inconsistent second row
-                            // is an `Err` out of this closure, which WP-04 turns into a
-                            // refused prune: the first pass's haplotype stands and the
-                            // accession is not lost.
+                            // An inconsistent second row leaves this closure as an `Err`,
+                            // which refuses the prune: the first pass's haplotype stands and
+                            // the accession is not lost.
                             stages::stitch::check_gaf_walk(cfg, &graph, &pruned, &p).map_err(
                                 |detail| crate::error::Error::GraphAligner {
                                     accession: graph.accession.clone(),
@@ -1207,16 +1120,10 @@ fn run_one(
         .iter()
         .map(|&id| graph.abundance_of(id))
         .fold(0.0f32, f32::max);
-    // WV-05. The allele floor is a flat `--min-abund` (5x) unless `--min-abund-frac` is set,
-    // which it is not by default. That is safe only because the prune is supposed to have
-    // removed sub-floor unitigs first. When the prune is REFUSED, the unpruned subgraph is
-    // what the variant stages see, and the 5x gate lets through exactly the branches the
-    // prune would have deleted: a gene at 1000x with a fork at 30x against 8x (below the 10x
-    // prune floor) published `alt1 vaf=0.211`, a PASS VCF row and an snvs.tsv row, with only
-    // `prune.outcome` in the summary to hint at it.
-    //
-    // So where the prune wanted a floor and did not get to apply it, the variant stages
-    // inherit that floor. Applied and pruned-off runs are untouched.
+    // The allele floor is a flat `--min-abund` unless `--min-abund-frac` is set, which is
+    // safe only because the prune is meant to have removed sub-floor unitigs first. Where the
+    // prune wanted a floor and was refused, those branches are still in the graph, so the
+    // variant stages inherit the floor instead. Applied and pruned-off runs are untouched.
     let raised_cfg = inherited_floor_config(cfg, prune.as_ref());
     let vcfg: &Config = raised_cfg.as_ref().unwrap_or(cfg);
     let mut majority_corrections = 0usize;
@@ -1226,7 +1133,7 @@ fn run_one(
         let (fixed, report) = stages::variants::prefer_majority(vcfg, &graph, &subgraph, path, query)?;
         // The sites left on the minority allele are reported whether or not anything was
         // swapped: a route with no corrections and four forks it declined to move is not the
-        // same result as a route with nothing to correct (WV-02).
+        // same result as a route with nothing to correct.
         majority = report;
         if let Some(fixed) = fixed {
             if let Some(mut h) = stages::stitch::stitch(vcfg, &graph, &fixed, &subgraph, query)? {
@@ -1246,16 +1153,15 @@ fn run_one(
         let (found, stats) = stages::variants::find_alts(vcfg, &graph, &subgraph, path, query)?;
         alts = found;
         variant_stats = stats;
-        // WA-04. The mixture numbers belong to the sequence that is published, so they are
-        // read off the route AFTER `prefer_majority` has decided what that route is, and
-        // copied onto the haplotype the FASTA writer will see. They describe the primary;
-        // an alt is one allele changed at one site and carries its own frequencies already.
+        // The mixture numbers describe the sequence that is published, so they are read off
+        // the route after `prefer_majority` has decided what it is. An alt is one allele at
+        // one site and carries its own frequencies already.
         if let Some(h) = haplotype.as_mut() {
             h.two_allele_sites = stats.two_allele_sites;
             h.min_site_vaf = stats.min_site_vaf;
         }
     }
-    // Bubbles are computed here, after the route is settled, for two reasons (WG-03): the
+    // Bubbles are computed here, after the route is settled, for two reasons: the
     // floor they are gated at comes from the gene's depth, and there is no depth without a
     // route; and `subgraph` is the pruned graph by now when the prune applied. The stage
     // itself still never looks at the GAF, it reports the neighbourhood's diamonds, which is
@@ -1269,12 +1175,12 @@ fn run_one(
     // Two things decide what is left to report, and it is worth being clear about which does
     // the work. The ORDER does most of it: an applied prune replaces `subgraph` with the
     // pruned one above, so by here the sub-floor branches are gone and the diamonds built
-    // from them cannot be found. Running before the alignment, as this stage used to, meant
-    // reporting the neighbourhood as extracted, including everything the prune then deleted.
+    // from them cannot be found. Running before the alignment would report the neighbourhood
+    // as extracted, including everything the prune then deletes.
     //
     // The FLOOR covers the cases where no prune cleaned the graph: `--prune-frac 0`, where it
-    // reduces to the variant stages' own floor, and a refused prune, where WV-05 raises their
-    // floor to this same number because the sub-floor branches are still there. Taking the
+    // reduces to the variant stages' own floor, and a refused prune, which raises their floor
+    // to this same number because the sub-floor branches are still there. Taking the
     // prune's fraction is that same argument: a branch the prune judged to be error is not an
     // allele, whether or not the prune got to act on it.
     let t = Instant::now();
@@ -1316,11 +1222,9 @@ fn run_one(
     let outcome = if !haplotypes.is_empty() {
         Outcome::Success
     } else if !graph_has_links {
-        // WG-07. The file carried no `L:` token anywhere, so there was no adjacency to walk
-        // and nothing could have spanned more than one unitig. Reporting that as `no_path`
-        // says "this accession does not carry the gene", which is a claim about the sample
-        // this run is in no position to make. Logan publishes such objects: 0 links in 15,864
-        // headers for `ERR3988483`.
+        // No `L:` token anywhere in the file, so nothing could have spanned more than one
+        // unitig. Reporting that as `no_path` would claim the sample does not carry the gene,
+        // which this run is in no position to say. Logan does publish such objects.
         //
         // Checked only when nothing was reconstructed. A gene that fits inside a single
         // unitig needs no edge and is a `success` like any other.
@@ -1352,7 +1256,7 @@ fn run_one(
         anchor_used: anchor_used_for_output,
         candidates: candidate_reports,
         subgraph_fraction: Some(subgraph_fraction),
-        // WV-03. Measured over the whole extracted neighbourhood rather than the walked route,
+        // Measured over the whole extracted neighbourhood rather than the walked route,
         // because the prune floor and every fork total are drawn from it, not just the path.
         snv_sites: None,
         ka_max,
@@ -1383,13 +1287,8 @@ mod floor_tests {
         }
     }
 
-    /// WV-05. The allele floor is a flat 5x by default, which is only safe because the prune
-    /// is supposed to have removed sub-floor unitigs first. When the prune is refused, the
-    /// variant stages see the unpruned subgraph, and the 5x gate admits exactly the branches
-    /// the prune meant to delete: a gene at 1000x with a fork at 30x against 8x published
-    /// `vaf=0.211`, a PASS VCF row and an snvs.tsv row, with only `prune.outcome` to hint at
-    /// it. Where the prune wanted a floor and could not apply it, the variant stages inherit
-    /// it.
+    /// A refused prune leaves the sub-floor branches it meant to delete in the graph, so the
+    /// flat `--min-abund` gate would admit them as alleles. The floor is inherited instead.
     #[test]
     fn a_refused_prune_hands_its_floor_to_the_variant_stages() {
         let cfg = Config { min_abund: 5.0, ..Config::default() };
@@ -1578,8 +1477,8 @@ mod prune_outcome_tests {
         assert!(kept.is_empty(), "prune_nodes agrees the subgraph would be emptied");
     }
 
-    /// WA-09. The three-base tolerance buys a shorter result only when the prune changed the
-    /// haplotype; a shorter copy of the same sequence is pure loss.
+    /// The span tolerance buys a shorter result only when the prune changed the haplotype;
+    /// a shorter copy of the same sequence is pure loss.
     #[test]
     fn a_shorter_copy_of_the_same_sequence_is_trimming_and_nothing_else() {
         let unpruned = b"ACGTACGTAA";
@@ -1616,12 +1515,9 @@ mod fetch_panic_tests {
         }
     }
 
-    /// WP-18. The compute pool has caught its panics since TW-01, the fetch pool did not,
-    /// and the difference is the whole run: an unwinding fetch thread re-panics in
-    /// `thread::scope`, so `main` exits 101 with no FASTA, no summary and no `skipped.tsv`,
-    /// and the collector never runs. At the scale this release is for, that is hours of
-    /// fetching and alignment for one panic in the pool that touches the network, zstd and
-    /// the filesystem.
+    /// An unwinding fetch thread re-panics in `thread::scope`, so without a `catch_unwind`
+    /// `main` exits 101 with no FASTA, no summary and no `skipped.tsv`, and the collector
+    /// never runs: hours of work lost to one panic.
     #[test]
     fn a_panicking_fetch_fails_its_own_accession_and_the_others_still_land() {
         let accs = ["SRR1".to_string(), "SRRBOOM".to_string(), "SRR3".to_string()];

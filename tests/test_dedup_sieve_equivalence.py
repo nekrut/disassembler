@@ -6,10 +6,10 @@ sieve. A later identical copy has novelty 0 and is never promoted, so the two
 paths promote the same sequences, in the same order.
 
 Two things changed in 0.2.0 and are reflected here. The admission gate is
-disarmed (PM-01), so these flags carry `--warmup 2147483647` as the wrapper now
+disarmed, so these flags carry `--warmup 2147483647` as the wrapper now
 does, and duplicates no longer skew anything: dedup is a speed-up and a memory
 saving, not a correctness fix. And the dedup pass renames records `>r0`, `>r1`,
-... (PM-04, PM-13), because the binary buckets novelty by a month parsed from the
+..., because the binary buckets novelty by a month parsed from the
 header and selects what to emit by the header's first 255 characters. The two
 paths therefore cannot be byte-identical any more, so what is asserted is the
 stronger claim the bytes were standing in for: the same sequences in the same
@@ -17,7 +17,7 @@ order, and the saved headers mapping back to exactly the full path's headers.
 
 Also records the dedup fold ratio and (loosely) checks the dedup pass itself is
 cheap. Does NOT assert on wall-clock speedup of the sieve (noisy on CI); the
-dedicated benchmark script in scratchpad does that.
+measurement belongs in bench/, not here.
 
 Skips cleanly if the sieve binary or its submodule are absent.
 """
@@ -202,7 +202,7 @@ class TestDedupSieveEquivalence(unittest.TestCase):
         dst = self.work / "ordered.deduped.fa"
         rep = self.dedup(src, dst)
         self.assertEqual((rep.n_in, rep.n_out), (3, 2))
-        # The file the binary reads now carries neutral ids (PM-04, PM-13); the headers it
+        # The file the binary reads now carries neutral ids; the headers it
         # must be given back are the first-encountered ones, in the same order.
         self.assertEqual([l for l in dst.read_text().splitlines() if l.startswith(">")],
                          [">r0", ">r1"])

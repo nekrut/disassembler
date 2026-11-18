@@ -52,13 +52,11 @@ command -v GraphAligner >/dev/null || { echo "FAIL: GraphAligner not on PATH"; e
 # a transient S3 failure does not turn the gate red. The CI workflow points this at a cached
 # directory; left unset, every run downloads afresh, which is the old behaviour.
 #
-# This used to say the `u/` objects are immutable and a cached one is therefore never stale.
-# They are not. A 5,000-key sample across five key ranges on 2026-11-16 found 3.1% of them
-# rewritten since the 2024-03 bulk load, in waves dated 2025-12-10, 2025-12-14 and 2026-02-08.
-# A warm cache can therefore hold bytes the bucket no longer serves, which is a feature here
-# (the gate wants the inputs it was captured against) but is not a safe assumption anywhere
-# else. The summary's per-record `payload.sha256` is gated, so a cache that disagrees with the
-# fixture shows up as a failure rather than as a silent pass.
+# The `u/` objects are NOT immutable: a 5,000-key sample found 3.1% rewritten since the
+# 2024-03 bulk load. A warm cache can therefore hold bytes the bucket no longer serves, which
+# is a feature here, since the gate wants the inputs it was captured against, but is not a safe
+# assumption anywhere else. The summary's per-record `payload.sha256` is gated, so a cache that
+# disagrees with the fixture fails rather than passing silently.
 CACHE_ARG=()
 if [ -n "${LOGAN_UNITIGS_CACHE:-}" ]; then
   mkdir -p "$LOGAN_UNITIGS_CACHE" || { echo "FAIL: cannot create $LOGAN_UNITIGS_CACHE"; exit 1; }
@@ -78,9 +76,9 @@ if [ -n "$captured" ] && [ "$running" != "$captured" ]; then
 fi
 
 # Writes $WORK/$acc.got (bare sequence) and $WORK/$acc.log, and RETURNS the walker's exit
-# status. That status used to be thrown away along with stderr, so an S3 timeout produced an
-# absent recon.fasta, an empty .got, and the message "FAIL <acc> (got 0 nt vs golden 1476 nt)":
-# an infrastructure outage reported as a walk regression, with every diagnostic discarded.
+# status. Discarding it along with stderr turns an S3 timeout into an absent recon.fasta, an
+# empty .got and "FAIL <acc> (got 0 nt vs golden 1476 nt)": an infrastructure outage reported
+# as a walk regression, with every diagnostic thrown away.
 run_primary() {  # acc query -> rc
   local acc="$1" query="$2"
   # Separate statement on purpose: every word of a simple command is expanded before the
@@ -114,7 +112,7 @@ for g in "${GATES[@]}"; do
   set -- $g; acc="$1"; query="$2"; golden="$3"
   if ! run_primary "$acc" "$query"; then
     # Since logan-walker exits non-zero when nothing reconstructed, this catches the fetch
-    # and GraphAligner failures that used to masquerade as a golden mismatch.
+    # and GraphAligner failures that would otherwise masquerade as a golden mismatch.
     echo "ERROR $acc  (walker exited non-zero: a run failure, NOT a walk regression)"
     show_log "$acc"
     fails=$((fails+1))
@@ -135,9 +133,9 @@ done
 # pre-0.1.0 behaviour its fixtures were captured under: it passes --prune-frac 0
 # --no-prefer-majority --no-emit-alts and compares only the bare primary sequence. So the
 # prune/realign acceptance, variants::prefer_majority, and the alt, VCF and SNV-table writers
-# had no end-to-end check at all, in any test (review TC-02). These fixtures close that: they
-# are the default walk's own outputs, captured 2026-11-13 with --emit-vcf --emit-snv-table
-# under GraphAligner 1.0.17b at graphaligner_threads=1 (the default).
+# have no end-to-end check in that set. These fixtures close that: they are the default walk's
+# own outputs, captured 2026-11-13 with --emit-vcf --emit-snv-table under GraphAligner 1.0.17b
+# at graphaligner_threads=1 (the default).
 #
 # SRR8209082 IS gated here, unlike in the old-behaviour set above. That is not an inconsistency:
 # the header explains that its route is stabilised BY the default pruning, which the gate above
@@ -174,10 +172,9 @@ cmp_fixture() {  # got fixture label
 }
 
 # bubbles.json is gated by content where it is small and by sha256 where it is not. All three
-# are gated by content now: SRR8209082's file was 1 MB of 3,632 bubbles, none of whose alleles
-# reached 0.5% of the gene's depth, and WG-03 took it to zero, so the checksum it used to be
-# gated by has been replaced with the file itself. The sha256 branch is kept for the next
-# accession whose file is too large to read as a diff.
+# are gated by content now, since the depth-relative floor took SRR8209082's file from 1 MB of
+# 3,632 bubbles to eight lines. The sha256 branch is kept for the next accession whose file is
+# too large to read as a diff.
 cmp_bubbles() {  # got tag
   local got="$1" tag="$2"
   local body="$ROOT/bench/golden/default/$tag.bubbles.json"
@@ -202,7 +199,7 @@ cmp_bubbles() {  # got tag
 # summary.json is gated with its volatile fields masked: the clock, the paths, and the
 # versions under test (bench/mask_summary.py says exactly which, and why). Everything that
 # describes the WALK is gated, including every count in `discards` and `cohort`, which is the
-# point: those numbers used to exist only on stderr, so nothing could regress them visibly.
+# point: on stderr alone, nothing could regress them visibly.
 cmp_summary() {  # got fixture label
   local got="$1" fixture="$2" label="$3"
   if [ ! -e "$fixture" ]; then

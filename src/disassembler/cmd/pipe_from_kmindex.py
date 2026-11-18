@@ -269,7 +269,7 @@ def _harvested_targets(summary_path):
 
     None rather than an empty set when the file is missing or unparseable: an unreadable
     summary is not evidence that a target had no hits, and the caller must not turn it
-    into a refusal (PC-05).
+    into a refusal.
     """
     try:
         doc = json.loads(summary_path.read_text())
@@ -379,7 +379,7 @@ def _run(args, stages) -> int:
                                     cohort_dir / "harvest.summary.json")
         if rc != 0:
             return rc
-        # PC-05. The cohort is picked by file name, and harvest writes a file per target of
+        # The cohort is picked by file name, and harvest writes a file per target of
         # THIS run. Re-running into the same -o with a collection in which --target has no
         # hits used to find the previous run's file and reconstruct the previous
         # collection's accessions, with exit 0 and a summary listing only the new targets.
@@ -395,7 +395,7 @@ def _run(args, stages) -> int:
 
     # ---- 2/3 stratify (optional) ------------------------------------------
     if args.score_bins:
-        # PC-05. With a directory to scan, stratify bins every `*.scores.json` in it,
+        # With a directory to scan, stratify bins every `*.scores.json` in it,
         # including an earlier harvest's. After a harvest of this run's own, name the file
         # instead. Under --skip-harvest the directory scan stays, because a hand-made
         # cohort is exactly what that flag is for (`docs/kmindex.md`).

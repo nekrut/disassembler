@@ -121,45 +121,29 @@ pub fn version(bin: &Path) -> Result<String> {
 ///
 /// # One record in, one record out
 ///
-/// `read_query` selects the first record of a query FASTA and warns about the rest, but
-/// handing the whole file to GraphAligner undoes that: it aligns every record, and
-/// `parse_gaf` used to take the best-scoring row across all of them. `stitch` then sliced
-/// with that row's coordinates while dividing by the *selected* record's length, so a
-/// 142-record panel such as `queries/master_planetary_targets.fasta` produced another gene's
-/// path published under the first gene's name, at a coverage above 1.0.
-///
-/// Every reference in `queries` is therefore written out as its own `>record_id` record in a
-/// merged temp FASTA, and `parse_gaf_multi` keeps the best row per query name so the caller
-/// can pick a primary against a known reference length.
+/// GraphAligner aligns every record it is handed, so each reference in `queries` is written
+/// as its own `>record_id` record in a merged temp FASTA and `parse_gaf_multi` keeps the best
+/// row per query name. Taking the best row across all of them instead would slice with one
+/// record's coordinates while dividing by another's length.
 ///
 /// # Normalised, not copied
 ///
 /// That merged FASTA is built from the sequence `read_query` parsed at startup, never from
-/// the user's file. Until 0.2.0 a single [`Query`] whose source file held exactly one record
-/// took a "byte-compat" path that re-opened that file and copied it through, so GraphAligner
-/// read the user's bytes exactly as it would have if handed the file itself. That cost three
-/// defects, all of them silent:
+/// the user's file, which matters for three reasons 1.0.17b makes silent:
 ///
-/// - **The file was re-read on every accession** and again on every prune realignment. A pipe
-///   (`-q <(zcat ref.fa.gz)`, `-q /dev/stdin`), which `README.md` invites, is empty after the
-///   first read, so GraphAligner got a 0-byte FASTA and every accession came back `no_path`:
-///   a run that looks like a clean biological negative. Editing the query mid-run moved the
-///   reference under the accessions that had not started yet (WA-01).
-/// - **The header reached GraphAligner verbatim.** 1.0.17b takes the whole header line as the
-///   read name and writes it unescaped into GAF column 1, so a tab in `>gene<TAB>desc` shifted
-///   every column and the row was dropped (`no_path` on every accession), and a non-UTF-8
-///   header failed the GAF parse outright (exit 3). `read_query` had already reduced the same
-///   header to its first token, so the two stages disagreed about the reference's name (WA-07).
-/// - **Whitespace inside sequence lines reached GraphAligner.** `read_query` strips it;
-///   1.0.17b strips only a trailing `\r` and trailing spaces, and its seeding restarts at
-///   every non-ACGT byte while a blank in the DP reaches `ambiguousMatch`'s `default:`, which
-///   calls `std::abort()`. Codon-spaced `ATG GCT AAA` gave `no_path` everywhere; GenBank
-///   10-base blocks gave SIGABRT everywhere (WA-08).
+/// - **A query is read once.** A pipe (`-q <(zcat ref.fa.gz)`, `-q /dev/stdin`) is empty
+///   after the first read, so re-opening it per accession yields a 0-byte FASTA and a run of
+///   `no_path` that looks like a clean biological negative.
+/// - **The header never reaches it verbatim.** 1.0.17b takes the whole header line as the
+///   read name and writes it unescaped into GAF column 1, so a tab in `>gene<TAB>desc` shifts
+///   every column, and a non-UTF-8 header fails the GAF parse outright.
+/// - **Whitespace inside sequence lines never reaches it.** 1.0.17b strips only a trailing
+///   `\r` and trailing spaces; a blank in the DP reaches `ambiguousMatch`'s `default:`, which
+///   calls `std::abort()`. Codon-spaced `ATG GCT AAA` gives `no_path`, GenBank 10-base blocks
+///   give SIGABRT.
 ///
-/// Writing `>{record_id}\n{seq}\n` fixes all three at once, and makes the aligner and the
-/// anchoring stage agree on the reference by construction. The sequence is the same bases in
-/// the same order, uppercased and unwrapped, so GraphAligner reads the same read: the golden
-/// fixtures are unchanged by it.
+/// Writing `>{record_id}\n{seq}\n` makes the aligner and the anchoring stage agree on the
+/// reference by construction, with the same bases in the same order.
 ///
 /// # Never the user's file name
 ///
@@ -224,14 +208,14 @@ pub fn run(
         }
     })?;
     // Held until the child has been reaped, so a signal arriving meanwhile can stop it
-    // (WF-15). Every return below happens after the wait.
+    //. Every return below happens after the wait.
     #[cfg(unix)]
     let watch = crate::scratch::watch_child(child.id());
 
-    // Drain stderr on its own thread. `Command::output`, which this used to be, did that for
-    // us; waiting with a deadline means doing it by hand, and it is not optional. A pipe
-    // nobody reads fills at 64 KiB and blocks the writer there for good, so a chatty aligner
-    // would hit the deadline below and be reported as stuck when what is stuck is us.
+    // Drain stderr on its own thread. `Command::output` does this for us, but waiting with a
+    // deadline means doing it by hand, and it is not optional: a pipe nobody reads fills at
+    // 64 KiB and blocks the writer there for good, so a chatty aligner would hit the deadline
+    // below and be reported as stuck when what is stuck is us.
     let mut pipe = child.stderr.take();
     let drain = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -279,10 +263,9 @@ pub fn run(
     let bytes = match std::fs::read(gaf_out) {
         Ok(b) => b,
         // Exited cleanly but wrote nothing: no alignment found. That reading holds only
-        // while the scratch directory is still ours, which `extract::scratch_stem`'s PID and
-        // per-task counter do not guarantee on their own: until WF-01 another run sharing the
-        // base could delete the whole directory mid-alignment, and this branch then published
-        // the deletion as the biological answer `no_path`, with exit 0.
+        // while the scratch directory is still ours. Without the lock, another run sharing
+        // the base could delete it mid-alignment, and this branch would publish the deletion
+        // as the biological answer `no_path`, with exit 0.
         //
         // So check what is actually missing. If the INPUTS are gone too, nothing was aligned
         // and this is not a negative result; it is an error, and the run must say so.
@@ -304,7 +287,7 @@ pub fn run(
                     ),
                 });
             }
-            // WA-10. Not a negative result: GraphAligner 1.0.17b creates the GAF before it
+            // Not a negative result: GraphAligner 1.0.17b creates the GAF before it
             // aligns anything and aborts if it cannot, so a clean exit with no file at all
             // means the program on `--graphaligner` is not GraphAligner, or a wrapper
             // swallowed its failure. The startup `--version` probe accepts any program that
@@ -342,13 +325,13 @@ pub fn run(
 
 /// Put the aligner where a signal can reach it, and nothing else can reach the aligner.
 ///
-/// **Its own process group** (WF-15). The signal handler can then stop the whole group with
+/// **Its own process group**. The signal handler can then stop the whole group with
 /// one `kill`, which matters when `--graphaligner` names a wrapper script: killing the process
 /// we spawned leaves its children running, and `wait_with_deadline` has the same limitation
 /// for the same reason. A group also means the terminal no longer delivers Ctrl-C to the
-/// aligner directly, which is why the handler has to do it: that is a change of mechanism, not
-/// of behaviour, and it buys the `kill <walker pid>` and `timeout N logan-walker` cases, where
-/// the aligners used to survive the run, reparented to init, working on deleted files.
+/// aligner directly, which is why the handler has to do it. What it buys is the
+/// `kill <walker pid>` and `timeout N logan-walker` cases, where the aligners would otherwise
+/// survive the run, reparented to init, working on deleted files.
 ///
 /// **No stdin.** A process in its own group that reads from the controlling terminal is
 /// stopped with SIGTTIN, and GraphAligner has no reason to read stdin: its reads come from
@@ -381,8 +364,8 @@ fn set_up_child(cmd: &mut Command) {
 
 /// Wait for GraphAligner, giving up after `timeout_secs`. `0` waits forever.
 ///
-/// Every other wait in the walker has a deadline; this one did not, and it is the only stage
-/// that hands control to a program the walker did not write. One call that never returns (a
+/// Every other wait in the walker has a deadline, and this is the only stage that hands
+/// control to a program the walker did not write. One call that never returns (a
 /// pathological neighbourhood, a stalled filesystem, a wrapper script waiting on a lock) holds
 /// its compute worker for good, and because the walker writes the FASTA, summary and VCF after
 /// `pipeline::run` returns, a scheduler's wall-time kill then throws away every accession the
@@ -551,18 +534,16 @@ pub fn parse_gaf_multi(
 /// Column 6 is the path, e.g. `>860013>579233<27101`. The best row is the one with the most
 /// residue matches (column 10), chosen with a stable sort so ties keep file order.
 ///
-/// TW-07: this used to be a second, independent implementation with no production caller,
-/// while `align::run` has used [`parse_gaf_multi`] since multi-anchor mode landed. Seven
-/// tests pinned the dead copy, so the parser that actually runs was covered by three. It is
-/// now a thin wrapper, which keeps those tests' single-reference shape and points every one
-/// of them at the live code.
+/// A thin wrapper over [`parse_gaf_multi`], which is what `align::run` calls. Keeping a
+/// second independent implementation here means the tests written against it pin code no
+/// production path runs.
 pub fn parse_gaf(gaf_bytes: &[u8], expect: &str) -> Result<Option<GafPath>> {
     Ok(parse_gaf_multi(gaf_bytes, &[expect])?.remove(expect))
 }
 
 /// Split a GAF path string into oriented steps. `>` is forward, `<` reverse-complement.
 /// No regex: the grammar is a sign followed by digits, repeated.
-/// WA-12. Strict: the walker writes the GFA this path refers to, and it names every segment
+/// Strict: the walker writes the GFA this path refers to, and it names every segment
 /// with a plain unitig id, so `>` or `<` then digits is the whole language. A byte outside it
 /// means the row was not produced against the graph the walker handed out, and the old reader
 /// silently skipped such bytes and dropped oversize ids, which turned a mis-parsed row into a
@@ -646,7 +627,7 @@ mod tests {
         ]);
     }
 
-    /// WA-12. The walker writes the GFA these names come from and names every segment with a
+    /// The walker writes the GFA these names come from and names every segment with a
     /// plain unitig id, so anything else means the row was produced against some other graph.
     /// The old reader skipped unknown bytes and dropped ids over `u32::MAX`, turning such a
     /// row into a SHORTER walk, which then stitched into a sequence and was published with
@@ -721,13 +702,11 @@ mod tests {
 
     /// Only one record is ever handed to GraphAligner, so an unrecognised name means the
     /// tool spelled it differently, not that a foreign gene crept in. Warn, do not drop.
-        /// TW-07. A row whose query name is not the one we asked for is NOT returned.
+        /// A row whose query name is not the one we asked for is NOT returned.
     ///
-    /// This test used to assert the opposite, and passed, because it exercised a second
-    /// `parse_gaf` implementation that no production path had called since multi-anchor mode
-    /// landed. The live parser attributes rows to references by name, which it must: in
-    /// multi-anchor mode a row for `Delta` is not an answer about `Omicron`. The lenient
-    /// behaviour the old test pinned was never available to a user.
+    /// The live parser attributes rows to references by name, which it must: in multi-anchor
+    /// mode a row for `Delta` is not an answer about `Omicron`. Any laxer behaviour would be
+    /// an artefact of a parser no production path calls.
     ///
     /// Upstream, `run` turns this into a warning naming the rows that were present, so a
     /// mangled query header is diagnosable rather than silently a `no_path`.
@@ -1001,10 +980,10 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
     /// must never reach `-f`: a Galaxy dataset is `dataset_<uuid>.dat`, which it refuses. A
     /// stand-in binary records what it was handed.
     ///
-    /// What it is handed is the query the walker parsed, not the user's bytes (WA-07, WA-08).
-    /// Each source below is a different way of writing the same reference, and all of them
-    /// must arrive as the same two lines. Under the old byte-copy path they did not, and
-    /// 1.0.17b failed differently on each: it takes the whole header line as the read name and
+    /// What it is handed is the query the walker parsed, not the user's bytes. Each source
+    /// below is a different way of writing the same reference, and all of them must arrive as
+    /// the same two lines. Copying the user's bytes through instead fails differently on each,
+    /// because 1.0.17b takes the whole header line as the read name and
     /// writes it unescaped into GAF column 1, so the tab shifted every column and the row was
     /// dropped as `no_path`; it strips only trailing whitespace from a sequence line, so the
     /// internal blanks survived into the DP, where a blank reaches `ambiguousMatch`'s
@@ -1079,7 +1058,7 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// WA-06: an aligner that never returns fails its own accession rather than holding its
+    /// An aligner that never returns fails its own accession rather than holding its
     /// compute worker for good. Before the deadline, the only thing that ended such a run was
     /// the scheduler's wall-time kill, and because every output is written after
     /// `pipeline::run` returns, that kill threw away every accession the shard had finished.
@@ -1179,10 +1158,11 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Waiting with a deadline means reading stderr ourselves, which `Command::output` used to
-    /// do. A pipe nobody reads fills at 64 KiB and blocks the writer there, so without the
-    /// drain thread a chatty aligner would stop dead and then be reported as timed out: a
-    /// stall of our own making, attributed to GraphAligner. The stand-in writes ~256 KiB.
+    /// Waiting with a deadline means reading stderr ourselves rather than letting
+    /// `Command::output` do it. A pipe nobody reads fills at 64 KiB and blocks the writer
+    /// there, so without the drain thread a chatty aligner stops dead and is then reported as
+    /// timed out: a stall of our own making, attributed to GraphAligner. The stand-in writes
+    /// ~256 KiB.
     #[cfg(unix)]
     #[test]
     fn a_chatty_aligner_does_not_deadlock_on_a_full_stderr_pipe() {
@@ -1235,11 +1215,9 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
     }
 
     /// The query file is read once, at startup, so a query that can only be read once still
-    /// works (WA-01, which shares its cause with WA-07 and WA-08). A FIFO stands in for the
-    /// `<(zcat ref.fa.gz)` and `/dev/stdin` forms `README.md` invites: the second read of one
-    /// blocks or returns nothing, and the byte-copy path did exactly that on every accession
-    /// after the first, so every accession came back `no_path` and the run reported a clean
-    /// biological negative.
+    /// works. A FIFO stands in for the `<(zcat ref.fa.gz)` and `/dev/stdin` forms the README
+    /// invites: a second read of one blocks or returns nothing, which would make every
+    /// accession after the first come back `no_path` as a clean biological negative.
     #[cfg(unix)]
     #[test]
     fn a_query_that_can_only_be_read_once_still_aligns_every_accession() {
@@ -1317,7 +1295,7 @@ mod align_real {
             return;
         };
         let mut cfg = Config::default();
-        // `write_gfa` no longer creates a missing scratch directory (WF-17),
+        // `write_gfa` no longer creates a missing scratch directory,
         // so a test that names its own creates it, as a run does.
         cfg.scratch_dir = std::env::temp_dir().join(format!("logan_align_{}", std::process::id()));
         std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
@@ -1375,7 +1353,7 @@ mod align_real {
     #[ignore]
     fn empty_subgraph_short_circuits() {
         let mut cfg = Config::default();
-        // `write_gfa` no longer creates a missing scratch directory (WF-17),
+        // `write_gfa` no longer creates a missing scratch directory,
         // so a test that names its own creates it, as a run does.
         cfg.scratch_dir = std::env::temp_dir().join(format!("logan_align_e_{}", std::process::id()));
         std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
@@ -1434,7 +1412,7 @@ mod determinism {
                 continue;
             };
             let mut cfg = Config::default();
-            // `write_gfa` no longer creates a missing scratch directory (WF-17),
+            // `write_gfa` no longer creates a missing scratch directory,
             // so a test that names its own creates it, as a run does.
             cfg.scratch_dir = std::env::temp_dir().join(format!("logan_det_{}", std::process::id()));
             std::fs::create_dir_all(&cfg.scratch_dir).unwrap();

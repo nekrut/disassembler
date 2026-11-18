@@ -5,18 +5,16 @@
 //! puts it back, as one extra record per site.
 //!
 //! IN   UnitigGraph, Subgraph, GafPath, Query
-//! OUT  Vec<AltHaplotype>. Written to `alt_haplotypes.fasta` unless `--no-emit-alts`, and
+//! OUT  `Vec<AltHaplotype>`. Written to `alt_haplotypes.fasta` unless `--no-emit-alts`, and
 //!      also computed for `--emit-vcf` and `--emit-snv-table`
 //!
 //! # What counts as a site worth recovering
 //!
 //! A fork the walked path passes through, where **both** the branch taken and the branch not
 //! taken clear `min_abund` and `min_vaf`. That "both" is the whole filter for what
-//! `find_alts` *reports*, and it is what separates real quasispecies from the far more common
-//! failure next door. It is no longer what `prefer_majority` *corrects*: see WV-02 below.
-//!
-//! Measured on `SRR8209082` (HIV-1 *pol*), over the 58 on-path forks that have a credible
-//! untaken branch:
+//! `find_alts` reports, and it separates real quasispecies from the far more common failure
+//! next door. Measured on `SRR8209082` (HIV-1 *pol*), over the 58 on-path forks with a
+//! credible untaken branch:
 //!
 //! ```text
 //! walked branch is itself under 10%   54   the aligner took a rare allele; not a variant
@@ -25,13 +23,9 @@
 //!
 //! The 54 are the reference-pull defect: GraphAligner scores paths by residue matches to the
 //! reference, so where the sample's dominant allele differs from the reference and an error
-//! branch matches it, the walk takes the error branch. Emitting those as "variants" would
-//! publish sequencing error as biology, so they are not recovered *here*, as alternatives.
-//!
-//! **They are not left alone either, since 0.2.0 (WV-02).** `prefer_majority` moves the route
-//! off such a branch when the other side holds an outright majority of the fork, which is the
-//! path-selection fix the paragraph above called for rather than a reporting change. What it
-//! declines to move, and why, is counted in `minority_left` in `summary.json`.
+//! branch matches it, the walk takes the error branch. Emitting those as variants would
+//! publish sequencing error as biology, so they are not recovered here as alternatives. They
+//! are counted in `minority_left` instead, and `--rescue-minority` is what acts on them.
 //! `docs/notes/intra_accession_variance.md` covers the defect itself.
 //!
 //! # Why one variant per record
@@ -42,14 +36,12 @@
 //! exists to avoid. Every record here is the primary path with **exactly one** allele changed,
 //! so it is a real connected path through the graph and asserts only the minimal thing.
 //!
-//! In practice the cap is not the binding constraint: the measured site count is 4, 4 and 0
-//! across the accessions looked at, not 50.
+//! In practice the cap is not the binding constraint: real site counts are single digits.
 //!
 //! # Which alleles are accepted
 //!
-//! WV-21: this section used to be "Why substitutions only", which has not been true since
-//! indels were admitted. Substitutions always. An indel allele when `allow_indel_alts` (**on
-//! by default**), its `|delta|` is at most `max_alt_indel` (30), and it is in frame unless
+//! Substitutions always. An indel allele when `allow_indel_alts` (**on by default**), its
+//! `|delta|` is at most `max_alt_indel` (30), and it is in frame unless
 //! `allow_frameshift_alts`. The alignment window moves with the splice via `shifted_window`,
 //! so `path_start`/`path_end` are **not** fixed across a swap and code that assumes they are
 //! is wrong.
@@ -58,8 +50,8 @@
 //! detour that rejoins far downstream is a path *shortcut* that silently deletes gene.
 //! Measured while prototyping, a coverage-greedy re-walk without any such constraint cut a
 //! 1,279-node path to 334 and the sequence from 2,738 to 653 nt. `prefer_majority` applies
-//! `max_alt_indel` to the whole correction set for the same reason (WV-02's panel found 64
-//! individually legal swaps compounding into +1,080 nt).
+//! `max_alt_indel` to the whole correction set for the same reason: one panel accession took
+//! 64 individually legal swaps compounding into +1,080 nt.
 
 use crate::config::Config;
 use crate::error::Result;
@@ -187,11 +179,9 @@ pub fn prefer_majority(
     // `stitch` returns `stitched[path_start..path_end]` (`stitch.rs`), not the whole path, so
     // this is the sequence each swap must preserve the length of.
     //
-    // WV-01: the guard below used to compare against `stitched_len`, the whole stitched
-    // path. The two are equal only when `path_start == 0` and `path_end >= path_len`, that
-    // is, only for a tip-to-tip alignment. Every real GAF row has a flank, so the guard
-    // rejected every correction, silently, leaving `_primary` on the minority allele with no
-    // `consensus:` line and output byte-identical to a `--no-prefer-majority` run.
+    // The guard below must compare against this and not against the whole stitched path:
+    // the two are equal only for a tip-to-tip alignment, and every real GAF row has a flank,
+    // so comparing against the path silently rejects every correction.
     let Some(first) = stitch::stitch(cfg, graph, path, subgraph, query)? else {
         // The route does not clear the coverage gate; nothing to correct.
         return Ok((None, report));
@@ -199,12 +189,11 @@ pub fn prefer_majority(
     let mut window = first.seq;
     // Total length the corrections have moved the primary by, across every swap so far.
     //
-    // `--max-alt-indel` was a PER-SWAP cap, which was enough while `prefer_majority` only ran
-    // at two-allele sites. WV-02 admits far more swaps, and they compound: on the 165-accession
-    // panel `SRR6007473` took 64 corrections, each one in frame and inside the 30 nt cap, and
-    // its ebola GP primary went from 2,049 nt to 3,129 against a 2,031 nt reference. 1,080 is
-    // 36 x 30. That is the greedy whole-route rewrite this stage exists to avoid, reached one
-    // legal step at a time, so the cap is now a budget for the whole correction set.
+    // `--max-alt-indel` is a budget for the whole correction set, not a per-swap cap,
+    // because swaps compound: one panel accession took 64 corrections, each in frame and
+    // inside the 30 nt cap, and its ebola GP primary went from 2,049 nt to 3,129 against a
+    // 2,031 nt reference. That is the greedy whole-route rewrite this stage exists to avoid,
+    // reached one legal step at a time.
     let mut cumulative_delta: i64 = 0;
 
     // Each swap fixes one site and makes that site's taken branch the majority, so it cannot
@@ -227,33 +216,27 @@ pub fn prefer_majority(
             if branches.len() < 2 || !branches.contains(&taken) {
                 continue;
             }
-            // WV-04: exits that never return to the route are not alleles of this gene and
+            // Exits that never return to the route are not alleles of this gene and
             // must not sit in the denominator.
             let total = site_total(&v.out, &v.at, branches, taken, i, cfg.alt_max_detour, abund);
             if total <= 0.0 {
                 continue;
             }
             let taken_ab = abund(taken);
-            // WV-02. This used to `continue` here whenever the walked branch was itself below
-            // `min_abund` or `min_vaf`, calling that "the error-branch case" and leaving it to
-            // `--prune-frac`. The two thresholds do not line up: pruning removes branches below
-            // 1% of GENE DEPTH, this gate is 10% of THE FORK, and a walked branch between them
-            // was neither pruned, nor swapped, nor reported in any output. That is where a
-            // reference-like contaminant or a wild-type minority beside a resistance mutation
-            // sits, and GraphAligner walks it precisely because it matches the reference, so
-            // `_primary` published the rarer base with `pident=100.0` and no alt, VCF row,
-            // summary field or `provisional` flag to say so. Reproduced at 2%, 5% and 9%.
+            // A fork whose walked branch is itself below `min_abund` or `min_vaf` falls
+            // between the two mechanisms: pruning removes branches below a fraction of GENE
+            // DEPTH, this gate is a fraction of THE FORK. That is where a reference-like
+            // contaminant or a wild-type minority beside a resistance mutation sits, and
+            // GraphAligner walks it precisely because it matches the reference.
             //
-            // The site is no longer skipped. What replaces the gate is a much higher bar on
-            // the ALTERNATIVE, below: when the walked branch is a minority, the route only
-            // moves onto a branch holding an outright majority of the fork. That is what keeps
-            // this from becoming the greedy whole-route rewrite that cut a 1,279-unitig route
-            // to 334; "is the other side more than half of everything here" is a far stronger
-            // claim than "is it bigger than what we took".
+            // Such a site is always reported. Acting on it is `--rescue-minority`, and then
+            // only onto a branch holding an outright majority of the fork: "more than half of
+            // everything here" is a far stronger claim than "bigger than what we took", and
+            // the weaker one becomes the greedy whole-route rewrite.
             let taken_minor = taken_ab < floor || (taken_ab as f64 / total) < cfg.min_vaf;
             // A fork the aligner walked on the rarer side. If the route is still on it when
             // the loop ends, `_primary` knowingly carries the minority allele, and the report
-            // says why (WV-02 asks for these sites to be first-class data).
+            // says why.
             let untaken_max = branches
                 .iter()
                 .copied()
@@ -261,35 +244,22 @@ pub fn prefer_majority(
                 .map(abund)
                 .fold(0.0f32, f32::max);
             let mut why: Option<fn(&mut MinorityLeft)> = None;
-            // WV-02 x WV-03. The rescue path replaced the error-branch exemption with a much
-            // higher bar on the other side: an outright majority of the fork. That bar is a
-            // ratio against `total`, and where a branch sits at Logan's ceiling `total` is a
-            // LOWER BOUND, so the ratio is overstated and the bar is not the bar.
-            //
-            // Measured on 5,000 walker20k accessions, 62% of which are saturated at spike's
-            // depth: without this guard corrections went from 470 sites to 97,068, the median
-            // corrected accession hit the loop's own `max_alts * 2` backstop, and 62
-            // accessions gained an internal stop codon while none lost one, 57 of them
-            // saturated. That is the greedy whole-route rewrite, re-entered sideways.
-            //
-            // Only the rescue path is refused. An ordinary two-allele correction still needs
-            // the alternative to BEAT the walked branch, which clipping cannot manufacture:
-            // two clipped branches compare equal and no swap happens.
+            // The rescue's bar is a ratio against `total`, and where a branch sits at
+            // Logan's ceiling `total` is a LOWER BOUND, so the ratio is overstated and the
+            // bar is not the bar. Only the rescue path is refused for this: an ordinary
+            // two-allele correction needs the alternative to BEAT the walked branch, which
+            // clipping cannot manufacture, since two clipped branches compare equal.
             if taken_minor {
-                // The restored error-branch exemption, now the default. WV-02 removed it and
-                // the 5,000-accession walker20k slice showed why it was there: corrections
-                // went 470 -> 97,068, the median corrected accession hit the loop's own
-                // backstop, and 64 swaps produced 6 bases of net change, so the swaps were
-                // undoing one another. The SITE is still reported, which was WV-02's real
-                // finding; only the acting is off. `--rescue-minority` turns it back on for
-                // whoever investigates the non-convergence.
+                // Off by default: on a 5,000-accession slice, acting here took corrections
+                // from 470 to 97,068 and the median corrected accession hit the loop's own
+                // backstop, with 64 swaps producing 6 bases of net change, so the swaps were
+                // undoing one another. The site is still reported; only the acting is off.
                 if !cfg.rescue_minority {
                     left.exempt_minority += 1;
                     continue;
                 }
-                // WV-02 x WV-03: even with rescues on, refuse where the fork is clipped. The
-                // rescue's only rail is "the other side holds an outright majority", and that
-                // is a ratio against a total that saturation makes a lower bound.
+                // Even with rescues on, refuse where the fork is clipped: the rescue's only
+                // rail is a ratio against a total that saturation makes a lower bound.
                 if branches.iter().any(|&b| abund(b) >= KA_CEILING) {
                     left.saturated += 1;
                     continue;
@@ -297,14 +267,11 @@ pub fn prefer_majority(
             }
             // Every credible alternative that beats what we took, best first.
             //
-            // WV-12: this kept only the single most abundant one, so when that was refused
-            // further down (no rejoin, a length or frameshift rule, the shifted window, the
-            // coverage gate) the whole fork was abandoned and a second credible branch that
-            // also beat the walked one was never tried. On a triallelic fork with a +1 nt
-            // artifact at 45x over a clean substitution at 30x, the primary kept the 25x
-            // allele and the alt reported `vaf=0.300 primary_vaf=0.250`, identical to
-            // `--no-prefer-majority`. The `continue`s in the loop below now mean "try the
-            // next alternative" rather than "give up on this fork".
+            // All of them, not just the most abundant: when the best is refused further down
+            // (no rejoin, a length or frameshift rule, the shifted window, the coverage gate)
+            // a second credible branch that also beats the walked one should still be tried.
+            // The `continue`s below therefore mean "try the next alternative", not "give up
+            // on this fork".
             let mut better: Vec<(Oriented, f32)> = branches
                 .iter()
                 .copied()
@@ -313,7 +280,7 @@ pub fn prefer_majority(
                 .filter(|&(_, ab)| {
                     // Always a credible allele that beats what we took. The VAF bar is the
                     // ordinary `min_vaf`, except when the walked branch is itself a minority
-                    // (WV-02), where only an outright majority of the fork will do.
+                    // where only an outright majority of the fork will do.
                     ab >= floor
                         && ab > taken_ab
                         && (ab as f64 / total) >= if taken_minor { 0.5 } else { cfg.min_vaf }
@@ -365,13 +332,10 @@ pub fn prefer_majority(
                 if delta != 0
                     && (!cfg.allow_indel_alts
                         || delta.unsigned_abs() as usize > cfg.max_alt_indel
-                        // WV-11: the consensus never takes a frameshift, whatever the flags say.
-                        // `--allow-frameshift-alts` is documented as admitting such alleles to
-                        // `alt_haplotypes.fasta`, a side file; reusing it here also let one
-                        // reframe `_primary`, which is the record the codon alignment and the
-                        // selection analysis read. On the panel 190 of 203 length-changing calls
-                        // are +-1 nt homopolymer artifacts, so the flag's users would have got
-                        // out-of-frame primaries in the codon MSA. Not `&& !allow_frameshift_alts`.
+                        // The consensus never takes a frameshift, whatever the flags say.
+                        // `--allow-frameshift-alts` admits such alleles to the side file;
+                        // honouring it here too would reframe `_primary`, which is what the
+                        // codon alignment reads. Deliberately not `&& !allow_frameshift_alts`.
                         || delta % 3 != 0)
                     {
                         why = Some(|l| l.length_refused += 1);
@@ -435,8 +399,8 @@ pub fn prefer_majority(
                 cumulative_delta += delta;
                 swaps += 1;
                 if taken_minor {
-                    // The WV-02 rescue, counted apart from an ordinary two-allele correction
-                    // because it is the one that changes what 0.1.x would have published.
+                    // Counted apart from an ordinary two-allele correction, because only
+                    // this one fires under `--rescue-minority`.
                     report.minority_rescues += 1;
                 }
                 applied = true;
@@ -446,9 +410,8 @@ pub fn prefer_majority(
                 break;
             }
             // Record the refusal for ANY fork a correction was tried on, not only minority
-            // ones. The cumulative indel cap and the rejoin and window rules all fire on
-            // ordinary two-allele sites too, and until this was unconditional those refusals
-            // were invisible, which is the exact failure mode WV-02 set out to fix.
+            // ones. The cumulative indel cap and the rejoin and window rules fire on
+            // ordinary two-allele sites too, and a refusal nobody counts is invisible.
             if let Some(bump) = why {
                 bump(&mut left);
             }
@@ -512,17 +475,12 @@ pub fn prefer_majority(
     // moved 91 positions in 11 blocks across the gene, one of them 339 nt wide, and put four
     // gaps into an alignment that previously had none. Its route also dips to 13.5x in a
     // 230x sample, so the majority call at those sites rests on very few reads.
-    // The 1-11 band was measured before WV-02, when a fork whose walked branch was itself a
-    // minority was skipped outright. Those sites are now corrected, so a clean accession can
-    // legitimately take more corrections than the band allows: SRR8209082 takes 20, all of
-    // them rescues, and the result is 10 substitutions with no length change, no new stop
-    // codon, 7 synonymous to 3 conservative non-synonymous, on a route whose mean `ka:f`
-    // rises from 16,987 to 17,758. The threshold is therefore stated against the ordinary
-    // corrections, with the rescue count reported beside it rather than folded into it.
+    // The band covers ordinary corrections only. Minority rescues are legitimate in bulk on
+    // a clean accession, so they are counted beside it rather than folded into it.
     let ordinary = swaps - report.minority_rescues;
     if ordinary > 12 {
         eprintln!(
-            "[{}] WARNING: {} ordinary consensus corrections (plus {} WV-02 minority rescues) \
+            "[{}] WARNING: {} ordinary consensus corrections (plus {} minority rescues) \
              is far more than the 1-11 seen across the panel. The route may have been rerouted \
              through a divergent segment rather than having single alleles swapped; treat this \
              accession as provisional and compare it against the unswapped result.",
@@ -540,23 +498,18 @@ pub fn find_alts(
     path: &GafPath,
     query: &Query,
 ) -> Result<(Vec<AltHaplotype>, VariantStats)> {
-    // WA-04. The fork scan now runs whatever the output flags say, and only the splicing is
-    // conditional. The scan is what decides `mixed=` and `min_vaf=` on the primary's own
-    // header, and a mixture flag that is computed only when alternatives were asked for is
-    // worse than none: `--no-emit-alts` would publish `mixed=0` for a sequence nobody looked
-    // at. A path with fewer than two steps, or no subgraph, genuinely has no fork.
+    // The fork scan runs whatever the output flags say; only the splicing is conditional.
+    // The scan decides `mixed=` and `min_vaf=` on the primary's own header, and a mixture
+    // flag computed only when alternatives were asked for is worse than none:
+    // `--no-emit-alts` would publish `mixed=0` for a sequence nobody looked at.
     let want_alts = cfg.emit_alts || cfg.emit_vcf || cfg.emit_snv_table;
     if path.steps.len() < 2 || subgraph.nodes.is_empty() {
         return Ok((Vec::new(), VariantStats::default()));
     }
 
-    // WV-22. This used to rebuild `local`, `out`, `walk` and `at` inline, an exact copy of
-    // `view()`, which `prefer_majority` calls. `View`'s own doc said the two shared it "so
-    // the two cannot drift apart", and they did not share it. Nothing was wrong in the
-    // output, but an adjacency change landing in one copy would have made `bubbles.json`,
-    // the corrected primary and the alts disagree about which forks exist, which is the kind
-    // of divergence no output reveals. `phase` still builds a third copy; that one is a
-    // different shape and is left for its own change.
+    // Shares `view()` with `prefer_majority` rather than rebuilding it: an adjacency change
+    // landing in one copy would make the corrected primary and the alts disagree about which
+    // forks exist, which no output reveals. `phase` still builds its own, differently shaped.
     let Some(View { out, walk, at }) = view(graph, subgraph, path) else {
         // The path leaves the subgraph; `stitch` would bail too. Nothing was examined, so
         // the stats stay zero rather than claiming forks that were never looked at.
@@ -576,21 +529,16 @@ pub fn find_alts(
     // to know which gate is doing the work, not just the total.
     let (mut forks, mut biallelic, mut no_rejoin, mut not_substitution, mut identical) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
-    // WA-04: sites, not alleles, and the weakest allele the published route carries.
+    // Sites, not alleles, and the weakest allele the published route carries.
     let mut two_allele_sites = 0usize;
     let mut min_site_vaf = 1.0f64;
     let (mut rejected_large, mut rejected_frameshift, mut rejected_window, mut indels) =
         (0usize, 0usize, 0usize, 0usize);
     let mut deltas: Vec<i64> = Vec::new();
     let mut alts: Vec<AltHaplotype> = Vec::new();
-    // WV-06. The scan used to `break` here at the cap, 5' to 3', so an accession with more
-    // than `--max-alts` credible sites got output for the start of the gene only and the rest
-    // looked invariant. The stderr counters stopped with the loop, so even they did not say
-    // so: the only clue was `bubbles=40` on the DONE line. Measured on 40 separate SNP
-    // bubbles: "32 on-path fork(s), 32 biallelic candidate(s) -> 32 recovered", last SNV at
-    // 1921, sites 1981 to 2401 simply absent.
-    //
-    // The scan now runs to the end and counts what it had to leave out.
+    // The scan runs to the end and counts what it leaves out. Breaking at the cap would
+    // give output for the 5' end of the gene only, with the rest looking invariant and the
+    // stderr counters stopping too, so nothing would say the result was truncated.
     let mut beyond_cap = 0usize;
     for i in 0..walk.len() - 1 {
         let fork = walk[i];
@@ -600,7 +548,7 @@ pub fn find_alts(
             continue;
         }
         forks += 1;
-        // WV-04, as in `prefer_majority`: only branches that rejoin count toward the total.
+        // As in `prefer_majority`: only branches that rejoin count toward the total.
         let total = site_total(&out, &at, branches, taken, i, cfg.alt_max_detour, abund);
         if total <= 0.0 {
             continue;
@@ -647,13 +595,11 @@ pub fn find_alts(
             let spliced_len = stitched_len(cfg, &steps, subgraph);
             let delta = spliced_len as i64 - baseline_len as i64;
 
-            // WA-04. A mixture site is one where the sample holds two POPULATIONS, and in a
-            // de Bruijn graph a length-changing branch is usually not one: the project's own
-            // panel found 190 of 203 length-changing calls to be plus or minus one base in a
-            // homopolymer, and this stage's own comment on large deltas says they are the
-            // route being sent through a different stretch of graph rather than an edited
-            // gene. So only an equal-length rejoining branch, a substitution, makes this fork
-            // count towards `mixed=`.
+            // A mixture site is one where the sample holds two POPULATIONS, and in a de
+            // Bruijn graph a length-changing branch is usually not one: 190 of 203
+            // length-changing calls across the panel are plus or minus one base in a
+            // homopolymer, and the large ones are the route being sent through a different
+            // stretch of graph. Only an equal-length rejoining branch counts towards `mixed=`.
             //
             // Measured on the gated fixtures: `ERR2028820` has four branches that clear the
             // abundance and frequency floors, and all four are length-changing or never
@@ -668,7 +614,7 @@ pub fn find_alts(
                 continue;
             }
             // Counted after the gates, so this is "credible alleles we could not emit", not
-            // "branches we did not look at" (WV-06). After the rejoin test too, so it means
+            // "branches we did not look at". After the rejoin test too, so it means
             // an allele the cap displaced rather than one that was never emittable.
             if alts.len() >= cfg.max_alts {
                 beyond_cap += 1;
@@ -749,7 +695,7 @@ pub fn find_alts(
             let replaced_span = a.len().max(b.len()).saturating_sub(head + tail);
             hap.id = format!("{}_alt{}", subgraph.accession, alts.len() + 1);
             alts.push(AltHaplotype {
-                // WV-03: the VAFs just computed rest on a total that is a lower bound.
+                // The VAFs just computed rest on a total that is a lower bound.
                 ka_saturated: branches.iter().any(|&b| abund(b) >= KA_CEILING),
                 haplotype: hap,
                 fork: subgraph.nodes[(fork as usize) / 2],
@@ -765,10 +711,9 @@ pub fn find_alts(
                 replaced_span,
             });
         }
-        // WA-04. One site, however many substitution alleles it holds, and the frequency of
-        // the one the primary took: two such sites more than k - 1 apart are independent
-        // choices that no read links, so the published sequence is a combination that may
-        // exist in no molecule. `vaf=1.00` in the header never said any of this.
+        // One site, however many substitution alleles it holds, and the frequency of the one
+        // the primary took: two such sites more than k - 1 apart are independent choices that
+        // no read links, so the published sequence may exist in no molecule.
         if second_allele_here {
             two_allele_sites += 1;
             min_site_vaf = min_site_vaf.min(taken_vaf);
@@ -794,7 +739,7 @@ pub fn find_alts(
             subgraph.accession, two_allele_sites
         );
     }
-    // WV-06: say it, rather than leaving the caller to infer truncation from a bubble count.
+    // Say it, rather than leaving the caller to infer truncation from a bubble count.
     if beyond_cap > 0 {
         eprintln!(
             "[{}] WARNING: {} credible alternative allele(s) beyond --max-alts {} were \
@@ -832,7 +777,7 @@ pub fn find_alts(
 /// Median rather than mean because a single repeat-collapsed unitig at 25,000x should not
 /// drag the estimate for an otherwise ordinary accession.
 fn path_depth(graph: &UnitigGraph, subgraph: &Subgraph, walk: &[Oriented]) -> f32 {
-    // The same median `extract` takes for the prune floor (WV-23), over the oriented walk
+    // The same median `extract` takes for the prune floor, over the oriented walk
     // rather than over `PathStep`s. Only the projection differs, so only it lives here.
     crate::stages::extract::median_abundance(
         walk.iter()
@@ -845,7 +790,7 @@ fn path_depth(graph: &UnitigGraph, subgraph: &Subgraph, walk: &[Oriented]) -> f3
 ///
 /// Never below `min_abund`: this can only tighten the existing gate, never loosen it.
 fn abundance_floor(cfg: &Config, depth: f32) -> f32 {
-    // `extract::depth_floor` with `--min-abund-frac` in place of `--prune-frac` (WV-23).
+    // `extract::depth_floor` with `--min-abund-frac` in place of `--prune-frac`.
     crate::stages::extract::relative_floor(cfg.min_abund_frac, depth, cfg.min_abund)
 }
 
@@ -934,13 +879,10 @@ fn stitched_len(cfg: &Config, steps: &[PathStep], subgraph: &Subgraph) -> usize 
 /// bounded so a tangled neighbourhood cannot make this expensive.
 /// Total abundance at a fork, counting only the branches that come back to the route.
 ///
-/// WV-04. Both stages used to sum **every** out-edge, including exits that leave the locus
-/// for good: a repeat, a paralog, or a contaminant that happens to share the fork's 30-mer.
-/// Such an exit is not an allele of this gene, and counting it in the denominator deflates
+/// An exit that leaves the locus for good, a repeat, a paralog or a contaminant sharing the
+/// fork's 30-mer, is not an allele of this gene, and counting it in the denominator deflates
 /// every frequency at the site. With the route at 80x, the allele at 20x and an exit at 400x,
-/// the allele's VAF reads 0.04 instead of 0.2, so it clears no gate and produces no alt, no
-/// VCF row and no snvs.tsv row; with the route at 20x and the allele at 80x, the 20% base
-/// stays on `_primary`.
+/// the allele reads 0.04 instead of 0.2 and clears no gate.
 ///
 /// `phase` already restricts its own total to in-bubble branches and says so
 /// (`phase.rs`), which is why `bubbles.json` and the VCF could report different VAFs for the
@@ -1031,7 +973,7 @@ mod tests {
 
     /// Two diamonds in series: `0 -> {1,2} -> 3 -> {4,5} -> 6`, k=4. The walk takes 1 and 4.
     ///
-    /// WA-04's shape. The two sites are joined only through node 3, which both strains carry,
+    /// The two sites are joined only through node 3, which both strains carry,
     /// so every combination of their alleles is a connected path and nothing in the graph
     /// says which pairs occur together in a molecule.
     fn two_diamonds(a_taken: f32, a_alt: f32, b_taken: f32, b_alt: f32) -> UnitigGraph {
@@ -1067,10 +1009,9 @@ mod tests {
         }
     }
 
-    /// WA-04. A primary that passes two two-allele sites is a combination of alleles nothing
-    /// links: in a k = 31 graph the sites are joined through unitigs both strains carry, so
-    /// the walk chooses at each independently and may publish a sequence carried by no
-    /// molecule. The header said `vaf=1.00` and nothing said this.
+    /// A primary that passes two two-allele sites is a combination of alleles nothing links:
+    /// the sites are joined through unitigs both strains carry, so the walk chooses at each
+    /// independently and may publish a sequence carried by no molecule.
     #[test]
     fn two_sites_on_the_route_are_counted_and_the_weakest_allele_is_reported() {
         let g = two_diamonds(60.0, 40.0, 55.0, 45.0);
@@ -1116,10 +1057,9 @@ mod tests {
         assert_eq!(stats.min_site_vaf, 1.0, "no site means no weakest allele, which is 1.0");
     }
 
-    /// WA-04. The mixture scan must not depend on the output flags. It decides `mixed=` on
-    /// the primary's own header, and `--no-emit-alts` used to skip the whole stage, so the
-    /// flag would have been computed for a run that asked for alternatives and guessed for
-    /// one that did not.
+    /// The mixture scan must not depend on the output flags: it decides `mixed=` on the
+    /// primary's own header, so skipping it under `--no-emit-alts` would publish `mixed=0`
+    /// for a sequence nothing examined.
     #[test]
     fn the_mixture_is_measured_even_when_no_variant_output_is_wanted() {
         let g = two_diamonds(60.0, 40.0, 55.0, 45.0);
@@ -1232,18 +1172,9 @@ mod tests {
         assert!(prefer_majority(&maj(true), &g, &s, &walked(), &q("ACGTAG")).unwrap().is_none());
     }
 
-    /// WV-02, and a deliberate reversal. This test used to assert the opposite, that a 0.02%
-    /// walked branch is sequencing error and belongs to `--prune-frac` rather than here.
-    ///
-    /// That reasoning does not survive contact with the thresholds. `--prune-frac` removes
-    /// branches below 1% of GENE DEPTH; the gate this replaced was 10% of THE FORK. A walked
-    /// branch between them was neither pruned nor corrected, and `_primary` published it. The
-    /// exemption also left real error alleles in place whenever the prune was refused (WV-05),
-    /// which is the case it was supposed to cover.
-    ///
-    /// What stops this becoming the greedy whole-route rewrite is not the exemption but the
-    /// bar on the other side: the route only moves onto a branch holding an outright majority
-    /// of the fork. Here that is 12,000 of 12,003, which is not a close call.
+    /// A fork whose walked branch is a minority is reported and, by default, left alone.
+    /// What would stop acting on it becoming a greedy whole-route rewrite is the bar on the
+    /// other side: an outright majority of the fork, here 12,000 of 12,003.
     #[test]
     fn an_error_branch_site_is_reported_but_not_touched() {
         let g = diamond(3.0, 12000.0);
@@ -1252,17 +1183,15 @@ mod tests {
             super::prefer_majority(&maj(true), &g, &s, &walked(), &q("ACGTAG")).unwrap();
         assert!(fixed.is_none(), "the exemption is the default again");
         assert_eq!(report.swaps, 0);
-        // WV-02's finding stands even though its action is off: the site is first-class data
-        // instead of being skipped in silence, which is what it was before 0.2.0.
+        // The site is first-class data even though nothing acts on it.
         assert_eq!(report.left.exempt_minority, 1, "{:?}", report.left);
         assert_eq!(report.left.total(), 1);
     }
 
-    /// `--rescue-minority` turns WV-02's action back on for whoever investigates the
-    /// non-convergence. The behaviour it restores is the one the 5,000-accession slice
-    /// measured, so it has to stay reachable and tested.
+    /// `--rescue-minority` acts on the site instead of only reporting it. Off by default
+    /// because the correction loop does not converge with it on, but it stays reachable.
     #[test]
-    fn rescue_minority_restores_the_wv02_behaviour() {
+    fn rescue_minority_moves_the_route_off_a_walked_minority_branch() {
         let g = diamond(3.0, 12000.0);
         let s = subgraph_of(&g);
         let c = Config { rescue_minority: true, ..maj(true) };
@@ -1274,7 +1203,7 @@ mod tests {
         assert_eq!(report.left.total(), 0);
     }
 
-    /// WV-03: the flag is set by the ceiling exactly, not by "large".
+    /// The flag is set by the ceiling exactly, not by "large".
     ///
     /// 24,999 is an ordinary high-coverage fork whose ratios mean what they say. 25,000 is
     /// Logan's clip, so the fork total is a lower bound and both VAFs on the record are
@@ -1296,11 +1225,11 @@ mod tests {
 
     /// The cap is a budget for the whole correction set, not for one swap.
     ///
-    /// Found by the WV-02 panel re-run, not by reasoning: `SRR6007473` took 64 corrections
-    /// that were each in frame and each inside the 30 nt `--max-alt-indel` cap, and its
-    /// ebola GP primary grew from 2,049 nt to 3,129 against a 2,031 nt reference. Every
-    /// individual step was legal; the total was the whole-route rewrite this stage exists to
-    /// avoid. Here two +30 nt swaps are each legal and the second must still be refused.
+    /// Found on a panel, not by reasoning: one accession took 64 corrections that were each
+    /// in frame and each inside the 30 nt cap, and its ebola GP primary grew from 2,049 nt to
+    /// 3,129 against a 2,031 nt reference. Every step was legal; the total was the
+    /// whole-route rewrite this stage exists to avoid. Here two +30 nt swaps are each legal
+    /// and the second must still be refused.
     #[test]
     fn the_indel_cap_bounds_the_whole_correction_set_not_one_swap() {
         // Two diamonds in series, each with a +30 nt in-frame majority branch.
@@ -1339,10 +1268,8 @@ mod tests {
                    report.left);
     }
 
-    /// The WV-02 case proper: a reference-like minority between the prune floor and
-    /// `--min-vaf`. Reproduced by the review at 2%, 5% and 9% of the fork; before the fix the
-    /// primary carried the minority base at every such site with `pident=100.0` and no alt,
-    /// VCF row, summary field or `provisional` flag to say so.
+    /// The case proper: a reference-like minority between the prune floor and `--min-vaf`,
+    /// which neither mechanism reaches. Reproduced at 2%, 5% and 9% of the fork.
     #[test]
     fn a_walked_minority_between_the_prune_floor_and_min_vaf_is_corrected() {
         // 5% of the fork: above the 1%-of-depth prune floor, below --min-vaf 0.10.
@@ -1355,7 +1282,7 @@ mod tests {
         assert_eq!((report.swaps, report.minority_rescues), (1, 1));
     }
 
-    /// WV-02 x WV-03: no minority rescue where the fork is clipped.
+    /// No minority rescue where the fork is clipped.
     ///
     /// The rescue path's whole safety rail is "the other side holds an outright majority of
     /// the fork", and that is a ratio against the fork total. Where a branch sits at Logan's
@@ -1366,7 +1293,7 @@ mod tests {
     /// while none lost one.
     #[test]
     fn a_minority_rescue_is_refused_at_a_saturated_fork() {
-        // 5% walked against 95%, which is the WV-02 case, but the majority is clipped.
+        // 5% walked against 95%, the rescue case, but the majority is clipped.
         let g = diamond(1_250.0, crate::types::KA_CEILING);
         let s = subgraph_of(&g);
         let c = Config { rescue_minority: true, ..maj(true) };
@@ -1387,7 +1314,7 @@ mod tests {
 
     /// An ORDINARY two-allele correction is not refused at a saturated fork, because it needs
     /// the alternative to beat the walked branch, which clipping cannot manufacture: two
-    /// clipped branches compare equal and nothing moves. WV-01's behaviour is untouched.
+    /// clipped branches compare equal and nothing moves.
     #[test]
     fn an_ordinary_correction_is_unaffected_by_saturation() {
         // Both branches well over --min-vaf, the alternative clipped and clearly larger.
@@ -1426,7 +1353,7 @@ mod tests {
             super::prefer_majority(&c, &g, &s, &walk, &q("ACGTAG")).unwrap();
         assert!(fixed.is_none(), "47.5% is a plurality, not a majority");
         assert_eq!(report.swaps, 0);
-        // Left, and said so, with the reason. Before WV-02 the site was skipped silently.
+        // Left, and said so, with the reason.
         assert_eq!(report.left.not_outright_majority, 1, "{:?}", report.left);
         assert_eq!(report.left.total(), 1);
     }
@@ -1464,9 +1391,9 @@ mod tests {
         let c = Config { allow_indel_alts: false, ..maj(true) };
         assert!(prefer_majority(&c, &g, &s, &walked(), &q("ACGTAG")).unwrap().is_none(),
                 "and not with indel support switched off either");
-        // WV-11. `--allow-frameshift-alts` admits a frameshifting allele to the side file; it
-        // must not reframe `_primary`. The rule used to be shared with `find_alts`, so the
-        // flag did both.
+        // `--allow-frameshift-alts` admits a frameshifting allele to the side file; it must
+        // not reframe `_primary`, so the rule here is deliberately not shared with
+        // `find_alts`.
         let c = Config { allow_frameshift_alts: true, ..maj(true) };
         assert!(prefer_majority(&c, &g, &s, &walked(), &q("ACGTAG")).unwrap().is_none(),
                 "--allow-frameshift-alts must not let the consensus be reframed");
@@ -1680,13 +1607,13 @@ mod tests {
         assert!(find_alts(&c, &g, &s, &walked(), &q("ACGTAG")).unwrap().is_empty());
     }
 
-    /// WV-04: a well-covered exit that never returns to the route is not an allele of this
-    /// gene and must not sit in the denominator.
+    /// A well-covered exit that never returns to the route is not an allele of this gene and
+    /// must not sit in the denominator.
     ///
     /// The shape is a repeat, a paralog, or a contaminant sharing the fork's 30-mer. Counting
-    /// it deflated every frequency at the site: here the allele is 20 against the route's 80,
-    /// which is 0.2, but with a 400x dead-end exit in the total it read 0.04 and cleared no
-    /// gate, so there was no alt, no VCF row and no snvs.tsv row. `phase` already excluded
+    /// it deflates every frequency at the site: here the allele is 20 against the route's 80,
+    /// which is 0.2, but with a 400x dead-end exit in the total it reads 0.04 and clears no
+    /// gate, so there is no alt, no VCF row and no snvs.tsv row. `phase` already excluded
     /// such branches from its own total, so `bubbles.json` and the VCF disagreed about the
     /// same site.
     #[test]
@@ -1720,8 +1647,8 @@ mod tests {
         assert!((alts[0].taken_vaf - 0.8).abs() < 1e-9, "{}", alts[0].taken_vaf);
     }
 
-    /// The other half of WV-04: with the route on the minority, the dead-end exit used to
-    /// hold the majority correction back, leaving the 20% base on `_primary`.
+    /// The other half: with the route on the minority, a dead-end exit in the denominator
+    /// holds the majority correction back and leaves the 20% base on `_primary`.
     #[test]
     fn a_dead_end_exit_no_longer_blocks_the_majority_correction() {
         let fa = ">T_0 ka:f:80.0   L:+:1:+  L:+:2:+  L:+:3:+\nACGT\n\
@@ -1747,12 +1674,10 @@ mod tests {
         assert_eq!(report.swaps, 1);
     }
 
-    /// WV-06: what the cap leaves out is counted and reported, not dropped in silence.
+    /// What the cap leaves out is counted and reported, not dropped in silence.
     ///
-    /// The scan used to `break` at the cap, 5' to 3', so an accession with more credible
-    /// sites than `--max-alts` got output for the start of the gene and the rest looked
-    /// invariant. Worse, the stderr counters stopped with the loop, so they agreed: "32
-    /// on-path fork(s), 32 biallelic candidate(s) -> 32 recovered" on a graph with 40.
+    /// Breaking at the cap would give output for the 5' end of the gene with the rest looking
+    /// invariant, and the stderr counters would stop with the loop and agree with it.
     #[test]
     fn alleles_past_the_cap_are_counted_and_the_scan_continues() {
         let g = diamond(60.0, 40.0);
@@ -1776,14 +1701,13 @@ mod tests {
         p.steps[1].node = 99;
         assert!(find_alts(&cfg(true), &g, &s, &p, &q("ACGTAG")).unwrap().is_empty());
     }
-    /// WV-01/TW-02 regression set: the alignment window sits INSIDE the path.
+    /// Regression set: the alignment window sits INSIDE the path.
     ///
-    /// Every other test in this module uses `walked()`, whose window spans the whole path
-    /// (`path_start: 0, path_end: 7` with `path_len: 7`). Real GAF rows almost never look
-    /// like that; the one the repository records is `7..1281` of 1288. That gap is how WV-01
-    /// survived two releases: `prefer_majority` compared its restitched sequence against the
-    /// whole stitched path rather than against the window, so every correction on a flanked
-    /// alignment was silently dropped. These cases fail against 0.1.0 and 0.1.1.
+    /// Every other test in this module uses `walked()`, whose window spans the whole path.
+    /// Real GAF rows almost never look like that; the one the repository records is `7..1281`
+    /// of 1288. Comparing a restitched sequence against the whole stitched path rather than
+    /// against the window silently drops every correction on a flanked alignment, and only a
+    /// flanked fixture catches it.
     ///
     /// The route takes the 40% branch; after correction the window must carry the 60% one.
     #[test]
@@ -1807,7 +1731,7 @@ mod tests {
             );
             let fixed = prefer_majority(&c, &g, &s, &w, &query)
                 .unwrap()
-                .unwrap_or_else(|| panic!("window [{start},{end}) should be corrected (WV-01)"));
+                .unwrap_or_else(|| panic!("window [{start},{end}) should be corrected"));
             let after = stitch::stitch(&c, &g, &fixed, &s, &query).unwrap().unwrap();
             assert_eq!(
                 after.seq,
@@ -1841,9 +1765,8 @@ mod tests {
         assert_eq!(after.seq.len(), 4 + 3, "the window grew by the inserted codon");
     }
 
-    /// `find_alts` already compared windows, so this passed before the WV-01 fix too. It is
-    /// here so the two stages are pinned on the same shape of input: a regression that made
-    /// `find_alts` compare whole paths would otherwise be caught by nothing.
+    /// Pins `find_alts` on the same shape of input as `prefer_majority`: a regression that
+    /// made it compare whole paths rather than windows would otherwise be caught by nothing.
     #[test]
     fn recovers_the_second_allele_when_the_window_is_inside_the_path() {
         let g = diamond(60.0, 40.0);
@@ -1857,13 +1780,10 @@ mod tests {
         assert_ne!(alts[0].haplotype.seq, primary.seq);
         assert_eq!(alts[0].haplotype.seq.len(), primary.seq.len());
     }
-    /// WV-12. A triallelic fork where the most abundant alternative is refused: a +1 nt
-    /// frameshift at 45%, which WV-11 keeps out of `_primary`. The next one down, a clean
-    /// substitution at 30%, still beats the walked 25% branch and must be taken.
-    ///
-    /// Before the fix only the top alternative was considered, so its refusal abandoned the
-    /// fork: the primary kept the 25% allele and the alt reported `vaf=0.300
-    /// primary_vaf=0.250`, which is what `--no-prefer-majority` would have given.
+    /// A triallelic fork where the most abundant alternative is refused: a +1 nt frameshift
+    /// at 45%, which never reaches `_primary`. The next one down, a clean substitution at
+    /// 30%, still beats the walked 25% branch and must be taken. Considering only the top
+    /// alternative would abandon the fork and leave the 25% allele published.
     #[test]
     fn a_refused_top_alternative_falls_through_to_the_next() {
         let fa = ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+  L:+:4:+\nACGT\n\
@@ -1884,7 +1804,7 @@ mod tests {
         let after = stitch::stitch(&c, &g, &fixed, &s, &q("ACGTAG")).unwrap().unwrap();
         assert_eq!(after.seq, b"ACGTCG", "in frame, one base changed");
 
-        // The same on a flanked window, which is where WV-01 used to stop all of this.
+        // The same on a flanked window, which is where the window comparison matters.
         let w = walked_window(1, 5);
         let fixed = prefer_majority(&c, &g, &s, &w, &q("ACGTAG"))
             .unwrap()

@@ -15,8 +15,8 @@
 //! in coordinate order instead produces sequences that never existed in any organism, which
 //! then read as strong positive selection downstream.
 //!
-//! It does not make the primary a phased haplotype, and WA-04 is the correction to the claim
-//! that it does. In a k = 31 graph, two allele sites more than 30 bases apart are joined
+//! It does not make the primary a phased haplotype. In a k = 31 graph, two allele sites more
+//! than 30 bases apart are joined
 //! through unitigs both strains share, so every combination of their alleles is a connected
 //! path and the walk picks one branch at each site independently. On a sample holding two
 //! strains at 60/40 and 40/60 over the two halves of a gene, the published primary matched
@@ -68,12 +68,11 @@ pub fn revcomp(seq: &[u8]) -> Vec<u8> {
 /// # Why a path at all
 ///
 /// Concatenating BLAST hits in coordinate order instead produces sequences assembled from
-/// fragments of different strains, which never existed in any organism. README section 4
-/// measures that at 87% chimeric artifacts, and a chimera looks exactly like a rapidly
-/// evolving gene to a selection test. Requiring a connected path makes a join **no k-mer
-/// supports** impossible, which is the defect that measured at 87%.
+/// fragments of different strains, measured at 87% chimeric artifacts on this project's own
+/// data, and a chimera looks exactly like a rapidly evolving gene to a selection test.
+/// Requiring a connected path makes a join **no k-mer supports** impossible.
 ///
-/// It does not phase sites further apart than k - 1 (WA-04). Those are linked only through
+/// It does not phase sites further apart than k - 1. Those are linked only through
 /// unitigs the strains share, so a mixture still yields a connected path that may combine
 /// alleles no molecule carries. The primary's header reports what the route passed through,
 /// `min_vaf=` and `mixed=`, rather than claiming the question does not arise.
@@ -101,7 +100,7 @@ pub fn stitched_len(cfg: &Config, steps: &[PathStep], subgraph: &Subgraph) -> us
 
 /// Check that a GAF row describes a walk this graph can actually support.
 ///
-/// WA-12. `stitch_steps` appends `&s[k_overlap..]` for every step without asking whether
+/// `stitch_steps` appends `&s[k_overlap..]` for every step without asking whether
 /// consecutive steps are joined by an edge, and `stitch` clamps a window that runs past the
 /// end instead of refusing it. So a GAF that disagrees with the GFA it was produced from, a
 /// different aligner build, a wrapper that rewrites node names, a truncated file, is stitched
@@ -240,11 +239,10 @@ pub struct Candidate {
 /// so an under-covered reference is filtered out before it can win regardless of metric.
 /// Candidates within `tie_eps` of the best score are treated as tied and the **deepest** of
 /// them wins, by `Haplotype::mean_ka`. Without that, a sample holding two strains that each
-/// equal a panel record gives two candidates scoring 1.0 and pident 100, and the record
-/// listed first in the panel wins: a 5% strain can be published as `_primary`, taking its
-/// `anchor=` tag and every VCF coordinate with it, while the 95% strain leaves no trace.
-/// Nothing downstream repairs that, because `prefer_majority` skips a fork whose taken branch
-/// is below `--min-vaf`, so a 5% route is never moved to the 95% one.
+/// equal a panel record gives two candidates scoring identically and the record listed first
+/// in the panel wins, so a 5% strain can be published as `_primary` with its `anchor=` tag
+/// and every VCF coordinate. Nothing downstream repairs it, because `prefer_majority` skips a
+/// fork whose taken branch is below `--min-vaf`.
 ///
 /// The band is measured on the metric's own value, normalised to a fraction (pident is
 /// divided by 100) so one `tie_eps` means the same thing whichever metric is in use.
@@ -342,7 +340,7 @@ pub fn stitch(
     let target: Vec<u8> = stitched[start..end.max(start)].to_vec();
 
     let cov = target.len() as f64 / query.seq.len() as f64;
-    // What `--min-cov` actually gates on (WA-05). `cov` above is the walked length, which an
+    // What `--min-cov` actually gates on. `cov` above is the walked length, which an
     // indel in the sample moves in the wrong direction: a deletion makes a gene that is fully
     // there look absent, and an insertion makes a partial alignment look complete. The
     // reference span is the fraction of the reference the alignment found, which is what the
@@ -382,7 +380,7 @@ pub fn stitch(
         // Was hardcoded 0.0 while being published in every FASTA header and in summary.json.
         mean_ka: crate::stages::extract::path_mean_ka(graph, &path.steps),
         vaf: 1.0,
-        // WA-04. `stitch` has the path but not the fork frequencies along it: those come from
+        // `stitch` has the path but not the fork frequencies along it: those come from
         // `variants::find_alts`, which runs after the majority correction has settled which
         // route is published. The pipeline copies them in. Until then this says what an
         // unexamined route can honestly say, that no two-allele site is known on it.
@@ -405,8 +403,8 @@ mod tests {
             accession: "ACC".into(),
             nodes,
             seqs: seqs.iter().map(|x| x.as_bytes().to_vec()).collect(),
-            // Points at nothing, and `owns_gfa: false` means Drop leaves it alone. Before
-            // TW-01 this relied on the unlink failing, which it does not do as root.
+            // Points at nothing, and `owns_gfa: false` means Drop leaves it alone rather
+            // than relying on the unlink failing, which it does not do as root.
             gfa_path: PathBuf::from("/tmp/logan-stitch-test-nonexistent.gfa"),
             n_edges: 0,
             owns_gfa: false,
@@ -459,7 +457,7 @@ mod tests {
         .unwrap()
     }
 
-    /// WA-12. A GAF row is believed about a graph the walker wrote itself, and nothing
+    /// A GAF row is believed about a graph the walker wrote itself, and nothing
     /// checked that the row describes a walk of it. `stitch_steps` appends `&s[k_overlap..]`
     /// for each step whatever the step is, so a row from a different aligner build, a wrapper
     /// that renames segments, or a truncated file is stitched into a sequence anyway and
@@ -871,8 +869,8 @@ mod tests {
 
     /// `path`, with the reference span given separately from the walked span.
     ///
-    /// The ordinary helper ties the two together, which is exactly the assumption WA-05 was
-    /// about: an indel in the sample makes them differ.
+    /// The ordinary helper ties the two together, which is exactly the assumption an indel in
+    /// the sample breaks.
     fn path_spanning(
         steps: &[(Orient, u32)],
         len: usize, start: usize, end: usize,
@@ -886,14 +884,13 @@ mod tests {
         }
     }
 
-    /// WA-05. A sample that carries the whole gene with an in-frame deletion is present, and
+    /// A sample that carries the whole gene with an in-frame deletion is present, and
     /// `--min-cov` is documented as the fraction of the reference a primary must cover.
     ///
-    /// The gate used to measure the walked length instead: a 300 nt gene with a 60 nt
-    /// deletion walks 240 bases, scores 0.80 against the default 0.85 and was published as
-    /// `no_path`, "the gene is not here". That biases presence calls against exactly the
-    /// alleles a deletion study is looking for. The alignment spans the whole reference, so
-    /// the reference coverage is 1.00 and it is kept.
+    /// Measuring the walked length instead would call a 300 nt gene with a 60 nt deletion
+    /// `no_path`: it walks 240 bases and scores 0.80 against the default 0.85, which biases
+    /// presence calls against exactly the alleles a deletion study looks for. The alignment
+    /// spans the whole reference, so the reference coverage is 1.00 and it is kept.
     #[test]
     fn a_deletion_does_not_make_a_present_gene_look_absent() {
         let c = cfg(4, 0.85);
@@ -909,8 +906,8 @@ mod tests {
 
     /// The mirror image, and the reason this is a correctness fix rather than a loosening:
     /// an alignment that reaches only reference base 240 of 300 is 0.80 of the reference
-    /// however much sequence it walked. Walking a 40 nt insertion used to lift it to 0.933
-    /// and publish it as a primary.
+    /// however much sequence it walked. On the walked length a 40 nt insertion lifts it to
+    /// 0.933 and it is published as a primary.
     #[test]
     fn an_insertion_does_not_make_a_partial_alignment_look_complete() {
         let c = cfg(4, 0.85);
@@ -1001,7 +998,7 @@ mod golden_haplotype {
             return;
         };
         let mut cfg = Config::default();
-        // `write_gfa` no longer creates a missing scratch directory (WF-17),
+        // `write_gfa` no longer creates a missing scratch directory,
         // so a test that names its own creates it, as a run does.
         cfg.scratch_dir = std::env::temp_dir().join(format!("logan_golden_{}", std::process::id()));
         std::fs::create_dir_all(&cfg.scratch_dir).unwrap();

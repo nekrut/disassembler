@@ -6,8 +6,8 @@ method were written by Andrew (@as042), building on an earlier Rust port
 of a Python prototype path walker. Both were developed in an earlier
 repository; their history was squashed into a single import commit here, and the
 design and measurement record that matters for users is kept under docs/
-(see docs/issue_intra_accession_variance_lost.md and
-docs/issue_graphaligner_end_clipping.md).
+(see docs/notes/intra_accession_variance.md and
+docs/notes/graphaligner_end_clipping.md).
 
 The k-mer diversity sieve under extern/kmer-diversity-sieve is a separate project,
 https://github.com/stevenweaver/kmer-diversity-sieve, included as a git submodule

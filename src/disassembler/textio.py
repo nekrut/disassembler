@@ -24,7 +24,7 @@ ZSTD_REFUSED = ("zstd-compressed; only plain and gzip-compressed input is read. 
 class _Gunzip(io.RawIOBase):
     """A gzip stream whose read errors are `ValueError`, naming the source.
 
-    PL-21. `gzip.GzipFile` raises `EOFError` for a truncated member and `zlib.error` for a
+    `gzip.GzipFile` raises `EOFError` for a truncated member and `zlib.error` for a
     corrupt one. Neither is caught by `except (OSError, ValueError)`, which is what
     `lexicmap`, `msa`, `sieve`, `stratify`, `reconstruct` and `from-lexicmap` all use, so a
     half-downloaded `.gz` ended in a traceback from every one of them. Fixed here rather than
@@ -64,7 +64,7 @@ def text_stream(raw, name: str = None) -> io.TextIOWrapper:
     if head.startswith(GZIP_MAGIC):
         label = name or getattr(raw, "name", None) or "the input"
         buf = io.BufferedReader(_Gunzip(gzip.GzipFile(fileobj=buf), label))
-    # PM-07: `utf-8-sig` strips a leading byte-order mark and is identical to `utf-8` when
+    # `utf-8-sig` strips a leading byte-order mark and is identical to `utf-8` when
     # there is none. With plain `utf-8` the BOM survived as U+FEFF at the head of the first
     # line, so `line.startswith(">")` was false for record 1 and the record was dropped
     # without being counted, in `sieve` and in every other reader that comes through here.

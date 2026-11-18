@@ -254,14 +254,9 @@ pub fn index_query_set(cfg: &Config, queries: &[Query]) -> Result<QueryIndex> {
 /// guaranteed every stored base is ACGT.
 /// Counts shared k-mers as a record streams past, so anchoring stores nothing.
 ///
-/// This is `parse::RecordSink`, driven by `parse::scan`. Until 0.2.0 anchoring was a second
-/// walk over the whole 2-bit store after the parser had built it, which meant the sequences
-/// of every unitig had to exist in memory for it to walk. Fused into the decode, it needs
-/// none of them: 68 million bases go past once and only the anchor ids survive.
-///
-/// Forward and reverse-complement registers roll in lockstep so each unitig is scanned once
-/// rather than twice. No ambiguity handling is needed: `parse` has already guaranteed every
-/// base is ACGT before it reaches `base`.
+/// This is `parse::RecordSink`, driven by `parse::scan`. Fusing anchoring into the decode is
+/// what lets the parser avoid storing every unitig's sequence: 68 million bases go past once
+/// and only the anchor ids survive. See `count_shared` for the register trick.
 pub struct Scanner<'a> {
     k: usize,
     min_shared: u32,
@@ -438,7 +433,7 @@ fn shared(a: &[u64], b: &[u64]) -> usize {
 }
 
 /// The share of the smaller reference's k-mers two references must have in common to count
-/// as the same gene (WP-02).
+/// as the same gene.
 ///
 /// 1%. Strains of one gene share far more than this (the SARS-CoV-2 spike panel is one group
 /// at any threshold up to 50%), and unrelated genes share far less: two random coding
@@ -449,7 +444,7 @@ pub const GROUP_MIN_SHARE: f64 = 0.01;
 
 /// Partition the anchor pool into groups of references that look like the same gene.
 ///
-/// WP-02. Multi-anchor mode ranks every `-q` record against one another and keeps a single
+/// Multi-anchor mode ranks every `-q` record against one another and keeps a single
 /// primary per accession, which is right for strains of one gene and wrong for a panel of
 /// different genes: an accession carrying both `bla_KPC` and `bla_NDM` comes back with one of
 /// them, exit 0, and the other visible only as an unselected candidate in the summary. The
@@ -499,12 +494,10 @@ pub fn reference_groups(k: usize, seqs: &[&[u8]], min_share: f64) -> Vec<Vec<usi
     out
 }
 
-// The anchor-fraction guard that used to live here has been removed. It was calibrated on
-// BLAST anchor counts and then applied to k-mer anchors, so at the default
-// `min_shared_kmers = 3` it sat 9x below its own threshold and stayed silent on the one
-// accession it existed to catch. `Anchors::fraction_of_graph` is still reported for
-// diagnostics. The real guard is `extract::exceeds_guard`, which measures the neighbourhood
-// after expansion.
+// There is deliberately no anchor-fraction guard here. One calibrated on BLAST anchor
+// counts sits 9x below its own threshold once applied to k-mer anchors, so it stays silent
+// on the accession it exists to catch. `Anchors::fraction_of_graph` is reported for
+// diagnostics; the guard is `extract::exceeds_guard`, which measures after expansion.
 
 #[cfg(test)]
 mod group_tests {
@@ -607,8 +600,7 @@ mod group_tests {
                 let seqs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
                 let groups = reference_groups(21, &seqs, GROUP_MIN_SHARE);
                 eprintln!("master_planetary_targets.fasta: {} records, {} groups", recs.len(), groups.len());
-                // DD-05 removed 18 records that were other genes of the reference's own
-                // contig; the file is 142 records in 31 groups.
+                // 25 gene prefixes, but 31 k-mer-sharing groups: some genes split.
                 assert_eq!((recs.len(), groups.len()), (142, 31));
                 assert!(
                     groups.len() > 1,
@@ -944,7 +936,7 @@ mod recall_study_kmers {
     use crate::io::input::read_query;
     use std::path::Path;
 
-    /// TW-11: not `#[ignore]`d. It reads only repository files, so there is nothing to skip
+    /// Not `#[ignore]`d. It reads only repository files, so there is nothing to skip
     /// for, and while it was ignored it never ran on push.
     #[test]
     fn matches_the_recall_study_kmer_counts() {
@@ -980,9 +972,8 @@ mod recall_study_kmers {
     }
 }
 
-/// Cross-validation against the anchor-recall study. Those anchor counts were
-/// produced by an independent implementation and then used to decide that k-mer anchoring
-/// is viable, so the two must agree exactly.
+/// Cross-validation against the anchor-recall study, whose counts came from an independent
+/// implementation and decided that k-mer anchoring is viable, so the two must agree exactly.
 ///
 /// `LOGAN_TEST_ZST=/path/to/ERR2028820.unitigs.fa.zst cargo test --release -- --ignored --nocapture`
 #[cfg(test)]

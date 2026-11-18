@@ -8,11 +8,9 @@ name: golden
 # one job: keeping it in `ci.yml` would mean either running it on every push to any file, or
 # filtering the offline jobs too.
 #
-# Until 2026-11-13 this was a job in `ci.yml` guarded by `if: github.event_name ==
-# 'workflow_dispatch'`, so it only ever ran when someone remembered to press the button. It had
-# been dispatched twice, both on 2026-09-12, 63 commits before v0.1.1; `walker/src` then changed
-# by +2004/-513 lines across 17 files, so the gate as written had never executed. Neither
-# release was gated by it. See review finding TC-01.
+# Its own workflow, and not a `workflow_dispatch`-guarded job in `ci.yml`: guarded that way it
+# runs only when someone remembers to press the button, which left `walker/src` changes of
+# +2004/-513 lines across 17 files ungated and meant no release was gated by it at all.
 
 on:
   workflow_dispatch:

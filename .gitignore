@@ -40,3 +40,7 @@ tests/*.rank*.fasta
 
 # setuptools metadata from `pip install -e .`
 *.egg-info/
+
+# The k-mer simulation harness writes its 4,860 records as both CSV and JSON. The CSV is the
+# committed artifact and the one `generate_figures.py` reads; the JSON is the same data again.
+/bench/simulated_kmer_sensitivity/simulation_results.json

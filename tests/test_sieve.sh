@@ -85,7 +85,7 @@ run_sieve() {
     [[ $rc -eq 0 ]] || { echo "[test_sieve] run '$tag' exit=$rc"; cat "$log" >&2; return 1; }
     # Count promoted sequences from the emitted shards.
     #
-    # `grep -c` exits 1 when the count is 0, and it used to be the last command here, so a
+    # `grep -c` exits 1 when the count is 0, so as the last command in a function it makes a
     # sieve that ran fine and promoted nothing was reported as "did not exit 0" and the
     # dedicated `N1 >= 1` assertion below could never run. An unexpanded glob (if
     # --emit-promoted ever changes its shard naming) hits the same path. Keep the count and

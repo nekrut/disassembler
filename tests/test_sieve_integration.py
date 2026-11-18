@@ -73,7 +73,7 @@ class TestReconstructSieveSeam(unittest.TestCase):
         self.fake_walker = self.work / "fake_walker.sh"
         self.fake_walker.write_text(
             "#!/usr/bin/env bash\n"
-            # PK-01: the composite checks the walker's version before running it.
+            # The composite checks the walker's version before running it.
             'if [ "$1" = --version ]; then echo "logan-walker 0.1.1"; exit 0; fi\n'
             "out=''; fasta=''\n"
             'while [ $# -gt 0 ]; do case "$1" in\n'
@@ -197,7 +197,7 @@ class TestReconstructSieveSeam(unittest.TestCase):
     def test_a_stage_that_died_on_a_signal_is_reported_as_one_not_as_a_masked_byte(self):
         """A non-positive code means the stage did not normalise a signal death.
 
-        Passing it on would let the shell mask it to an unrelated byte (PM-19's `-4` read as
+        Passing it on would let the shell mask it to an unrelated byte (the `-4` read as
         252), so it becomes 1, which is at least true.
         """
         self.assertEqual(self.pipe_reconstruct._stage_code(-4), 1)
@@ -419,7 +419,7 @@ class TestFromLexicmapGates(unittest.TestCase):
         self.seen = {}
 
         # Gap-free by default, so these tests see the gates the COHORT GATE derives.
-        # PC-03 gave the derived values a floor at the cohort's own worst row, which a
+        # The derived values have a floor at the cohort's own worst row, which a
         # fixture full of gaps would hide; `self.rows` lets one test exercise that floor.
         self.rows = [("a", "ACGTAC"), ("b", "ACGTAG")]
 
@@ -479,7 +479,7 @@ class TestFromLexicmapGates(unittest.TestCase):
         self.assertEqual((seen["max_gap_frac"], seen["msa_min_cov"]), (0.1, 0.9))
 
     def test_a_long_deletion_lexicmap_admitted_is_not_dropped_by_the_derived_gates(self):
-        """PC-03. lexicmap counts a trusted deletion as covered with no limit and leaves
+        """Lexicmap counts a trusted deletion as covered with no limit and leaves
         `-` in the row. The derived allowance was a flat 5% over the gate, so a clean,
         full-length row whose in-frame deletion exceeded 5% of the reference was dropped
         by the sieve's completeness gate, with exit 0 and a line that reads as thinning.
@@ -504,7 +504,7 @@ class TestFromLexicmapGates(unittest.TestCase):
 
 
 class TestSieveAdmissionAndHeaders(unittest.TestCase):
-    """PM-01, PM-04, PM-05, PM-07, PM-13, PM-14, PM-15, PM-19, PM-20 against the real binary."""
+    """The admission gate, the neutral ids and the header round-trip, against the real binary."""
 
     @classmethod
     def setUpClass(cls):
@@ -550,21 +550,15 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
             if path.is_file() else []
 
     def test_a_late_divergent_lineage_survives_a_large_unique_cohort(self):
-        # PM-01. 2,100 unique haplotypes, then one 2% away. Past the binary's 2,000-record
-        # warmup that record used to be rejected as an admission outlier, which means never
-        # sketched, never promoted and never added to the k-mer table, so the rest of its
-        # clade went with it: the lineage vanished from the MSA and tree at exit 0, and
-        # whether it survived depended on where in the file it sat.
+        # 2,100 unique haplotypes, then one 45 SNVs (3%) away. With the binary's admission
+        # gate armed, a record past the warmup that looks like an outlier is never sketched,
+        # promoted or added to the k-mer table, so the rest of its clade goes with it and the
+        # lineage vanishes from the MSA and tree at exit 0.
         #
-        # 45 SNVs in 1,500 nt. Measured against this binary on this fixture, 30 SNVs (2%)
-        # is admitted and 45 (3%) is rejected; on a cohort built with a different random
-        # stream the boundary sat between 20 and 30. The admission band is
-        # `mean + 5*sd + 0.5` over the running singleton counts, and record 1 contributes
-        # about 1,486 novel k-mers against every later record's ~30, so the band's width is
-        # a property of the FILE, not of the biology: there is no divergence a user can
-        # stay under. That is a sharper statement of the defect than a single cut-off, and
-        # the direction is the alarming one, since it is the genuinely novel lineages that
-        # were dropped, which are the ones the sieve exists to keep.
+        # The band is `mean + 5*sd + 0.5` over the running singleton counts, and record 1
+        # contributes about 1,486 novel k-mers against every later record's ~30, so its
+        # width is a property of the FILE rather than of the biology: there is no divergence
+        # a user can stay under, and it is the genuinely novel lineages that are dropped.
         cohort = [(f"u{i}", self.mutate(self.base, 2)) for i in range(2100)]
         divergent = ("late_lineage", self.mutate(self.base, 45))   # 45/1500 = 3%
         rc, out, log, _err = self.run_sieve(cohort + [divergent])
@@ -584,7 +578,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
         self.assertIn("early_lineage", self.headers_of(out))
 
     def test_dated_headers_do_not_partition_novelty(self):
-        # PM-04: the binary folds a month parsed from `|YYYY-MM` into every LSH band key, so
+        # The binary folds a month parsed from `|YYYY-MM` into every LSH band key, so
         # a record was compared only with promoted records of the same month. Six copies of
         # one sequence, one SNV apart, in six different months, all survived.
         seqs = [self.mutate(self.long_base, 1) for _ in range(6)]
@@ -599,7 +593,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
                          "and the original header comes back intact")
 
     def test_a_long_header_survives_intact(self):
-        # PM-13: the binary keys its emit set on the first 255 characters of the header and
+        # The binary keys its emit set on the first 255 characters of the header and
         # writes that truncated copy out, so a from-lexicmap header with a long `indels=`
         # list lost its tail.
         long_hdr = "acc1 " + "indels=" + ",".join(f"{i}_{i+1}insA" for i in range(40))
@@ -609,7 +603,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
         self.assertEqual(self.headers_of(out), [long_hdr])
 
     def test_two_records_sharing_a_header_are_not_over_emitted(self):
-        # PM-13: only one was promoted, but the binary emitted every record whose truncated
+        # Only one was promoted, but the binary emitted every record whose truncated
         # header matched, so `PROMOTED 3` came out as `4 -> 4`.
         a, b = self.mutate(self.long_base, 1), self.mutate(self.long_base, 8000)
         rc, out, log, _e = self.run_sieve([("same", a), ("same", b)])
@@ -623,7 +617,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
                          "one promoted means one emitted, whatever the headers say")
 
     def test_a_byte_order_mark_does_not_drop_the_first_record(self):
-        # PM-07: the BOM survived decoding, so the first header failed `startswith(">")` and
+        # The BOM survived decoding, so the first header failed `startswith(">")` and
         # its lines were dropped while `header is None`: the record vanished and was not
         # even counted in n_in.
         records = [(f"r{i}", self.mutate(self.base, 2)) for i in range(5)]
@@ -634,7 +628,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
         self.assertIn("r0", self.headers_of(out))
 
     def test_trailing_whitespace_does_not_count_as_bad_bases(self):
-        # PM-07: the binary strips only \n and \r and counts every other byte as an N,
+        # The binary strips only \n and \r and counts every other byte as an N,
         # while the wrapper's own predictor stripped all whitespace, so records at 4% N were
         # dropped by the completeness gate with no "completeness gate drops" line and the
         # loss read as thinning.
@@ -656,7 +650,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
         self.assertIn("text before the first", err)
 
     def test_sibling_files_and_glob_characters_in_the_name_are_safe(self):
-        # PM-05: the shard glob was `{stem}.rank*.fasta`, unescaped, in the user's own
+        # The shard glob was `{stem}.rank*.fasta`, unescaped, in the user's own
         # directory. It deleted look-alikes before the input was read, merged any match into
         # the output, and missed the real shard when the stem held a bracket.
         for name in ("out.ranked_by_abundance.fasta", "out.rank1_manual.fasta",
@@ -682,7 +676,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
         self.assertEqual([f.name for f in self.work.glob(".sieve_*")], [])
 
     def test_a_run_that_promotes_nothing_leaves_the_previous_output_alone(self):
-        # PM-14: the output was opened for writing before anything was counted, so a run
+        # The output was opened for writing before anything was counted, so a run
         # that promoted nothing truncated the earlier result, and the hint led with
         # --threshold, which cannot be the cause: an empty promoted set accepts everything.
         out = self.work / "out.fasta"
@@ -696,7 +690,6 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
         self.assertEqual([f.name for f in self.work.glob(".sieve_*")], [])
 
     def test_empty_records_are_not_counted_as_duplicates(self):
-        # PM-15
         records = [("a", self.mutate(self.base, 2)), ("empty1", ""),
                    ("b", self.mutate(self.base, 2)), ("empty2", "")]
         rc, _out, log, _e = self.run_sieve(records)
@@ -705,7 +698,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
                       "2 empty records dropped)", log)
 
     def test_a_binary_killed_by_a_signal_is_named(self):
-        # PM-19: a signal death is a negative returncode; it was printed as "exited -4" and
+        # A signal death is a negative returncode; it was printed as "exited -4" and
         # returned to sys.exit, so the shell saw 252. The sieve Makefile builds with
         # -march=native, so a binary moved to another CPU dies exactly this way.
         killer = self.work / "killer.sh"
@@ -723,7 +716,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
         self.assertIn("-march=native", err.getvalue())
 
     def test_an_unwritable_output_directory_is_not_blamed_on_the_input(self):
-        # PM-20: `byte_exact_dedup` both reads the input and writes the scratch copy.
+        # `byte_exact_dedup` both reads the input and writes the scratch copy.
         ro = self.work / "ro"
         ro.mkdir()
         src = self.work / "in.fasta"
@@ -742,7 +735,7 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
             ro.chmod(0o700)
 
     def test_an_input_that_would_hang_the_binary_is_refused(self):
-        # PM-02: the promoted set's LSH index is a fixed 2^20-slot open-addressing table
+        # The promoted set's LSH index is a fixed 2^20-slot open-addressing table
         # that is never grown, and lookup stops only at an empty slot, so past about 65,536
         # admitted records the binary can loop forever at 100% CPU. That is upstream's code
         # and is not patched here; the wrapper refuses rather than hanging a Galaxy job

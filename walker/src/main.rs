@@ -230,7 +230,7 @@ struct Args {
 
 /// A finite float in `[lo, hi]`, or a usage error naming the flag.
 ///
-/// WV-15. These were a bare `parse()`, which accepts `inf` and `NaN`. Both then reached
+/// These were a bare `parse()`, which accepts `inf` and `NaN`. Both then reached
 /// `summary.json` through `format!("{:?}")` as the bare tokens `inf` and `NaN`, **which no
 /// JSON parser accepts**, so the run exited 0 and left a summary that `json.load` rejects.
 /// `--min-cov NaN` also disables the coverage gate entirely, since every comparison against
@@ -358,9 +358,8 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
                 i += 1;
                 continue;
             }
-            // TW-04 found this was the only boolean without a positive spelling, while the
-            // other six all have one. It is a no-op against the default, but a user scripting
-            // the flags should not have to know which direction each one is written in.
+            // A no-op against the default, but every other boolean flag has a positive
+            // spelling and a user scripting them should not have to remember which.
             "--indel-alts" | "--no-indel-alts" => {
                 args.cfg.allow_indel_alts = flag == "--indel-alts";
                 i += 1;
@@ -587,15 +586,14 @@ fn decision_lines(results: &[types::AccessionResult], guard: f64) -> Vec<String>
     lines
 }
 
-/// WP-02. Say so when the `-q` pool is not one gene.
+/// Say so when the `-q` pool is not one gene.
 ///
 /// Multi-anchor mode ranks every reference against every other and keeps one primary per
 /// accession. That is what it is for across strains of a gene; across *different* genes it
-/// silently answers a different question than the user asked, because an accession carrying
-/// both genes comes back with whichever scored higher, exit 0, and the other one appears only
-/// as an unselected candidate in `summary.json`. 0.1.0 printed "One gene per query" for a
-/// multi-record `-q`; 0.1.1 dropped the warning and put nothing in its place, while the README
-/// goes on listing the 25-gene master target file among the references to start from.
+/// answers a different question than the user asked, because an accession carrying both comes
+/// back with whichever scored higher, exit 0, and the other appears only as an unselected
+/// candidate in `summary.json`. The shipped master target file is 25 genes, so this is
+/// reachable by following the README.
 ///
 /// A warning and not a refusal: a deliberately divergent panel also splits, and the walker
 /// cannot know which the user meant. Returns the line to print, or `None` when the pool is one
@@ -646,10 +644,10 @@ fn check_run(results: &[types::AccessionResult], allow_empty: bool) -> error::Re
     if errors == total {
         return Err(error::Error::AllErrored { total });
     }
-    // Any error is a failure of the run, even beside successes. This used to return `Ok` the
-    // moment one accession succeeded, so a 5,000-accession run in which 8 panicked exited 0
-    // and the scheduler that launched it saw a green job. The successes are still written;
-    // what changes is that the exit code stops claiming they were the whole story.
+    // Any error is a failure of the run, even beside successes: returning `Ok` on the first
+    // success means a 5,000-accession run in which 8 panicked exits 0 and the scheduler sees
+    // a green job. The successes are still written; the exit code just stops claiming they
+    // were the whole story.
     if errors > 0 {
         return Err(if success > 0 {
             error::Error::SomeErrored { total, success, errors }
@@ -725,9 +723,8 @@ fn real_main(mut args: Args) -> error::Result<()> {
         //
         // Both decisions are made from ONE read of the file. Every input the walker takes may
         // be a pipe (`-q <(zcat ref.fa.gz)`, `-q /dev/stdin`), which can only be read once,
-        // and this used to call `read_query` and then `read_query_set`, opening the same path
-        // twice: a multi-record query through a pipe died with "no FASTA records found" on
-        // the second open, naming a file that was perfectly good (WA-01).
+        // so opening the path twice kills a multi-record query with "no FASTA records found"
+        // on the second open, naming a file that is perfectly good.
         Some(if args.query.len() == 1 {
             let path = args.query[0].clone();
             let bytes = io::input::read_input(&path, "query")?;
@@ -755,7 +752,7 @@ fn real_main(mut args: Args) -> error::Result<()> {
             // The list path has always validated; `-a` did not, though the value reaches the
             // same URL and the same two filesystem paths.
             let acc = io::input::validate_accession(a, "--accession")?;
-            // WF-12: `-a srr8209082` used to 404 and be recorded as `no_logan_data`, a
+            // `-a srr8209082` used to 404 and be recorded as `no_logan_data`, a
             // biological negative about a run Logan does have.
             if acc != *a {
                 eprintln!(
@@ -794,9 +791,8 @@ fn real_main(mut args: Args) -> error::Result<()> {
         }
     }
 
-    // State the memory bound up front. This used to be a comment in `pipeline`, and it was
-    // wrong by 5x; a number that moves with -w, --fetch-workers and --max-size-mb is worth
-    // printing rather than documenting.
+    // State the memory bound up front: a number that moves with -w, --fetch-workers and
+    // --max-size-mb is worth printing rather than documenting.
     let gb = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     // What the pipeline will actually process: `n_listed` counts the list before duplicates
     // were dropped, and a duplicate never becomes a second in-flight buffer.
@@ -849,11 +845,10 @@ fn real_main(mut args: Args) -> error::Result<()> {
             gb(args.cfg.max_graph_resident_bytes_for(n)),
         )
     };
-    // The compressed term used to be the whole story and is now, usually, nothing. A
-    // download is written to disk as it arrives, so an in-flight accession costs one copy
-    // buffer rather than its own size, and `--max-size-mb` stops appearing in the memory
-    // bound at all. Stated in the units it actually has: "0.00 GB" invites the reader to
-    // wonder what is being hidden, where "2.0 MiB" answers it.
+    // The compressed term is usually nothing: a download is written to disk as it arrives,
+    // so an in-flight accession costs one copy buffer rather than its own size and
+    // `--max-size-mb` does not appear in the memory bound. Stated in the units it actually
+    // has, because "0.00 GB" invites the reader to wonder what is hidden.
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     let buffer_clause = if args.cfg.downloads_stream_to_disk() {
         format!(
@@ -879,9 +874,8 @@ fn real_main(mut args: Args) -> error::Result<()> {
          Excludes GraphAligner, the scratch GFA and the output buffers.",
         gb(args.cfg.max_resident_bytes_for(n)),
     );
-    // This used to restate the graph term with the correct number, because the line above
-    // had the wrong one. The line above is now right, so this says what makes it right, and
-    // what happens when the thing that makes it right is unavailable.
+    // What makes the bound above a bound rather than a calibration, and what happens when
+    // the thing that makes it one is unavailable.
     if args.cfg.graph_bound_is_set_by_the_gene() && !args.cfg.fetch_only {
         eprintln!(
             "[logan-walker] that bound does not mention --max-size-mb, because nothing in the \
@@ -988,10 +982,9 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // came from is not a frozen input, it is just a directory. Rule 4 of the summary contract
     // applies here as everywhere: the summary is written even when the fetch fails.
     if args.cfg.fetch_only {
-        // WP-06, same reason as the walk below: an `-o` that cannot be made is a fact about
-        // this command, not about the bucket, so find it before downloading a cohort. No
-        // journal here, because the cache entries a fetch writes ARE its durable output: a
-        // killed `--fetch-only` leaves everything it fetched, and rerunning skips it.
+        // Same reason as the walk below: an `-o` that cannot be made is a fact about this
+        // command, not about the bucket, so find it before downloading a cohort. No journal
+        // here, because the cache entries a fetch writes ARE its durable output.
         std::fs::create_dir_all(&args.out_dir).map_err(error::file_err("create", &args.out_dir))?;
         let summary = pipeline::run_fetch_only(&args.cfg, accessions)?;
         let ok = summary.success;
@@ -1036,7 +1029,7 @@ fn real_main(mut args: Args) -> error::Result<()> {
     // Unwrap the query set for the full pipeline. The guard above ensures it is Some here.
     let queries = queries.expect("queries is Some when not --fetch-only");
 
-    // WV-14: the id reaches CHROM and `##contig=<ID=...>` verbatim, so refuse one that
+    // The id reaches CHROM and `##contig=<ID=...>` verbatim, so refuse one that
     // cannot legally appear there rather than writing a VCF no parser will read.
     for q in &queries {
         let id = if q.record_id.is_empty() { &q.name } else { &q.record_id };
@@ -1050,8 +1043,8 @@ fn real_main(mut args: Args) -> error::Result<()> {
         }
     }
 
-    // Checked before any download. GraphAligner used to be looked up per accession, after
-    // its unitigs were fetched and parsed, so a missing binary failed each one in turn.
+    // Checked before any download rather than per accession, so a missing binary fails the
+    // run once instead of failing every accession after its unitigs have been fetched.
     let bin = stages::align::resolve_binary(&args.cfg)?;
     let version = stages::align::version(&bin)?;
     eprintln!("[logan-walker] GraphAligner: {version} ({})", bin.display());
@@ -1080,9 +1073,9 @@ fn real_main(mut args: Args) -> error::Result<()> {
         }
     }
 
-    // WP-06, the cheap half: touch the output locations BEFORE the cohort runs. An
-    // unusable `-o` (a regular file of that name) or an `-f` whose parent does not exist
-    // used to be found only after every accession had been fetched and aligned. The probe
+    // Touch the output locations BEFORE the cohort runs, so an unusable `-o` (a regular
+    // file of that name) or an `-f` whose parent does not exist fails in a fraction of a
+    // second rather than after every accession has been fetched and aligned. The probe
     // leaves the filesystem as it found it: `-f` is created only to see whether it can be,
     // and removed again if it was not already there, so the canonical FASTA stays something
     // only a finished run writes.
@@ -1102,7 +1095,7 @@ fn real_main(mut args: Args) -> error::Result<()> {
         let _ = std::fs::remove_file(&args.out_fasta);
     }
 
-    // WP-06, the rest: a journal of what has finished, so a run that is killed leaves its
+    // A journal of what has finished, so a run that is killed leaves its
     // reconstructions and a list of what it got through. Removed below once the real outputs
     // are on disk.
     let journal = io::output::Journal::create(&args.out_dir, &queries[0].name)?;
@@ -1121,11 +1114,10 @@ fn real_main(mut args: Args) -> error::Result<()> {
 
     // ---- OUT of the pipeline ----------------------------------------------
     //
-    // WV-18: every writer is attempted and the summary is ALWAYS written, with the first
-    // error returned at the end. These used to be chained with `?` and the summary came
-    // last, so one write failure after the compute (a full disk, a directory in the way)
-    // threw away the whole shard's per-accession status and timings although every accession
-    // had reconstructed. The run still exits non-zero, so the failure is not hidden.
+    // Every writer is attempted and the summary is ALWAYS written, with the first error
+    // returned at the end. Chaining them with `?` lets one write failure after the compute
+    // (a full disk, a directory in the way) throw away the whole shard's per-accession status
+    // and timings although every accession reconstructed. The run still exits non-zero.
     let mut first_err: Option<error::Error> = None;
     // The run's verdict, reached before any output is written so the summary can state the
     // exit code instead of inferring it from counts, and returned unchanged at the end.
@@ -1158,9 +1150,9 @@ fn real_main(mut args: Args) -> error::Result<()> {
         let alts = args.out_dir.join("alt_haplotypes.fasta");
         keep(io::output::write_alts(&summary, &alts).map_err(|e| e.at("write", &alts)));
     }
-    // WV-17: a rerun with a writer switched off used to leave the previous run's file beside
+    // A rerun with a writer switched off must not leave the previous run's file beside
     // fresh results, with nothing to show the mismatch. Remove our own leftovers; a file we
-    // did not write is left alone (WV-16).
+    // did not write is left alone.
     io::output::remove_disabled_outputs(&args.cfg, &args.out_dir, &summary);
     let summary_path = args.out_dir.join(format!("{}.summary.json", queries[0].name));
     let bin_display = bin.display().to_string();
@@ -1188,7 +1180,7 @@ fn real_main(mut args: Args) -> error::Result<()> {
         return Err(e);
     }
     // Everything the run produces is on disk, so the salvage copies have nothing left to
-    // say. WP-06: they exist only while a run is in flight, or after one died.
+    // say: they exist only while a run is in flight, or after one died.
     journal.discard();
 
     crate::outln!(
@@ -1201,9 +1193,8 @@ fn real_main(mut args: Args) -> error::Result<()> {
 
     // Per-accession failures are collected rather than propagated, which is what lets one bad
     // accession not sink a 10,000-accession shard. The cost is that a run where *every*
-    // accession failed used to write a 0-byte FASTA and exit 0, which any scheduler reads as
-    // a good shard; until 0.1.1, --allow-empty still did that for a run where every
-    // accession errored. Outputs are already written above, so they stay on disk for
+    // accession failed would otherwise write a 0-byte FASTA and exit 0, which any scheduler
+    // reads as a good shard. Outputs are already written above, so they stay on disk for
     // inspection.
     verdict
 }
@@ -1218,7 +1209,7 @@ mod flag_tests {
         parse_args(&v)
     }
 
-    /// TW-04. Every long flag the usage text advertises must actually be accepted.
+    /// Every long flag the usage text advertises must actually be accepted.
     ///
     /// `parse_args` is a hand-written match over about 40 spellings and nothing checked that
     /// the match and the help agree. A mutant parser that swapped `--min-vaf` with
@@ -1287,7 +1278,7 @@ mod flag_tests {
         );
     }
 
-    /// TW-04. Each flag sets the field it names, and the boolean pairs move in opposite
+    /// Each flag sets the field it names, and the boolean pairs move in opposite
     /// directions. Covers the 0.2.0 additions, which are the ones with no history behind
     /// them.
     #[test]
@@ -1331,7 +1322,7 @@ mod flag_tests {
 mod range_tests {
     use super::finite_in;
 
-    /// WV-15. These flags were a bare `parse()`, so `inf` and `NaN` were accepted and then
+    /// These flags were a bare `parse()`, so `inf` and `NaN` were accepted and then
     /// written into `summary.json` as bare tokens that **no JSON parser accepts**: the run
     /// exited 0 and left a summary `json.load` rejects. `--min-cov NaN` additionally disables
     /// the coverage gate, since every comparison against NaN is false.
@@ -1374,7 +1365,7 @@ mod tests {
         s.split_whitespace().map(String::from).collect()
     }
 
-    /// WP-02. Two unrelated genes in the anchor pool must draw a warning naming them, and a
+    /// Two unrelated genes in the anchor pool must draw a warning naming them, and a
     /// panel of one gene's strains must not. A pool of different genes is not refused: the
     /// walker cannot know whether the user meant a catalogue or a panel, and only one of the
     /// two is a mistake.

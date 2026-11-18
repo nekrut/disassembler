@@ -50,7 +50,7 @@ def _resolved_or_report(walker_bin: str | None) -> str | None:
     if not resolved:
         print(not_found_message("walker", "walker"), file=sys.stderr)
         return None
-    # PK-01: a binary that exists is not enough. The published 0.1.1 container pairs this
+    # A binary that exists is not enough. The published 0.1.1 container pairs this
     # package with logan-walker 0.1.0, whose multi-anchor primary is chosen by `cov` instead
     # of `matched` and which has no prune-span guard, and nothing in the outputs says so.
     err = walker_version_error(resolved)

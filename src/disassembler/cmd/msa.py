@@ -55,7 +55,7 @@ def find_bin(name: str, *aliases: str) -> str:
 
 
 def clean_id(s: str) -> str:
-    """A record id reduced to `[A-Za-z0-9_]`, **not truncated** (PM-26).
+    """A record id reduced to `[A-Za-z0-9_]`, **not truncated**.
 
     It used to be cut to 40 characters, which is exactly where a GISAID or NCBI header
     carries the part that tells two records apart: two
@@ -70,12 +70,12 @@ def clean_id(s: str) -> str:
 def assign_ids(raw_ids: list) -> tuple:
     """`(ids, changed)`: a unique alignment id per raw id, and whether any differs from it.
 
-    Two passes (PM-26): an id that is already clean, unique and not `Reference` keeps
+    Two passes: an id that is already clean, unique and not `Reference` keeps
     itself, whatever the order it appears in. Only the rest are renamed, and a suffix never
     takes a name pass 1 reserved. Before this, an id that was already clean could be renamed
     while another record took its name.
 
-    The suffix search remembers where each base stopped (PM-22). It used to restart at 1 for
+    The suffix search remembers where each base stopped. It used to restart at 1 for
     every record, so n ids sharing a prefix cost about n squared probes: 10,000 such ids
     spent 31.8 s in renaming alone, against 0.05 s now, for the same names.
     """
@@ -123,7 +123,7 @@ BAD_MAFFT = {(7, 525): "segfaults on the --addfragments path msa uses; fixed in 
 
 
 def check_mafft(mafft_bin: str) -> None:
-    """Refuse a MAFFT release known to break the path this stage uses (PM-17).
+    """Refuse a MAFFT release known to break the path this stage uses.
 
     `docs/packaging.md` has recorded since 0.1.0 that 7.525 segfaults on `--addfragments`,
     and the published recipe leaves MAFFT unpinned, but nothing ever ran `mafft --version`:
@@ -146,7 +146,7 @@ def check_mafft(mafft_bin: str) -> None:
 
 @functools.lru_cache(maxsize=8)
 def tool_version(binary: str, *argv: str) -> str | None:
-    """The first non-empty line a tool prints when asked its version (PM-16).
+    """The first non-empty line a tool prints when asked its version.
 
     stdin is closed and the timeout is short, because a tool that does not recognise the
     flag may fall back to reading a sequence from standard input and wait there; cached,
@@ -172,7 +172,7 @@ def is_special(path: Path) -> bool:
 
 
 def publish(tmp: Path, dest: Path) -> None:
-    """Move `tmp` onto `dest`, by copy when `dest` is not a plain file (PM-09).
+    """Move `tmp` onto `dest`, by copy when `dest` is not a plain file.
 
     A rename swaps a directory entry, so `--out-tree /dev/null` turned the null device into
     a regular file holding a Newick tree (as root, which is the default in a container), and
@@ -191,16 +191,14 @@ STOP_CODONS = ("TAA", "TAG", "TGA")
 
 
 def codon_qc(row: str, input_acgt: int) -> dict:
-    """What `--keeplength` did to one row, which nothing used to look at (PM-03).
+    """What `--keeplength` did to one row.
 
-    MAFFT is run with `--auto --keeplength --addfragments`, which deletes every base a row
-    has beyond the reference and puts gaps where nucleotide scoring wants them, not on codon
-    boundaries. The only check afterwards was `len(row) != ref_len`, which `--keeplength`
-    guarantees, printed under the banner "Validating codon lengths...". So a +1 insertion row
-    came out identical to the reference, a -1 deletion shifted the rest of the row into the
-    reference frame, in-frame insertions vanished from the alignment and the tree, and an
-    internal stop passed: the run ended "Codon alignment complete", exit 0. The alignment is
-    not changed here; it is described.
+    MAFFT runs with `--auto --keeplength --addfragments`, which deletes every base a row has
+    beyond the reference and puts gaps where nucleotide scoring wants them rather than on
+    codon boundaries. Checking `len(row) != ref_len` catches none of that, because
+    `--keeplength` guarantees it: a +1 insertion row comes out identical to the reference, a
+    -1 deletion shifts the rest of the row into the reference frame, and an internal stop
+    passes. The alignment is not changed here, only described.
     """
     aligned_acgt = real_bases(row)
     internal = [len(m.group(0)) for m in re.finditer(r"(?<=[^-])-+(?=[^-])", row)]
@@ -249,7 +247,7 @@ ORIENT_FALLBACK_K = 11
 def orientation(seq: str, fwd: set, rev: set, fallback: tuple = None) -> int:
     """+1 if `seq` looks like the reference, -1 like its reverse complement, 0 undecided.
 
-    PM-12. The exact 15-mers sampled every 4th position find nothing in common with either
+    The exact 15-mers sampled every 4th position find nothing in common with either
     strand once a row is about 30% divergent, and a tie was written out as given: MAFFT does
     not reverse-complement, so a divergent minus-strand row aligned at about 0.43 identity
     and sat in the alignment and the tree as one noise taxon, with a warning that named the
@@ -274,7 +272,7 @@ ACGT_SET = frozenset("ACGT")
 def identity_to_reference(ref: str, row: str) -> float:
     """Matches over the alignment columns where both the reference and the row have A/C/G/T.
 
-    PM-23: the reference used to be upper-cased again for every row, and the loop tested
+    The reference used to be upper-cased again for every row, and the loop tested
     membership in a string literal per column. Same answer, one pass, no per-column set-up.
     """
     ref_u, row_u = ref.upper(), row.upper()
@@ -295,8 +293,8 @@ def identity_ok(aligned_recs, min_identity: float) -> bool:
     not catch an alignment that is noise. Identity can: a strand mismatch measured 0.40-0.50.
     """
     ref = str(aligned_recs[0].seq)
-    # PM-23: the reference is upper-cased once, not once per row. Rows that share a
-    # sequence (PM-10's expansion) are measured once and the value reused, which is what
+    # The reference is upper-cased once, not once per row. Rows that share a
+    # sequence (the expansion) are measured once and the value reused, which is what
     # keeps the median weighted by copy number without doing the work N times.
     ref_u = ref.upper()
     cache = {}
@@ -441,7 +439,7 @@ def _run_mafft(args, mafft_bin, clean_input_p, clean_ref_p, tmp_aln) -> int:
     reported the failure.
 
     Pulled out of `_run` when `--aligned` gave it a second way to produce the alignment
-    (PC-01), so the two paths are visibly alternatives rather than a flag read in the
+, so the two paths are visibly alternatives rather than a flag read in the
     middle of a long function.
     """
     print("[*] Running MAFFT --keeplength --addfragments...")
@@ -449,7 +447,7 @@ def _run_mafft(args, mafft_bin, clean_input_p, clean_ref_p, tmp_aln) -> int:
         mafft_bin,
         "--auto",
         "--keeplength",
-        # PM-11: without this MAFFT lower-cases its output, so the codon MSA was the one
+        # Without this MAFFT lower-cases its output, so the codon MSA was the one
         # lower-case file in the pipeline while the docs claimed rows came through
         # unchanged, and soft-masking tools saw a fully masked alignment.
         "--preservecase",
@@ -468,7 +466,7 @@ def _run_mafft(args, mafft_bin, clean_input_p, clean_ref_p, tmp_aln) -> int:
 def _run(args, state) -> int:
     from Bio import SeqIO  # imported lazily so `disassembler --help` does not need biopython
 
-    # PM-18: `--out-tree` used to be required and FastTree looked up before any work, so an
+    # `--out-tree` used to be required and FastTree looked up before any work, so an
     # alignment-only run needed FastTree installed even though it was never going to be run.
     want_tree = not getattr(args, "no_tree", False)
     if want_tree and not args.out_tree:
@@ -487,7 +485,7 @@ def _run(args, state) -> int:
     if out_tree is not None:
         out_tree.parent.mkdir(parents=True, exist_ok=True)
 
-    # PC-01: `--aligned` says the rows are already on the reference grid, so there is no
+    # `--aligned` says the rows are already on the reference grid, so there is no
     # MAFFT to find and no MAFFT release to refuse.
     aligned_in = bool(getattr(args, "aligned", False))
     mafft_bin = None
@@ -503,7 +501,7 @@ def _run(args, state) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    # PM-17: refuse a MAFFT release known to break --addfragments, before any work.
+    # Refuse a MAFFT release known to break --addfragments, before any work.
     if mafft_bin is not None:
         try:
             check_mafft(mafft_bin)
@@ -511,7 +509,7 @@ def _run(args, state) -> int:
             print(f"Error: {e}", file=sys.stderr)
             return 1
 
-    # PM-16: nothing recorded which MAFFT or FastTree produced the result, although the
+    # Nothing recorded which MAFFT or FastTree produced the result, although the
     # published recipe leaves MAFFT unpinned, so two installs could give different files
     # with nothing in either output naming the tools.
     state["mafft_version"] = tool_version(mafft_bin, "--version") if mafft_bin else None
@@ -526,7 +524,7 @@ def _run(args, state) -> int:
         with open_text(ref_p) as fh:
             ref_records = list(SeqIO.parse(fh, "fasta"))
         with open_text(in_p) as fh:
-            # PM-23: `SimpleFastaParser` gives (title, sequence) and builds no SeqRecord,
+            # `SimpleFastaParser` gives (title, sequence) and builds no SeqRecord,
             # which is almost all of the 222 MB a 20,000-row cohort cost here. The rows are
             # iterated exactly once either way.
             from Bio.SeqIO.FastaIO import SimpleFastaParser
@@ -562,11 +560,11 @@ def _run(args, state) -> int:
 
     ref_seq = str(ref_rec.seq).upper()
     fwd_kmers, rev_kmers = kmer_set(ref_seq), kmer_set(revcomp(ref_seq))
-    # The shorter-k sets, built once, for rows whose 15-mers tie (PM-12).
+    # The shorter-k sets, built once, for rows whose 15-mers tie.
     fallback = (kmer_set(ref_seq, 1, ORIENT_FALLBACK_K),
                 kmer_set(revcomp(ref_seq), 1, ORIENT_FALLBACK_K))
 
-    # PM-06, PM-09, PM-27: one private directory with fixed names, beside the output so
+    # One private directory with fixed names, beside the output so
     # `os.replace` stays on one filesystem. The three scratch files used to be named after
     # the user's own files (`.tmp_<name>.<pid>`) in the output directory, where ordinary
     # choices collide: `-i raw/cohort.fasta -a aligned/cohort.fasta` truncated MAFFT's input
@@ -594,7 +592,7 @@ def _run(args, state) -> int:
             if real_bases(seq) < ref_len * args.msa_min_cov:
                 continue
             if aligned_in:
-                # PC-01. Already on the grid: every base is at the reference position its
+                # Already on the grid: every base is at the reference position its
                 # HSP put it at, so there is nothing to orient and nothing to place. A row
                 # of another length is not on this grid, and silently aligning it would be
                 # the defect this mode exists to avoid, so it is named and the run stops.
@@ -623,13 +621,13 @@ def _run(args, state) -> int:
                   file=sys.stderr)
             return 1
 
-        # PM-26: ids are assigned over the surviving rows at once, so one that is already
+        # Ids are assigned over the surviving rows at once, so one that is already
         # clean and unique keeps itself whatever order it arrived in.
         ids, ids_changed = assign_ids(kept_raw)
         with open(clean_input_p, "w") as fh:
             for clean, seq in zip(ids, kept_seq):
                 input_acgt[clean] = real_bases(seq)
-                # PM-10: under --addfragments each row is aligned to the reference alone, so
+                # Under --addfragments each row is aligned to the reference alone, so
                 # every copy of a sequence gets the same row. Sending one copy and expanding
                 # afterwards gives a byte-identical alignment: 600 rows drawn from 30
                 # variants took 129.7 s and the 30 distinct ones 8.4 s.
@@ -665,7 +663,7 @@ def _run(args, state) -> int:
                   f"not be decided; aligned as given, and possibly the other way round.",
                   file=sys.stderr)
 
-        # PM-26: the mapping, whenever a name changed or a row was flipped. Truncation is
+        # The mapping, whenever a name changed or a row was flipped. Truncation is
         # gone, but renaming is not reversible either and nothing recorded it.
         if ids_changed or flipped:
             id_map = out_aln.with_name(out_aln.name + ".ids.tsv")
@@ -681,7 +679,7 @@ def _run(args, state) -> int:
             fh.write(f">Reference\n{str(ref_rec.seq).upper()}\n")
 
         if aligned_in:
-            # PC-01. The rows are the alignment. MAFFT would discard their gaps and place
+            # The rows are the alignment. MAFFT would discard their gaps and place
             # the bases again, and where several placements score the same it slides bases
             # across an uncovered stretch or a deletion: on a reference HIV-1 pol with two
             # gap-free HSPs around an internal hole, a C1416G call moved to T1424C and a
@@ -702,7 +700,7 @@ def _run(args, state) -> int:
                 return 1
         # Checked before the rename, so a failed check never replaces a good alignment.
         distinct = list(SeqIO.parse(tmp_aln, "fasta"))
-        # PM-06: nothing used to check that MAFFT returned the records it was given, so a
+        # Nothing used to check that MAFFT returned the records it was given, so a
         # run that aligned the reference to itself reported "MAFFT aligned 2 records" and
         # published a two-row alignment over a good one.
         by_id = {r.id: r for r in distinct}
@@ -714,7 +712,7 @@ def _run(args, state) -> int:
                   f"plus {len(rep_of)} sequences", file=sys.stderr)
             return 1
 
-        # PM-10: expand the representatives back to every id, in input order. A new record
+        # Expand the representatives back to every id, in input order. A new record
         # sharing the representative's `Seq` object, not a deep copy of it: `Seq` is
         # immutable, and copying one per row would put the whole alignment in memory twice.
         from Bio.SeqRecord import SeqRecord
@@ -737,7 +735,7 @@ def _run(args, state) -> int:
                 )
                 return 1
 
-        # PM-25: coverage is measured again on the ALIGNED row. The only gate used to run on
+        # Coverage is measured again on the ALIGNED row. The only gate used to run on
         # the unaligned one, so a contig carrying part of the gene plus flanking sequence
         # passed on its raw base count and `--keeplength` then trimmed the flank away,
         # leaving a 20-25% fragment in the alignment and the tree with no message, although
@@ -761,7 +759,7 @@ def _run(args, state) -> int:
                       file=sys.stderr)
                 return 1
 
-        # PM-03: say what --keeplength did. Warnings only; the alignment is unchanged.
+        # Say what --keeplength did. Warnings only; the alignment is unchanged.
         qc_rows, flags = [], {"frameshift": [], "split_codons": [], "internal_stops": [],
                               "trimmed": []}
         for r in aligned_recs[1:]:
@@ -819,7 +817,7 @@ def _run(args, state) -> int:
         # Written to a temp and published on success: opening out_tree directly truncated it
         # before FastTree ran, so a failure left a 0-byte .nwk that looks like a real output
         # to anything downstream (and destroyed a previously good tree). FastTree is fed from
-        # the temp alignment, because a special `--out-aln` cannot be read back (PM-09).
+        # the temp alignment, because a special `--out-aln` cannot be read back.
         print(f"[*] Generating FastTree GTR phylogeny -> {out_tree}...")
         src_aln = tmp_aln if tmp_aln.is_file() else out_aln
         with open(src_aln, "r") as infh, open(tmp_tree, "w") as outfh:

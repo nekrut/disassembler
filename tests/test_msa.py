@@ -111,7 +111,7 @@ class TestMsaCoverageGate(unittest.TestCase):
         return rc, out.getvalue() + err.getvalue(), rows
 
     def test_aligned_rows_are_published_exactly_as_given(self):
-        """PC-01. A lexicmap row carries every base at the reference position its HSP gave
+        """A lexicmap row carries every base at the reference position its HSP gave
         it, and `-` where no HSP reached, so the cohort is already an alignment. MAFFT
         discards those gaps and places the bases again, and where several placements score
         the same it slides bases across the uncovered stretch: on real HIV-1 pol rows a
@@ -254,7 +254,7 @@ class TestMsaCoverageGate(unittest.TestCase):
 
 
 class TestMsaUnits(unittest.TestCase):
-    """PM-03, PM-12, PM-22, PM-26: the pieces, without running either tool."""
+    """The pieces, without running either tool."""
 
     @classmethod
     def setUpClass(cls):
@@ -262,7 +262,7 @@ class TestMsaUnits(unittest.TestCase):
         cls.msa = msa_cmd
 
     def test_ids_are_not_truncated(self):
-        # PM-26: ids were cut to 40 characters, which is exactly where a GISAID header
+        # Ids were cut to 40 characters, which is exactly where a GISAID header
         # carries the accession that tells two records apart.
         raw = ["hCoV-19/USA/CA-CDC-QDX12345678/2021|EPI_ISL_1000001|x",
                "hCoV-19/USA/CA-CDC-QDX12345678/2021|EPI_ISL_1000002|x"]
@@ -273,7 +273,7 @@ class TestMsaUnits(unittest.TestCase):
         self.assertIn("EPI_ISL_1000002", ids[1])
 
     def test_a_clean_unique_id_keeps_its_name_whatever_the_order(self):
-        # PM-26: `SRR1.1` used to be renamed to `SRR1_1`, taking the name of the record that
+        # `SRR1.1` used to be renamed to `SRR1_1`, taking the name of the record that
         # was already called `SRR1_1`, which was then renamed `SRR1_1_1`.
         for raw in (["SRR1.1", "SRR1_1"], ["SRR1_1", "SRR1.1"]):
             ids, _changed = self.msa.assign_ids(raw)
@@ -288,7 +288,7 @@ class TestMsaUnits(unittest.TestCase):
         self.assertEqual(len(set(ids)), 2)
 
     def test_many_ids_sharing_a_prefix_are_not_quadratic(self):
-        # PM-22: the suffix search restarted at 1 for every record, so n ids with the same
+        # The suffix search restarted at 1 for every record, so n ids with the same
         # prefix cost about n squared probes; 10,000 took 31.8 s in renaming alone.
         import time
         raw = ["Severe_acute_respiratory_syndrome_coronavirus_2_isolate"] * 20000
@@ -298,7 +298,7 @@ class TestMsaUnits(unittest.TestCase):
         self.assertLess(time.perf_counter() - t0, 5.0)
 
     def test_codon_qc_names_what_keeplength_did(self):
-        # PM-03: the only check after MAFFT was a row-length test that --keeplength
+        # The only check after MAFFT was a row-length test that --keeplength
         # guarantees, printed under the banner "Validating codon lengths...".
         ref = "ATGGCTGAACCCTTTAAA"
         clean = self.msa.codon_qc(ref, self.msa.real_bases(ref))
@@ -331,7 +331,7 @@ class TestMsaUnits(unittest.TestCase):
         self.assertTrue(q["frameshift"])
 
     def test_a_divergent_reverse_row_is_oriented_by_the_fallback(self):
-        # PM-12: the exact 15-mers find nothing in common once a row is ~30% divergent, and
+        # The exact 15-mers find nothing in common once a row is ~30% divergent, and
         # a tie was written out as given, so a minus-strand row aligned at ~0.43 identity
         # and stayed in the tree as noise.
         import random
@@ -359,7 +359,7 @@ class TestMsaUnits(unittest.TestCase):
         self.assertEqual(self.msa.orientation(other, fwd, rev, fallback), 0)
 
     def test_a_bad_mafft_version_is_refused(self):
-        # PM-17: docs/packaging.md has recorded since 0.1.0 that 7.525 segfaults on the
+        # Docs/packaging.md has recorded since 0.1.0 that 7.525 segfaults on the
         # --addfragments path, and nothing ever ran `mafft --version`.
         with tempfile.TemporaryDirectory() as d:
             for text, bad in (("#!/bin/sh\necho 'v7.525 (2024)' >&2\n", True),
@@ -376,7 +376,7 @@ class TestMsaUnits(unittest.TestCase):
                     self.msa.check_mafft(str(stub))
 
     def test_publish_writes_into_a_fifo_instead_of_replacing_it(self):
-        # PM-09: a rename swaps a directory entry, so a FIFO output became a regular file
+        # A rename swaps a directory entry, so a FIFO output became a regular file
         # and its reader blocked forever; /dev/null became a regular file as root.
         import threading
         with tempfile.TemporaryDirectory() as d:

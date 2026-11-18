@@ -70,7 +70,7 @@ def resolve_sieve(explicit: str | None = None) -> str | None:
 # report a missing binary used to write their own message: `sieve` said "put it on PATH"
 # without naming the file it looks for (`l1_pipeline_serial`, not `kmer-diversity-sieve`,
 # which is what a user would reasonably install) or the environment override, and the
-# composites exited 1 where the stages exited 127 (PL-27).
+# composites exited 1 where the stages exited 127.
 TOOLS = {
     "walker": {
         "file": "logan-walker",
@@ -105,7 +105,7 @@ def not_found_message(tool: str, prog: str = "disassembler") -> str:
     )
 
 
-# PK-01. The published biocontainer `disassembler:0.1.1--pyhdfd78af_0` carries disassembler
+# The published biocontainer `disassembler:0.1.1--pyhdfd78af_0` carries disassembler
 # 0.1.1 beside **logan-walker 0.1.0**: the recipe floor was `>=0.1.0,<0.2` and the image was
 # built three days before walker 0.1.1 reached the channel. Everything run from that image
 # behaves like 0.1.0, which picks the multi-anchor primary by `cov` rather than `matched` (62%

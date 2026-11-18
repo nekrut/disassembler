@@ -57,10 +57,10 @@ const BUBBLE_N0: &str = "CACGATACAATAAGAGTAGTGATTGGCCAGTTGTGATTGTAGGAACCCATGCCTG
 const BUBBLE_N1: &str = "TTGTGATTGTAGGAACCCATGCCTGCCTGAACCTACAACTCCTGAGACTGGAGATCCCGCA";
 const BUBBLE_N2: &str = "TTGTGATTGTAGGAACCCATGCCTGCCTGAGCCTACAACTCCTGAGACTGGAGATCCCGCA";
 const BUBBLE_N3: &str = "CCTACAACTCCTGAGACTGGAGATCCCGCACAGCCTCGATCAGACGGTGCCTAGTCCAAG";
-/// WA-04: the same reference with 61 more bases, so the graph can carry **two** bubbles with
+/// The same reference with 61 more bases, so the graph can carry **two** bubbles with
 /// a shared unitig between them. 182 bases; the two allele sites are at offsets 60 and 121,
 /// which is further apart than k - 1 = 30, so no k-mer links them.
-/// Four unitigs for the WG-03 fixture's off-route diamond: arbitrary sequence, since nothing
+/// Four unitigs for the off-route diamond fixture: arbitrary sequence, since nothing
 /// stitches through them. Only their abundances and the edges between them matter.
 const OFF_N4: &str = "TGGGCGAACTTGGTCACCCCGAAGTATCTGATGAGATGATCACCGAGAGCCGGGGCGAGGA";
 const OFF_N5: &str = "AGATGTACGGATACTTTCCGCACAGGGACTAGGTTAACCGCGATTTCTTATCCTGCGATAG";
@@ -94,9 +94,9 @@ impl Fixture {
         // `ga_slow` sleeps, so a test can catch the walker mid-alignment.
         //
         // `ga_fast` writes an EMPTY GAF rather than exiting 0 with no file at all. Those are
-        // different answers since WA-10: an empty GAF is "the tool ran and found nothing",
-        // which is what this stand-in is for, while no file is "that was not GraphAligner"
-        // and is now an error. It used to be a bare `exit 0`, which is the second.
+        // different answers: an empty GAF is "the tool ran and found nothing", which is what
+        // this stand-in is for, while no file at all is "that was not GraphAligner", an
+        // error. A bare `exit 0` would be the second.
         for (name, body) in [
             ("ga_fast", "while [ $# -gt 0 ]; do [ \"$1\" = -a ] && { : > \"$2\"; exit 0; }; shift; done\nexit 0"),
             ("ga_slow", "sleep 5"),
@@ -115,8 +115,8 @@ impl Fixture {
         // test reach a successful reconstruction with no GraphAligner and no network.
         //
         // The row is deliberately full-span (`path_start` 0, `path_end` == `path_len`). A row
-        // whose window sits inside the path is the WV-01 reproducer and belongs with that fix,
-        // not here: asserting today's output for such a row would pin the defect in place.
+        // whose window sits inside the path belongs with the majority-correction tests, not
+        // here.
         {
             let script = dir.join("ga_align");
             std::fs::write(&script, GA_ALIGN).unwrap();
@@ -203,8 +203,8 @@ impl Fixture {
         // The GAF row the stand-in replays. `>0>1>3` is the reference-matching branch, which is
         // the route GraphAligner takes on this graph because the query matches it base for base.
         // The window spans the whole path (`path_start` 0, `path_end` == `path_len`), so
-        // `prefer_majority`'s length guard is satisfied and the swap is reached; see WV-01 for
-        // what a flanked window does instead.
+        // `prefer_majority`'s length guard is satisfied and the swap is reached; a flanked
+        // window is covered separately.
         let n = BUBBLE_QUERY.len();
         std::fs::write(
             dir.join("gaf.txt"),
@@ -216,7 +216,7 @@ impl Fixture {
         Fixture { dir }
     }
 
-    /// WG-03: a deep gene with a shallow diamond hanging off its neighbourhood.
+    /// A deep gene with a shallow diamond hanging off its neighbourhood.
     ///
     /// The route is two unitigs at 15,000x with no fork of its own, so nothing about the
     /// primary, the alts or the VCF depends on the diamond. The diamond is 6x against 8x,
@@ -253,7 +253,7 @@ impl Fixture {
         Fixture { dir }
     }
 
-    /// WG-07: a Logan object with no `L:` token anywhere, so the graph has no adjacency.
+    /// A Logan object with no `L:` token anywhere, so the graph has no adjacency.
     ///
     /// Logan publishes these. The review found 0 links in 15,864 headers for `ERR3988483`
     /// and 0 in 21,370 for `ERR3988478`, against 9,752 of 10,070 for `SRR8209082`.
@@ -298,7 +298,7 @@ impl Fixture {
         Fixture { dir }
     }
 
-    /// WA-04's shape, end to end: two bubbles joined through a unitig both strains carry.
+    /// End to end: two bubbles joined through a unitig both strains carry.
     ///
     /// `0 -> {1,2} -> 3 -> {4,5} -> 6`, with the branch pairs at 40/60 and 45/55 of their
     /// forks. The stand-in replays `>0>1>3>4>6`, the reference-matching route, so the
@@ -367,10 +367,10 @@ impl Fixture {
 
     fn cmd_ga(&self, ga: &str, cache: &str, extra: &[&str]) -> Command {
         let mut c = Command::new(BIN);
-        // TW-08: the binary reads this from the environment, and any value turns cleanup off,
+        // The binary reads this from the environment, and any value turns cleanup off,
         // so a developer who exports it saw four cleanup tests fail on a correct build.
         c.env_remove("LOGAN_KEEP_SCRATCH");
-        // TW-10: keep scratch inside the fixture. Without this the CLI tests use, and sweep,
+        // Keep scratch inside the fixture. Without this the CLI tests use, and sweep,
         // the machine-wide /dev/shm, and leave directories there when a test kills the walker.
         c.arg("--scratch-dir").arg(self.dir.join("scratch"));
         c.arg("--graphaligner").arg(self.dir.join(ga))
@@ -409,7 +409,7 @@ fn wait_or_kill(child: &mut std::process::Child, limit: Duration) -> Option<std:
     None
 }
 
-/// TW-05. Results are stored in the order the accessions were listed, whatever order they
+/// Results are stored in the order the accessions were listed, whatever order they
 /// finish in.
 ///
 /// The unit test that claimed to cover this sorted a vector of its own and never entered the
@@ -429,7 +429,7 @@ fn results_are_stored_in_input_order_not_completion_order() {
     let slow_first = fx.dir.join("ga_order");
     std::fs::write(
         &slow_first,
-        // Writes an empty GAF, as `ga_fast` does: no alignment, not a missing tool (WA-10).
+        // Writes an empty GAF, as `ga_fast` does: no alignment, not a missing tool.
         "#!/bin/sh\n\
          [ \"$1\" = --version ] && { echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }\n\
          case \"$*\" in *SRRFAKE0*) sleep 2;; esac\n\
@@ -511,15 +511,15 @@ fn a_closed_stdout_ends_the_run_instead_of_hanging() {
     let status = wait_or_kill(&mut child, Duration::from_secs(60)).expect("walker hung on a closed stdout");
     assert_eq!(status.signal(), Some(13), "expected to end on SIGPIPE, got {status:?}");
 
-    // WF-17 and WP-26: this ending used to skip cleanup altogether. The scratch directory
-    // stayed in /dev/shm holding RAM until some later run over the same base swept it, and
-    // the aligners carried on writing GAFs into it.
+    // Without cleanup on this ending the scratch directory stays in /dev/shm holding RAM
+    // until some later run over the same base sweeps it, with the aligners still writing
+    // GAFs into it.
     assert_eq!(run_dirs(&base), Vec::<PathBuf>::new(), "SIGPIPE left the scratch directory");
     let started = wait_for_aligner_pids(&pids);
     assert_all_gone(&started, "after SIGPIPE");
 }
 
-/// WF-17: the signals a scheduler uses to announce a limit clean up like SIGTERM.
+/// The signals a scheduler uses to announce a limit clean up like SIGTERM.
 ///
 /// SGE announces a soft wall-time limit with SIGUSR1 or SIGUSR2, LSF with SIGUSR2, and a CPU
 /// ulimit or a cgroup sends SIGXCPU. The handler watched only SIGINT, SIGTERM and SIGHUP, so
@@ -626,15 +626,14 @@ fn an_accession_that_errors_fails_the_run_that_reconstructed_the_others() {
     assert!(summary.contains("\"exit_code\": 4"), "{summary}");
 }
 
-/// WA-01: a query that can only be read once is read once.
+/// A query that can only be read once is read once.
 ///
 /// `README.md` says every input file may be a pipe, and `cat q.fa | logan-walker -q /dev/stdin`
 /// is the form it invites. Two places reopened the path after the first read: `align::run`, on
-/// every accession (fixed with WA-07 and WA-08, and covered by an `align` unit test), and
-/// `main`, which read the file to count its records and then read it again to load the whole
-/// set when there was more than one. On a pipe that second read returned nothing, so a
-/// multi-record query failed with "no FASTA records found" naming a file that was perfectly
-/// good. Both record counts go through here, since the two are one decision in `main` now.
+/// every accession, covered by an `align` unit test, and `main`, which would otherwise read
+/// the file to count its records and read it again to load them. On a pipe that second read
+/// returns nothing, so a multi-record query fails with "no FASTA records found" naming a file
+/// that is perfectly good. Both record counts go through one decision in `main`.
 #[test]
 fn a_query_arriving_on_a_pipe_is_read_once_whatever_its_record_count() {
     let f = Fixture::matching("pipe-query", 1);
@@ -680,7 +679,7 @@ fn a_query_arriving_on_a_pipe_is_read_once_whatever_its_record_count() {
     }
 }
 
-/// WA-06: a GraphAligner call that never returns fails its own accession instead of holding a
+/// A GraphAligner call that never returns fails its own accession instead of holding a
 /// compute worker for the rest of the job.
 ///
 /// Every output is written after the run loop finishes, so before the deadline the only thing
@@ -735,7 +734,7 @@ fn a_stuck_alignment_fails_its_own_accession_and_the_rest_are_still_written() {
     assert!(summary.contains("\"exit_code\": 4"), "{summary}");
 }
 
-/// WF-03: an accession the cache has a recorded negative for keeps that negative offline.
+/// An accession the cache has a recorded negative for keeps that negative offline.
 ///
 /// `disassembler fetch` writes no object for an accession Logan has no unitigs for, because
 /// there is nothing to write. The documented `--offline` run that follows then saw an
@@ -776,7 +775,7 @@ fn an_offline_miss_with_a_recorded_negative_keeps_its_status() {
     assert!(err.contains("cache miss under --offline"), "{err}");
 }
 
-/// WA-05: `--min-cov` is a gate on the reference span, so a deletion does not make a gene
+/// `--min-cov` is a gate on the reference span, so a deletion does not make a gene
 /// that is entirely present look absent.
 ///
 /// The stand-in reports an alignment covering the whole 63 nt reference while walking only 24
@@ -845,13 +844,11 @@ fn two_pass_aligner(dir: &std::path::Path, name: &str, pass2: &str) -> PathBuf {
     script
 }
 
-/// WP-04: a second pass that fails leaves the first pass's haplotype standing.
+/// A second pass that fails leaves the first pass's haplotype standing.
 ///
-/// Every step of the prune's realignment used to be `?`, so GraphAligner aborting or being
-/// OOM-killed on the pruned graph turned an accession that was already reconstructed into
-/// `error`: missing from the FASTA, `prune: null` in the summary, and exit 3 for a
-/// one-accession run. That contradicts the stage's own contract, that pruning can improve an
-/// accession and cannot break one.
+/// GraphAligner aborting or being OOM-killed on the pruned graph must refuse the prune, not
+/// fail an accession that was already reconstructed. The stage's contract is that pruning
+/// can improve an accession and cannot break one.
 #[test]
 fn a_prune_whose_realignment_fails_keeps_the_first_pass() {
     let f = Fixture::bubble("prune-error");
@@ -870,11 +867,11 @@ fn a_prune_whose_realignment_fails_keeps_the_first_pass() {
     assert!(recon.contains(">SRRFAKE0_primary"), "the haplotype must survive:\n{recon}");
     let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
     assert!(summary.contains("\"outcome\": \"refused_error\""), "{summary}");
-    // A refused prune means the first-pass route stands, reference pull and all (WP-01).
+    // A refused prune means the first-pass route stands, reference pull and all.
     assert!(summary.contains("\"bias_uncorrected\": true"), "{summary}");
 }
 
-/// WA-09: a realignment that is the first pass minus an end base is refused, not "applied".
+/// A realignment that is the first pass minus an end base is refused, not "applied".
 ///
 /// `pruned_covers_as_much` allows three reference bases of slack, because a strict rule kept a
 /// reference-biased primary over one terminal codon. But the slack was the whole test, so a
@@ -882,7 +879,7 @@ fn a_prune_whose_realignment_fails_keeps_the_first_pass() {
 /// a lost terminal base can be a truncated stop codon.
 ///
 /// The floor here is above the off-route branch and above the route's thin unitig, so the
-/// route survives the prune only because WP-01 protects it, which is what lets the second
+/// route survives the prune only because the thin-stretch rule protects it, which lets the second
 /// pass walk the same route and return a trimmed copy of the first.
 #[test]
 fn a_prune_that_only_trims_an_end_base_is_refused() {
@@ -911,7 +908,7 @@ fn a_prune_that_only_trims_an_end_base_is_refused() {
     assert_eq!(seq.len(), n, "the full-length first pass is what gets published");
 }
 
-/// WA-10: a program that exits 0 without writing a GAF is not a biological negative.
+/// A program that exits 0 without writing a GAF is not a biological negative.
 ///
 /// GraphAligner 1.0.17b creates the GAF before it aligns anything and aborts if it cannot, so
 /// this state means the thing on `--graphaligner` is not GraphAligner, or a wrapper swallowed
@@ -1112,12 +1109,12 @@ fn assert_all_gone(pids: &[u32], how: &str) {
     panic!("{how}: aligners still running: {left:?}");
 }
 
-/// WF-15: the signal that ends the run ends the aligners it started.
+/// The signal that ends the run ends the aligners it started.
 ///
-/// The handler used to remove the scratch directory and exit, and nothing tracked the
-/// children, so after `kill <walker pid>` or `timeout N logan-walker` up to `-w` GraphAligner
-/// processes kept burning CPU and RAM, reparented to init, working on files that had just been
-/// deleted. Ctrl-C hid it, because a terminal signals the whole foreground process group.
+/// A handler that removes the scratch directory without stopping the children leaves up to
+/// `-w` GraphAligner processes burning CPU and RAM after `kill <walker pid>` or
+/// `timeout N logan-walker`, reparented to init, working on files that have just been
+/// deleted. Ctrl-C hides it, because a terminal signals the whole foreground process group.
 #[test]
 fn sigterm_stops_the_aligners_the_run_started() {
     use std::os::unix::process::ExitStatusExt;
@@ -1244,11 +1241,9 @@ fn zero_workers_is_a_usage_error_not_a_hang() {
 /// the data-backed `#[ignore]` tests call stage functions directly and are skipped in CI. So
 /// nothing covered the defaults every user actually runs: the prune/realign acceptance, the
 /// stitch, and the writers for the reconstruction, bubbles, alts, SNV table and summary
-/// (review TC-02, TW-03).
 ///
 /// This fixture has no fork, so it gates the pipeline and the writers rather than the variant
-/// logic; `prefer_majority` and the alt/VCF content need a bubble fixture, which is the rest of
-/// TC-02.
+/// logic; `prefer_majority` and the alt/VCF content need a bubble fixture.
 #[test]
 fn the_default_walk_reconstructs_and_writes_every_output() {
     let f = Fixture::matching("default-walk", 1);
@@ -1266,8 +1261,8 @@ fn the_default_walk_reconstructs_and_writes_every_output() {
     let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
     assert_eq!(
         recon,
-        // WA-04 added `min_vaf=`, the measured counterpart of the constant `vaf=`. This
-        // route passes no fork at all, so it is 1.000 and there is no `mixed=` tag.
+        // `min_vaf=` is the measured counterpart of the constant `vaf=`. This route passes
+        // no fork at all, so it is 1.000 and there is no `mixed=` tag.
         format!(
             ">SRRFAKE0_primary cov=1.000 pident=100.0 nodes=1 ka=5.0 vaf=1.00 min_vaf=1.000\n{QUERY}\n"
         ),
@@ -1400,7 +1395,7 @@ fn a_fork_is_phased_and_the_majority_allele_becomes_the_primary() {
     assert_eq!(
         snvs.lines().nth(1).unwrap(),
         // Trailing 0: this fork is at 40x and 60x, nowhere near Logan's 25,000 ceiling,
-        // so its frequencies are real ratios rather than lower bounds (WV-03).
+        // so its frequencies are real ratios rather than lower bounds.
         // Trailing empty `block`: one substitution, so it is not part of a linked block.
         "gene\t61\tA\tG\tSRRFAKE0\t0.6000\t60.0\t40.0\t0\t0\t"
     );
@@ -1438,7 +1433,7 @@ fn write_replay_script(dir: &std::path::Path) {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// WG-03: `bubbles.json` is gated against the gene's own depth, not an absolute 5x.
+/// `bubbles.json` is gated against the gene's own depth, not an absolute 5x.
 ///
 /// The gate was `ka:f >= --min-abund`, an absolute 5x, applied to the whole unpruned
 /// neighbourhood before the alignment even ran. On a 15,000x sample that admits anything two
@@ -1479,7 +1474,7 @@ fn a_shallow_diamond_beside_a_deep_gene_is_not_reported_as_a_bubble() {
     let kept = bubbles_of(&g, &["--prune-frac", "0"]);
     assert!(kept.contains("\"n_bubbles\": 1"), "{kept}");
     assert!(kept.contains("\"ka\": 6.0"), "{kept}");
-    // The record says where that allele set was found (WG-04).
+    // The record says where that allele set was found.
     assert!(kept.contains("\"flanks\": [{\"fork\": 4"), "{kept}");
 
     // Same unpruned graph, same alignment, a depth-relative floor: this is the floor half,
@@ -1492,7 +1487,7 @@ fn a_shallow_diamond_beside_a_deep_gene_is_not_reported_as_a_bubble() {
     );
 }
 
-/// WP-06: a run that is killed leaves the reconstructions it had already made.
+/// A run that is killed leaves the reconstructions it had already made.
 ///
 /// Everything a run produces was written after the last accession finished, so a scheduler's
 /// walltime SIGTERM, an OOM kill or a dropped connection at hour eight of a nine-hour shard
@@ -1575,7 +1570,7 @@ fn a_finished_run_leaves_no_journal_behind() {
     assert_eq!(recon.matches(">SRRFAKE").count(), 2, "{recon}");
 }
 
-/// WP-06, the cheap half: an unusable output location is found before the cohort runs, not
+/// An unusable output location is found before the cohort runs, not
 /// after every accession has been fetched and aligned.
 #[test]
 fn an_unusable_out_dir_fails_before_any_accession_is_fetched() {
@@ -1612,7 +1607,7 @@ fn an_unusable_out_dir_fails_before_any_accession_is_fetched() {
     assert!(!marker.exists(), "the cohort ran before the output location was checked");
 }
 
-/// WF-12: a lowercase accession is the accession it spells, not a missing one.
+/// A lowercase accession is the accession it spells, not a missing one.
 ///
 /// Logan's bucket is case-sensitive, so `srr8209082` is fetched verbatim, 404s, and the 404 is
 /// recorded as `no_logan_data`: "Logan has nothing for this run". For a run Logan does have
@@ -1659,7 +1654,7 @@ fn a_lowercase_accession_finds_the_run_it_names() {
     );
 }
 
-/// WA-12: a GAF row that is not a walk of the graph is an error, not a primary.
+/// A GAF row that is not a walk of the graph is an error, not a primary.
 ///
 /// The walker writes the GFA, hands it to GraphAligner and then believes the row that comes
 /// back. `stitch_steps` appends each step's sequence minus the k - 1 overlap whatever the
@@ -1702,7 +1697,7 @@ fn a_gaf_row_that_is_not_a_walk_of_the_graph_fails_the_accession() {
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
-/// WG-07: an object with no adjacency is `no_links`, not "the gene is absent".
+/// An object with no adjacency is `no_links`, not "the gene is absent".
 ///
 /// `parse` builds edges only from `L:` header fields and never checked that any record had
 /// one. A file with none parses into an edgeless graph, the BFS adds no neighbours, the GFA
@@ -1740,9 +1735,8 @@ fn an_object_with_no_links_is_its_own_outcome_not_a_biological_negative() {
     assert_eq!(code, 0, "no_links must be tolerated like no_path and too_large");
 }
 
-/// WG-07's other half: an edgeless graph is not refused, because a gene that fits inside one
-/// unitig needs no edge. Refusing at parse time, which the review proposed, would have turned
-/// these into negatives.
+/// An edgeless graph is not refused, because a gene that fits inside one unitig needs no
+/// edge. Refusing at parse time would turn these into negatives.
 #[test]
 fn a_gene_inside_one_unitig_still_reconstructs_without_any_links() {
     let f = Fixture::unlinked("no-links-one-unitig", false);
@@ -1756,7 +1750,7 @@ fn a_gene_inside_one_unitig_still_reconstructs_without_any_links() {
     assert!(summary.contains(r#""no_links": 0"#), "{summary}");
 }
 
-/// WA-04: a primary stitched through two unphased sites says so./// WA-04: a primary stitched through two unphased sites says so.
+/// A primary stitched through two unphased sites says so.
 ///
 /// `stitch.rs` claimed that requiring a connected path "makes chimeras impossible". That holds
 /// for a join no k-mer supports, which is the 87% artifact rate the README measures against
@@ -1811,11 +1805,11 @@ fn a_primary_crossing_two_unphased_sites_is_labelled_mixed() {
     assert!(header.contains(" min_vaf=0.600"), "header:\n{header}");
 }
 
-/// WA-04: the flag must not depend on whether alternatives were asked for.
+/// The flag must not depend on whether alternatives were asked for.
 ///
-/// `find_alts` used to return early when no variant output was wanted, so under
-/// `--no-emit-alts` nothing scanned the route and a mixed primary would have been published
-/// with the same header a clonal one gets.
+/// `find_alts` must not return early when no variant output is wanted: under
+/// `--no-emit-alts` nothing would scan the route, and a mixed primary would be published with
+/// the same header a clonal one gets.
 #[test]
 fn the_mixed_flag_survives_no_emit_alts() {
     let f = Fixture::two_forks("mixed-quiet");
@@ -1831,7 +1825,7 @@ fn the_mixed_flag_survives_no_emit_alts() {
     );
 }
 
-/// WP-02: a `-q` pool that is not one gene must say so./// WP-02: a `-q` pool that is not one gene must say so.
+/// A `-q` pool that is not one gene must say so.
 ///
 /// Multi-anchor mode ranks every reference together and keeps one primary per accession. For
 /// strains of a gene that is the feature; for a panel of different genes it answers a
@@ -1862,7 +1856,7 @@ fn a_multi_anchor_pool_of_unrelated_genes_warns() {
     assert!(!quiet.contains("multi-anchor"), "single-anchor runs must not warn:\n{quiet}");
 }
 
-/// WG-05: `--min-abund` is the allele floor and must not move the prune floor.
+/// `--min-abund` is the allele floor and must not move the prune floor.
 ///
 /// `depth_floor` returned `max(prune_frac * depth, min_abund)`, so a user tightening the
 /// variant gate also raised the coverage at which unitigs are deleted from the graph the
@@ -1906,7 +1900,7 @@ fn the_allele_floor_does_not_move_the_prune_floor() {
     );
 }
 
-/// WG-02: Logan's `km:f:` abundance alias must be read as the abundance it is.
+/// Logan's `km:f:` abundance alias must be read as the abundance it is.
 ///
 /// Logan's `Unitigs.md` says the `ka:f:` field "is replaced by `km:f:`" in some large
 /// accessions and that they are the same information. The parser matched only `ka:f:`, so such
@@ -1948,14 +1942,14 @@ fn the_km_f_abundance_alias_is_read_like_ka_f() {
     let vcf = std::fs::read_to_string(outdir.join("SRRFAKE0.vcf")).unwrap();
     assert!(vcf.contains("AF=0.6000;AO=60.0;RO=40.0"), "{vcf}");
 
-    // Every record carries an abundance, so the WG-02 counter stays silent and the summary
+    // Every record carries an abundance, so the counter stays silent and the summary
     // keeps the shape an ordinary run has.
     let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
     assert!(!summary.contains("abundance_missing"), "{summary}");
     assert!(!stderr.contains("carry no ka:f/km:f abundance"), "{stderr}");
 }
 
-/// WG-02's other half: an accession whose records carry neither tag is not a 0x gene, it is an
+/// An accession whose records carry neither tag is not a 0x gene, it is an
 /// accession whose abundances are unknown, and the run must say so somewhere a machine reads.
 #[test]
 fn unitigs_with_no_abundance_tag_are_reported_not_read_as_zero() {
@@ -1978,12 +1972,11 @@ fn unitigs_with_no_abundance_tag_are_reported_not_read_as_zero() {
     );
 }
 
-/// WV-01, fixed: the majority correction must fire on a flanked window too.
+/// The majority correction must fire on a flanked window too.
 ///
-/// `variants::prefer_majority` used to reject its swap unless the restitched sequence was as
-/// long as the whole stitched path, but `stitch` returns only the aligned window. The two
-/// agree only when `path_start == 0` and `path_end >= path_len`, so for any alignment that
-/// started or ended inside the path, which is every real GAF row, the correction was skipped
+/// `variants::prefer_majority` must compare its restitched sequence against the aligned
+/// window, not against the whole stitched path. The two agree only when `path_start == 0` and
+/// `path_end >= path_len`, so comparing against the path skips the correction
 /// silently: `_primary` kept the minority allele, no `consensus:` line was printed, and the
 /// output was byte-identical to a `--no-prefer-majority` run. Present in 0.1.0 and 0.1.1.
 ///
@@ -2000,7 +1993,7 @@ fn a_flanked_alignment_window_still_gets_the_majority_correction() {
     assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
     assert!(
         stderr.contains("consensus: 1 site(s) where the route carried the minority allele, corrected"),
-        "the correction did not fire on a flanked window, which is WV-01; stderr:\n{stderr}"
+        "the correction did not fire on a flanked window; stderr:\n{stderr}"
     );
 
     // The published record is the window, not the whole path: 109 of 121 nt, carrying the 60%
@@ -2023,7 +2016,7 @@ fn a_flanked_alignment_window_still_gets_the_majority_correction() {
 }
 
 /// `--fetch-only` had no test at all: nothing called `pipeline::run_fetch_only`, and no case
-/// passed the flag (review TW-03). It is the path a Galaxy wrapper and the CI data step both
+/// passed the flag. It is the path a Galaxy wrapper and the CI data step both
 /// use to warm a cache before the real run, so its counts and its exit code are a contract.
 #[test]
 fn fetch_only_reports_its_counts_and_exit_code() {
@@ -2088,9 +2081,8 @@ fn fetch_only_reports_its_counts_and_exit_code() {
 ///
 /// The distinction is the whole point. `--allow-empty` accepts negatives and not errors, and a
 /// scheduler reads the exit code: mapping this to `error` would turn "this accession does not
-/// fit the cap you set" into "this run broke". The compute pool used to send every error it
-/// saw through `AccessionResult::failed`, so until the pool learned the same mapping the fetch
-/// pool had, the budget refusal arrived as a failure.
+/// fit the cap you set" into "this run broke". Both pools have to agree on the mapping, or a
+/// budget refusal from the compute side arrives as a failure.
 #[test]
 fn a_graph_over_its_budget_is_a_too_large_negative_not_an_error() {
     let f = Fixture::dense("dense-budget");

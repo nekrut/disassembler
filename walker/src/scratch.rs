@@ -1,10 +1,10 @@
 //! The run's private scratch directory.
 //!
 //! GraphAligner reads and writes files, so each accession in flight has a GFA, a GAF and a
-//! one-record query FASTA in scratch. They used to go straight into a shared
-//! `/dev/shm/logan-walker`. Created by one user with mode 0755, that directory failed every
-//! other user's run with a bare EACCES; a run stopped with SIGTERM left its files there (12
-//! were measured), holding RAM until reboot; and `/dev/shm` does not exist on macOS.
+//! one-record query FASTA in scratch. They do not go into a shared `/dev/shm/logan-walker`:
+//! created by one user at mode 0755 that fails every other user's run with a bare EACCES, a
+//! run stopped with SIGTERM leaves its files there holding RAM until reboot, and `/dev/shm`
+//! does not exist on macOS.
 //!
 //! Each run now makes its own directory, `logan-walker.<pid>.<suffix>` with mode 0700, under
 //! `--scratch-dir` (default `/dev/shm` where it exists, else the system temp directory). It is
@@ -12,7 +12,7 @@
 //! killer left it behind, by the next run over the same base once that PID is gone.
 //! `LOGAN_KEEP_SCRATCH` keeps it, for debugging.
 //!
-//! The same signal also stops the run's GraphAligner children (WF-15). They are the only
+//! The same signal also stops the run's GraphAligner children. They are the only
 //! processes the walker starts, they are what the scratch files are for, and without this
 //! they outlived the run: see [`watch_child`].
 
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 /// Whether the run should keep its scratch files, `LOGAN_KEEP_SCRATCH`.
 ///
-/// TW-08. Four sites read the variable directly and any value, even `0`, turned cleanup off.
+/// Four sites read the variable directly and any value, even `0`, turned cleanup off.
 /// A developer who follows `docs/walker.md` and exports it then saw four cleanup tests fail
 /// on a correct build. `cfg!(test)` makes the unit tests ignore the environment; the CLI
 /// tests clear it from the child's environment instead, since they run a real binary.
@@ -30,7 +30,7 @@ pub fn keep_scratch() -> bool {
 }
 
 /// A scratch directory owned by one unit test, created now and removed when the test's guard
-/// drops (TW-10).
+/// drops.
 ///
 /// Several test helpers built a `Config` around a path under the system temp directory and
 /// never removed it. `write_gfa` creates the directory, the test removed only the GFA, and a
@@ -46,11 +46,10 @@ pub struct TestDir(PathBuf);
 impl TestDir {
     /// A fresh directory tagged with `tag`.
     ///
-    /// It is created here. `extract::write_gfa` used to create a missing scratch directory
-    /// itself, which is how these tests got away with a path that did not exist; it now
-    /// refuses instead (WF-17), because the one thing that removes the directory mid-run is
-    /// this run's own signal handler, and a worker that puts it back undoes the cleanup.
-    /// Tests that want a scratch directory make their own, as a run does.
+    /// It is created here, and `extract::write_gfa` refuses a missing one rather than
+    /// creating it: the one thing that removes the directory mid-run is this run's own
+    /// signal handler, and a worker that puts it back undoes the cleanup. Tests that want a
+    /// scratch directory make their own, as a run does.
     pub fn new(tag: &str) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
@@ -76,12 +75,11 @@ impl Drop for TestDir {
 
 /// PIDs of the GraphAligner children this run has started and not yet reaped.
 ///
-/// WF-15. The signal thread used to remove the scratch directory and exit, and nothing knew
-/// about the aligners: after `kill <walker pid>` or `timeout N logan-walker`, up to `-w`
-/// GraphAligner processes kept burning CPU and RAM, reparented to init, working on files that
-/// had just been deleted. Ctrl-C in a terminal hid it, because the tty signals the whole
-/// foreground process group, and so do runners that kill a process group or a cgroup; a bare
-/// `kill` to the walker alone does not.
+/// Tracked so the signal handler can stop them. Without it, `kill <walker pid>` or
+/// `timeout N logan-walker` leaves up to `-w` GraphAligner processes burning CPU and RAM,
+/// reparented to init, working on files that have just been deleted. Ctrl-C in a terminal
+/// hides this, because the tty signals the whole foreground process group, as do runners that
+/// kill a process group or a cgroup; a bare `kill` to the walker alone does not.
 ///
 /// Each entry is also a **process group id**, because `align::run` spawns with
 /// `process_group(0)`, which makes the child its own group leader. Signalling the group rather
@@ -139,7 +137,7 @@ fn stop_children() {
 fn stop_children() {}
 
 const PREFIX: &str = "logan-walker.";
-/// Marks a scratch directory as claimed by a live run (WF-01).
+/// Marks a scratch directory as claimed by a live run.
 const LOCK: &str = ".lock";
 /// Written beside it under `LOGAN_KEEP_SCRATCH`, so a kept directory is never swept.
 const KEEP: &str = ".keep";
@@ -147,14 +145,12 @@ const KEEP: &str = ".keep";
 pub struct Scratch {
     path: PathBuf,
     keep: bool,
-    /// The run's `.lock`, held open and `flock`ed for the life of the run (WF-01).
+    /// The run's `.lock`, held open and `flock`ed for the life of the run.
     ///
-    /// Liveness used to be `kill(pid, 0)`, which sees only the caller's PID namespace on the
-    /// caller's host, so a live run in another container or on another node sharing the base
-    /// looked dead and had its in-flight directory **deleted**. The victim did not notice:
-    /// the directory was silently recreated and the vanished GAF became the biological
-    /// answer `no_path`, with exit 0. A held lock is a fact about the filesystem rather than
-    /// about one process table.
+    /// A held lock is a fact about the filesystem; `kill(pid, 0)` is a fact about one process
+    /// table. It sees only the caller's PID namespace on the caller's host, so a live run in
+    /// another container or on another node sharing the base looks dead and has its in-flight
+    /// directory **deleted**, which the victim reports as `no_path` at exit 0.
     _lock: Option<std::fs::File>,
 }
 
@@ -210,7 +206,7 @@ impl Scratch {
     /// the directory, then end the process as the signal would have, so the caller still sees
     /// "terminated by SIGTERM". The list is in the body, with what sends each one.
     ///
-    /// **Signals the process inherited as ignored are left ignored** (WF-02). Registering a
+    /// **Signals the process inherited as ignored are left ignored**. Registering a
     /// handler for one is a 0.1.1 regression that breaks `nohup`: bash sends SIGHUP to every
     /// job when an SSH session drops, `nohup` exists to set that signal to ignored, and
     /// catching it anyway killed the run with exit 129. Since outputs are written at the end,
@@ -223,24 +219,21 @@ impl Scratch {
         use signal_hook::consts::{
             SIGHUP, SIGINT, SIGPIPE, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGXCPU, SIGXFSZ,
         };
-        // WF-17. Only INT, TERM and HUP were watched, so every other way a run ends killed
-        // the process with the directory still in `/dev/shm`, holding RAM until some later
-        // run over the same base swept it. Each of these was measured leaving one behind:
+        // Every way a run can be ended from outside, or the scratch directory stays in
+        // `/dev/shm` holding RAM until some later run over the same base sweeps it:
         //
-        // - SIGPIPE (141), `logan-walker ... | head -1`. `main::default_sigpipe` undoes the
-        //   `SIG_IGN` Rust installs at startup, which is what lets this list claim it;
-        //   `crate::outln!` then keeps the writing thread from panicking on the EPIPE that
-        //   now comes back before the signal is acted on.
-        // - SIGQUIT (131), Ctrl-\.
-        // - SIGUSR1 (138) and SIGUSR2 (140), which is how SGE and LSF announce a soft
-        //   wall-time limit, and SIGXCPU (152), which is a CPU ulimit or a cgroup.
-        // - SIGXFSZ, a file-size ulimit, included for the same reason though it was not
-        //   measured: the walker writes files.
+        // - SIGPIPE, from `logan-walker ... | head -1`. `main::default_sigpipe` undoes the
+        //   `SIG_IGN` Rust installs at startup, which is what lets this list claim it, and
+        //   `crate::outln!` keeps the writing thread from panicking on the EPIPE that comes
+        //   back before the signal is acted on.
+        // - SIGQUIT, Ctrl-\.
+        // - SIGUSR1 and SIGUSR2, how SGE and LSF announce a soft wall-time limit, and
+        //   SIGXCPU, a CPU ulimit or a cgroup.
+        // - SIGXFSZ, a file-size ulimit: the walker writes files.
         //
-        // SIGALRM, SIGVTALRM and SIGPROF are deliberately **not** here, though the review
-        // listed them. Nothing sends them to announce a limit; what does send them is a timer
-        // or a sampling profiler belonging to the process itself, and catching those would
-        // end a profiled run rather than clean up after one.
+        // SIGALRM, SIGVTALRM and SIGPROF are deliberately **not** here. Nothing sends them to
+        // announce a limit; what does send them is a timer or a sampling profiler belonging
+        // to the process itself, and catching those would end a profiled run.
         let wanted: Vec<i32> =
             [SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGQUIT, SIGUSR1, SIGUSR2, SIGXCPU, SIGXFSZ]
                 .into_iter()
@@ -281,7 +274,7 @@ impl Drop for Scratch {
 
 /// Whether this process inherited `SIG_IGN` for `sig`.
 ///
-/// WF-02. `sigaction` with a null action reads the current disposition without changing it.
+/// `sigaction` with a null action reads the current disposition without changing it.
 fn is_ignored(sig: libc::c_int) -> bool {
     // SAFETY: `sigaction` with a null `act` only reads. `old` is a valid, owned struct, and
     // the call is made before any handler is installed.
@@ -296,7 +289,7 @@ fn is_ignored(sig: libc::c_int) -> bool {
 
 /// This kernel's boot id, or the hostname if the kernel does not publish one.
 ///
-/// WF-01. A `flock` is only meaningful on the machine that took it: NFS mounted `nolock`, or
+/// A `flock` is only meaningful on the machine that took it: NFS mounted `nolock`, or
 /// Lustre mounted `localflock`, does not carry it between nodes. Recording the machine makes
 /// the sweep fail SAFE there, leaking directories rather than deleting a live run's.
 fn machine_id() -> String {
@@ -348,8 +341,8 @@ fn claim(_dir: &Path, _keep: bool) -> Option<std::fs::File> {
 
 /// Whether `dir`'s lock says it belongs to this machine and nobody is holding it.
 ///
-/// A missing lock means the directory predates WF-01, and is left alone. A lock naming
-/// another machine is left alone: we cannot reason about it from here.
+/// A missing lock means the directory predates this scheme and is left alone, as is a lock
+/// naming another machine: we cannot reason about it from here.
 #[cfg(unix)]
 fn lock_is_free(dir: &Path, me: &str) -> bool {
     use std::os::unix::io::AsRawFd;
@@ -411,11 +404,8 @@ fn make_private_dir(path: &Path) -> std::io::Result<()> {
 
 /// Remove run directories in `base` that are ours, on this machine, and not in use.
 ///
-/// WF-01. This used to decide with `kill(pid, 0)`, which answers only about the caller's PID
-/// namespace on the caller's host: a live run in another container, or on another node
-/// sharing the base over Lustre or NFS, looked dead and had its directory deleted mid-flight.
-/// The victim recreated the directory silently and reported the affected accessions as
-/// `no_path`, the biological answer, with exit 0. Reproduced twice; one reproduction lost 4
+/// Decided by the lock, not by `kill(pid, 0)`: see [`lock_is_free`]. Reproduced twice that
+/// a PID test deletes a live run's directory from another container or node, once losing 4
 /// of 8 accessions.
 ///
 /// Four conditions now, all required:
@@ -474,7 +464,7 @@ mod signal_tests {
     use super::is_ignored;
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
-    /// WF-02. `nohup` works by setting SIGHUP to ignored before exec. The walker registered a
+    /// `nohup` works by setting SIGHUP to ignored before exec. The walker registered a
     /// handler for it regardless, so bash's hangup on an SSH drop killed the run with exit
     /// 129 and, because outputs are written at the end, lost all of it. The fix is to read
     /// the inherited disposition first, which is what this asserts.
@@ -502,12 +492,11 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A base directory for one test, removed when the returned guard drops (TW-10).
+    /// A base directory for one test, removed when the returned guard drops.
     ///
-    /// The manual `remove_dir_all` these tests used to end with ran only when the test
-    /// reached it, so an assertion failure leaked the directory, and the sweep test leaked
-    /// one on every run: it deliberately leaves behind the directories the sweep must not
-    /// touch, and so could never have ended by removing its base.
+    /// A manual `remove_dir_all` at the end of a test runs only when the test reaches it, so
+    /// an assertion failure leaks the directory. The sweep test cannot clean up that way at
+    /// all: it deliberately leaves behind the directories the sweep must not touch.
     fn base(name: &str) -> TestDir {
         TestDir::new(name)
     }
@@ -534,7 +523,7 @@ mod tests {
         drop((s1, s2));
     }
 
-    /// WF-01. Liveness is a held lock, not a PID.
+    /// Liveness is a held lock, not a PID.
     ///
     /// The old rule was `kill(pid, 0)`, which answers only about the caller's PID namespace
     /// on the caller's host, so a live run in another container or on another node sharing

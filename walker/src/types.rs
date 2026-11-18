@@ -72,14 +72,13 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// The whole graph's adjacency, held on disk instead of in RAM.
 ///
-/// Adjacency is the last part of the walker that is O(accession) rather than O(neighbourhood):
-/// 12 bytes per unitig, 15.4 MB for `ERR2028820`, and it exists from `parse::scan` until
-/// `extract::expand` has finished walking it. It is also the term that keeps `--max-size-mb`
-/// in the memory bound, because it scales with the file rather than with the gene.
+/// Adjacency is the last part of the walker that is O(accession) rather than O(neighbourhood),
+/// at 12 bytes per unitig, so spilling it is what takes `--max-size-mb` out of the memory
+/// bound.
 ///
 /// Two unlinked temp files, read with `pread`. Unlinked at creation, so the data is reclaimed
-/// when the handles close even if the process is killed: there is no cleanup path to get
-/// wrong and nothing to sweep.
+/// when the handles close even if the process is killed: no cleanup path to get wrong and
+/// nothing to sweep.
 ///
 /// Spilling is opt-in per accession, past [`SPILL_ADJACENCY_AT`]. A small accession stays in
 /// RAM and never touches the disk, which keeps the common case free of a new failure mode, and
@@ -255,11 +254,9 @@ impl PayloadSource {
 /// What one accession's unitig object was, as opposed to what the walker made of it.
 ///
 /// The Logan objects at `logan-pub.s3.amazonaws.com/u/{acc}/` are unversioned and mutable,
-/// and they do get replaced: a 5,000-key sample across five ranges found 3.1% of objects
-/// rewritten after the 2024-03 bulk load, in waves on 2025-12-10, 2025-12-14 and 2026-02-08.
-/// Until 0.2.0 a run recorded nothing about the bytes it consumed, so a rerun after an
-/// upstream regeneration produced different results with no detectable difference in any
-/// output. This is the record that makes those two runs tell apart.
+/// and they do get replaced: a 5,000-key sample found 3.1% rewritten after the 2024-03 bulk
+/// load. Without this record, a rerun after an upstream regeneration produces different
+/// results with no detectable difference in any output.
 ///
 /// `sha256` is the field that works on every path, because it is derived from the bytes
 /// rather than from the transport: a cache hit and an `--offline` run have no HTTP response
@@ -521,22 +518,12 @@ pub struct FetchedUnitigs {
 
 /// Everything one accession's unitig file contains, in compact form.
 ///
-/// Built in a single streaming pass so the decompressed text is never held. Measured
-/// against `ERR2028820` (1,277,362 unitigs, 2,582,206 edge tokens, 68,745,081 bp):
+/// Built by streaming, so the decompressed text is never held: `ERR2028820`'s 1.28M unitigs
+/// come to about 43 MB of arrays against 145 MB of decompressed text and ~897 MB for a
+/// dict-of-sets adjacency. At peak, with the slack the arrays keep as they grow, a graph
+/// measures 1.24x to 1.62x its compressed file; see `config::GRAPH_PEAK_PER_COMPRESSED_BYTE`.
 ///
-/// | field | bytes |
-/// |---|---|
-/// | `offsets` | 5.1 MB |
-/// | `targets` | 10.3 MB |
-/// | `abundance` | 5.1 MB |
-/// | `seq_2bit` | 17.2 MB |
-/// | `seq_offset` | 5.1 MB |
-/// | total | **~43 MB** |
-///
-/// Against ~897 MB measured for a dict-of-sets adjacency, and against 145 MB for the
-/// decompressed text alone. Those are the arrays' lengths; at peak, with the slack the arrays
-/// keep as they grow, a graph measured 1.24x to 1.62x its compressed file across seven
-/// accessions (1.25x here). See `config::GRAPH_PEAK_PER_COMPRESSED_BYTE`. Holding sequences here rather than re-reading the file is what lets
+/// Holding sequences here rather than re-reading the file is what lets
 /// `extract::collect_seqs` be O(nodes kept) instead of O(all unitigs).
 pub struct UnitigGraph {
     pub accession: Accession,
@@ -595,7 +582,7 @@ pub struct UnitigGraph {
     /// That saves the ~1.9 MB of padding byte-alignment would cost on a 1.28M-unitig
     /// accession, at the price of a shift in `decode_seq`.
     pub seq_offset: Vec<u32>,
-    /// WG-07: `L:` link tokens read from the whole file, counted in pass 1.
+    /// `L:` link tokens read from the whole file, counted in pass 1.
     ///
     /// Zero means the graph has no adjacency at all, which is a property of the object rather
     /// than of the neighbourhood: nothing can be walked across unitigs, the GFA comes out with
@@ -604,7 +591,7 @@ pub struct UnitigGraph {
     /// because `offsets`/`targets` are rewritten to the neighbourhood by `collect`, so by the
     /// time the outcome is decided the graph no longer holds the answer.
     pub n_links: u64,
-    /// WG-02: records in the whole file that carried neither `ka:f:` nor `km:f:`.
+    /// Records in the whole file that carried neither `ka:f:` nor `km:f:`.
     ///
     /// Counted over every record by `parse::scan`, not over the neighbourhood, because the
     /// question it answers is whether this accession's abundances can be believed at all.
@@ -709,12 +696,10 @@ impl UnitigGraph {
     /// they are indexed by slot, so the id has to go through `nodes`. Rows are kept whole in
     /// both states, so the row this returns is the same one either way.
     ///
-    /// Both states are reachable. `pipeline` expands the neighbourhood a second time when
-    /// pruning is rejected, and that runs after `collect`: indexing by id there read a
-    /// slot-indexed array, which is shorter than the id space by the whole of the accession.
-    /// On a 5,000-accession run all 8 accessions that reached it panicked, and an id that
-    /// happened to land inside the shorter array would have silently returned another
-    /// unitig's edges instead.
+    /// Both states are reachable, because `pipeline` expands the neighbourhood a second time
+    /// when pruning is rejected, after `collect`. Indexing by id there reads a slot-indexed
+    /// array, which is shorter than the id space by the whole accession: an id past its end
+    /// panics, and one that lands inside it silently returns another unitig's edges.
     ///
     /// Fills a caller-owned buffer rather than returning a slice because the rows may be on
     /// disk; pass the same buffer back each time.
@@ -788,11 +773,11 @@ pub struct Subgraph {
 /// appears in any process's RSS. At ~1 MB for a large subgraph, a 10,000-accession run
 /// would quietly consume gigabytes.
 ///
-/// The `owns_gfa` guard exists because this used to unlink `gfa_path` whoever built the value,
-/// and unit tests build `Subgraph` by hand with paths they do not own: `/dev/null` and two
-/// fixed `/tmp` names. As an ordinary user those unlinks fail silently, so CI never showed it.
-/// As root they succeed, which turned `/dev/null` into a regular file and then failed every
-/// `tests/cli.rs` case with `NotFound`, because they open it for child stdio. See TW-01.
+/// The `owns_gfa` guard exists because unit tests build `Subgraph` by hand with paths they
+/// do not own: `/dev/null` and two fixed `/tmp` names. Unlinking regardless fails silently
+/// as an ordinary user, so CI never shows it, and succeeds as root, which turns `/dev/null`
+/// into a regular file and then fails every `tests/cli.rs` case that opens it for child
+/// stdio.
 impl Drop for Subgraph {
     fn drop(&mut self) {
         // Set LOGAN_KEEP_SCRATCH=1 to retain the GFA for debugging a specific accession.
@@ -848,10 +833,8 @@ pub struct GafPath {
 impl GafPath {
     /// Percent identity of this alignment: matches over aligned length.
     ///
-    /// WV-24. The formula was spelled out in `stitch` and again in `pipeline`, which is the
-    /// kind of duplication that survives until one of the two is changed. `aln_len == 0`
-    /// gives 0.0 rather than NaN, which would reach `summary.json` as an invalid token
-    /// (WV-15).
+    /// `aln_len == 0` gives 0.0 rather than NaN, which would reach `summary.json` as an
+    /// invalid JSON token.
     pub fn pident(&self) -> f64 {
         if self.aln_len > 0 {
             (self.num_matches as f64 / self.aln_len as f64) * 100.0
@@ -888,14 +871,11 @@ pub struct Haplotype {
     pub cov: f64,
     /// Fraction of the reference the alignment spans: `(query_end - query_start) / ref_len`.
     ///
-    /// WA-05. This is what `--min-cov` gates on, and what the flag has always been documented
-    /// as meaning. Until 0.2.0 the gate used `cov` instead, which measures the walked length,
-    /// so an indel in the sample moved the decision: on a 300 nt gene at the default 0.85, a
-    /// sample carrying the whole gene with a 60 nt in-frame deletion scored 0.80 and was
-    /// published as `no_path`, "the gene is not here", while an alignment that reached only
-    /// reference base 240 but walked a 20 nt insertion scored 0.867 and was published as a
-    /// primary. The first biases presence calls against deletion alleles, which is the
-    /// opposite of what a gene-presence gate should do.
+    /// What `--min-cov` gates on, deliberately rather than `cov`, which measures the walked
+    /// length. An indel moves the two apart: on a 300 nt gene at the default 0.85, a sample
+    /// carrying the whole gene with a 60 nt in-frame deletion walks 0.80 and would be called
+    /// `no_path`, biasing presence calls against exactly the deletion alleles a study looks
+    /// for.
     pub ref_cov: f64,
     /// The reference interval the alignment covers, GAF columns 3 and 4, end exclusive.
     ///
@@ -927,11 +907,10 @@ pub struct Haplotype {
     pub mean_ka: f64,
     /// Variant allele frequency at the defining fork (1.0 if primary backbone).
     ///
-    /// For the primary this is the constant 1.0 and always has been, which is the WA-04
-    /// defect: see `min_site_vaf` for the measured number. Kept for one release because it is
-    /// in every parser written against the header so far.
+    /// For the primary this is the constant 1.0; `min_site_vaf` is the measured number. Kept
+    /// for one release because parsers are written against the header as it stands.
     pub vaf: f64,
-    /// WA-04: forks on this haplotype's route carrying a second allele over both floors.
+    /// Forks on this haplotype's route carrying a second allele over both floors.
     ///
     /// Copied from [`VariantStats::two_allele_sites`] by the pipeline, after the majority
     /// correction has settled which route is published. Two or more means the sequence is a
@@ -940,7 +919,7 @@ pub struct Haplotype {
     /// chimera of unlinked sites, and downstream it reads as excess substitutions and
     /// recombination.
     pub two_allele_sites: usize,
-    /// WA-04: the lowest frequency of any allele this haplotype carries, 1.0 when its route
+    /// The lowest frequency of any allele this haplotype carries, 1.0 when its route
     /// passes no two-allele site. Published as `min_vaf=` in the FASTA header.
     pub min_site_vaf: f64,
     /// Reference record id this haplotype was scored against. `None` on the single-anchor
@@ -953,7 +932,7 @@ pub struct Haplotype {
 /// A recovered second allele: the primary haplotype with exactly one allele changed.
 ///
 /// A substitution in the common case, or an in-frame indel of at most `max_alt_indel` bases
-/// when `allow_indel_alts` is on, which it is by default (WV-21).
+/// when `allow_indel_alts` is on, which it is by default.
 ///
 /// The frequencies are what make it interpretable. `alt_vaf` is this allele's share of
 /// coverage at its fork, `taken_vaf` the primary's, and both cleared the same gates, so the
@@ -976,7 +955,7 @@ pub struct AltHaplotype {
     /// Zero for a substitution, which is the common case.
     pub length_delta: i64,
     /// A branch of this fork sits at [`KA_CEILING`], so `taken_vaf` and `alt_vaf` are computed
-    /// against a total that is a lower bound and both are overstated (WV-03).
+    /// against a total that is a lower bound and both are overstated.
     pub ka_saturated: bool,
     /// How much sequence the allele actually replaces, in bases.
     ///
@@ -1023,17 +1002,14 @@ pub struct Bubble {
     /// Every pair of flanks this same allele set was found between, the first of which is
     /// `fork`/`merge` above.
     ///
-    /// WG-04. One record used to be emitted per (fork, merge) pair, so an allele set
-    /// reachable between several flanks was reported several times with identical branches
-    /// and VAFs: `SRR8209082` gave 3,632 records for 317 distinct allele sets, one of them
-    /// repeated 16 times, and two SNPs exactly k apart form a bow-tie that counted as four
-    /// bubbles. Since `n_bubbles` is read as a diversity signal, that inflation was a
-    /// property of local topology rather than of the sample. The record is now keyed on the
-    /// alleles and the flanks are listed.
+    /// The record is keyed on the alleles, not on one flank pair, because an allele set
+    /// reachable between several flanks would otherwise be counted several times: two SNPs
+    /// exactly k apart form a bow-tie worth four records. `n_bubbles` is read as a diversity
+    /// signal, so that inflation would be local topology rather than the sample.
     pub flanks: Vec<(UnitigId, Strand, UnitigId, Strand)>,
     pub branches: Vec<Branch>,
     /// A branch of this bubble is at [`KA_CEILING`], so every `vaf` on it is computed against
-    /// a lower-bound total and is overstated (WV-03).
+    /// a lower-bound total and is overstated.
     pub ka_saturated: bool,
 }
 
@@ -1065,7 +1041,7 @@ pub struct CandidateReport {
     /// the reference that was found; `ref_cov` is that.
     pub cov: Option<f64>,
     /// Fraction of the reference this candidate's alignment spans, which is what `--min-cov`
-    /// gates on (WA-05). `None` when this reference produced no GAF row.
+    /// gates on. `None` when this reference produced no GAF row.
     ///
     /// Present even when `cov` is `None`, because a candidate rejected by the gate has no
     /// stitched span but does have an alignment, and this is the number that rejected it.
@@ -1109,18 +1085,13 @@ pub enum Outcome {
     SubgraphTooLarge,
     /// The whole unitig file carried no `L:` link, so the graph has no adjacency to walk.
     ///
-    /// WG-07. Logan publishes such objects: the first 256 KiB of `ERR3988483` has 0 links in
-    /// 15,864 headers and `ERR3988478` 0 in 21,370, against 9,752 of 10,070 for `SRR8209082`.
-    /// A gene that spans more than one unitig cannot be reconstructed from an edgeless graph,
-    /// and the walker used to report that as `no_path`, which is the same word it uses for
-    /// "this accession does not carry the gene". They are different findings: one is about
-    /// the sample, the other about the file, and a cohort report that cannot tell them apart
-    /// understates how often the gene is present.
+    /// Logan does publish such objects: 0 links in 15,864 headers for `ERR3988483`, against
+    /// 9,752 of 10,070 for `SRR8209082`. Distinguished from `no_path` because they are
+    /// different findings, one about the file and one about the sample, and a cohort report
+    /// that cannot tell them apart understates how often the gene is present.
     ///
-    /// A negative, not an error, for the same reason `no_logan_data` is: the walker read what
-    /// Logan published and Logan published a graph with no edges. An accession whose gene
-    /// fits inside a single unitig still reconstructs and is still `success`; this outcome is
-    /// reported only when nothing was walked.
+    /// A negative, not an error, for the same reason `no_logan_data` is. An accession whose
+    /// gene fits inside a single unitig still reconstructs and is still `success`.
     NoLinks,
     Failed,
 }
@@ -1168,7 +1139,7 @@ pub struct VariantStats {
     /// Forks the walked route passes through, and how many had exactly one viable alternative.
     pub forks: usize,
     pub biallelic: usize,
-    /// WA-04. Forks ON the published route carrying a second allele that clears both floors
+    /// Forks ON the published route carrying a second allele that clears both floors
     /// **and is a substitution**, counted as **sites** rather than as alleles (`biallelic`
     /// counts a three-branch fork twice). Two or more of them is a mixture: the alleles are
     /// further apart than k - 1, so no k-mer links them, the primary takes one branch at each
@@ -1192,8 +1163,8 @@ pub struct VariantStats {
     pub min_site_vaf: f64,
     /// Alternatives actually emitted.
     pub recovered: usize,
-    /// Credible alleles that cleared every gate but did not fit under `--max-alts`
-    /// (WV-06). Non-zero means the variant outputs are incomplete for this accession.
+    /// Credible alleles that cleared every gate but did not fit under `--max-alts`.
+    /// Non-zero means the variant outputs are incomplete for this accession.
     pub beyond_cap: usize,
     /// Of those, how many change length.
     pub indels: usize,
@@ -1233,11 +1204,10 @@ impl Default for VariantStats {
 
 /// The value Logan's `ka:f` stops at.
 ///
-/// WV-03. Logan caps abundance, and the published values stop at exactly this number: measured
-/// on three cached accessions, `ERR2028820` has 664 unitigs here against 4 at the next value
-/// down, `SRR8209082` has 802 against 24, and `SRR12363134` has 1 here and the next is
-/// 14,500. A distribution does not pile up on one value and empty out immediately below it;
-/// that is a clip.
+/// Logan caps abundance and the published values stop here: on three cached accessions,
+/// `ERR2028820` has 664 unitigs at exactly this value against 4 at the next one down, and
+/// `SRR12363134` has one against a next-highest of 14,500. A distribution does not pile up on
+/// one value and empty out immediately below it.
 ///
 /// It matters because the walker reads `ka:f` as linear depth. Where a branch is clipped the
 /// fork total is a lower bound, so the minority allele's share is OVERSTATED: a 3,000x allele
@@ -1249,19 +1219,16 @@ pub const KA_CEILING: f32 = 25_000.0;
 
 /// What `variants::prefer_majority` did, and what it left behind.
 ///
-/// WV-02. Before 0.2.0 the stage refused a fork outright when the branch the aligner walked
-/// was itself below `min_abund` or `min_vaf`, on the reasoning that such a branch is
-/// sequencing error and belongs to `--prune-frac`. But pruning removes branches below 1% of
-/// *gene depth* while this gate is 10% of the *fork*, so a walked branch between the two was
-/// neither pruned, nor swapped, nor reported anywhere. The reference-like minority of a
-/// contaminated or mixed sample lands exactly there, and `_primary` published it with
-/// `pident=100.0` and nothing to say so.
+/// A fork whose walked branch is itself below `min_abund` or `min_vaf` falls between the two
+/// mechanisms: pruning removes branches below a fraction of *gene depth*, while this gate is a
+/// fraction of the *fork*. Such a site is reported in `minority_left` whatever happens, and
+/// acted on only under `--rescue-minority`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MajorityReport {
     /// Sites where the route was moved onto the majority allele.
     pub swaps: usize,
     /// Of those, sites where the branch the aligner walked was itself a minority of the fork,
-    /// so the swap was the WV-02 rescue rather than an ordinary two-allele correction.
+    /// so the swap was a `--rescue-minority` rescue rather than an ordinary correction.
     pub minority_rescues: usize,
     /// The correction loop exhausted its `max_alts * 2` pass backstop with swaps still being
     /// applied, so this route was rewritten rather than corrected at a few sites.
@@ -1270,9 +1237,8 @@ pub struct MajorityReport {
     /// counted by reason. A non-zero total is a site where `_primary` knowingly keeps an
     /// allele the stage looked at replacing.
     ///
-    /// `exempt_minority` is the WV-02 category, a fork whose walked branch is itself a
-    /// minority; the others fire on ordinary two-allele sites as well. The JSON key stays
-    /// `minority_left` so the 0.2.0 schema does not churn again.
+    /// `exempt_minority` is a fork whose walked branch is itself a minority, which only
+    /// `--rescue-minority` acts on; the others fire on ordinary two-allele sites as well.
     pub left: MinorityLeft,
 }
 
@@ -1332,7 +1298,7 @@ pub struct AccessionResult {
     pub accession: Accession,
     pub outcome: Outcome,
     pub n_unitigs: usize,
-    /// WG-02: unitigs in this accession's file carrying neither `ka:f:` nor `km:f:`.
+    /// Unitigs in this accession's file carrying neither `ka:f:` nor `km:f:`.
     ///
     /// Copied from [`UnitigGraph::abundance_missing`], so it is a count over the whole file
     /// rather than the neighbourhood. Written to `summary.json` only when non-zero: an
@@ -1372,22 +1338,22 @@ pub struct AccessionResult {
     pub prune: Option<PruneReport>,
     /// Sites where `variants::prefer_majority` swapped the route onto the majority allele.
     ///
-    /// WV-07. The stage prints this, and prints a WARNING above 11, while `summary.json` said
-    /// only `pident_inherited: true`, which cannot tell 1 correction from 27. A primary that
-    /// was rerouted through a divergent segment looked identical to one that was not.
+    /// Reported as a count rather than as a flag: `pident_inherited: true` cannot tell one
+    /// correction from twenty-seven, and a primary rerouted through a divergent segment
+    /// should not look identical to one that was corrected at a single site.
     pub majority_corrections: usize,
     /// What the majority correction did and what it left behind. See [`MajorityReport`].
     pub majority: MajorityReport,
     /// What the alt search considered and refused. See [`VariantStats`].
     pub variants: VariantStats,
     /// Intra-host SNV sites called for this accession, or `None` when the primary could not
-    /// be mapped to the query within the alignment budget (WV-09/WV-20). `Some(0)` and `None`
+    /// be mapped to the query within the alignment budget. `Some(0)` and `None`
     /// are different answers: no variants, against no attempt.
     pub snv_sites: Option<usize>,
     /// Largest `ka:f` anywhere in this accession's extracted neighbourhood.
     pub ka_max: f32,
     /// That maximum has reached [`KA_CEILING`], so this accession's abundances are clipped
-    /// and every VAF, the prune floor and the majority calls rest on lower bounds (WV-03).
+    /// and every VAF, the prune floor and the majority calls rest on lower bounds.
     pub depth_saturated: bool,
     /// What this accession was built from. Present whatever the outcome: a `too_large` skip
     /// still records the size that got it skipped, and a reconstruction that later failed
@@ -1409,7 +1375,7 @@ pub enum PruneResult {
     /// The realignment produced no haplotype; the first stands.
     RefusedNoHaplotype,
     /// The realignment produced the first pass's haplotype with bases trimmed off an end and
-    /// nothing else changed; the first stands (WA-09).
+    /// nothing else changed; the first stands.
     ///
     /// `pruned_covers_as_much` lets a prune give up up to three reference bases, because a
     /// strict rule kept a reference-biased primary over one terminal codon. That tolerance is
@@ -1417,18 +1383,15 @@ pub enum PruneResult {
     /// sequence is pure loss, and a lost terminal base can be a truncated stop codon.
     RefusedTrimmed,
     /// The second pass itself failed: GraphAligner aborted, the scratch filesystem filled, or
-    /// the pruned GFA could not be written. The first pass stands (WP-04).
-    ///
-    /// Before 0.2.0 this was not a prune outcome at all: the error propagated and an
-    /// accession that was already reconstructed became `error`, with no FASTA record and
-    /// `prune: null`.
+    /// the pruned GFA could not be written. The first pass stands: a second pass that fails
+    /// refuses the prune rather than failing an accession that was already reconstructed.
     RefusedError,
 }
 
 impl PruneResult {
     /// Whether the prune ran and its result was thrown away, so the first-pass route stands.
     ///
-    /// WP-01. That route is the one the aligner produced on the unpruned graph, which is
+    /// That route is the one the aligner produced on the unpruned graph, which is
     /// where its reference pull is strongest: the low-depth reference-matching branches the
     /// prune exists to remove are still in the search space, and `prefer_majority` skips
     /// sites whose alternative is below the variant floor, so nothing else corrects them
@@ -1648,9 +1611,8 @@ mod tests {
         );
     }
 
-    /// TW-01. `Drop` unlinked `gfa_path` whoever built the value, and unit tests build
-    /// `Subgraph` by hand with paths they never created, so as root the suite deleted
-    /// `/dev/null` and then failed every `tests/cli.rs` case with `NotFound`.
+    /// Unit tests build `Subgraph` by hand with paths they never created, so an
+    /// unconditional `Drop` unlink deletes `/dev/null` when the suite runs as root.
     #[test]
     fn drop_unlinks_the_gfa_only_when_the_subgraph_owns_it() {
         let dir = std::env::temp_dir().join(format!("logan-types-drop-{}", std::process::id()));
@@ -1672,9 +1634,8 @@ mod tests {
 
         std::fs::write(&owned, b"H\tVN:Z:1.0\n").unwrap();
         drop(make(&owned, true));
-        // TW-08: `scratch::keep_scratch()` ignores the environment under `cfg(test)`, so this
-        // asserts one contract rather than branching on the developer's shell. The branch
-        // that used to be here was the workaround for the variable leaking into the suite.
+        // `scratch::keep_scratch()` ignores the environment under `cfg(test)`, so this can
+        // assert one contract rather than branching on the developer's shell.
         assert!(!owned.exists(), "Drop left a file the Subgraph did create");
 
         let _ = std::fs::remove_dir_all(&dir);

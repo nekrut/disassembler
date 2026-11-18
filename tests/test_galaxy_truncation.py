@@ -1,4 +1,4 @@
-"""PL-03: a Galaxy download that ends early must not read as a complete table.
+"""A Galaxy download that ends early must not read as a complete table.
 
 Run against a real local HTTP server rather than a stubbed stream, because the defect lives
 in the socket layer: `http.client.HTTPResponse.read1` returns `b""` when the connection

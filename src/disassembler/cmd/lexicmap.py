@@ -1,92 +1,61 @@
 #!/usr/bin/env python3
 """lexicmap: streaming multi-HSP coordinate tiling, codon QC, and haplotype collapsing.
 
-Streams LexicMap tabular search results directly from usegalaxy.org (over HTTP API),
-a local TSV file, or standard input (stdin).
+Reads a LexicMap tabular search from a Galaxy dataset, a local TSV or stdin, and writes a
+codon-checked cohort. The user documentation is docs/lexicmap.md; this is the contract.
 
-Core capabilities:
-  1. Multi-HSP coordinate tiling:
-     Solves the Logan contig-shattering problem by grouping HSPs by SRA accession
-     (`sgenome`), projecting alignment blocks onto the reference CDS coordinate system,
-     and resolving each overlapping position on its own, by how deep it lies inside each
-     HSP, recording the positions where two HSPs disagree. LexicMap is indexed
-     on Logan's *contigs* (`s3://logan-pub/c/`), not its unitig graph. On a diverse sample
-     the assembler shatters the gene at every bubble it cannot cleanly pop -- on Zika NS5
-     the gene tiles across ~50 short contigs, longest under 100 nt -- so LexicMap emits
-     one HSP per surviving contig. See docs/notes/contigs_vs_unitigs.md.
-  2. Reading-frame codon QC & Stop-codon screening:
-     Translates in-frame CDS (NCBI Code 11 or Standard), detects premature internal stop
-     codons (e.g. Sanger am3 amber mutants, sequencing errors, or out-of-frame projections),
-     and audits exact codon coordinates.
-  3. Cohort partitioning (tiers numbered as written to the ledger):
-     - Tier 1: Clean Full-Length (coverage >= min_coverage, 0 premature stops, no frameshift)
-     - Tier 2: Clean Partial (min_coverage_partial <= coverage < min_coverage, same rules)
-     - Tier 4: Low-Coverage Fragments (coverage < min_coverage_partial), whatever its frame
-       and stop codons say: too little of the gene is on the grid to judge either
-     - Tier 5: Flagged Frameshift (covered, frame shifted for >= FRAMESHIFT_MIN_SPAN bases)
-     - Tier 3: Flagged Premature Stops (covered, in frame, stops > max_stops)
-     - Tier 6: Flagged Mixed HSPs (covered, in frame, no stops, but the accession's own HSPs
-       place different bases at a position well inside both; `--allow-mixed` waives it)
-     Indels are read from the aligned qseq/sseq. In-frame deletions stay in the row as '-' and
-     count as covered; insertions have no column, so they are recorded instead (ledger, FASTA
-     headers, haplotype table). Indels within INDEL_EDGE_WINDOW bases of an HSP end are
-     reported but not trusted.
-  4. Online haplotype collapser:
-     Collapses clean full-length sequences without holding the input, calls nucleotide and
-     amino acid mutations, classifies mutation impact (WT, WT_partial, Synonymous, Missense,
-     Nonsense, InFrameIndel, Frameshift), and outputs clean MSAs, mutation frequency tables,
-     and complete cohort ledgers. A haplotype is its row plus its trusted indels.
+What it does, in order:
 
-     Memory is O(distinct clean full-length haplotypes), NOT O(1): `clean_full_haps`,
-     `clean_full_pident_sum` and `clean_full_samples` are keyed by the full merged sequence,
-     so on a divergent target where few accessions share a haplotype this approaches one
-     entry per accession, each holding a copy of the sequence. It is the ROW count that
-     streams, which is the thing that is unbounded; the haplotype count is not.
-  5. Regime diagnostics:
-     Calculates coverage and identity quantiles (p10, p25, median, p75, p90), detects
-     divergent targets (median pid < 85% or cov < 0.60), and alerts when de novo
-     graph path-walking with `logan-walker` is required.
+  1. **Tiles multi-HSP accessions.** LexicMap is indexed on Logan's *contigs*, not its unitig
+     graph, and on a diverse sample the assembler shatters the gene at every bubble it cannot
+     pop, so one accession arrives as many HSPs. Rows are grouped by `sgenome`, projected onto
+     the reference CDS coordinates, and each overlapping position is resolved on its own by
+     how deep it lies inside each HSP, recording where two HSPs disagree. See
+     docs/notes/contigs_vs_unitigs.md.
+  2. **Checks the reading frame**, translating in-frame CDS (NCBI code 11 or standard) and
+     auditing premature internal stops at exact codon coordinates.
+  3. **Sorts accessions into six tiers**, written to the ledger as `status` and `tier`:
 
-Outputs generated:
-  - <out-prefix>.clean.msa.fasta             (collapsed clean haplotypes with rank and count)
-  - <out-prefix>.clean.haplotypes.tsv        (detailed mutation audit, frequencies, sample accessions)
-  - <out-prefix>.clean.accessions.fasta      (uncollapsed full-length clean accessions)
-  - <out-prefix>.clean_expanded.accessions.fasta (clean cohort including >=50% partials)
-  - <out-prefix>.flagged.accessions.fasta    (flagged: stops, frameshifts, low cov, mixed HSPs)
-  - <out-prefix>.cohort_ledger.tsv           (--cohort-ledger only: the summary's
-                                              records[] as a TSV)
-  - <out-prefix>.summary.json                (quantiles, cohort breakdown, multi-HSP rescue counts)
-  - <out-prefix>.clean.a2m                   (NUCLEOTIDE A2M of the reference + collapsed
-                                              tier 1 haplotypes; translate before using it with
-                                              protein MSA models / EVcouplings)
+       1 CLEAN_FULL_LENGTH       coverage >= min_coverage, no premature stop, no frameshift
+       2 CLEAN_PARTIAL           coverage >= min_coverage_partial, same stop/frame rules
+       3 FLAGGED_PREMATURE_STOPS covered and in frame, stops > max_stops
+       4 LOW_COVERAGE_FRAGMENT   coverage < min_coverage_partial, whatever its frame says
+       5 FLAGGED_FRAMESHIFT      covered, frame shifted for >= FRAMESHIFT_MIN_SPAN bases
+       6 FLAGGED_MIXED_HSPS      covered, in frame, no stops, but its own HSPs disagree
 
-Note on the FASTA/MSA outputs:
-  Every row is projected onto the reference grid, so .clean.msa.fasta, .clean.accessions.fasta
-  and .clean.a2m are already column-aligned, reference-length files. Reference positions no HSP
-  covers, or that the sample deletes, are written as '-': with the default --min-cov 0.80 a
-  clean row can be up to 20% '-' plus its deletions. Under --require-full-length the only '-'
-  in a clean row are in-frame deletions; on three cohorts without any, re-running MAFFT
-  reproduced the rows byte for byte. Insertions have no column; they are listed in the ledger,
-  the FASTA headers and the haplotype table instead. See docs/lexicmap.md.
+     The rules apply in the order coverage, frameshift, stops, conflict, which is not tier
+     order: too little of the gene on the grid to judge is a fragment whatever else is true.
+     Indels come from the aligned qseq/sseq; an in-frame deletion stays in the row as `-` and
+     counts as covered, while an insertion has no column and is recorded separately. An indel
+     within INDEL_EDGE_WINDOW bases of an HSP end is reported but not trusted.
+  4. **Collapses tier 1 into haplotypes** as they stream, calling nucleotide and amino-acid
+     mutations and classifying each (WT, WT_partial, Synonymous, Missense, Nonsense,
+     InFrameIndel, Frameshift). A haplotype is its row plus its trusted indels.
 
-Examples:
-  # Stream directly from a Galaxy dataset ID over HTTP:
-  disassembler lexicmap \\
-      -q queries/markers/zika_ns5.fasta \\
-      -d f9cad7b01a47213500416a19986dca5c \\
-      -o out/zika_lexicmap
+     Memory is O(distinct clean full-length haplotypes), **not** O(1): `clean_full_haps`,
+     `clean_full_pident_sum` and `clean_full_samples` are keyed by the merged sequence, so on
+     a divergent target this approaches one entry per accession. The ROW count is what
+     streams, and rows are what is unbounded.
+  5. **Reports the regime**: coverage and identity quantiles, and a warning when the target is
+     divergent enough (median pident < 85% or cov < 0.60) that `logan-walker` is the better
+     route.
 
-  # Stream from a local LexicMap tabular file:
-  disassembler lexicmap \\
-      -q queries/query_hiv1_pol.fasta \\
-      -f /data/hiv1_pol_lexicmap.tsv \\
-      -o out/hiv1_pol
+Outputs, all at `<out-prefix>`:
 
-  # Pipe directly from a compressed file or stream via STDIN:
-  zcat /data/lexicmap_output.tsv.gz | disassembler lexicmap \\
-      -q queries/pfcrt_only.fasta \\
-      -f - \\
-      -o out/pfcrt
+  .clean.msa.fasta              collapsed clean haplotypes, with rank and count
+  .clean.haplotypes.tsv         mutation audit, frequencies, sample accessions
+  .clean.accessions.fasta       uncollapsed full-length clean accessions
+  .clean_expanded.accessions.fasta   clean cohort including partials
+  .flagged.accessions.fasta     stops, frameshifts, low coverage, mixed HSPs
+  .cohort_ledger.tsv            --cohort-ledger only: the summary's records[] as a TSV
+  .summary.json                 quantiles, cohort breakdown, multi-HSP rescue counts
+  .clean.a2m                    NUCLEOTIDE A2M of the reference plus tier 1; translate it
+                                before use with protein MSA models
+
+Every row is projected onto the reference grid, so the FASTA and MSA outputs are already
+column-aligned at reference length and need no MAFFT. A position no HSP covers, or that the
+sample deletes, is `-`, so at the default --min-cov 0.80 a clean row can be a fifth `-` plus
+its deletions; under --require-full-length the only `-` are in-frame deletions.
 """
 
 import os
@@ -120,7 +89,7 @@ from disassembler.validators import (
 
 # Translation table: NCBI standard / bacterial code 11
 def codon_table_for(genetic_code: int = 11) -> dict:
-    """`{codon: residue}` with `*` for stops, for an NCBI genetic code id (PL-04).
+    """`{codon: residue}` with `*` for stops, for an NCBI genetic code id.
 
     The table used to be a single hand-written code 11 literal with no way to choose another.
     TGA is Trp in code 4 and in the mitochondrial codes, and CTG is Ser in code 12, which the
@@ -147,7 +116,7 @@ def codon_table_for(genetic_code: int = 11) -> dict:
 CODON_TABLE_11 = codon_table_for(11)
 
 def get_galaxy_api_key(api_key: str = None, key_file: str = None) -> str:
-    """The Galaxy API key. One implementation, in `disassembler.galaxy` (PL-27); this name
+    """The Galaxy API key. One implementation, in `disassembler.galaxy`; this name
     stays because the tests and `harvest` both reach for it."""
     return galaxy.api_key(api_key, key_file)
 
@@ -170,11 +139,11 @@ def find_internal_stops(seq: str, ref_len: int, codon_table: dict = CODON_TABLE_
     Finds 1-based codon positions of premature stop codons in the coding body.
 
     `skip_last` leaves the final codon out, which is right only when the reference ends in its
-    natural stop. PL-05: it was unconditional, and six shipped references are polyprotein
-    segments that end in a sense codon (`dengue_1_ns5` to `dengue_4_ns5`, `westnile_ns5`,
-    `zika_ns5`, which ends CTG). A nonsense change in the last codon of those passed the tier
-    rule while the haplotype table, which translates the whole row, called the same haplotype
-    `Nonsense`: the two outputs contradicted each other. Dengue NS5 ends TGG, one G>A from
+    natural stop. It cannot be unconditional: six shipped references are polyprotein segments
+    that end in a sense codon (`dengue_1_ns5` to `dengue_4_ns5`, `westnile_ns5`, `zika_ns5`,
+    which ends CTG). Skipping the last codon of those lets a nonsense change there pass the
+    tier rule while the haplotype table, which translates the whole row, calls the same
+    haplotype `Nonsense`. Dengue NS5 ends TGG, one G>A from
     TAG or TGA.
     """
     stop_positions = []
@@ -184,17 +153,6 @@ def find_internal_stops(seq: str, ref_len: int, codon_table: dict = CODON_TABLE_
             if codon_table.get(codon, 'X') == '*':
                 stop_positions.append(i // 3 + 1)
     return stop_positions
-
-def compute_quantiles(values: list) -> dict:
-    """Deprecated alias for `summary.quantiles`, kept for callers outside this module.
-
-    0.1.x named the median `p50_median` here while nothing else in the suite reported
-    quantiles at all. `summary.quantiles` is now the one implementation, under `p50`, and an
-    empty input gives None rather than a row of zeros that looks like a measurement.
-    """
-    return summary_io.quantiles(values) or {
-        "p10": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "p90": 0.0, "mean": 0.0
-    }
 
 # How many malformed rows to name individually before falling back to a count.
 MALFORMED_REPORT_LIMIT = 5
@@ -228,16 +186,15 @@ def load_reference(fasta_path: str):
                     header = line[1:]
                 continue
             if n_records == 0:
-                # PL-08: `msa` rejects text before the first header and this reader skipped
+                # `msa` rejects text before the first header and this reader skipped
                 # it, so one file had two lengths in one `from-lexicmap` run.
                 raise ValueError(f"{path}: text before the first '>' header ({line[:40]!r})")
             if n_records == 1:
-                # PL-08: a space or tab inside a sequence line used to become a reference
+                # A space or tab inside a sequence line must not become a reference
                 # POSITION. `validators.fasta_record_lengths` and Biopython both drop it, so
-                # a 12 nt CDS written `ATGGCT GAATAA` loaded as 13 nt here and 12 everywhere
-                # else: `is_cds` went false, the stop and frame rules switched off, an
-                # identical sample scored 0.9231 coverage with spurious changes, and a
-                # premature stop entered the clean cohort, all at exit 0.
+                # a 12 nt CDS written `ATGGCT GAATAA` would load as 13 nt here and 12
+                # everywhere else: `is_cds` goes false, the stop and frame rules switch off,
+                # and an identical sample scores 0.9231 coverage, all at exit 0.
                 seq_parts.append("".join(line.split()))
 
     if n_records > 1:
@@ -272,7 +229,7 @@ def get_galaxy_stream(dataset_id: str, base_url: str = "https://usegalaxy.org", 
 # Galaxy's own `Dataset.non_ready_states`.
 GALAXY_PENDING_STATES = {"new", "upload", "queued", "running", "setting_metadata"}
 
-# PL-23: states that will never become `ok` on their own. `deferred` and `paused` used to be
+# States that will never become `ok` on their own. `deferred` and `paused` used to be
 # treated as pending, so the run exited EX_TEMPFAIL saying "rerun once it is 'ok'" and a
 # script retrying on 75, which the docs invite, looped until its own limit. A deferred
 # dataset is terminal and needs a materialize request; a paused job needs a person to resume
@@ -363,7 +320,7 @@ class Tiling(NamedTuple):
     single_ge_min_cov: bool
     single_full: bool
     indels: list         # Indel, in reference order
-    conflicts: tuple = ()  # 0-based reference positions where two HSPs disagreed (PL-01)
+    conflicts: tuple = ()  # 0-based reference positions where two HSPs disagreed
 
 
 def _covered_runs(seq: str):
@@ -384,7 +341,7 @@ def _covered_runs(seq: str):
 
 
 def coverage_independent_haplotypes(haps, hap_indels, ref_seq: str, ref_len: int) -> dict:
-    """Haplotype counts that do not move when an accession's contigs stop short (PL-02).
+    """Haplotype counts that do not move when an accession's contigs stop short.
 
     Tier 1 rows are collapsed on the whole reference-length row, which carries `-` at every
     untiled position, and with the default `--min-cov 0.80` a tier 1 row may be a fifth `-`.
@@ -498,15 +455,12 @@ def shannon_bits(counts) -> float:
 
 
 class StagedOutputs:
-    """Writes every bulk output to `<name>.part` and renames them in only on success (PL-22).
+    """Writes every bulk output to `<name>.part` and renames them in only on success.
 
-    Five cohort files used to be opened under their final names before a single row was
-    streamed, while the MSA, A2M, haplotype tables and summary were written at the end. A
-    rerun that failed part-way (ungrouped input, a qlen mismatch, no matching query) left
-    this run's cohort files beside the previous run's MSA and haplotype table, and a
-    successful `--no-a2m` rerun left the previous run's `.clean.a2m`, with a different
-    haplotype count in it, next to a fresh MSA at exit 0. Nothing on disk said which files
-    belonged together.
+    The cohort files stream from the first row while the MSA, A2M, haplotype tables and
+    summary are written at the end, so opening them under their final names leaves a failed
+    rerun's cohort files beside the previous run's MSA, with nothing on disk saying which
+    belong together.
 
     `summary.json` is deliberately NOT staged: a failed run still writes one, saying it
     failed, which is how a reader is meant to tell (docs/summaries.md rule 4). Anything else
@@ -564,7 +518,7 @@ class StagedOutputs:
 
 
 def output_stem(ref_name: str, ref_path: str) -> str:
-    """The file stem for a run's outputs: `ref_name` made safe as one path component (PL-10).
+    """The file stem for a run's outputs: `ref_name` made safe as one path component.
 
     `ref_name` itself is unchanged and keeps driving the query-name filter, the FASTA headers
     and `summary.json`, because that is the name the search used and it has to keep matching.
@@ -602,22 +556,17 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
     `pident`, then by input order. Where two HSPs place different symbols at a position that
     is at least INDEL_EDGE_WINDOW inside both, the position is recorded in `conflicts`.
 
-    PL-01. The rule used to be whole-HSP: `if ex is None or pident > ex[1]`, so the HSP with
-    the higher identity *to the reference* won every position it touched. Logan leaves an
-    unpopped SNP bubble as two separate contigs, both of which pass LexicMap's default
-    `-l 50 -i 70`, and the reference branch is 100% identical while the alternative one is
-    not, so the reference branch overrode the real variant at every position regardless of
-    which allele the sample actually carries. A deletion carried by the losing HSP was then
-    dropped as "not owned", so premature stops and frameshifts disappeared with it: a mixed
-    sample came out CLEAN_FULL_LENGTH wild type with nothing in any column saying so. On an
-    emulation of LexicMap HSPs over the real Logan contigs of the 9 Zika accessions in the
-    docs, that was 37-46 wrong bases per accession.
+    Per position, and not per HSP. Ranking whole HSPs by identity to the reference makes the
+    reference branch win every position it touches: Logan leaves an unpopped SNP bubble as two
+    contigs, both of which pass LexicMap's defaults, and only the reference branch is 100%
+    identical. That overrides the real variant whatever the sample carries, and a deletion on
+    the losing HSP goes with it, so a mixed sample comes out CLEAN_FULL_LENGTH wild type.
+    Measured at 37-46 wrong bases per accession on emulated HSPs over real Logan contigs.
 
     Depth is the right tiebreak because a short bubble branch is short: every one of its
     positions is near one of its ends, while the same positions sit deep inside the contig
-    that spans the gene. Identity to the reference is kept only as a second-order tiebreak,
-    where it no longer decides between alleles. Ranking whole HSPs by length or bitscore
-    instead does not help: bubble branches tie on length and bitscore favours the reference.
+    that spans the gene. Length and bitscore do not work: branches tie on length, and bitscore
+    favours the reference.
 
     Conflicts are not resolved silently either way, because the tiler cannot know which
     branch the sample carries: they are reported, and `--allow-mixed` is how a caller says to
@@ -631,7 +580,7 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
     supplied the positions it affects: both flanks of an insertion, every position of a
     deletion. Otherwise another HSP's bases are what the row shows there.
     """
-    # Four parallel lists, not one list of tuples (PL-25). `chars` is the row itself, so an
+    # Four parallel lists, not one list of tuples. `chars` is the row itself, so an
     # ungapped HSP landing on untouched ground is one slice assignment from a string rather
     # than a tuple allocated per reference position; `own` is the HSP that supplied each
     # position, from which the rest is looked up. Depth and identity are not stored at all:
@@ -640,7 +589,7 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
     own = [-1] * ref_len
     # The best real base at each position, ignoring gaps. A deletion writes '-' into the row
     # like any other symbol, so without this an edge deletion hides a base another HSP
-    # supplied (PL-07).
+    # supplied.
     bchar = [None] * ref_len
     bown = [-1] * ref_len
 
@@ -753,7 +702,7 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
             if cur < hi:
                 contested.append((cur, hi))
             # Inlined rather than calling `place`: `place` and the `depth_at` inside it were
-            # 60% of this function's time, at four calls per contested position (PL-25).
+            # 60% of this function's time, at four calls per contested position.
             for a, b in contested:
                 for p in range(a, b):
                     ch = upper[p - first]
@@ -816,7 +765,7 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
 
     # An insertion occupies no reference position, so two HSPs disagreeing about one cannot
     # show up as two symbols at a position. If another HSP spans the junction well inside
-    # itself and carries no matching insertion there, they disagree (PL-01).
+    # itself and carries no matching insertion there, they disagree.
     ins_at = {(k, pos): bases for k, kind, pos, length, bases in raw if kind == "ins"}
     for (k, pos), bases in ins_at.items():
         first, end = spans[k]
@@ -839,14 +788,13 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
         return (min(pos - first, end - pos) if kind == "ins"
                 else min(pos - first, end - (pos + length)))
 
-    # PL-06: an indel is an end artefact only if EVERY HSP carrying it sees it near one of
-    # its own ends. The margin used to be read from the owning HSP alone, so an indel 10
-    # bases from one contig's end but deep inside the next contig's overlap with it was
-    # marked `(edge)`, then ignored by the frame rule and the stop splice, and which contig
-    # was consulted depended on input order: a frameshifted gene entered the clean cohort for
+    # An indel is an end artefact only if EVERY HSP carrying it sees it near one of its own
+    # ends. Reading the margin from the owning HSP alone marks an indel 10 bases from one
+    # contig's end but deep inside the next contig's overlap as `(edge)`, and which contig
+    # owns it depends on input order: a frameshifted gene enters the clean cohort for
     # no better reason than the order of the rows.
     #
-    # Measured note: with ownership decided by depth (PL-01) this set cannot change a verdict,
+    # Measured note: with ownership decided by depth this set cannot change a verdict,
     # because the HSP that owns every position of an indel is necessarily the one with the
     # largest margin. Checked over 20,000 randomized multi-HSP tilings with indels: zero
     # differences against reading the margin from the owner alone. It is kept because it
@@ -867,11 +815,11 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
                                 (kind, pos, length, bases) not in inner))
     indels.sort(key=lambda e: e.pos)
 
-    # PL-07: an edge deletion is an alignment artefact, not a claim about the sample, so its
-    # '-' must not hide a base another HSP placed at the same position. The gap entered the
-    # per-position contest like a base and stayed there even after the deletion was ruled an
-    # artefact, so the row showed '-', `covered` was short by its length, and the accession
-    # became a haplotype of its own (and, under --require-full-length, CLEAN_PARTIAL).
+    # An edge deletion is an alignment artefact, not a claim about the sample, so its '-'
+    # must not hide a base another HSP placed at the same position. Letting the gap into the
+    # per-position contest leaves it there even after the deletion is ruled an artefact, so
+    # the row shows '-', `covered` is short by its length, and the accession becomes a
+    # haplotype of its own.
     # Refilled only when every position of the deletion has a base to put back: a partial
     # refill would leave an indel record that no longer describes what the row shows.
     if any(e.kind == "del" and e.edge for e in indels):
@@ -924,7 +872,7 @@ def split_by_frame(indels: list) -> tuple:
             continue
         opening = offset == 0
         if opening:
-            # PL-17: the frame shifts only AFTER a deletion's own bases, which the sample
+            # The frame shifts only AFTER a deletion's own bases, which the sample
             # does not have. Opening the cluster at `e.pos` counted them as read out of
             # frame, so `31_64del,70_71del` (5 bases genuinely out of frame) was
             # FLAGGED_FRAMESHIFT while `31_34del,40_41del`, the same 5 bases, was clean.
@@ -949,11 +897,11 @@ def apply_indels(seq: str, ref_len: int, applied: list):
     and `pieces[j]` is `(reference position it begins at, is it an insertion)`, which is what
     maps a position in the sample back to a reference codon.
 
-    PL-29 split this out of `find_internal_stops_with_indels`, which was the only thing that
-    had it: the haplotype table called amino-acid changes on the reference-GRID row, where an
-    insertion is absent and deleted bases are `-`, and `translate_nt` returns `-` for any
-    codon holding a gap. Every codon an indel touched was therefore skipped, inserted
-    residues never appeared, and a haplotype whose only changes were indels printed
+    Split out of `find_internal_stops_with_indels` so the haplotype table can use it too.
+    Calling amino-acid changes on the reference-GRID row instead loses them: an insertion is
+    absent there, deleted bases are `-`, and `translate_nt` returns `-` for any codon holding
+    a gap, so every codon an indel touches is skipped, inserted residues never appear, and a
+    haplotype whose only changes are indels prints
     `num_aa_muts 0` and `aa_mutations NA` while `nt_mutations` and the `InFrameIndel` class
     said plainly that something had changed.
     """
@@ -1123,11 +1071,10 @@ def stream_lexicmap_to_msa(
     else:
         src_kind, src_id = "stdin", "-"
 
-    # PL-19: --require-full-length REPLACES --min-cov as the tier 1 gate, so everything
-    # that describes or applies that gate has to read the same value. The banner printed
-    # `full_length_cov=80.0%`, the tier 2 label read "50%-80% cov", the argument check
-    # refused `--min-cov-partial 0.9` with a false reason, and `tile_accession_hsps` was
-    # handed `min_coverage`, so `multi_hsp_rescued_accessions` was judged against 80% in a
+    # --require-full-length REPLACES --min-cov as the tier 1 gate, so everything that
+    # describes or applies that gate has to read the same value: the banner, the tier 2
+    # label, the argument check, and the value handed to `tile_accession_hsps`, which is
+    # what `multi_hsp_rescued_accessions` is judged against in a
     # run whose gate was 100%.
     full_cov = 1.0 if full_length_only else min_coverage
 
@@ -1135,11 +1082,10 @@ def stream_lexicmap_to_msa(
     ref_len = len(ref_seq)
     codon_table = codon_table_for(genetic_code)
 
-    # PL-04. The only test of the reference used to be `ref_len % 3 == 0`; it was never
-    # translated and never checked. One non-coding target in three has a length that is a
-    # multiple of 3 (E. coli 16S is 1542 nt), and its own in-frame stops were then counted
-    # against every sample, so perfect matches included, the whole cohort landed in
-    # FLAGGED_PREMATURE_STOPS and the run exited 1 reporting an empty clean cohort: the right
+    # `ref_len % 3 == 0` is not enough on its own: one non-coding target in three has a
+    # length that is a multiple of 3 (E. coli 16S is 1542 nt), and its own in-frame stops
+    # would be counted against every sample, perfect matches included, putting the whole
+    # cohort in FLAGGED_PREMATURE_STOPS and exiting 1 on an empty clean cohort: the right
     # exit code for the wrong reason, and nothing pointed at the reference.
     ref_is_cds = (not non_coding) and ref_len % 3 == 0
     if not non_coding and ref_len % 3 != 0:
@@ -1158,7 +1104,7 @@ def stream_lexicmap_to_msa(
                 f"--genetic-code, or pass --non-coding."
             )
     ref_aa = translate_nt(ref_seq, codon_table) if ref_is_cds else ""
-    # PL-05: only skip the final codon when the reference actually ends in a stop.
+    # Only skip the final codon when the reference actually ends in a stop.
     ref_has_term_stop = ref_aa.endswith("*")
 
     if dataset_id:
@@ -1207,19 +1153,16 @@ def stream_lexicmap_to_msa(
         if header_line and not (header_line.startswith("#") and "\t" not in header_line):
             break
 
-    # Strip leading '#' if present on first column
     if header_line.startswith("#"):
         header_line = header_line[1:].strip()
 
     header_cols = header_line.split("\t")
     col_idx = {c.strip(): i for i, c in enumerate(header_cols)}
 
-    # Schema resolution
     def find_col(candidates):
         for c in candidates:
             if c in col_idx:
                 return col_idx[c]
-        # Case-insensitive fallback
         lower_map = {k.lower(): v for k, v in col_idx.items()}
         for c in candidates:
             if c.lower() in lower_map:
@@ -1256,7 +1199,7 @@ def stream_lexicmap_to_msa(
         # here rather than leaving it to the collector.
         if raw is not sys.stdin.buffer:
             stream.close()
-        # PL-21: a KeyError here gave a 15-line traceback for the likeliest user mistake of
+        # A KeyError here gave a 15-line traceback for the likeliest user mistake of
         # all, which is running `lexicmap search` without `-a/--all`: its default output
         # carries no qseq/sseq at all. `run` promises one line naming the cause.
         hint = ("" if not ({"qseq", "sseq"} & {m for m in missing}) else
@@ -1272,7 +1215,6 @@ def stream_lexicmap_to_msa(
     if idx_qlen is None:
         print(f"[*] no qlen column; skipping the reference length agreement check.")
 
-    # Cohort file handles
     staged = StagedOutputs(out_prefix)
     f_clean_fa = staged.open(".clean.accessions.fasta")
     f_clean_exp_fa = staged.open(".clean_expanded.accessions.fasta")
@@ -1300,9 +1242,8 @@ def stream_lexicmap_to_msa(
     clean_full_samples = defaultdict(list)
     hap_indels = {}   # haplotype key -> its trusted Indel list
 
-    # PL-24: the docstring promised memory proportional to distinct haplotypes, but these
-    # two lists grew one Python float per accession (about 177 B measured, 384 MB at 2 M
-    # accessions), so a Galaxy allocation sized from the docs was too small. Coverage is
+    # Counters, not lists: one Python float per accession is about 177 B, so lists would be
+    # 384 MB at 2M accessions and break the memory bound this module documents. Coverage is
     # `covered / ref_len` with `covered` an integer in [0, ref_len], so a Counter over it is
     # exact and holds at most ref_len + 1 keys however many accessions there are; identities
     # go in a C array of doubles rather than a list of boxed floats.
@@ -1361,9 +1302,9 @@ def stream_lexicmap_to_msa(
                 f"contiguous. Sort the data rows, keeping the header where it is:\n"
                 f"  (head -n1 in.tsv; tail -n +2 in.tsv | "
                 f"sort -t$'\\t' -k{idx_sgenome + 1},{idx_sgenome + 1} -s) > sorted.tsv\n"
-                f"then re-run on sorted.tsv. PL-12: the advice used to be a bare `sort`, "
-                f"which under LC_ALL=C puts the header last, so the first data row was read "
-                f"as the header and the re-run died in the schema check."
+                f"then re-run on sorted.tsv. A bare `sort` will not do: under LC_ALL=C it "
+                f"puts the header last, so the first data row is read as the header and the "
+                f"re-run dies in the schema check."
             )
         seen_accessions.add(acc)
 
@@ -1401,7 +1342,7 @@ def stream_lexicmap_to_msa(
         # so it never shows one as a run of stop codons. Only a shift lasting
         # FRAMESHIFT_MIN_SPAN bases counts. --allow-frameshift-alts waives that tier only;
         # premature stops still flag.
-        # PL-01: positions where this accession's own HSPs placed different bases. The
+        # Positions where this accession's own HSPs placed different bases. The
         # tiler picked one by depth, but which allele the sample carries is not something the
         # tiler can know, so a conflicted row is reported rather than published as clean.
         conflicts = tiling.conflicts
@@ -1410,7 +1351,7 @@ def stream_lexicmap_to_msa(
         count_conflict_sites += len(conflicts)
 
         stops_ok = n_stops <= max_internal_stops
-        # PL-09: the frame rule applies to a coding reference only. For an rRNA, ITS, UTR
+        # The frame rule applies to a coding reference only. For an rRNA, ITS, UTR
         # or intergenic marker the tool already switches the stop scan off and has
         # NonCoding_* haplotype classes, but any accession with a 1 or 2 nt indel lasting 30
         # bases was still filed FLAGGED_FRAMESHIFT at exit 0, so the indel allele could never
@@ -1446,19 +1387,17 @@ def stream_lexicmap_to_msa(
             f_clean_exp_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} status=CLEAN_PARTIAL{indel_tag}\n{merged_seq}\n")
 
         # Coverage decides before the frame and stop rules do. Below the partial threshold
-        # there is too little of the gene on the grid to tell a real frameshift or a real
-        # premature stop from a gap in the tiling: on the SARS-CoV-2 strict pass, 61,897 of
-        # the 64,034 accessions this reported as frameshifted were fragments at a median
-        # coverage of 0.18. Through 0.1.1-dev the frame and stop rules ran first, so both
-        # flagged tiers were mostly fragments. In this order they mean what they say: covered
-        # well enough to judge, and broken.
-        # PL-18: `--min-cov-partial 0` (which the Galaxy wrapper allows) let an accession
-        # whose HSPs all failed --min-pident through as CLEAN_PARTIAL, and with --min-cov 0
-        # as well its all-gap row became a `WT_partial` haplotype counted in the frequencies
-        # and the entropy. Nothing tiled is a fragment whatever the thresholds say.
+        # there is too little of the gene on the grid to tell a real frameshift or premature
+        # stop from a gap in the tiling: judging frame first would put 61,897 of 64,034
+        # SARS-CoV-2 frameshift calls at a median coverage of 0.18. In this order the flagged
+        # tiers mean what they say: covered well enough to judge, and broken.
+        #
+        # Nothing tiled is a fragment whatever the thresholds say: `--min-cov-partial 0`
+        # would otherwise admit an accession whose HSPs all failed --min-pident, and its
+        # all-gap row would be counted as a `WT_partial` haplotype.
         else:
             # One writer for the four flagged tiers; they differed only in the label and in
-            # what each adds after it, and the same line was written out four times (PL-28).
+            # what each adds after it, and the same line was written out four times.
             def flag(label, extra=""):
                 f_flagged_fa.write(f">{acc} cov={cov:.4f} pid={mean_pid:.2f} flag={label}"
                                    f"{extra}{indel_tag}\n{merged_seq}\n")
@@ -1475,7 +1414,7 @@ def stream_lexicmap_to_msa(
                 status, tier = "FLAGGED_PREMATURE_STOPS", 3
                 count_flagged_stops += 1
                 flag("PREMATURE_STOPS", f" stops={n_stops} codons={stop_str}")
-            else:  # covered, in frame, no stops: mixed_ok is false by elimination (PL-01)
+            else:  # covered, in frame, no stops: mixed_ok is false by elimination
                 status, tier = "FLAGGED_MIXED_HSPS", 6
                 count_flagged_mixed += 1
                 flag("MIXED_HSPS", f" conflicts={len(conflicts)} sites={conflict_str}")
@@ -1504,10 +1443,10 @@ def stream_lexicmap_to_msa(
         })
 
     def check_download_complete():
-        """Raise if a Galaxy body stopped short of its Content-Length (PL-03).
+        """Raise if a Galaxy body stopped short of its Content-Length.
 
         Called from two places. A cut lands either between rows, where only the byte count
-        reveals it, or inside one, where PL-14's short-row check notices first. When it is a
+        reveals it, or inside one, where the short-row check notices first. When it is a
         download, the byte count is the better message: it says what went wrong rather than
         describing the shape of the damage, so it is consulted before that check raises.
         """
@@ -1519,7 +1458,7 @@ def stream_lexicmap_to_msa(
                 f"and every output below it would be incomplete. Rerun it."
             )
 
-    # Hoisted: this was rebuilt for every row (PL-28).
+    # Hoisted: this was rebuilt for every row.
     max_needed = max([idx_sgenome, idx_pident, idx_qcov, idx_qstart, idx_qend, idx_qseq,
                       idx_sseq] + [i for i in (idx_query, idx_qlen) if i is not None])
     try:
@@ -1527,7 +1466,7 @@ def stream_lexicmap_to_msa(
             line = stream.readline()
             if not line:
                 break
-            # PL-14: `strip()` also removed empty trailing fields, so a row whose last column
+            # `strip()` also removed empty trailing fields, so a row whose last column
             # is empty looked short. Only the line ending comes off.
             unterminated = not line.endswith("\n")
             line = line.rstrip("\r\n")
@@ -1537,7 +1476,7 @@ def stream_lexicmap_to_msa(
             total_rows += 1
             parts = line.split("\t")
             if len(parts) <= max_needed:
-                # PL-14: this used to be a silent `continue`, with no counter and no message,
+                # This used to be a silent `continue`, with no counter and no message,
                 # unlike every other skip. A plain table cut inside its last row therefore
                 # demoted its final accession at exit 0, and a table whose rows were all short
                 # exited 1 reporting an empty clean cohort instead of a schema mismatch.
@@ -1602,7 +1541,7 @@ def stream_lexicmap_to_msa(
             qseq = parts[idx_qseq]
             sseq = parts[idx_sseq]
 
-            # PL-20: nothing used to compare `qseq` with the reference slice it is projected
+            # Nothing used to compare `qseq` with the reference slice it is projected
             # onto, so a reference carrying the search's query NAME and LENGTH but another
             # sequence tiled every accession against the wrong sequence at exit 0, and a
             # hand-edited or truncated row tiled partially without a word.
@@ -1636,22 +1575,20 @@ def stream_lexicmap_to_msa(
                       f"Flagged Stops: {count_flagged_stops:,} | Speed: {rate:,.0f} rows/s")
                 last_report_time = now
 
-            # PL-13: the limit used to cut through an accession's HSP block, so the last
-            # accession of a preview was judged from a fraction of its HSPs and a clean
-            # multi-HSP accession came out LOW_COVERAGE_FRAGMENT. tools-iuc #8800 exposes
-            # this as a Galaxy "preview" knob, where that is exactly the wrong answer to
-            # show. Finish the open block, then stop before opening another.
+            # Finish the open block, then stop before opening another. Cutting through an
+            # accession's HSP block judges it from a fraction of its HSPs, so a clean
+            # multi-HSP accession comes out LOW_COVERAGE_FRAGMENT, which is the wrong thing
+            # for a preview to show.
             if max_records and total_rows >= max_records and not limit_hit:
                 print(f"\n[*] Reached row limit (--max-records {max_records:,}); "
                       f"finishing the HSP block of '{curr_acc}'.")
                 limit_hit = True
 
-        # PL-03. A body cut short of its Content-Length reads as a plain end of file:
-        # `HTTPResponse.read1` returns b"" rather than raising `IncompleteRead`, which CPython
-        # does deliberately for compatibility, and `TextIOWrapper` passes that on as EOF. The
-        # loop above therefore treated a half-delivered table as the whole table, tiled the
-        # accessions it did get, wrote `"status": "ok"` and exited 0. A preview is the one
-        # case where bytes are owed on purpose.
+        # A body cut short of its Content-Length reads as a plain end of file:
+        # `HTTPResponse.read1` returns b"" rather than raising `IncompleteRead`, deliberately,
+        # and `TextIOWrapper` passes that on as EOF, so without this check a half-delivered
+        # table is tiled as the whole table and written with `"status": "ok"`. A preview is
+        # the one case where bytes are owed on purpose.
         if not limit_hit:
             check_download_complete()
 
@@ -1699,14 +1636,14 @@ def stream_lexicmap_to_msa(
                 )
 
     except BaseException:
-        # PL-22: whatever went wrong, this run's half-written outputs do not survive it.
+        # Whatever went wrong, this run's half-written outputs do not survive it.
         for fh in (f_clean_fa, f_clean_exp_fa, f_flagged_fa, f_cohort_tsv):
             if fh is not None:
                 fh.close()
         staged.abort()
         raise
     finally:
-        # PL-26: for `-f -` this wrapped `sys.stdin.buffer` and skipped closing the wrapper,
+        # For `-f -` this wrapped `sys.stdin.buffer` and skipped closing the wrapper,
         # but never detached it either, so `IOBase.__del__` closed the process's stdin when
         # the wrapper was collected and a library caller reading stdin afterwards got
         # "I/O operation on closed file". The CLI never noticed because fd 0 stays open.
@@ -1734,11 +1671,10 @@ def stream_lexicmap_to_msa(
     med_pid = pid_stats["p50"] if pid_stats else None
     stop_rate_ge_50 = (cov_ge_50_stops / cov_ge_50_count * 100.0) if cov_ge_50_count > 0 else 0.0
 
-    # PL-16. An empty list of quantiles used to come back as a row of zeros, and the regime
-    # test fired on those placeholders: a header-only table (a search that found nothing) was
-    # labelled `divergent` with "median identity is 0.0%", and under --allow-empty, which a
-    # fan-out over many targets would use, it exited 0 carrying that record. "No data" and
-    # "data that is far from the reference" are different answers, and only one of them is a
+    # An empty list of quantiles must not come back as a row of zeros, or the regime test
+    # fires on the placeholders and a header-only table is labelled `divergent` with "median
+    # identity is 0.0%". "No data" and "data that is far from the reference" are different
+    # answers, and only one of them is a
     # measurement.
     if total_accessions == 0:
         regime, is_divergent = "no_data", False
@@ -1802,15 +1738,14 @@ def stream_lexicmap_to_msa(
         print(warning_msg)
         print("!" * 80 + "\n")
 
-    # Sort clean full-length haplotypes
     sorted_haplotypes = clean_full_haps.most_common()
 
     # Shannon entropy over the haplotype keys. Every tier 1 accession contributes exactly one
     # key, so these counts sum to count_clean_full and this is the same number the inline loop
-    # produced before PL-02 shared the helper.
+    # produced before this helper was shared.
     shannon_entropy = shannon_bits([c for _key, c in sorted_haplotypes])
 
-    # PL-02: the same cohort measured without the coverage artefact. Additive; the fields
+    # The same cohort measured without the coverage artefact. Additive; the fields
     # above keep their meaning so runs already done stay comparable.
     coverage_independent = coverage_independent_haplotypes(
         clean_full_haps, hap_indels, ref_seq, ref_len)
@@ -1841,7 +1776,6 @@ def stream_lexicmap_to_msa(
             indel_tag = f" indels={','.join(indels)}" if indels else ""
             _w(f">haplotype_{rank:05d} count={count} freq={freq:.5f} tag={tag}{indel_tag}\n{seq}\n")
 
-    # Write A2M
     if write_a2m:
         with staged.open(".clean.a2m") as f_a2m, staged.open(".a2m") as f_a2m_compat:
             for f in [f_a2m, f_a2m_compat]:
@@ -1849,7 +1783,6 @@ def stream_lexicmap_to_msa(
                 for rank, ((seq, _indels), count) in enumerate(sorted_haplotypes, 1):
                     f.write(f">hap_{rank}_count_{count}/1-{ref_len}\n{seq}\n")
 
-    # Write Haplotype TSV
     top_preview = []
     # One computation pass, two files. The loop body translates the haplotype and diffs it
     # against the reference per position; running it again for the byte-identical compat
@@ -1876,7 +1809,7 @@ def stream_lexicmap_to_msa(
             deleted = sum(e.length for e in indels if e.kind == "del")
             cov_pct = (sum(1 for c in seq if c != '-') + deleted) / ref_len * 100.0
 
-            # PL-04: an ambiguity code is missing information, not a change. `N` used to be
+            # An ambiguity code is missing information, not a change. `N` used to be
             # reported as a substitution and, through `codon_table.get(codon, 'X')`, as an
             # `X` residue classed Missense.
             nt_muts = []
@@ -1889,7 +1822,7 @@ def stream_lexicmap_to_msa(
             if seq == ref_seq and not indels:
                 mut_class = "WT"
             elif ref_is_cds:
-                # PL-29: the indels' own protein effect, from the sample's sequence rather
+                # The indels' own protein effect, from the sample's sequence rather
                 # than from the reference grid, plus the codons it already accounts for.
                 indel_aa, covered_codons = indel_protein_changes(
                     ref_seq, seq, ref_aa, indels, codon_table)
@@ -1965,11 +1898,8 @@ def stream_lexicmap_to_msa(
                     "samples": samples_str
                 })
 
-    # Summary JSON
-    # The shared contract (docs/summaries.md). Until 0.2.0 this file carried cohort
-    # statistics and no provenance at all: not this tool's version, not the input it read,
-    # and not one of the eight flags that change its answer, so two summaries from different
-    # thresholds were indistinguishable on disk.
+    # The shared contract (docs/summaries.md). Without the provenance blocks, two summaries
+    # written at different thresholds are indistinguishable on disk.
     n_flagged = (count_flagged_stops + count_flagged_low_cov + count_flagged_frameshift
                  + count_flagged_mixed)
     n_clean = count_clean_full + count_clean_partial
@@ -2049,7 +1979,7 @@ def stream_lexicmap_to_msa(
         },
     }
     records.close()
-    # Everything written; swap the whole set in at once, then record it (PL-22).
+    # Everything written; swap the whole set in at once, then record it.
     staged.commit()
     summary_io.write(summary_json_path, records_file=records.path,
                      **{k: v for k, v in summary_data.items() if k != "schema"})
@@ -2065,7 +1995,6 @@ def stream_lexicmap_to_msa(
               f"({total_accessions:,} rows)")
     print(f"     [✓] Summary JSON          : {summary_json_path}")
 
-    # Display Top Table
     print("\n" + "=" * 80)
     print(f" Top Clean Haplotypes ({ref_name})")
     print("=" * 80)
@@ -2193,7 +2122,7 @@ def _write_failed_summary(out_prefix: str, args, started: float, error: str) -> 
             out_prefix, output_stem(load_reference(args.ref)[0], args.ref))
     except (OSError, ValueError, IndexError):
         out_prefix = resolve_out_prefix(out_prefix, "lexicmap")
-    # PL-22: nothing half-written outlives a failed run.
+    # Nothing half-written outlives a failed run.
     StagedOutputs.clear(out_prefix)
     summary_io.discard_records(out_prefix)
     try:
@@ -2228,7 +2157,7 @@ def _write_failed_summary(out_prefix: str, args, started: float, error: str) -> 
 def validate_args(args, prog: str = "lexicmap"):
     """The argument checks both front ends make. `None` when they pass, else an exit code.
 
-    PL-28: `from-lexicmap` had its own copy, which had already drifted in wording, and a
+    `from-lexicmap` had its own copy, which had already drifted in wording, and a
     check added to one did not reach the other. It still has to run before `--out-dir` is
     created, so it stays a plain function rather than something the stage runner calls.
     """
@@ -2237,7 +2166,7 @@ def validate_args(args, prog: str = "lexicmap"):
               f"(or '-' for stdin).", file=sys.stderr)
         return 2
 
-    # PL-19: --require-full-length replaces --min-cov as the tier 1 gate, so a run with
+    # --require-full-length replaces --min-cov as the tier 1 gate, so a run with
     # `--require-full-length --min-cov-partial 0.9` is well formed and used to be refused
     # with a reason that was not true of it.
     gate = 1.0 if args.require_full_length else args.min_cov
@@ -2304,7 +2233,7 @@ def run(args) -> int:
         return EX_TEMPFAIL
     # Input problems (a missing or empty file, a bad table, an unreadable Galaxy dataset, a
     # missing API key) end in one line naming the cause, not a traceback.
-    # PL-03: a cut chunked body raises http.client.IncompleteRead and a cut gzip body raises
+    # A cut chunked body raises http.client.IncompleteRead and a cut gzip body raises
     # EOFError. Both were leaving as tracebacks. An HTTPException carries its detail in
     # `repr`, not `str`, so an IncompleteRead would otherwise print as an empty message.
     except (ValueError, OSError, RuntimeError, EOFError, http.client.HTTPException) as e:

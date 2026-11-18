@@ -225,7 +225,7 @@ class TestHarvestLocal(unittest.TestCase):
         self.assertTrue((self.out / "harvest.summary.json").is_file())
 
     def test_json_vec_hits_harvest_the_same_as_plain_json(self):
-        """GX-07. kmindex writes a hit two ways and the Galaxy tool offers both.
+        """Kmindex writes a hit two ways and the Galaxy tool offers both.
 
         `--format json` gives the ratio; `--format json_vec` gives
         `{"R": ratio, "P": [positions]}` under the same output datatype. Every
@@ -250,7 +250,7 @@ class TestHarvestLocal(unittest.TestCase):
         self.assertEqual(dict(per_target["pfcrt"]), dict(plain["pfcrt"]))
 
     def test_hits_that_are_not_numbers_at_all_are_refused_not_harvested_as_nothing(self):
-        """GX-07. A format whose hits this cannot read is an unreadable input, not an
+        """A format whose hits this cannot read is an unreadable input, not an
         empty collection, and the difference has to reach the exit code."""
         self._write_shard("odd.json", {"idx": {"pfcrt": {"SRR1": {"score": 0.4}}}})
         with self.assertRaises(RuntimeError) as cm:
@@ -421,7 +421,7 @@ class TestSafeTargetName(unittest.TestCase):
 
 
 class TestTiedScoresAreDeterministic(unittest.TestCase):
-    """PH-01: equal scores must not be ordered by the order the shards arrived in.
+    """Equal scores must not be ordered by the order the shards arrived in.
 
     `sorted(acc_dict, key=lambda a: -acc_dict[a])` is stable, so tied accessions kept dict
     insertion order, which is `as_completed` order in Galaxy API mode and file-name order

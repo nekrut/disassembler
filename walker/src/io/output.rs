@@ -1,7 +1,7 @@
 //! Everything that leaves the pipeline.
 //!
 //! IN   Summary
-//! OUT  reconstructed.fasta, bubbles.json, <query>.summary.json
+//! OUT  `reconstructed.fasta`, `bubbles.json`, `<query>.summary.json`
 //!
 //! `reconstructed.fasta` is consumed by `disassembler msa`, which feeds MAFFT and FastTree,
 //! so its record format is a fixed contract: downstream parsers read it, and the
@@ -24,7 +24,7 @@ fn outcome_str(o: Outcome) -> &'static str {
         Outcome::Success => "success",
         Outcome::NoAnchors => "no_anchors",
         Outcome::NoPath => "no_path",
-        // WG-07: the file had no adjacency, which is not the same finding as "the sample does
+        // The file had no adjacency, which is not the same finding as "the sample does
         // not carry this gene".
         Outcome::NoLinks => "no_links",
         Outcome::NoLoganData => "no_logan_data",
@@ -67,14 +67,11 @@ fn esc(s: &str) -> String {
 /// when the route passes two or more two-allele sites, then ` anchor={rid}` in multi-anchor
 /// mode, sequence on a single line.
 ///
-/// WA-04: `vaf=` on a primary is the constant 1.0 and always was. `min_vaf=` is the measured
+/// `vaf=` on a primary is the constant 1.0 and always was. `min_vaf=` is the measured
 /// number, the lowest frequency of any allele this sequence carries, and `mixed=1` says the
 /// sequence combines alleles from sites nothing links, so it may match no molecule in the
 /// sample. `vaf=` stays for one release because parsers key on it; new readers want
 /// `min_vaf=`.
-///
-/// WV-24: this doc stopped at `nodes=` while the writer has emitted `ka=` and `vaf=` for some
-/// time, so anyone writing a parser from it got the fields wrong.
 ///
 /// The identity key is `pident=` when it was measured on this haplotype's own alignment and
 /// `inherited_pident=` when it came from the pre-splice route (see `Haplotype::pident`), so a
@@ -90,16 +87,12 @@ pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// What a killed run leaves behind (WP-06).
+/// What a killed run leaves behind.
 ///
-/// Everything a run produces used to be written after the last accession finished: the FASTA,
-/// `summary.json`, `skipped.tsv`, the VCFs. A scheduler's walltime SIGTERM, an OOM kill or a
-/// dropped connection at hour eight of a nine-hour shard therefore threw away every
-/// reconstruction, and there was nothing to resume from. It has happened in this project
-/// already: a `timeout 1500` killed a 50-accession measurement run at 47 of 50 and wrote
-/// nothing.
-///
-/// So each result is also appended, as it lands, to two files in `--out-dir`:
+/// Every other output is written after the last accession finishes, so a walltime SIGTERM,
+/// an OOM kill or a dropped connection part way through a long shard would otherwise throw
+/// away every reconstruction. Each result is therefore also appended, as it lands, to two
+/// files in `--out-dir`:
 ///
 /// - `<query stem>.partial.fasta`, the haplotypes, byte-identical to the records the final
 ///   FASTA will hold, in **completion order** rather than input order;
@@ -125,7 +118,7 @@ impl Journal {
     ///
     /// Truncating matters: a `.partial.fasta` left by an earlier run that died in this same
     /// `--out-dir` would otherwise have this run's records appended to it, and the salvage
-    /// would be two runs deep with nothing saying so (the WV-17 hazard).
+    /// would be two runs deep with nothing saying so.
     pub fn create(out_dir: &Path, stem: &str) -> Result<Journal> {
         let fasta_path = out_dir.join(format!("{stem}.partial.fasta"));
         let lines_path = out_dir.join(format!("{stem}.journal.jsonl"));
@@ -180,7 +173,7 @@ impl Journal {
 
 /// One haplotype as it appears in the FASTA: header line, sequence line, both newline ended.
 ///
-/// Shared by [`write_fasta`] and the crash journal (WP-06), so a run that is killed leaves
+/// Shared by [`write_fasta`] and the crash journal, so a run that is killed leaves
 /// records byte-identical to the ones a finished run would have written. `anchor=` is emitted
 /// only in multi-anchor mode, which keeps single-anchor output byte-identical to the
 /// pre-multi-anchor shape and every golden fixture diffing clean.
@@ -222,13 +215,11 @@ pub fn haplotype_record(h: &crate::types::Haplotype) -> String {
 /// >ACC_alt1 cov=0.999 inherited_pident=98.1 nodes=1281 vaf=0.310 alt_kaf=3600.0 primary_vaf=0.688 fork=49624+
 /// ```
 ///
-/// WV-24: that fence used to stay open, so the prose below rendered as code.
-///
 /// `inherited_pident` is the PRIMARY's alignment identity, not this allele's: an alt is a
-/// spliced path with no alignment of its own. It was published as `pident=` per record, which
-/// read as a measurement of that allele.
+/// spliced path with no alignment of its own, so publishing it as `pident=` would read as a
+/// measurement of that allele.
 ///
-/// ` ka_sat=1` is appended when the fork is at Logan's abundance ceiling (WV-03), and
+/// ` ka_sat=1` is appended when the fork is at Logan's abundance ceiling, and
 /// ` anchor={rid}` in multi-anchor mode.
 pub fn write_alts(summary: &Summary, path: &Path) -> Result<()> {
     let mut w = create(path)?;
@@ -236,7 +227,7 @@ pub fn write_alts(summary: &Summary, path: &Path) -> Result<()> {
         for a in &r.alts {
             let h = &a.haplotype;
             let anchor_suffix = anchor_suffix(h);
-            // WV-03: appended only when the fork is clipped, so an unsaturated record is
+            // Appended only when the fork is clipped, so an unsaturated record is
             // byte-identical to what 0.1.x wrote.
             let ka_sat_suffix = if a.ka_saturated { " ka_sat=1" } else { "" };
             writeln!(
@@ -277,11 +268,10 @@ pub fn write_bubbles(summary: &Summary, path: &Path) -> Result<()> {
             writeln!(w, "      {{")?;
             writeln!(w, "        \"fork\": {}, \"fork_strand\": \"{}\",", b.fork, strand_str(b.fork_strand))?;
             writeln!(w, "        \"merge\": {}, \"merge_strand\": \"{}\",", b.merge, strand_str(b.merge_strand))?;
-            // WG-04. One record per allele set, and this says where that set was found. The
+            // One record per allele set, and this says where that set was found. The
             // first entry is the `fork`/`merge` above, kept as their own fields so a reader
             // written against the old shape still works. More than one entry means the same
-            // two alleles are reachable between several flank pairs, which used to be that
-            // many separate bubbles.
+            // two alleles are reachable between several flank pairs, which is one site.
             write!(w, "        \"flanks\": [")?;
             for (k, (f, fs, m, ms)) in b.flanks.iter().enumerate() {
                 write!(
@@ -293,7 +283,7 @@ pub fn write_bubbles(summary: &Summary, path: &Path) -> Result<()> {
                 )?;
             }
             writeln!(w, "],")?;
-            // WV-03. Written always, including false, so a consumer can tell an unsaturated
+            // Written always, including false, so a consumer can tell an unsaturated
             // bubble from one produced before the flag existed.
             writeln!(w, "        \"ka_saturated\": {},", b.ka_saturated)?;
             writeln!(w, "        \"branches\": [")?;
@@ -321,10 +311,8 @@ pub fn write_bubbles(summary: &Summary, path: &Path) -> Result<()> {
 
 /// The first bytes every walker-written VCF starts with.
 ///
-/// WV-16. `write_vcfs` removed or truncated `<out-dir>/<ACC>.vcf` without ever checking who
-/// wrote it. Point `-o` at a directory already holding per-sample VCFs from a read-based
-/// caller, which use the same `<ACC>.vcf` names, and a run with no sites **deletes them** and
-/// exits 0. Observed on a `##source=bcftools` file.
+/// `<out-dir>/<ACC>.vcf` is also what a read-based caller names its per-sample VCFs, so
+/// without this check a run with no sites would delete someone else's files and exit 0.
 const VCF_SIGNATURE: &[u8] = b"##fileformat=VCFv4.2\n##source=logan-walker";
 
 /// Whether this path is absent or was written by us, so replacing it loses nothing of
@@ -338,12 +326,9 @@ fn walker_owned(path: &Path) -> bool {
 
 /// A file that appears at its final path only once it is complete.
 ///
-/// WV-18. Every writer opened the destination directly, so a write error after the compute
-/// (a full disk, a directory in the way) left a truncated or missing file under the final
-/// name, and because `main` used `?` between writers, the **summary was never written at
-/// all**: the shard lost its per-accession status and timings even though the accessions had
-/// reconstructed. A signal mid-write had the same effect. `stages::stream` already writes its
-/// cache this way.
+/// A write error after the compute (a full disk, a directory in the way) would otherwise
+/// leave a truncated file under the final name, and a signal mid-write does the same.
+/// `stages::stream` writes its cache the same way.
 struct AtomicFile {
     tmp: std::path::PathBuf,
     dst: std::path::PathBuf,
@@ -391,13 +376,9 @@ impl Drop for AtomicFile {
 
 /// Remove this run's own leftovers from a writer that is switched off.
 ///
-/// WV-17. Each optional writer ran only when its flag was set, so a rerun into the same
-/// `--out-dir` without `--emit-vcf`, without `--emit-snv-table` or with `--no-emit-alts` left
-/// the PREVIOUS run's `<ACC>.vcf`, `snvs.tsv` and `alt_haplotypes.fasta` sitting beside a
-/// fresh primary and a fresh summary. Observed on a rerun two seconds later: the three
-/// variant files still carried the first run's timestamps, and nothing in the outputs said
-/// so. The emit flags are now in the summary too (WV-20), but a stale file is still a stale
-/// file.
+/// A writer that is switched off writes nothing, so without this a rerun into the same
+/// `--out-dir` leaves the PREVIOUS run's `<ACC>.vcf`, `snvs.tsv` or `alt_haplotypes.fasta`
+/// beside a fresh primary and a fresh summary, with nothing in the outputs saying so.
 ///
 /// Only files this walker wrote are removed. `snvs.tsv` and the VCFs are identified by their
 /// header; `alt_haplotypes.fasta` has no signature, so it is removed only when it sits beside
@@ -438,8 +419,7 @@ pub fn remove_disabled_outputs(cfg: &Config, out_dir: &Path, summary: &Summary) 
 
 /// Open `path` for writing, creating its parent directory.
 ///
-/// WV-24: five writers spelled this block out. The VCF writer uses `AtomicFile` instead,
-/// which does the same thing and then some.
+/// The VCF writer uses `AtomicFile` instead, which does this and then some.
 fn create(path: &Path) -> Result<BufWriter<std::fs::File>> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -450,8 +430,6 @@ fn create(path: &Path) -> Result<BufWriter<std::fs::File>> {
 }
 
 /// The ` anchor={rid}` suffix a FASTA header carries in multi-anchor mode, or nothing.
-///
-/// WV-24: `write_fasta` and `write_alts` built this identically.
 fn anchor_suffix(h: &crate::types::Haplotype) -> String {
     match &h.anchor_used {
         Some(rid) => format!(" anchor={rid}"),
@@ -461,7 +439,7 @@ fn anchor_suffix(h: &crate::types::Haplotype) -> String {
 
 /// A float as JSON, or `null` when it is not finite.
 ///
-/// WV-15. `format!("{:?}")` on an f64 yields the bare tokens `inf` and `NaN`, which **no JSON
+/// `format!("{:?}")` on an f64 yields the bare tokens `inf` and `NaN`, which **no JSON
 /// parser accepts**, so one such value made the whole summary unreadable while the run exited
 /// 0. The flags that could carry one are now validated, but a value can still arrive from a
 /// division by zero, and a summary that cannot be parsed is worse than one with a null in it.
@@ -519,10 +497,8 @@ fn quantiles(mut v: Vec<f64>) -> String {
     // Linear interpolation between the two neighbouring order statistics (numpy "linear",
     // `statistics.quantiles(method="inclusive")`), which is what the Python side does.
     //
-    // PL-15. Both sides used to pick a rounded index, so an even cohort's median was one of
-    // the two middle values. Worse for a contract that says `p50` means `p50` on both
-    // pathways: Rust's `round` goes half away from zero and Python's goes to even, so the
-    // two stages disagreed on exactly the inputs where the choice mattered.
+    // Not a rounded index: Rust's `round` goes half away from zero and Python's goes to
+    // even, so the two stages would disagree on exactly the inputs where it mattered.
     let at = |q: f64| {
         let pos = (v.len() as f64 - 1.0) * q;
         let lo = pos.floor() as usize;
@@ -648,7 +624,7 @@ fn write_settings(w: &mut impl Write, run: &RunInfo) -> Result<()> {
         ("primary_metric", format!("\"{}\"", c.primary_metric.as_str())),
         ("primary_tie_eps", jf(c.primary_tie_eps)),
         ("prune_frac", jf(c.prune_frac)),
-        // WG-05: the prune's own lower bound. It shared `min_abund` until 0.2.0, so a summary
+        // The prune's own lower bound. It shared `min_abund` until 0.2.0, so a summary
         // from an older run cannot tell which of the two a non-default value was meant for.
         ("prune_min_abund", jf(c.prune_min_abund as f64)),
         ("prefer_majority", c.prefer_majority.to_string()),
@@ -663,7 +639,7 @@ fn write_settings(w: &mut impl Write, run: &RunInfo) -> Result<()> {
         ("graphaligner_threads", c.graphaligner_threads.to_string()),
         ("rescue_minority", c.rescue_minority.to_string()),
         ("summary_seqs", c.summary_seqs.to_string()),
-        // WV-20: which outputs this run was asked for. Without these, a summary beside a
+        // Which outputs this run was asked for. Without these, a summary beside a
         // missing VCF cannot say whether the run found no sites or was never asked to look.
         ("emit_alts", c.emit_alts.to_string()),
         ("emit_vcf", c.emit_vcf.to_string()),
@@ -739,7 +715,7 @@ fn write_discards(w: &mut impl Write, s: &Summary, run: &RunInfo) -> Result<()> 
         run.n_requested.saturating_sub(s.results.len()),
         count(Outcome::NoAnchors),
         count(Outcome::NoPath),
-        // WG-07: beside `no_path` rather than inside it, because the two answer different
+        // Beside `no_path` rather than inside it, because the two answer different
         // questions and a cohort report that merges them understates gene presence.
         count(Outcome::NoLinks),
         count(Outcome::NoLoganData),
@@ -760,7 +736,7 @@ fn write_discards(w: &mut impl Write, s: &Summary, run: &RunInfo) -> Result<()> 
         v(|x| x.window_not_shiftable),
         v(|x| x.identical)
     )?;
-    // WV-02: forks the run left with `_primary` on the rarer allele. A third group, because
+    // Forks the run left with `_primary` on the rarer allele. A third group, because
     // these are not candidate alleles that were refused; they are sites where the published
     // sequence is known to carry the minority base.
     let m = |f: fn(&crate::types::MinorityLeft) -> usize| {
@@ -838,13 +814,13 @@ fn write_cohort(w: &mut impl Write, s: &Summary) -> Result<()> {
             .filter(|r| r.prune.as_ref().is_some_and(|p| p.result.is_refusal()))
             .count()
     )?;
-    // WG-02 at cohort scale: accessions whose abundances cannot be believed. Omitted when
+    // At cohort scale: accessions whose abundances cannot be believed. Omitted when
     // there are none, like the per-record field it counts.
     let no_abundance = s.results.iter().filter(|r| r.abundance_missing > 0).count();
     if no_abundance > 0 {
         writeln!(w, "    \"abundance_missing\": {no_abundance},")?;
     }
-    // WA-04 at cohort scale: primaries that combine alleles from two or more sites nothing
+    // At cohort scale: primaries that combine alleles from two or more sites nothing
     // phases. These are the records whose substitutions a selection test should not read as
     // one organism's.
     writeln!(
@@ -942,7 +918,7 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
     writeln!(w, "      \"status\": \"{}\",", outcome_str(r.outcome))?;
     write_payload(w, &r.payload)?;
     writeln!(w, "      \"n_unitigs\": {},", r.n_unitigs)?;
-    // WG-02. Omitted when every record carried an abundance, which is every ordinary Logan
+    // Omitted when every record carried an abundance, which is every ordinary Logan
     // object, so its presence is itself the signal: the depth-based stages saw 0x for this
     // many unitigs and whatever they did or did not do must be read in that light.
     if r.abundance_missing > 0 {
@@ -957,17 +933,17 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
     writeln!(w, "      \"provisional\": {},", r.provisional)?;
     // Derived from `prune.result` rather than stored, so there is one source of truth. It
     // names what a refused prune means for this haplotype: the first-pass route stands, and
-    // that is the route with the aligner's reference pull still in it (WP-01).
+    // that is the route with the aligner's reference pull still in it.
     writeln!(
         w,
         "      \"bias_uncorrected\": {},",
         r.prune.as_ref().is_some_and(|p| p.result.is_refusal())
     )?;
-    // WV-03. `ka_max` at the ceiling means every VAF, the prune floor and the majority calls
+    // `ka_max` at the ceiling means every VAF, the prune floor and the majority calls
     // on this accession are computed against lower bounds.
     writeln!(w, "      \"ka_max\": {:.1},", r.ka_max)?;
     writeln!(w, "      \"depth_saturated\": {},", r.depth_saturated)?;
-    // WV-20: null when the primary could not be mapped to the query at all, which is not
+    // Null when the primary could not be mapped to the query at all, which is not
     // the same as finding no sites. A missing VCF reads as the latter.
     match r.snv_sites {
         Some(n) => writeln!(w, "      \"snv_sites\": {n},")?,
@@ -990,7 +966,7 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
             // f64 precision, 17 digits of it, which is noise in a diff and is finer than the
             // alignment it came from.
             write!(w, ", \"cov\": {:.4}", h.cov)?;
-            // What `--min-cov` gated on, and the interval it measured (WA-05). `cov` above is
+            // What `--min-cov` gated on, and the interval it measured. `cov` above is
             // the walked length over the reference length, which an indel moves; these two
             // are the alignment's own footprint on the reference, and they are what decided
             // whether this record exists at all.
@@ -1011,13 +987,13 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
     }
     writeln!(w, "      \"alts\": {},", r.alts.len())?;
     writeln!(w, "      \"bubbles\": {},", r.bubbles.len())?;
-    // WV-07. The stage prints this and warns above 11; until 0.2.0 the summary said only
+    // The stage prints this and warns above 11; until 0.2.0 the summary said only
     // `pident_inherited`, which cannot tell 1 correction from 27.
     writeln!(w, "      \"majority_corrections\": {},", r.majority_corrections)?;
-    // WV-02. Of those corrections, the ones where the branch the aligner walked was itself a
+    // Of those corrections, the ones where the branch the aligner walked was itself a
     // minority of its fork, which 0.1.x refused to touch at all.
     writeln!(w, "      \"minority_rescues\": {},", r.majority.minority_rescues)?;
-    // WV-02: the route was still being rewritten when the backstop stopped it.
+    // The route was still being rewritten when the backstop stopped it.
     writeln!(w, "      \"hit_pass_cap\": {},", r.majority.hit_pass_cap)?;
     // Forks still on the route where `_primary` carries the rarer allele, by why it was left.
     // Omitted when there are none, so an ordinary record does not pay for it.
@@ -1047,7 +1023,7 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
              \"not_substitution\": {}, \"over_indel_cap\": {}, \"frameshifting\": {}, \
              \"window_not_shiftable\": {}, \"identical\": {}}},",
             v.depth, v.floor, v.forks, v.biallelic,
-            // WA-04: sites rather than alleles, and the weakest allele the primary carries.
+            // Sites rather than alleles, and the weakest allele the primary carries.
             // `biallelic` counts a three-branch fork twice, which is right for "alleles we
             // could emit" and wrong for "places the sequence had to choose".
             v.two_allele_sites, v.min_site_vaf,
@@ -1205,15 +1181,14 @@ pub fn write_summary(summary: &Summary, run: &RunInfo, path: &Path) -> Result<()
 /// One file `<out_dir>/<accession>.vcf` per accession that has at least one recovered SNP.
 /// The intra-host SNP sites for every result, computed once.
 ///
-/// `write_vcfs` and `write_snv_table` both need these, and each used to call `snv_sites`
-/// itself, so with both flags on every accession paid for two identical alignments. Measured
-/// at 11.1 ms each for pfcrt and 15.7 ms for hiv1_pol, which is 3.1 s of pure duplication on a
-/// 200-accession hiv1_pol panel.
+/// `write_vcfs` and `write_snv_table` both need these, so they are computed once: the
+/// alignment is 11 to 16 ms per accession, which is seconds of pure duplication on a panel if
+/// each writer calls `snv_sites` itself.
 pub fn snv_sites_all(summary: &mut Summary, queries: &[Query]) -> Vec<Vec<VcfRow>> {
     let mut all = Vec::with_capacity(summary.results.len());
     for r in summary.results.iter_mut() {
         let (rows, mapped) = snv_sites_counted(r, reference_of(r, queries));
-        // WV-20: `Some(0)` is "looked, found nothing"; `None` is "could not look". The
+        // `Some(0)` is "looked, found nothing"; `None` is "could not look". The
         // summary could not tell them apart, and a missing VCF reads as the former.
         r.snv_sites = mapped.then_some(rows.len());
         all.push(rows);
@@ -1245,7 +1220,7 @@ pub fn write_vcfs(
     // examples rely on. `read_accession_list` drops duplicates, so each path is written once.
     for (r, rows) in summary.results.iter().zip(sites) {
         let path = out_dir.join(format!("{}.vcf", r.accession));
-        // WV-16: never touch a file we did not write. The same check guards the removal and
+        // Never touch a file we did not write. The same check guards the removal and
         // the overwrite, because both destroy it.
         if !walker_owned(&path) {
             eprintln!(
@@ -1258,9 +1233,9 @@ pub fn write_vcfs(
         if rows.is_empty() {
             // A VCF an earlier run left in this --out-dir would claim sites this run did not
             // find, beside a primary that no longer has them.
-            // WV-19: a stale file we cannot remove is a warning, not a dead run. This used
-            // to be fatal, so one EACCES or EISDIR here threw away the summary, the SNV table
-            // and the alt FASTA for every accession that had already succeeded.
+            // A stale file we cannot remove is a warning, not a dead run: one EACCES or
+            // EISDIR here must not throw away the summary, the SNV table and the alt FASTA
+            // for every accession that already succeeded.
             if let Err(e) = std::fs::remove_file(&path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     eprintln!("[warn] cannot remove stale {}: {e}", path.display());
@@ -1293,7 +1268,7 @@ pub fn write_vcfs(
                 aos.join(","),
                 row.ref_ka,
                 row.fork,
-                // WV-08: only multi-site alleles carry one, so single-site rows are
+                // Only multi-site alleles carry one, so single-site rows are
                 // byte-identical to what 0.1.x wrote.
                 row.block.map_or(String::new(), |b| format!(";BLOCK={b}")),
                 afs.join(","),
@@ -1346,10 +1321,10 @@ pub fn write_snv_table(
                     ka_alt,
                     row.ref_ka,
                     row.fork,
-                    // WV-03: `af` here is a lower-bound ratio. A cohort query that averages
+                    // `af` here is a lower-bound ratio. A cohort query that averages
                     // these without filtering on this column averages overstated frequencies.
                     u8::from(row.ka_saturated),
-                    // WV-08: rows sharing a block are on one molecule. Empty for a
+                    // Rows sharing a block are on one molecule. Empty for a
                     // single-site call, so a `GROUP BY block` ignores them naturally.
                     row.block.map_or(String::new(), |b| b.to_string()),
                 )?;
@@ -1362,7 +1337,7 @@ pub fn write_snv_table(
 
 /// A reference base as VCF 4.2 allows it to appear in REF: A, C, G, T, or N.
 ///
-/// WV-14. The base was copied verbatim, so an IUPAC ambiguity code in the reference produced
+/// The base was copied verbatim, so an IUPAC ambiguity code in the reference produced
 /// `REF=R` and an invalid record.
 fn vcf_base(b: u8) -> u8 {
     match b.to_ascii_uppercase() {
@@ -1373,7 +1348,7 @@ fn vcf_base(b: u8) -> u8 {
 
 /// Whether a reference record id can be a VCF contig name.
 ///
-/// WV-14. CHROM and `##contig=<ID=...>` take the reference's id verbatim, which is the first
+/// CHROM and `##contig=<ID=...>` take the reference's id verbatim, which is the first
 /// token of its FASTA header or the file stem. A `,` or `<` in it produces a malformed header
 /// line and a record no parser will read. The grammar is VCF 4.3's.
 pub fn valid_contig_id(id: &str) -> bool {
@@ -1409,7 +1384,7 @@ fn snv_sites(r: &AccessionResult, query: &Query) -> Vec<VcfRow> {
 
 /// As `snv_sites`, also saying whether the primary could be mapped to the query at all.
 ///
-/// WV-20: `false` means the mapping was refused (too divergent for the budget), which is a
+/// `false` means the mapping was refused (too divergent for the budget), which is a
 /// different statement from "no sites" and must not reach `summary.json` as `0`.
 fn snv_sites_counted(r: &AccessionResult, query: &Query) -> (Vec<VcfRow>, bool) {
     let Some(primary) = &r.haplotype else { return (Vec::new(), true) };
@@ -1419,7 +1394,7 @@ fn snv_sites_counted(r: &AccessionResult, query: &Query) -> (Vec<VcfRow>, bool) 
     // Map each primary base to a query position (None where the primary base aligns to a gap in
     // the query, i.e. an insertion relative to the gene).
     //
-    // WV-09: bounded by memory rather than by a 20 kb length test. That test dated from the
+    // Bounded by memory rather than by a 20 kb length test. That test dated from the
     // full O(n*m) DP and survived the move to a banded one, so it dropped every SNV and the
     // whole VCF for any gene over 20 kb (SARS-CoV-2 ORF1ab is 21,290 nt) while the run still
     // exited 0 and the docs say a missing VCF means no sites.
@@ -1444,13 +1419,11 @@ fn snv_sites_counted(r: &AccessionResult, query: &Query) -> (Vec<VcfRow>, bool) 
         if alt_seq.len() != primary.seq.len() {
             continue; // an indel allele; it stays in alt_haplotypes.fasta
         }
-        // WV-08. This used to stop at the SECOND differing base and discard the whole allele.
-        // In a k=31 graph two substitutions within 30 nt sit on one bubble, so `find_alts`
-        // returns them as a single alternative and BOTH sites vanished from the VCF and
-        // snvs.tsv with no message. Two changes in one codon are the common case. Measured on
-        // the panel, 58 of 267 substitution alleles span more than 3 nt, so per-site counts
-        // and cohort matrices were biased against exactly the dense variable regions they are
-        // built to find.
+        // Every differing base, not just the first. In a k=31 graph two substitutions
+        // within 30 nt sit on one bubble, so `find_alts` returns them as a single
+        // alternative; stopping at the second would drop both sites with no message, and two
+        // changes in one codon are the common case. 58 of 267 substitution alleles on the
+        // panel span more than 3 nt.
         let diffs: Vec<usize> = primary
             .seq
             .iter()
@@ -1479,7 +1452,7 @@ fn snv_sites_counted(r: &AccessionResult, query: &Query) -> (Vec<VcfRow>, bool) 
         for &i in &diffs {
         let Some(qpos) = map[i] else { continue }; // primary base has no query coordinate
 
-        // WV-14: REF is copied from the reference, and VCF 4.2 allows only A/C/G/T/N there.
+        // REF is copied from the reference, and VCF 4.2 allows only A/C/G/T/N there.
         // An IUPAC code in the query (R, Y, S, ...) produced `REF=R`, which is not a legal
         // record. The ambiguity is in the reference, not in what we observed, so it maps to N.
         let ref_base = vcf_base(query.seq[qpos]);
@@ -1559,7 +1532,7 @@ fn snv_sites_counted(r: &AccessionResult, query: &Query) -> (Vec<VcfRow>, bool) 
 
 /// Most linked substitutions one alternative may carry and still be called as SNVs.
 ///
-/// WV-08. Below this, an alternative with several substitutions is a short haplotype block
+/// Below this, an alternative with several substitutions is a short haplotype block
 /// worth reporting site by site. Above it, the alternative is a rerouted stretch of graph and
 /// calling every base of it as a SNV would assert more than the graph supports; those stay in
 /// `alt_haplotypes.fasta` and are counted on stderr.
@@ -1569,12 +1542,12 @@ pub struct VcfRow {
     pos: usize,
     ref_base: u8,
     /// Set when this row is one of several substitutions carried by a single alternative
-    /// haplotype (WV-08). Rows sharing a block ARE on one molecule, unlike two rows that
+    /// haplotype. Rows sharing a block ARE on one molecule, unlike two rows that
     /// merely share a position, so the `##source` caveat about co-occurrence does not apply
     /// to them. `None` for an ordinary single-site allele.
     block: Option<usize>,
     /// A branch of this site's fork is at `KA_CEILING`, so AF and RO are lower-bound ratios
-    /// and the row is FILTERed `KaSat` rather than `PASS` (WV-03).
+    /// and the row is FILTERed `KaSat` rather than `PASS`.
     ka_saturated: bool,
     /// (allele base, frequency, ka:f) for each sample allele that differs from the gene base.
     alts: Vec<(u8, f64, f32)>,
@@ -1635,7 +1608,7 @@ fn write_vcf_header<W: Write>(w: &mut W, chrom: &str, len: usize, sample: &str) 
 /// # Why this cannot silently return a worse alignment
 ///
 /// A band is only a speedup if the optimum stays inside it, and **the edge check alone does not
-/// establish that** (WV-10). When the true optimum leaves the band, the best in-band path can
+/// establish that**. When the true optimum leaves the band, the best in-band path can
 /// be strictly worse and still never touch an edge, so the traceback accepts it. Reproduced
 /// with compensating indels of +33 and -33 nt in a 2.4 kb gene: the banded score was 1367
 /// against 2233 for the full alignment, about 940 bases mapped to the wrong reference
@@ -1654,7 +1627,7 @@ fn align_primary_to_query(primary: &[u8], query: &[u8]) -> Vec<Option<usize>> {
 
 /// The traceback matrix this is willing to allocate for one accession's SNV mapping.
 ///
-/// WV-09. What this replaces was a flat 20 kb length test, left over from the full O(n*m) DP
+/// What this replaces was a flat 20 kb length test, left over from the full O(n*m) DP
 /// and never revisited when the alignment was banded. It refused cheap inputs (a 21 kb gene at
 /// high identity costs a few MB banded) while doing nothing about the expensive case, a short
 /// but divergent pair that widens the band to full width. A budget measures the thing that
@@ -1753,7 +1726,7 @@ fn align_banded(primary: &[u8], query: &[u8], band: usize) -> Option<Vec<Option<
         std::mem::swap(&mut prev, &mut curr);
     }
 
-    // WV-10. `prev` holds row `n` after the final swap, so this is the in-band optimum.
+    // `prev` holds row `n` after the final swap, so this is the in-band optimum.
     //
     // The cheapest escape from the band: cross to `d_max + 1` and return to the end diagonal,
     // or cross to `d_min - 1` and return. Each step off the diagonal is one gap.
@@ -1907,7 +1880,7 @@ mod banded_equivalence_tests {
         }
     }
 
-    /// WV-09. A long gene at high identity is cheap to align banded, and used to be refused
+    /// A long gene at high identity is cheap to align banded, and used to be refused
     /// by a flat 20 kb length test left over from the full O(n*m) DP. SARS-CoV-2 ORF1ab is
     /// 21,290 nt, so every SNV and the whole VCF were dropped for it while the run exited 0.
     #[test]
@@ -1935,7 +1908,7 @@ mod banded_equivalence_tests {
         assert!(super::align_within(&a, &b, super::SNV_ALIGN_BUDGET).is_some());
     }
 
-    /// WV-10. Compensating indels of opposite sign, each longer than the initial band, are
+    /// Compensating indels of opposite sign, each longer than the initial band, are
     /// the shape the edge check alone could not catch: the path leaves the band and comes
     /// back, so the best in-band route never touches an edge and was accepted although it was
     /// strictly worse. Before the score certificate, +33/-33 scored 1367 against the exact
@@ -2104,13 +2077,13 @@ mod vcf_tests {
         assert_eq!(rows[0].ref_ka, 100.0, "RO is the major (=REF) coverage, once");
     }
 
-    /// WV-08. Two substitutions on one alternative yield two rows, sharing a BLOCK.
+    /// Two substitutions on one alternative yield two rows, sharing a BLOCK.
     ///
-    /// This used to stop at the second differing base and discard the whole allele, so both
-    /// sites vanished from the VCF and snvs.tsv with no message. In a k=31 graph two
+    /// Stopping at the second differing base would discard the whole allele, so both sites
+    /// would vanish from the VCF and snvs.tsv with no message. In a k=31 graph two
     /// substitutions within 30 nt share one bubble and arrive as a single alternative, and
-    /// two changes in one codon are the common case, so the loss concentrated in exactly the
-    /// dense variable regions these outputs exist to find.
+    /// two changes in one codon are the common case, so the loss would concentrate in exactly
+    /// the dense variable regions these outputs exist to find.
     #[test]
     fn two_linked_substitutions_yield_two_rows_sharing_a_block() {
         let primary = b"TTTATTTATTT";
@@ -2150,10 +2123,9 @@ mod vcf_tests {
         assert!(rows.is_empty(), "{} diffs is past the cap", super::MAX_LINKED_SNVS + 1);
     }
 
-    /// WV-13. ALT is every sample allele that differs from the gene base, which is the
-    /// MAJORITY allele when the sample's consensus differs from the reference. The docs used
-    /// to call ALT "the minor allele" flatly, so a cohort query averaging AF as a
-    /// minor-allele frequency silently mixed in values above 0.5.
+    /// ALT is every sample allele that differs from the gene base, which is the
+    /// MAJORITY allele when the sample's consensus differs from the reference. It is not "the
+    /// minor allele": a cohort query averaging AF as one silently mixes in values above 0.5.
     #[test]
     fn alt_is_the_majority_allele_when_the_consensus_differs_from_the_reference() {
         // Primary (the sample's majority) carries C at index 3; the gene base there is A.
@@ -2168,8 +2140,8 @@ mod vcf_tests {
         assert_eq!(rows[0].ref_ka, 40.0, "RO is the gene base's own coverage");
     }
 
-    /// WV-24. One identity formula, used by `stitch` and `pipeline`, including the
-    /// `aln_len == 0` case that would otherwise be NaN and make the summary invalid (WV-15).
+    /// One identity formula, used by `stitch` and `pipeline`, including the
+    /// `aln_len == 0` case that would otherwise be NaN and make the summary invalid.
     #[test]
     fn pident_is_matches_over_aligned_length() {
         use crate::types::GafPath;
@@ -2189,7 +2161,7 @@ mod vcf_tests {
         assert!(p(0, 0).pident().is_finite());
     }
 
-    /// WV-14. The reference id becomes CHROM and `##contig=<ID=...>` verbatim, so an id
+    /// The reference id becomes CHROM and `##contig=<ID=...>` verbatim, so an id
     /// carrying `,` or `<` writes a malformed header and an unreadable record.
     #[test]
     fn contig_ids_follow_the_vcf_grammar() {
@@ -2201,7 +2173,7 @@ mod vcf_tests {
         }
     }
 
-    /// WV-14. VCF 4.2 allows only A/C/G/T/N in REF, and the base was copied verbatim, so an
+    /// VCF 4.2 allows only A/C/G/T/N in REF, and the base was copied verbatim, so an
     /// IUPAC code in the reference produced `REF=R`.
     #[test]
     fn an_ambiguous_reference_base_is_written_as_n() {
@@ -2215,7 +2187,7 @@ mod vcf_tests {
         assert_eq!(bases, vec![b'C', b'A']);
     }
 
-    /// WV-16. A VCF this walker did not write is never removed or overwritten.
+    /// A VCF this walker did not write is never removed or overwritten.
     ///
     /// Point `-o` at a directory holding per-sample VCFs from a read-based caller, which use
     /// the same `<ACC>.vcf` names, and a run with no sites used to delete them and exit 0.
@@ -2247,7 +2219,7 @@ mod vcf_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// WV-18. Nothing appears at the final path until the write is complete, and an
+    /// Nothing appears at the final path until the write is complete, and an
     /// abandoned write leaves no temporary file behind.
     #[test]
     fn an_abandoned_atomic_write_leaves_nothing() {
@@ -2274,7 +2246,7 @@ mod vcf_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// WV-03. A site whose fork touches Logan's ceiling is FILTERed, not PASSed, because its
+    /// A site whose fork touches Logan's ceiling is FILTERed, not PASSed, because its
     /// AF is a ratio against a total that is a lower bound.
     ///
     /// The number that makes this matter: a 3,000x minor allele beside a true 250,000x major

@@ -3,10 +3,10 @@
 //! The CSR from `parse` is already in memory, so the BFS is a pointer chase and only the
 //! sequence pass needs the bytes again.
 //!
-//! Scale, measured: 76 anchors expand to 356 nodes for `ERR2028820`; median 330 across the
-//! ERG11 panel; 26,323 for `SRR8209082`, which is about a third of that accession's entire
-//! graph. A "20-100 local unitigs" estimate is wrong by one to two orders of magnitude,
-//! so do not size buffers from it.
+//! Scale, measured: 76 anchors expand to 356 nodes for `ERR2028820`, a median of 330 across
+//! the ERG11 panel, and 34,582 for `SRR8209082`, which is 42% of that accession's entire
+//! graph. A "20-100 local unitigs" estimate is wrong by one to two orders of magnitude, so do
+//! not size buffers from it.
 //!
 //! GFA shape:
 //!
@@ -34,22 +34,14 @@ use crate::types::{Anchors, PathStep, Subgraph, UnitigGraph, UnitigId};
 ///
 /// # Direction
 ///
-/// Logan writes every edge into *both* endpoints' headers, so the CSR already contains each
-/// connection from both sides and following `targets` forward is equivalent to an
-/// explicitly symmetrised adjacency. Verified on `ERR2028820`: 2,578,430 distinct link tokens,
-/// **zero** with a missing reciprocal. Also present are 1,156 self-loops, which the visited
-/// set absorbs.
+/// Logan writes every edge into *both* endpoints' headers, so the CSR already holds each
+/// connection from both sides and following `targets` forward is equivalent to an explicitly
+/// symmetrised adjacency. Verified on `ERR2028820`: 2,578,430 distinct link tokens, zero with
+/// a missing reciprocal, plus 1,156 self-loops the visited set absorbs. A one-sided edge
+/// would make this explore slightly less than a symmetrised adjacency; the concordance
+/// fixtures would catch it.
 ///
-/// If a future accession did carry a one-sided edge this would quietly explore slightly
-/// less than a symmetrised adjacency would. That has not been observed, and the concordance
-/// fixtures would catch it on the two golden accessions.
-///
-/// # Scale
-///
-/// Measured: 77 anchors expand to 422 nodes on `ERR2028820`, out of 1,277,362. An estimate
-/// of "20-100 local unitigs" understates this by one to two orders of magnitude, and for
-/// `SRR8209082` the neighbourhood reaches 8,466 nodes, about a tenth of that accession's
-/// entire graph. Do not size buffers from that figure.
+/// See the module doc for the scale this reaches.
 pub fn expand(cfg: &Config, graph: &UnitigGraph, anchors: &Anchors) -> Result<Vec<UnitigId>> {
     if anchors.ids.is_empty() {
         return Ok(Vec::new());
@@ -132,19 +124,15 @@ pub fn expand(cfg: &Config, graph: &UnitigGraph, anchors: &Anchors) -> Result<Ve
 ///
 /// Median rather than mean, so one repeat-collapsed unitig cannot drag it.
 ///
-/// **Unweighted, deliberately.** WP-01 asks for a k-mer-weighted median, on the reasoning that
-/// a route is not a list of equal things and short error unitigs can drag the estimate down.
-/// That was implemented and **measured, and it is wrong on this walker's data**: on
-/// `SRR8209082`, whose true depth is about 14,500x (see above), the step median gives 15,000x
-/// and the k-mer-weighted median gives **91.7x**, which collapses the floor to `--min-abund`
-/// and stops the prune removing anything. Forks went 136 -> 1,303, the primary changed, and
-/// its identity to the reference rose from 97.48% to 98.50%, which on a less-pruned graph is
-/// the reference pull the prune exists to remove rather than a better answer.
+/// **Unweighted, deliberately.** Weighting by k-mer count is the obvious refinement, and it
+/// is wrong on this walker's data: on `SRR8209082`, whose true depth is about 14,500x, the
+/// step median gives 15,000x and the k-mer-weighted median gives 91.7x, which collapses the
+/// floor to `--min-abund` and stops the prune removing anything.
 ///
-/// The reason is that a tangled neighbourhood's route threads long, low-coverage unitigs that
-/// are not the gene, while the gene itself is cut into short high-coverage pieces by its own
-/// variation. Weighting by sequence therefore weights the noise. Reconsider only with a
-/// measurement on an accession whose depth is independently known.
+/// A tangled neighbourhood's route threads long, low-coverage unitigs that are not the gene,
+/// while the gene is cut into short high-coverage pieces by its own variation, so weighting
+/// by sequence weights the noise. Reconsider only with a measurement on an accession whose
+/// depth is independently known.
 pub fn path_depth(cfg: &Config, graph: &UnitigGraph, steps: &[PathStep]) -> f32 {
     let _ = cfg;
     median_abundance(steps.iter().map(|s| graph.abundance_of(s.node)).collect())
@@ -152,7 +140,7 @@ pub fn path_depth(cfg: &Config, graph: &UnitigGraph, steps: &[PathStep]) -> f32 
 
 /// Median of a set of abundances, or 0.0 when empty.
 ///
-/// WV-23. `variants` measures the same quantity over the oriented walk rather than over
+/// `variants` measures the same quantity over the oriented walk rather than over
 /// `PathStep`s, and had its own copy of this. Identical today, but a change to one (a NaN-safe
 /// sort, length weighting) would have made the prune floor and the allele floor measure gene
 /// depth differently, which is the kind of divergence nothing downstream would reveal.
@@ -187,18 +175,16 @@ pub fn path_mean_ka(graph: &UnitigGraph, steps: &[PathStep]) -> f64 {
 /// `prune_frac` of the gene's depth, never below `prune_min_abund`, which is why a shallow
 /// gene is not pruned at a fraction of a read.
 ///
-/// WG-05: the lower bound used to be `min_abund`, the *allele* floor, so `--min-abund 20` on
-/// a 60x gene silently moved this floor from 5.0 to 20.0 and could change the published
-/// primary, while on a gene under 500x every `--prune-frac` below `5/depth` meant the same
-/// thing. The two are separate settings now, with the same default each, so a default run
-/// prunes exactly as it did.
+/// The lower bound is `prune_min_abund`, not `min_abund`: sharing them means `--min-abund 20`
+/// on a 60x gene moves this floor from 5.0 to 20.0 and can change the published primary,
+/// while on a gene under 500x every `--prune-frac` below `5/depth` means the same thing.
 pub fn depth_floor(cfg: &Config, depth: f32) -> f32 {
     relative_floor(cfg.prune_frac, depth, cfg.prune_min_abund)
 }
 
 /// A floor at `frac` of the gene's depth, never below `min_abund`.
 ///
-/// WV-23. The prune uses it with `--prune-frac` and the allele gate with `--min-abund-frac`;
+/// The prune uses it with `--prune-frac` and the allele gate with `--min-abund-frac`;
 /// the two differ only in which fraction they pass, so they share the arithmetic.
 pub fn relative_floor(frac: f64, depth: f32, min_abund: f32) -> f32 {
     if frac > 0.0 {
@@ -210,7 +196,7 @@ pub fn relative_floor(frac: f64, depth: f32, min_abund: f32) -> f32 {
 
 /// Whether a unitig at `abund` clears a coverage floor. At the floor exactly, it does.
 ///
-/// TW-06. Three sites pruned on this comparison: `prune_nodes`, the surviving-node count in
+/// Three sites pruned on this comparison: `prune_nodes`, the surviving-node count in
 /// `pipeline::run_one` (which carried the comment "Predicate must match `prune_nodes`
 /// exactly") and the branch gate in `phase`. A comment is not a guarantee: if one of them
 /// had drifted to `>`, the count reported in `PruneReport` would have disagreed with the
@@ -244,7 +230,7 @@ pub fn prune_nodes(
 
 /// Whether a prune at `floor` keeps unitig `id`. **The one predicate**: `prune_nodes` and the
 /// surviving-node count in `pipeline::run_one` must agree, or the count the summary reports
-/// describes a different prune from the one performed (TW-06).
+/// describes a different prune from the one performed.
 pub fn kept_by_prune(
     graph: &UnitigGraph,
     id: UnitigId,
@@ -254,7 +240,7 @@ pub fn kept_by_prune(
     survives(graph.abundance_of(id), floor) || protected.contains(&id)
 }
 
-/// Route unitigs that are below `floor` but are the only way through at that point (WP-01).
+/// Route unitigs that are below `floor` but are the only way through at that point.
 ///
 /// The prune floor is one number for the whole gene, and `prune_nodes` drops every unitig
 /// below it. That is right for a reference-matching error branch sitting beside a deep true
@@ -344,10 +330,8 @@ pub fn protected_route_nodes(
 
 /// Share of the whole graph pulled into the local neighbourhood.
 ///
-/// This is the guard signal, and it replaces the anchor-fraction check that used to live in
-/// `anchor::find`. That one was calibrated on BLAST anchor counts and then applied to k-mer
-/// anchors, so at the default `min_shared_kmers = 3` it sat 9x below its threshold and
-/// stayed silent on the very accession it existed to catch.
+/// Reported for diagnostics, not used as a gate: see `config::subgraph_nodes_per_base_guard`
+/// for the density signal that is.
 ///
 /// Subgraph fraction measures the thing that actually causes trouble: a neighbourhood that
 /// swallows a large share of the graph offers many near-equal paths, leaving the haplotype
@@ -449,11 +433,10 @@ pub fn write_gfa(
         });
     }
 
-    // WF-01, then WF-17. This used to be a bare `create_dir_all`, which silently put back a
-    // scratch directory another run had deleted mid-flight, and put it back with the default
-    // mode 0755 instead of 0700. That silence is half of why the deletion surfaced as the
-    // biological answer `no_path` rather than as a fault. WF-01 made it warn and recreate;
-    // it now refuses instead, because recreating is wrong in every case that is left.
+    // Refuses rather than recreating. A bare `create_dir_all` here silently puts back a
+    // scratch directory another run deleted mid-flight, at the default mode 0755 instead of
+    // 0700, and that silence is half of why such a deletion surfaces as the biological
+    // answer `no_path` rather than as a fault.
     //
     // `Scratch::create` makes this directory and holds its `.lock` for the life of the run,
     // so another live run cannot sweep it any more. What can still remove it mid-run is this
@@ -756,10 +739,9 @@ mod recall_study_subgraphs {
 
     /// Load a study fixture. `None` means the file is absent; anything else panics.
     ///
-    /// TW-12: read, decode and parse failures all used to become `None`, and the caller
-    /// printed `SKIP: no data for {acc}` and carried on. A truncated or non-zstd fixture
-    /// therefore reported `ok` locally with a false reason, and in CI the `SKIP:` guard
-    /// failed the job with a message pointing at missing data. The sibling tests panic.
+    /// Panics rather than returning `None`: collapsing read, decode and parse failures into
+    /// "no data for {acc}" reports a truncated or non-zstd fixture as `ok` locally with a
+    /// false reason, and fails CI with a message pointing at missing data.
     fn load(dir: &str, acc: &str) -> Option<UnitigGraph> {
         let p = format!("{dir}/{acc}.unitigs.fa.zst");
         let compressed = match std::fs::read(&p) {
@@ -772,7 +754,7 @@ mod recall_study_subgraphs {
         Some(parse::build(&f.accession, rd, u64::MAX).unwrap_or_else(|e| panic!("{p}: not parseable: {e}")))
     }
 
-    /// TW-12: a corrupt fixture must fail loudly, not be reported as "no data".
+    /// A corrupt fixture must fail loudly, not be reported as "no data".
     #[test]
     // The zstd reader is lazy, so a bad frame surfaces at parse rather than at decode. Match
     // the filename, which both panics carry, rather than pinning which stage noticed.
@@ -958,7 +940,7 @@ mod gfa_tests {
     fn graph(fa: &str) -> UnitigGraph {
         parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap()
     }
-    /// A config and the guard that removes its scratch directory (TW-10). Bind the guard,
+    /// A config and the guard that removes its scratch directory. Bind the guard,
     /// usually as `_d`, for as long as the config is in use.
     fn tmp_cfg(tag: &str) -> (Config, crate::scratch::TestDir) {
         let d = crate::scratch::TestDir::new(tag);
@@ -1038,7 +1020,7 @@ mod gfa_tests {
     }
 
     /// An edge pointing past the end of the graph: refused by `expand`, skipped by the GFA
-    /// writer, a panic in neither (TW-06).
+    /// writer, a panic in neither.
     ///
     /// Logan's headers are reciprocal and in range, so this is malformed input rather than
     /// something seen in the wild; the point is that the two readers of `graph.edges` treat
@@ -1048,15 +1030,14 @@ mod gfa_tests {
     /// space already chosen, and a target outside the graph cannot be one of `nodes`, so
     /// there is nothing to emit and nothing to report.
     ///
-    /// The fixture is assembled by hand because **the parser no longer hands one over**:
-    /// WG-10 made a link past the last record a parse error, since the dense id rule means
-    /// such a link can only mean records are missing. These two guards stay because they are
-    /// what keeps a structural fault from becoming an out-of-bounds index, and the parser
-    /// being strict is not a reason to stop testing them.
+    /// The fixture is assembled by hand because the parser will not produce one: a link past
+    /// the last record is a parse error, since the dense id rule means it can only mean
+    /// records are missing. These guards stay anyway, because they are what keeps a
+    /// structural fault from becoming an out-of-bounds index.
     #[test]
     fn an_edge_past_the_end_of_the_graph_is_refused_then_skipped() {
         use crate::types::Anchors;
-        // WG-10: the same text through the parser is now refused outright.
+        // The same text through the parser is now refused outright.
         let text = concat!(
             ">ACC_0 ka:f:10.0  L:+:1:+  L:+:99:+\nACGT\n",
             ">ACC_1 ka:f:10.0  L:-:0:-\nTTTT\n",
@@ -1164,7 +1145,7 @@ mod cross_check {
             scratch_dir: PathBuf::from(&outdir),
             ..Config::default()
         };
-        // `write_gfa` no longer creates a missing scratch directory (WF-17), so a test that
+        // `write_gfa` no longer creates a missing scratch directory, so a test that
         // names its own creates it, as a run does.
         std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
         let idx = anchor::index_query(&cfg, &query).unwrap();
@@ -1173,13 +1154,12 @@ mod cross_check {
         let seqs = collect_seqs(&graph, &nodes).unwrap();
         let sub = write_gfa(&cfg, &graph, nodes, seqs).unwrap();
 
-        // TW-13: copy the GFA to a stable name BEFORE `sub` drops. `Drop for Subgraph`
-        // unlinks the file it created, so this helper used to report "wrote <path>" and then
-        // delete it, leaving `LOGAN_GFA_OUT` holding only anchors.txt. The name it printed
-        // also embedded the PID, so it was not a name another tool could be pointed at.
+        // Copy the GFA to a stable name BEFORE `sub` drops: `Drop for Subgraph` unlinks
+        // the file it created, and the name it carries embeds the PID, so neither survives
+        // for another tool to be pointed at.
         //
-        // This is not TW-01: here the walker really did create the file, so the ownership
-        // flag is correct and the copy is the fix.
+        // The walker really did create this file, so the ownership flag is correct and
+        // copying it out is the right way to keep it.
         let kept = format!("{outdir}/{}.sub.gfa", f.accession);
         std::fs::copy(&sub.gfa_path, &kept)
             .unwrap_or_else(|e| panic!("could not keep {}: {e}", sub.gfa_path.display()));
@@ -1211,9 +1191,9 @@ mod depth_tests {
         ids.iter().map(|&node| PathStep { node, orient: Orient::Forward }).collect()
     }
 
-    /// WP-01 asked for a k-mer-weighted median here. It was implemented and then removed:
-    /// see `path_depth`'s own note for the measurement that refutes it. This pins the
-    /// statistic that survived, so a future attempt starts from the number it has to beat.
+    /// A k-mer-weighted median was implemented here and then removed; see `path_depth`'s own
+    /// note for the measurement that refutes it. This pins the statistic that survived, so a
+    /// future attempt starts from the number it has to beat.
     #[test]
     fn depth_is_the_step_median_not_the_kmer_weighted_one() {
         let c = Config { graph_k: 4, ..Config::default() };
@@ -1230,7 +1210,7 @@ mod depth_tests {
         );
     }
 
-    /// WP-01. A sub-floor route unitig with a deeper sibling is an error branch and is
+    /// A sub-floor route unitig with a deeper sibling is an error branch and is
     /// pruned; one with no deeper sibling is the only way through and is kept.
     ///
     /// Removing the second cuts the gene's route in two. The realignment then cannot span the
@@ -1343,7 +1323,7 @@ mod depth_tests {
         assert_eq!(path_depth(&Config::default(), &g, &[]), 0.0);
     }
 
-    /// At the floor exactly, a unitig is kept (TW-06).
+    /// At the floor exactly, a unitig is kept.
     ///
     /// `depth_floor` computes the floor as an f32 product, so "exactly at the floor" is a
     /// value the pipeline really does produce, not a contrived one: 1% of a 14,500x gene is
@@ -1401,12 +1381,11 @@ mod depth_tests {
         }
     }
 
-    /// WG-05. `--min-abund` is the allele floor. It used to be the prune's lower bound as
-    /// well, so a user raising it to be stricter about which forks count as variants also
-    /// raised the coverage at which unitigs are deleted from the graph the primary is walked
-    /// on. On a 60x gene with a 42x/18x fork that moved the floor from 5.0 to 20.0, removed
-    /// the reference-matching branch and published a different sequence, with nothing in the
-    /// help text, the docs or the summary saying the two settings were one.
+    /// `--min-abund` is the allele floor and nothing else. Were it also the prune's lower
+    /// bound, raising it to be stricter about variants would raise the coverage at which
+    /// unitigs are deleted from the graph the primary is walked on: on a 60x gene with a
+    /// 42x/18x fork that moves the floor from 5.0 to 20.0, removes the reference-matching
+    /// branch and publishes a different sequence.
     #[test]
     fn min_abund_does_not_move_the_prune_floor() {
         let strict = Config { min_abund: 20.0, ..Config::default() };

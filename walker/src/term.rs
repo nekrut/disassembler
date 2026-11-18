@@ -2,7 +2,7 @@
 
 /// `println!` that does not panic when stdout is a closed pipe.
 ///
-/// WF-17, WP-26. Rust sets SIGPIPE to `SIG_IGN` at startup, so a write to a closed pipe
+/// Rust sets SIGPIPE to `SIG_IGN` at startup, so a write to a closed pipe
 /// returns `EPIPE` rather than killing the process, and `println!` turns that into a panic:
 /// `failed printing to stdout: Broken pipe`. `main` therefore restored the default action, so
 /// `logan-walker ... | head -1` ended the way any Unix tool does. That worked, but it ended the

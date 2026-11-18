@@ -1,13 +1,12 @@
 """from-lexicmap: LexicMap tabular stream -> (sieve opt) -> codon MSA + tree.
 
-Composite: lexicmap -> sieve (optional) -> msa. Lexicmap already writes its
-cohort on the reference grid (`<prefix>.clean.msa.fasta` and friends), with '-'
-at reference positions no HSP covers and at in-frame deletions. Under
---require-full-length the only gaps are those deletions, and rows without one come
-through MAFFT unchanged (measured on three cohorts of 27 to 14,594 sequences), so
-there the MSA stage mostly adds the tree; with the default --min-cov 0.80, rows can
-carry up to 20% '-' and MAFFT may place those gaps differently. The stage is kept so both routes produce the same codon MSA and
-Newick tree shape. See docs/lexicmap.md and docs/codon_msa.md.
+Composite: lexicmap -> sieve (optional) -> msa. Lexicmap already writes its cohort on the
+reference grid (`<prefix>.clean.msa.fasta` and friends), with '-' at reference positions no
+HSP covers and at in-frame deletions. Under --require-full-length the only gaps are those
+deletions and MAFFT reproduces the rows unchanged, so the MSA stage mostly adds the tree;
+with the default --min-cov 0.80 a row can be a fifth '-' and MAFFT may place those gaps
+differently. The stage is kept so both routes produce the same codon MSA and Newick tree
+shape. See docs/lexicmap.md and docs/codon_msa.md.
 
 Sieve/MSA input defaults to `<prefix>.clean.accessions.fasta` (uncollapsed
 clean cohort, one seq per accession); pass --include-partials to feed
@@ -55,7 +54,7 @@ def _cohort_shape(path):
 
     One pass, where the records were already being counted. The second number is what
     keeps the derived sieve and MSA gates from dropping a row lexicmap itself admitted
-    (PC-03).
+.
     """
     n = 0
     worst = 0.0
@@ -85,7 +84,7 @@ def _cohort_shape(path):
 def _derived_gap_limit(gate, worst_gap):
     """The sieve's non-ACGT allowance, never below the cohort's own worst row.
 
-    PC-03. lexicmap counts a trusted deletion as covered with no limit, and leaves `-` in
+    Lexicmap counts a trusted deletion as covered with no limit, and leaves `-` in
     the row where it was. The derived allowance was a flat `1 - gate + 0.05`, so a clean,
     full-length row whose in-frame deletion exceeded 5% of the reference (45 nt in 900)
     was dropped by the sieve's completeness gate, with exit 0 and a `6 -> 5 haplotypes`
@@ -256,7 +255,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     g_msa.add_argument("--mafft-threads", type=positive_int, default=8,
                        help="Accepted for compatibility and ignored: a lexicmap cohort is "
                             "already on the reference grid, so the MSA stage runs with "
-                            "--aligned and does not call MAFFT at all (PC-01).")
+                            "--aligned and does not call MAFFT at all.")
     g_msa.add_argument("--msa-min-cov", type=fraction, default=None,
                        help="Minimum fraction of the reference a row must cover in A/C/G/T "
                             "bases to enter the MSA. Default: 0.70, or the cohort's coverage "
@@ -299,7 +298,7 @@ def _write_manifest(args, stages, started, status=None, error=None) -> None:
 
 
 def _run(args, stages) -> int:
-    # PL-28: one copy of the checks, in `lexicmap`, so one added there reaches both. It runs
+    # One copy of the checks, in `lexicmap`, so one added there reaches both. It runs
     # before --out-dir is created, which is why it is not left to the stage itself.
     bad = lexicmap_cmd.validate_args(args, "from-lexicmap")
     if bad is not None:
@@ -331,7 +330,7 @@ def _run(args, stages) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     prefix = out_dir / "lexicmap"
 
-    # PC-04. `lexicmap` turns a prefix that is an existing DIRECTORY into `<dir>/<ref>.*`,
+    # `lexicmap` turns a prefix that is an existing DIRECTORY into `<dir>/<ref>.*`,
     # so its cohort would land inside `out/lexicmap/` while this composite goes on reading
     # `out/lexicmap.clean.accessions.fasta`. With an earlier run's file at that path, the
     # MSA and the tree are built from the old cohort and reported as this run's.
@@ -346,7 +345,7 @@ def _run(args, stages) -> int:
         Path(f"{prefix}{sfx}").unlink(missing_ok=True)
 
     if args.sieve and not resolve_sieve(args.sieve_bin):
-        # PL-27: the composites exited 1 where the stage they wrap exits 127.
+        # The composites exited 1 where the stage they wrap exits 127.
         print(not_found_message("sieve", "from-lexicmap"), file=sys.stderr)
         return EX_TOOL_NOT_FOUND
 
@@ -369,7 +368,7 @@ def _run(args, stages) -> int:
                   f"off, so these values are inert. Add --sieve to make them take effect.",
                   file=sys.stderr)
 
-    # PC-01: the MSA stage runs with --aligned here, so there is no MAFFT to give threads to.
+    # The MSA stage runs with --aligned here, so there is no MAFFT to give threads to.
     if args.mafft_threads != 8:
         print(f"[from-lexicmap] warn: --mafft-threads {args.mafft_threads} is inert. A "
               f"lexicmap cohort is already on the reference grid, so the MSA stage takes "
@@ -479,11 +478,11 @@ def _run(args, stages) -> int:
           f"--out-tree {tree}", flush=True)
     msa_min_cov = args.msa_min_cov
     if msa_min_cov is None:
-        # PC-03, the same floor from the other side: the MSA's gate is a minimum share of
+        # The same floor from the other side: the MSA's gate is a minimum share of
         # ACGT, so it must not ask for more than the cohort's worst row has.
         msa_min_cov = min(round(min(0.70, gate - GATE_MARGIN), 6),
                           math.floor((1.0 - worst_gap) * 1e6) / 1e6)
-    # PC-01. lexicmap writes every base at the reference position its HSP gives it and `-`
+    # Lexicmap writes every base at the reference position its HSP gives it and `-`
     # where no HSP reached, so this cohort IS an alignment on the reference grid. Handing it
     # to MAFFT discarded those gaps and placed the bases again, and where several placements
     # score the same it slides bases across an uncovered stretch or a deletion: the codon MSA

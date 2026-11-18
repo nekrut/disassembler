@@ -2,7 +2,7 @@
 //!
 //! IN   accession list (one per line, `#` comments skipped) or a single accession
 //!      reference CDS FASTA, in frame, single record
-//! OUT  Vec<Accession>, Query
+//! OUT  `Vec<Accession>`, `Query`
 
 use crate::error::{Error, Result};
 use crate::types::{Accession, Query};
@@ -76,7 +76,7 @@ pub fn read_accession_list_counted(path: &Path) -> Result<(Vec<Accession>, usize
             continue;
         }
         let acc = validate_accession(line, &format!("{}:{}", path.display(), lineno + 1))?;
-        // WF-12: counted rather than warned per line, because a 5,000-accession list written
+        // Counted rather than warned per line, because a 5,000-accession list written
         // in lowercase would otherwise print 5,000 warnings.
         if acc != line {
             uppercased += 1;
@@ -117,15 +117,15 @@ pub fn read_accession_list_counted(path: &Path) -> Result<(Vec<Accession>, usize
 /// Reject an accession that cannot safely be interpolated into a URL and two filesystem
 /// paths, and warn about one that does not look like an SRA run.
 ///
-/// `source` names where the value came from, e.g. `"list.txt:12"` or `"--accession"`. It used
-/// to take a path and a line number, which is why only the `--accession-list` path could call
-/// it: `-a` therefore accepted anything, and the value reaches `s3://logan-pub/u/<acc>/…`,
-/// the scratch GFA name and `<out_dir>/<acc>.vcf`, so `-a ../../foo` escaped both directories.
+/// `source` names where the value came from, e.g. `"list.txt:12"` or `"--accession"`. A free
+/// string rather than a path and a line number, so `-a` can call it too: the value reaches
+/// `s3://logan-pub/u/<acc>/…`, the scratch GFA name and `<out_dir>/<acc>.vcf`, so an
+/// unvalidated `-a ../../foo` escapes both directories.
 pub fn validate_accession(s: &str, source: &str) -> Result<String> {
     if s.is_empty() {
         return Err(Error::Usage(format!("{source}: empty accession")));
     }
-    // WV-19. The value becomes `<out_dir>/<acc>.vcf`, so a 252-character line (accessions
+    // The value becomes `<out_dir>/<acc>.vcf`, so a 252-character line (accessions
     // joined without a separator) pushes the filename past NAME_MAX. `--emit-vcf` then failed
     // the whole run with "File name too long" and wrote no snvs.tsv, no alt FASTA and no
     // summary, although the good accessions had reconstructed; the same list without
@@ -152,7 +152,7 @@ pub fn validate_accession(s: &str, source: &str) -> Result<String> {
     if sra_shaped(s) {
         return Ok(s.to_string());
     }
-    // WF-12. The bucket is case-sensitive, so `srr8209082` fetched verbatim is a 404, and a
+    // The bucket is case-sensitive, so `srr8209082` fetched verbatim is a 404, and a
     // 404 is `no_logan_data`: "Logan has nothing for this accession". For a run Logan does
     // have, that is a silent false negative, and `--allow-empty` turns it into exit 0 with an
     // empty FASTA. Uppercasing is safe because the SRA's own run accessions are uppercase, so
@@ -269,10 +269,9 @@ pub fn read_query_from(path: &Path, bytes: &[u8]) -> Result<Query> {
 /// single-record path. `read_query_set` is what runs when the collected reference set is
 /// wider than that — repeated `-q file.fa`, or a multi-record FASTA passed intentionally.
 /// Each returned [`Query`] holds one record, so the "one record per Query" contract every
-/// stage assumes is preserved by splitting up front here. Its `n_records` is still the count
-/// of records in its file, as the field promises: it used to be 1, which told
-/// `align::run` the file could be handed to GraphAligner as is, so the prune pass's
-/// realignment against the winning reference aligned every record in a panel again.
+/// stage assumes is preserved by splitting up front here. Its `n_records` is the count of
+/// records in its FILE, as the field promises, not 1: `align::run` reads it to decide whether
+/// the file can be handed to GraphAligner as is.
 ///
 /// Naming: the [`Query::name`] is the file stem when a file holds a single record (matching
 /// `read_query`), and `<stem>__<record_id>` when a file holds several. That keeps the
@@ -296,7 +295,7 @@ pub fn read_query_set(paths: &[PathBuf]) -> Result<Vec<Query>> {
 /// between the single-record path and the whole set by reading the one `-q` file and looking
 /// at its record count, and before 0.2.0 it then called [`read_query_set`], which opened the
 /// same path again: on a pipe the second read returned nothing and a multi-record query died
-/// with "no FASTA records found" (WA-01). It hands those bytes here instead.
+/// with "no FASTA records found". It hands those bytes here instead.
 pub fn read_query_set_from(sources: &[(PathBuf, Vec<u8>)]) -> Result<Vec<Query>> {
     if sources.is_empty() {
         return Err(Error::Usage("no query FASTAs provided".into()));
@@ -658,7 +657,7 @@ mod repo_files {
 
     /// Every shipped query FASTA must be readable.
     ///
-    /// TW-11: this logged bad files and asserted only `n > 0`, so a malformed FASTA under
+    /// This logged bad files and asserted only `n > 0`, so a malformed FASTA under
     /// `queries/` passed, and it was `#[ignore]`d so it did not run on push at all. It needs
     /// nothing but repository files, so there is no reason to skip it.
     #[test]
@@ -697,7 +696,7 @@ mod repo_files {
 mod validation_tests {
     use super::validate_accession;
 
-    /// WF-12. The bucket is case-sensitive, so a lowercase accession 404s, and a 404 is
+    /// The bucket is case-sensitive, so a lowercase accession 404s, and a 404 is
     /// `no_logan_data`: a statement that Logan holds nothing for this run. For a run Logan
     /// does hold, that is a false negative the output cannot be told apart from a real one,
     /// and `--allow-empty` makes it exit 0.
@@ -741,10 +740,10 @@ mod validation_tests {
         }
     }
 
-    /// WV-19. The accession becomes `<out_dir>/<acc>.vcf`, and past NAME_MAX that write
-    /// fails with "File name too long". Under `--emit-vcf` it used to take the whole run
-    /// down with it, summary included, after the other accessions had already succeeded.
-    /// 64 is far above any real run accession and far below the limit.
+    /// The accession becomes `<out_dir>/<acc>.vcf`, and past NAME_MAX that write fails with
+    /// "File name too long", which under `--emit-vcf` would take the whole run down after the
+    /// other accessions had succeeded. 64 is far above any real accession and far below the
+    /// limit.
     #[test]
     fn an_accession_too_long_for_a_filename_is_refused() {
         assert!(

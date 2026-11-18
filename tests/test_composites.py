@@ -43,7 +43,7 @@ class _Stubs(unittest.TestCase):
         self.walker = self.work / "fake_walker.sh"
         self.walker.write_text(
             "#!/usr/bin/env bash\n"
-            # PK-01: the composites check the walker's version before running it, because
+            # The composites check the walker's version before running it, because
             # the published 0.1.1 container pairs this package with walker 0.1.0. A stub
             # that cannot answer --version is, as far as that check is concerned, exactly
             # the broken install it exists to catch.
@@ -101,7 +101,7 @@ class TestStageArgs(unittest.TestCase):
         from disassembler.cmd import msa
         from disassembler.stage import stage_args
         # `--out-tree` is no longer argparse-required: an alignment can be produced without
-        # FastTree, under `--no-tree` (PM-18). Exactly one of the two is still required, and
+        # FastTree, under `--no-tree`. Exactly one of the two is still required, and
         # msa itself enforces that, so it is checked below rather than here.
         with self.assertRaisesRegex(TypeError, "missing required input, out_aln"):
             stage_args(msa, ref="r.fa")
@@ -155,7 +155,7 @@ class TestFromKmindex(_Stubs):
         self.assertTrue((self.out / "gene_fasttree.nwk").is_file())
 
     def test_a_target_with_no_hits_in_this_harvest_is_refused(self):
-        """PC-05. The cohort is picked by file name, and harvest writes a file per target
+        """The cohort is picked by file name, and harvest writes a file per target
         of this run. Re-running into the same -o with a collection in which --target has
         no hits found the previous run's file and reconstructed the previous collection's
         accessions, with exit 0 and a summary listing only the new targets.
@@ -285,7 +285,7 @@ class TestReconstruct(_Stubs):
         self.assertEqual((out / "gene_codon_msa.fasta").read_text().count(">"), 3)
 
     def test_a_walker_that_writes_nothing_does_not_align_an_earlier_runs_cohort(self):
-        """PC-04. The reconstruction is found by a fixed name, and nothing checked that
+        """The reconstruction is found by a fixed name, and nothing checked that
         this run wrote it. A walker flag that makes the walker exit 0 without writing `-f`
         (`--fetch-only`, `-h`, `--version`) therefore left the composite aligning whatever
         an earlier run had put at that path, reporting it as this run's, with exit 0.
@@ -311,7 +311,7 @@ class TestReconstruct(_Stubs):
         self.assertFalse(stale.exists(), "the stale handoff survived the run")
 
     def test_walker_flags_that_skip_the_reconstruction_are_refused(self):
-        """PC-04, the clearer half: each of these has a better form of its own, and
+        """Each of these has a better form of its own, and
         `docs/codon_msa.md` invites any walker flag after `--`."""
         out = self.work / "out"
         for flag in ("--fetch-only", "-h", "--help", "-V", "--version"):
@@ -377,14 +377,14 @@ class TestReconstruct(_Stubs):
         self.assertEqual(rc, 0, log)
         self.assertIn("multi-anchor: 2 references. The MSA aligns against the first record of "
                       "the first -q (gene in", log)
-        # PC-02: the walker's own gate, not a flat 95%. The walker publishes a primary
+        # The walker's own gate, not a flat 95%. The walker publishes a primary
         # from 0.85 of the reference, so thinning at 0.95 removed haplotypes both
         # neighbouring stages accept.
         self.assertEqual(seen["min_len"], int(9 * 0.85),
                          "the walker's --min-cov over the shortest reference")
 
     def test_the_sieve_gate_follows_a_passed_through_min_cov(self):
-        """PC-02. `-- --min-cov 0.6` widens what the walker publishes, and the sieve's
+        """`-- --min-cov 0.6` widens what the walker publishes, and the sieve's
         completeness gate has to widen with it or it removes exactly the rows that flag
         was passed to keep."""
         import sys
@@ -426,7 +426,7 @@ class TestReconstruct(_Stubs):
 class TestFromLexicmap(_Stubs):
 
     def test_the_cohort_reaches_the_msa_unmoved(self):
-        """PC-01. lexicmap writes each base at the reference position its HSP gives it, so
+        """Lexicmap writes each base at the reference position its HSP gives it, so
         the cohort is already an alignment. It used to go through MAFFT anyway, which
         discards the gaps and places the bases again; where several placements score the
         same, a SNV slides across an uncovered stretch and the codon MSA and tree disagree
@@ -465,7 +465,7 @@ class TestFromLexicmap(_Stubs):
                              f"{rid} moved between the cohort and the MSA")
 
     def test_a_lexicmap_directory_in_the_way_is_refused_not_worked_around(self):
-        """PC-04. `lexicmap` turns a prefix that is an existing directory into
+        """`lexicmap` turns a prefix that is an existing directory into
         `<dir>/<ref>.*`, so the cohort lands inside `out/lexicmap/` while this composite
         goes on reading `out/lexicmap.clean.accessions.fasta`. With an earlier run's file
         at that path, the MSA and tree were built from the old cohort, with exit 0.
@@ -490,7 +490,7 @@ class TestFromLexicmap(_Stubs):
         self.assertFalse((out / "gene_codon_msa.fasta").exists())
 
     def test_a_cohort_this_run_did_not_write_is_not_aligned(self):
-        """PC-04, the other half: the cohort files this run reads are removed before
+        """The cohort files this run reads are removed before
         lexicmap runs, so one left by an earlier run cannot stand in for this run's.
 
         lexicmap is stubbed to the exact shape that caused it: exit 0 having written no
