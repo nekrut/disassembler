@@ -232,7 +232,7 @@ pub fn run_fetch_only(
                 let progress = out.len() + 1;
                 match fetched {
                     Ok(f) => {
-                        println!(
+                        crate::outln!(
                             "[{progress}/{total}] {accession}: cached ({} bytes in {:.1}s)",
                             f.compressed_len,
                             t.elapsed().as_secs_f64()
@@ -466,7 +466,7 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
             } else {
                 String::new()
             };
-            println!(
+            crate::outln!(
                 "[{done}/{total}] {}: DONE in {:.1}s (nodes={}, cov={:.2}, pid={:.1}%, bubbles={}{})",
                 r.accession,
                 r.timing.total,
@@ -477,23 +477,23 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
                 haps_info
             );
         }
-        Outcome::NoAnchors => println!("[{done}/{total}] {}: no_anchors", r.accession),
-        Outcome::NoPath => println!("[{done}/{total}] {}: no_path", r.accession),
-        Outcome::NoLoganData => println!(
+        Outcome::NoAnchors => crate::outln!("[{done}/{total}] {}: no_anchors", r.accession),
+        Outcome::NoPath => crate::outln!("[{done}/{total}] {}: no_path", r.accession),
+        Outcome::NoLoganData => crate::outln!(
             "[{done}/{total}] {}: no_logan_data (no Logan unitigs for this accession)",
             r.accession
         ),
-        Outcome::SubgraphTooLarge => println!(
+        Outcome::SubgraphTooLarge => crate::outln!(
             "[{done}/{total}] {}: subgraph_too_large{}",
             r.accession,
             r.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default()
         ),
-        Outcome::TooLarge => println!(
+        Outcome::TooLarge => crate::outln!(
             "[{done}/{total}] {}: too_large, skipped ({})",
             r.accession,
             r.error.as_deref().unwrap_or("over the cap")
         ),
-        Outcome::Failed => println!(
+        Outcome::Failed => crate::outln!(
             "[{done}/{total}] {}: ERROR: {}",
             r.accession,
             r.error.as_deref().unwrap_or("unknown")

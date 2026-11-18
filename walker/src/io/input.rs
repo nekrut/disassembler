@@ -149,7 +149,15 @@ pub fn validate_accession(s: &str, source: &str) -> Result<()> {
 /// no case folding.
 pub fn read_query(path: &Path) -> Result<Query> {
     let bytes = read_input(path, "query")?;
+    read_query_from(path, &bytes)
+}
 
+/// [`read_query`] over bytes already in hand.
+///
+/// The split exists so a caller that has to decide between the single-record path and the
+/// whole set can do it without opening the file twice. `path` is kept for messages and for
+/// [`Query::path`]; nothing here touches the filesystem.
+pub fn read_query_from(path: &Path, bytes: &[u8]) -> Result<Query> {
     let mut records: Vec<(String, Vec<u8>)> = Vec::new();
     let mut header: Option<String> = None;
     let mut seq: Vec<u8> = Vec::new();
@@ -246,9 +254,28 @@ pub fn read_query_set(paths: &[PathBuf]) -> Result<Vec<Query>> {
     if paths.is_empty() {
         return Err(Error::Usage("no query FASTAs provided".into()));
     }
-    let mut out: Vec<Query> = Vec::new();
+    let mut sources: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(paths.len());
     for path in paths {
         let bytes = read_input(path, "query")?;
+        sources.push((path.clone(), bytes));
+    }
+    read_query_set_from(&sources)
+}
+
+/// [`read_query_set`] over bytes already in hand, one entry per `-q` file.
+///
+/// Every input the walker accepts may be a pipe, which can only be read once. `main` decides
+/// between the single-record path and the whole set by reading the one `-q` file and looking
+/// at its record count, and before 0.2.0 it then called [`read_query_set`], which opened the
+/// same path again: on a pipe the second read returned nothing and a multi-record query died
+/// with "no FASTA records found" (WA-01). It hands those bytes here instead.
+pub fn read_query_set_from(sources: &[(PathBuf, Vec<u8>)]) -> Result<Vec<Query>> {
+    if sources.is_empty() {
+        return Err(Error::Usage("no query FASTAs provided".into()));
+    }
+    let mut out: Vec<Query> = Vec::new();
+    for (path, bytes) in sources {
+        let path = path.as_path();
 
         let mut records: Vec<(String, Vec<u8>)> = Vec::new();
         let mut header: Option<String> = None;

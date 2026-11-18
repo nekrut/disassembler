@@ -11,6 +11,10 @@
 //! removed when the run ends, on SIGINT, SIGTERM or SIGHUP, and, if a SIGKILL or the OOM
 //! killer left it behind, by the next run over the same base once that PID is gone.
 //! `LOGAN_KEEP_SCRATCH` keeps it, for debugging.
+//!
+//! The same signal also stops the run's GraphAligner children (WF-15). They are the only
+//! processes the walker starts, they are what the scratch files are for, and without this
+//! they outlived the run: see [`watch_child`].
 
 use crate::error::{file_err, Error, Result};
 use std::path::{Path, PathBuf};
@@ -25,7 +29,8 @@ pub fn keep_scratch() -> bool {
     !cfg!(test) && std::env::var_os("LOGAN_KEEP_SCRATCH").is_some()
 }
 
-/// A scratch directory owned by one unit test, removed when the test's guard drops (TW-10).
+/// A scratch directory owned by one unit test, created now and removed when the test's guard
+/// drops (TW-10).
 ///
 /// Several test helpers built a `Config` around a path under the system temp directory and
 /// never removed it. `write_gfa` creates the directory, the test removed only the GFA, and a
@@ -39,15 +44,23 @@ pub struct TestDir(PathBuf);
 
 #[cfg(test)]
 impl TestDir {
-    /// A fresh, not-yet-created directory path tagged with `tag`.
+    /// A fresh directory tagged with `tag`.
+    ///
+    /// It is created here. `extract::write_gfa` used to create a missing scratch directory
+    /// itself, which is how these tests got away with a path that did not exist; it now
+    /// refuses instead (WF-17), because the one thing that removes the directory mid-run is
+    /// this run's own signal handler, and a worker that puts it back undoes the cleanup.
+    /// Tests that want a scratch directory make their own, as a run does.
     pub fn new(tag: &str) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        Self(std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().join(format!(
             "logan_{tag}_test_{}_{n}",
             std::process::id()
-        )))
+        ));
+        let _ = std::fs::create_dir_all(&path);
+        Self(path)
     }
     pub fn path(&self) -> PathBuf {
         self.0.clone()
@@ -60,6 +73,70 @@ impl Drop for TestDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// PIDs of the GraphAligner children this run has started and not yet reaped.
+///
+/// WF-15. The signal thread used to remove the scratch directory and exit, and nothing knew
+/// about the aligners: after `kill <walker pid>` or `timeout N logan-walker`, up to `-w`
+/// GraphAligner processes kept burning CPU and RAM, reparented to init, working on files that
+/// had just been deleted. Ctrl-C in a terminal hid it, because the tty signals the whole
+/// foreground process group, and so do runners that kill a process group or a cgroup; a bare
+/// `kill` to the walker alone does not.
+///
+/// Each entry is also a **process group id**, because `align::run` spawns with
+/// `process_group(0)`, which makes the child its own group leader. Signalling the group rather
+/// than the process is what reaches a `--graphaligner` wrapper script's own children.
+///
+/// The one race left is a PID reused between the child being reaped and [`ChildGuard`]
+/// dropping, a window of microseconds. Nothing cheap closes it, and the cost of losing is one
+/// stray SIGTERM to an unrelated group of this user's, at a moment when this process is
+/// already exiting.
+static ALIGNERS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Register a spawned aligner, and unregister it when the returned guard drops.
+///
+/// The caller holds the guard until it has reaped the child, so the list only ever names
+/// processes that are, as far as this process knows, still running.
+pub fn watch_child(pid: u32) -> ChildGuard {
+    lock_aligners().push(pid);
+    ChildGuard(pid)
+}
+
+pub struct ChildGuard(u32);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        lock_aligners().retain(|&p| p != self.0);
+    }
+}
+
+/// The aligner list, taking a poisoned lock rather than panicking.
+///
+/// A panicking compute worker must not disarm the cleanup for every other worker's child.
+fn lock_aligners() -> std::sync::MutexGuard<'static, Vec<u32>> {
+    ALIGNERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// SIGTERM every running aligner's process group.
+///
+/// SIGTERM, not SIGKILL: this is the signal a scheduler would have sent them itself had they
+/// been in the job's process group, and GraphAligner has nothing to flush. The walker exits
+/// immediately afterwards, so it does not wait for them.
+#[cfg(unix)]
+fn stop_children() {
+    for pid in lock_aligners().drain(..) {
+        // `kill(-pgid)` with pgid 0 or 1 would mean "my own group" and "every process I may
+        // signal". Neither can be a child of ours, so neither is worth the risk.
+        if pid > 1 {
+            // SAFETY: `kill` has no preconditions beyond a valid signal number; an exited
+            // group is ESRCH, which is ignored.
+            unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn stop_children() {}
 
 const PREFIX: &str = "logan-walker.";
 /// Marks a scratch directory as claimed by a live run (WF-01).
@@ -129,8 +206,9 @@ impl Scratch {
         &self.path
     }
 
-    /// On SIGINT, SIGTERM or SIGHUP, remove the directory, then end the process as the
-    /// signal would have, so the caller still sees "terminated by SIGTERM".
+    /// On a signal that would end the run, stop the run's GraphAligner children and remove
+    /// the directory, then end the process as the signal would have, so the caller still sees
+    /// "terminated by SIGTERM". The list is in the body, with what sends each one.
     ///
     /// **Signals the process inherited as ignored are left ignored** (WF-02). Registering a
     /// handler for one is a 0.1.1 regression that breaks `nohup`: bash sends SIGHUP to every
@@ -142,11 +220,32 @@ impl Scratch {
     /// across `exec`, so GraphAligner stopped inheriting the ignore and died of the same
     /// hangup. Leaving the disposition alone passes the ignore through.
     pub fn remove_on_signal(&self) -> Result<()> {
-        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-        let wanted: Vec<i32> = [SIGINT, SIGTERM, SIGHUP]
-            .into_iter()
-            .filter(|&s| !is_ignored(s))
-            .collect();
+        use signal_hook::consts::{
+            SIGHUP, SIGINT, SIGPIPE, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGXCPU, SIGXFSZ,
+        };
+        // WF-17. Only INT, TERM and HUP were watched, so every other way a run ends killed
+        // the process with the directory still in `/dev/shm`, holding RAM until some later
+        // run over the same base swept it. Each of these was measured leaving one behind:
+        //
+        // - SIGPIPE (141), `logan-walker ... | head -1`. `main::default_sigpipe` undoes the
+        //   `SIG_IGN` Rust installs at startup, which is what lets this list claim it;
+        //   `crate::outln!` then keeps the writing thread from panicking on the EPIPE that
+        //   now comes back before the signal is acted on.
+        // - SIGQUIT (131), Ctrl-\.
+        // - SIGUSR1 (138) and SIGUSR2 (140), which is how SGE and LSF announce a soft
+        //   wall-time limit, and SIGXCPU (152), which is a CPU ulimit or a cgroup.
+        // - SIGXFSZ, a file-size ulimit, included for the same reason though it was not
+        //   measured: the walker writes files.
+        //
+        // SIGALRM, SIGVTALRM and SIGPROF are deliberately **not** here, though the review
+        // listed them. Nothing sends them to announce a limit; what does send them is a timer
+        // or a sampling profiler belonging to the process itself, and catching those would
+        // end a profiled run rather than clean up after one.
+        let wanted: Vec<i32> =
+            [SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGQUIT, SIGUSR1, SIGUSR2, SIGXCPU, SIGXFSZ]
+                .into_iter()
+                .filter(|&s| !is_ignored(s))
+                .collect();
         if wanted.is_empty() {
             // Every signal we would clean up on is ignored, so there is nothing to hook.
             // `Drop` still removes the directory on an ordinary exit.
@@ -156,6 +255,9 @@ impl Scratch {
         let (path, keep) = (self.path.clone(), self.keep);
         std::thread::spawn(move || {
             if let Some(sig) = signals.forever().next() {
+                // Before the files, because the aligners are reading and writing them: a
+                // child left running after the directory goes is working on nothing.
+                stop_children();
                 if !keep {
                     remove(&path);
                 }
@@ -268,11 +370,21 @@ fn lock_is_free(dir: &Path, me: &str) -> bool {
     true
 }
 
-/// `remove_dir_all`, tried twice: a worker can create a file in the directory while it is
-/// being emptied, which makes the first attempt fail with "directory not empty".
+/// `remove_dir_all`, retried: a worker can create a file in the directory while it is being
+/// emptied, which makes an attempt fail with "directory not empty".
+///
+/// Two attempts back to back were not always enough on the signal path, where several
+/// compute workers may be mid-write; 20 tries over 100 ms covers the gap between a worker's
+/// last write and its death without making an ordinary exit wait for anything (the first
+/// attempt succeeds, and the loop stops as soon as the directory is gone).
 fn remove(path: &Path) {
-    if std::fs::remove_dir_all(path).is_err() {
-        let _ = std::fs::remove_dir_all(path);
+    for attempt in 0..20 {
+        if std::fs::remove_dir_all(path).is_ok() || !path.exists() {
+            return;
+        }
+        if attempt < 19 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 

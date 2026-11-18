@@ -50,6 +50,40 @@ if it is not 1.0.17b.
 To reproduce the original one-haplotype-per-accession behaviour (the golden fixtures' setting),
 use `--prune-frac 0.0 --no-prefer-majority --no-emit-alts`.
 
+### The reference the aligner sees
+
+The query file is read once, at startup. What GraphAligner is handed is the record the walker
+parsed, written as `>{record id}` followed by one line of uppercased sequence, never a copy of
+the file. The record id is the header's first token, whitespace inside the sequence is gone and
+case is folded, so the aligner and the anchoring stage see the same bases by construction.
+
+Until 0.2.0 a query file holding exactly one record was copied through byte for byte instead,
+which cost three things, all of them quiet:
+
+- a query that can only be read once, such as `-q <(zcat ref.fa.gz)` or `-q /dev/stdin`, was
+  empty from the second accession onward, so GraphAligner got a 0-byte FASTA and every
+  accession after the first came back `no_path`. A plumbing failure, reported as a clean
+  biological negative
+- the header line reached GraphAligner intact. 1.0.17b takes the whole line as the read name
+  and writes it unescaped into GAF column 1, so a tab in `>gene<TAB>description` shifted every
+  column and the row was dropped, and a non-UTF-8 byte anywhere in the header failed the
+  accession outright
+- whitespace inside sequence lines reached it too. 1.0.17b strips only trailing whitespace, so
+  codon-spaced `ATG GCT AAA` left no usable seed and `no_path` everywhere, while GenBank-style
+  10-base blocks reached the alignment's fallback branch, which calls `abort()`: SIGABRT on
+  every accession
+
+A query with more than one record was always written out the normalised way, so the last two
+showed only where a single record arrived on its own: a one-record file, or the prune pass
+realigning the multi-anchor winner out of a pool built from one-record files.
+
+The first had a second cause, in startup rather than in the aligner. The walker read a single
+`-q` file to count its records and, finding more than one, read it again to load the whole
+reference set. On a pipe that second read saw an empty stream, so a multi-record query stopped
+the run with `no FASTA records found`, naming a file that was perfectly good. Both reads are
+now one, so `cat panel.fa | logan-walker -q /dev/stdin` works for any record count and
+`README.md`'s "so does a pipe" is true of the query as it is of the other inputs.
+
 ## Multi-anchor mode
 
 Give the walker more than one reference, by repeating `-q` or with a FASTA that holds several
@@ -272,6 +306,41 @@ disassembler walker -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/r
 `fetch` skips accessions already in the cache; delete a file to refetch it. The composites take
 the same two flags.
 
+### Accessions with nothing to cache
+
+Some accessions have no object to write: Logan holds no unitigs for them, or they are over
+`--max-size-mb`. Both are properties of the accession rather than failures of the run, and
+online the walker reports them as `no_logan_data` and `too_large` and carries on. Until 0.2.0
+the follow-up `--offline` run could not tell: it saw an ordinary cache miss and called it an
+`error`, so the same list with the same flags gave exit 0 online and exit 1, or 3, offline.
+Since 0.2.0 any error also makes the run non-zero, which turned that into a shard of 404s
+failing outright.
+
+The fetch now leaves a one-line note, `<DIR>/<ACC>.unitigs.absent`, saying which negative it
+was (`no_logan_data`, or `too_large <bytes>`), and the offline run reads it back and reports
+the same status it would have reported online. Three things follow from that:
+
+- **Deleting a note forces the next online run to ask the bucket again.** A successful fetch
+  removes it by itself, because Logan does add data for accessions it had none for.
+- **A `too_large` note stops applying once `--max-size-mb` is raised past the size it
+  records**, so filling a cache at one cap and walking at a higher one does not keep refusing.
+  The accession is then an ordinary cache miss, because the object really is not there.
+- **A damaged note is no note at all.** It degrades to the plain cache-miss error rather than
+  inventing an outcome.
+
+### When a cache entry is not a Logan object
+
+A cache entry used to be accepted on "not empty". A 200 response that was not a Logan object
+at all, such as a proxy's HTML error page, was therefore written into the cache under the
+accession's name, where it failed that accession with `parse failed: Unknown frame descriptor`
+on every later run, online runs included, until someone found and deleted the file by hand.
+
+The walker now checks the first four bytes for the zstd frame magic, both on the body it is
+about to cache and on an entry it is about to read. A body that is not zstd is never cached
+and the attempt is retried. An entry that is not zstd is removed and downloaded again; under
+`--offline` there is nothing to replace it with, so it is refused with a message naming the
+file, and the file is left alone for you to inspect.
+
 ### What a cached object is a copy of
 
 Beside each cached object the walker writes `<ACC>.unitigs.fa.zst.provenance`, a few lines of
@@ -346,9 +415,12 @@ Options that are on by default are turned off with a `--no-…` form.
 | `--hops <N>` | `5` | hop radius of the subgraph around the anchors |
 | `--max-size-mb <N>` | `4096` | refuse accessions above this compressed size. See [Choosing the size cap](#choosing-the-size-cap) |
 | `--fetch-workers <N>` | `8` | parallel S3 downloads (bandwidth saturates around 8); at least 1 |
+| `--fetch-attempts <N>` | `6` | failed attempts per accession before it is given up. 408, 429, 5xx and transport errors are retried with a jittered exponential backoff (1, 2, 4 ... seconds, capped at 60) and `Retry-After` is honoured; an attempt that transferred real data before the connection dropped resumes and does not count as a failure |
+| `--fetch-timeout <SECS>` | `300` | budget for one fetch attempt, connect and body included. An interrupted transfer resumes from where it stopped, so this bounds how long a stalled connection goes unnoticed, not how long an accession may take |
 | `-w, --workers <N>` | `8` | compute workers (see [Memory](#memory) before raising); at least 1 |
 | `-t, --threads <N>` | `1` | threads per GraphAligner call; above 1 is not reproducible |
 | `--graphaligner <PATH>` | `GraphAligner` on `PATH` | the GraphAligner executable |
+| `--graphaligner-timeout <SECS>` | `3600` | kill a single GraphAligner call after this many seconds and fail that accession only; `0` waits forever. A stall detector, not a budget: the largest subgraph measured here (34,582 nodes) aligns in 0.47 s |
 | `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover |
 | `--primary-metric <M>` | `matched` | multi-anchor primary selection: `matched`, `cov`, `pident` or `cov_x_pident` |
 | `--primary-tie-eps <F>` | `0.002` | references scoring within this of the best are treated as tied and the deepest route wins; `0` restores pre-0.2.0 panel-order behaviour (see [Multi-anchor mode](#multi-anchor-mode)) |
@@ -657,10 +729,33 @@ Each accession's subgraph GFA, alignment GAF and a temporary copy of the referen
 a scratch directory while it is aligned. Every run makes its own, `logan-walker.<pid>.<suffix>`
 with mode 0700, under `--scratch-dir`. The default is `/dev/shm`, which is tmpfs, so the files use
 RAM; where it does not exist (macOS), the system temp directory is used instead. The files are
-removed as each accession finishes, and the directory is removed when the run ends, including
-on SIGINT, SIGTERM or SIGHUP. A run killed outright (SIGKILL, or the out-of-memory killer)
-cannot clean up, so the next run with the same `--scratch-dir` removes any directory whose
-process no longer exists. Set `LOGAN_KEEP_SCRATCH=1` to keep the directory for debugging.
+removed as each accession finishes, and the directory is removed when the run ends, on any of
+the signals that end a run: SIGINT, SIGTERM, SIGHUP, SIGPIPE, SIGQUIT, SIGUSR1, SIGUSR2,
+SIGXCPU and SIGXFSZ. A run killed outright (SIGKILL, or the out-of-memory killer) cannot clean
+up, so the next run with the same `--scratch-dir` removes any directory whose process no
+longer exists. Set `LOGAN_KEEP_SCRATCH=1` to keep the directory for debugging.
+
+Until 0.2.0 the list was SIGINT, SIGTERM and SIGHUP only, so every other ending left the
+directory in `/dev/shm` holding RAM until a later run swept it. The ones that matter in
+practice are `logan-walker ... | head` (SIGPIPE, which is what makes a pipeline exit 141),
+SIGUSR1 and SIGUSR2, which is how SGE and LSF announce a soft wall-time limit, and SIGXCPU
+from a CPU ulimit or a cgroup. A signal the walker inherited as ignored stays ignored, so
+`nohup` still works.
+
+SIGALRM, SIGVTALRM and SIGPROF are deliberately not in the list. Nothing sends those to
+announce a limit; what does send them is a timer or a sampling profiler belonging to the
+process itself, and catching them would end a profiled run rather than clean up after one.
+
+**Any of those signals also stops the GraphAligner processes the run started.** They are the only
+processes the walker starts, and these scratch files are what they are working on. Until
+0.2.0 nothing tracked them, so `kill <walker pid>` or `timeout 3600 logan-walker` left up to
+`-w` of them running, reparented to init, aligning against files that had just been deleted.
+Ctrl-C in a terminal never showed this, because a terminal signals the whole foreground
+process group, and neither do schedulers that kill a process group or a cgroup; a plain `kill`
+to the walker alone does. Each aligner now runs in its own process group, which is what lets
+one signal reach a wrapper script's children as well, and on Linux it is additionally marked
+to die with the walker, so even SIGKILL and the out-of-memory killer take the aligners with
+them.
 
 Before 0.1.1 every run shared `/dev/shm/logan-walker`: created by one user, it failed other
 users' runs with a bare "permission denied", and an interrupted run left its files there,
@@ -708,6 +803,29 @@ a `HEAD` of its object. The bucket also honours conditional requests, so
 `If-None-Match: "<etag>"` returns `304` when the object is unchanged and the full body when it
 is not.
 
+### When a fetch goes wrong
+
+A transfer that is interrupted **resumes**. The next attempt asks for the rest with a `Range`
+header and an `If-Match` on the object's `ETag`, so a dropped connection costs the time it was
+up, not the bytes it transferred. The `If-Match` is what makes that safe: the `u/` objects are
+mutable, and without it a resume could staple the tail of a replaced object onto the head of
+the one the transfer started with. A server that cannot honour the range answers 200 or 412
+and the transfer starts again from the beginning.
+
+Before 0.2.0 every attempt reissued a plain `GET` from byte 0 against a fixed 900 s
+whole-request timeout with no flag, which made that timeout a hard floor on transfer rate: an
+object whose per-stream rate fell below size/900s could not be fetched **at all**, however many
+attempts it was given, because every attempt timed out in the same place. At the 4 GB cap that
+floor is 4.7 MB/s per stream.
+
+Retries used to be three attempts at a fixed `500 ms x attempt`, which is 1.5 s in total, and
+408 and 429 were not retried at all. A 60-second network, proxy or DNS interruption therefore
+discarded one accession per fetch worker every 1.5 s: about 320 accessions marked `error` at
+the default eight workers. The default is now six failed attempts with a jittered exponential
+backoff, which covers about half a minute, and `--fetch-attempts 10` covers about four. The
+jitter matters because fetch workers fail together, for the same reason, and would otherwise
+all return together.
+
 ## Reproducibility
 
 - **Input bytes.** See [Input provenance](#input-provenance). Reproducing a run means
@@ -738,7 +856,7 @@ Each accession ends with one status, printed as it finishes and recorded in the 
 | `no_logan_data` | Logan has no unitigs for the accession: the bucket returns 404, or it serves an object that decompresses to nothing (a 55-byte empty zstd frame, which about 0.4% of accessions have) | nothing found |
 | `too_large` | over `--max-size-mb`, so skipped before downloading; or its parsed graph would exceed the per-accession graph budget; or its spooled adjacency will not fit under `--spool-dir` (see [Disk](#disk)) | nothing found |
 | `subgraph_too_large` | the gene's neighbourhood is over `--max-subgraph-nodes` | nothing found |
-| `error` | anything else: a network or cache failure, a corrupt file, GraphAligner crashing | error |
+| `error` | anything else: a network or cache failure, a corrupt file, GraphAligner crashing, or one GraphAligner call passing `--graphaligner-timeout` | error |
 
 One bad accession does not stop the run: the others are still walked, and whatever was
 reconstructed is still written. **It does make the run fail, though.** An accession that
@@ -776,7 +894,9 @@ accessions with no Logan data or over the size cap; any other failure exits 1, o
 accession failed.
 
 If the walker's standard output is closed early (`logan-walker ... | head`), the walker stops
-on SIGPIPE, as other Unix tools do. Before 0.1.1 it panicked and then hung.
+on SIGPIPE, as other Unix tools do, and exits 141. Before 0.1.1 it panicked and then hung.
+Through 0.1.1 it ended on the spot, mid-write, with nothing run on the way out; from 0.2.0 it
+cleans up first (see [Scratch files](#scratch-files)).
 
 ## Logan unitig files
 

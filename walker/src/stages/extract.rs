@@ -326,21 +326,27 @@ pub fn write_gfa(
         });
     }
 
-    // WF-01. This used to be a bare `create_dir_all`, which silently put back a scratch
-    // directory another run had deleted mid-flight, and put it back with the default mode
-    // 0755 instead of 0700. That silence is half of why the deletion surfaced as the
-    // biological answer `no_path` rather than as a fault. The directory is created by
-    // `Scratch::create` and should already be here; say so when it is not, and restore the
-    // private mode rather than widening it.
+    // WF-01, then WF-17. This used to be a bare `create_dir_all`, which silently put back a
+    // scratch directory another run had deleted mid-flight, and put it back with the default
+    // mode 0755 instead of 0700. That silence is half of why the deletion surfaced as the
+    // biological answer `no_path` rather than as a fault. WF-01 made it warn and recreate;
+    // it now refuses instead, because recreating is wrong in every case that is left.
+    //
+    // `Scratch::create` makes this directory and holds its `.lock` for the life of the run,
+    // so another live run cannot sweep it any more. What can still remove it mid-run is this
+    // run's own signal handler, on its way out, and a worker that recreates the directory
+    // then puts it straight back after the cleanup that was supposed to remove it, with a
+    // GFA and a GAF inside. The remaining case, somebody deleting the directory by hand, is
+    // a fault too. So: fail the accession and say what happened.
     if !cfg.scratch_dir.exists() {
-        eprintln!(
-            "[warn] {} vanished during the run and is being recreated. Another process \
-             removed this run's scratch directory; if several runs share a --scratch-dir, \
-             give each its own.",
-            cfg.scratch_dir.display()
-        );
-        private_dir_all(&cfg.scratch_dir)
-            .map_err(crate::error::file_err("create", &cfg.scratch_dir))?;
+        return Err(crate::error::file_err("write into", &cfg.scratch_dir)(
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the scratch directory vanished during the run. Either this run is shutting \
+                 down on a signal, or another process removed it; if several runs share a \
+                 --scratch-dir, give each its own",
+            ),
+        ));
     }
     let gfa_path = cfg.scratch_dir.join(format!("{}.sub.gfa", scratch_stem(&graph.accession)));
     // A failed write (a full tmpfs) removes the partial file instead of leaving it behind.
@@ -1009,6 +1015,9 @@ mod cross_check {
             scratch_dir: PathBuf::from(&outdir),
             ..Config::default()
         };
+        // `write_gfa` no longer creates a missing scratch directory (WF-17), so a test that
+        // names its own creates it, as a run does.
+        std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
         let idx = anchor::index_query(&cfg, &query).unwrap();
         let a = anchor::find(&cfg, &graph, &idx).unwrap();
         let nodes = expand(&cfg, &graph, &a).unwrap();

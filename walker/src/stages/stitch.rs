@@ -736,7 +736,10 @@ mod golden_haplotype {
             return;
         };
         let mut cfg = Config::default();
+        // `write_gfa` no longer creates a missing scratch directory (WF-17),
+        // so a test that names its own creates it, as a run does.
         cfg.scratch_dir = std::env::temp_dir().join(format!("logan_golden_{}", std::process::id()));
+        std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
         if align::resolve_binary(&cfg).is_err() {
             eprintln!("SKIP: GraphAligner not on PATH");
             return;

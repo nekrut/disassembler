@@ -37,6 +37,7 @@ mod io;
 mod pipeline;
 mod scratch;
 mod stages;
+mod term;
 mod types;
 
 use config::{Config, PrimaryMetric};
@@ -106,8 +107,22 @@ TUNING:
         --graphaligner <PATH>     GraphAligner executable [default: GraphAligner on PATH].
                                   Checked once at startup; results are validated against
                                   1.0.17b
+        --graphaligner-timeout <SECS>
+                                  Kill a single GraphAligner call after this many seconds and
+                                  fail that accession only, instead of letting it hold its
+                                  worker until the job's wall-time kill discards the whole
+                                  shard [default: 3600; 0 waits forever]
     -w, --workers <N>             Compute workers, at least 1 [default: 8]
         --fetch-workers <N>       Fetch workers, at least 1 [default: 8]
+        --fetch-attempts <N>      Failed attempts per accession before it is given up, at
+                                  least 1 [default: 6]. 408, 429, 5xx and transport errors
+                                  are retried with a jittered exponential backoff, honouring
+                                  Retry-After; an attempt that transferred real data before
+                                  the connection dropped resumes and does not count
+        --fetch-timeout <SECS>    Budget for one fetch attempt, including connect and body
+                                  [default: 300]. An interrupted transfer resumes, so this
+                                  bounds how long a stalled connection goes unnoticed, not
+                                  how long an accession may take
 
 INTRA-HOST VARIANTS:
         --no-prefer-majority      Leave the primary on the reference-matching allele at
@@ -294,8 +309,24 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             "-t" | "--threads" => args.cfg.graphaligner_threads = at_least_one("--threads", &value()?)?,
             "-w" | "--workers" => args.cfg.compute_workers = at_least_one("--workers", &value()?)?,
             "--fetch-workers" => args.cfg.fetch_workers = at_least_one("--fetch-workers", &value()?)?,
+            "--fetch-attempts" => {
+                args.cfg.fetch_attempts =
+                    at_least_one("--fetch-attempts", &value()?)?.try_into().map_err(|_| {
+                        error::Error::Usage("--fetch-attempts: too large".to_string())
+                    })?;
+            }
+            "--fetch-timeout" => {
+                args.cfg.fetch_timeout_secs =
+                    at_least_one("--fetch-timeout", &value()?)? as u64;
+            }
             "--scratch-dir" => args.scratch_base = Some(PathBuf::from(value()?)),
             "--graphaligner" => args.cfg.graphaligner_bin = value()?,
+            // 0 is meaningful (wait forever), so this is a plain parse, not `at_least_one`.
+            "--graphaligner-timeout" => {
+                args.cfg.graphaligner_timeout_secs = value()?.parse().map_err(|e| {
+                    error::Error::Usage(format!("--graphaligner-timeout: {e}"))
+                })?;
+            }
             // The prune sweep is the reason this flag exists, so it validates its range
             // rather than just parsing.
             // A boolean, so it consumes no value and must not fall through to `value()`.
@@ -484,7 +515,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if argv.iter().any(|a| a == "-V" || a == "--version") {
-        println!("logan-walker {}", env!("CARGO_PKG_VERSION"));
+        crate::outln!("logan-walker {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
 
@@ -623,13 +654,21 @@ fn real_main(mut args: Args) -> error::Result<()> {
         if args.query.is_empty() {
             return Err(error::Error::Usage("--query is required".into()));
         }
-        // Try the legacy single-file path first for its n_records semantics.
-        // If that file turns out to hold more than one record, re-load through
-        // read_query_set so the whole pool goes into anchor union / align fan-out.
+        // Try the legacy single-file path first for its n_records semantics. If that file
+        // turns out to hold more than one record, the whole pool goes into the anchor union
+        // and the align fan-out instead.
+        //
+        // Both decisions are made from ONE read of the file. Every input the walker takes may
+        // be a pipe (`-q <(zcat ref.fa.gz)`, `-q /dev/stdin`), which can only be read once,
+        // and this used to call `read_query` and then `read_query_set`, opening the same path
+        // twice: a multi-record query through a pipe died with "no FASTA records found" on
+        // the second open, naming a file that was perfectly good (WA-01).
         Some(if args.query.len() == 1 {
-            let first = io::input::read_query(&args.query[0])?;
+            let path = args.query[0].clone();
+            let bytes = io::input::read_input(&path, "query")?;
+            let first = io::input::read_query_from(&path, &bytes)?;
             if first.n_records > 1 {
-                io::input::read_query_set(&args.query)?
+                io::input::read_query_set_from(&[(path, bytes)])?
             } else {
                 vec![first]
             }
@@ -1031,12 +1070,12 @@ fn real_main(mut args: Args) -> error::Result<()> {
         return Err(e);
     }
 
-    println!(
+    crate::outln!(
         "[logan-walker] {}/{} accessions reconstructed",
         summary.success, summary.total
     );
     for line in decision_lines(&summary.results, args.cfg.subgraph_nodes_per_base_guard) {
-        println!("{line}");
+        crate::outln!("{line}");
     }
 
     // Per-accession failures are collected rather than propagated, which is what lets one bad
@@ -1075,8 +1114,10 @@ mod flag_tests {
                 "--min-abund" => Some("5"),
                 "--max-alts" | "--max-alt-indel" | "--alt-max-detour" | "--hops"
                 | "--min-shared-kmers" | "--max-size-mb" | "-w" | "--workers"
-                | "--fetch-workers" | "-t" | "--threads" | "-k" | "--graph-k" => Some("2"),
+                | "--fetch-workers" | "-t" | "--threads" | "-k" | "--graph-k"
+                | "--fetch-attempts" | "--fetch-timeout" => Some("2"),
                 "--subgraph-nodes-per-base-guard" => Some("3"),
+                "--graphaligner-timeout" => Some("60"),
                 "--primary-metric" => Some("matched"),
                 "-a" | "--accession" => Some("SRR1"),
                 "-l" | "--accession-list" | "-q" | "--query" | "-o" | "--out-dir"

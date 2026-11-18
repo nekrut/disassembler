@@ -655,7 +655,10 @@ mod phase_real {
             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd, u64::MAX).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();
+            // `write_gfa` no longer creates a missing scratch directory (WF-17),
+            // so a test that names its own creates it, as a run does.
             cfg.scratch_dir = std::env::temp_dir().join(format!("logan_phase_real_{}", std::process::id()));
+            std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
 
             let idx = anchor::index_query(&cfg, &query).unwrap();
             let a = anchor::find(&cfg, &graph, &idx).unwrap();
@@ -724,7 +727,10 @@ mod phase_diagnostic {
             let graph = { let rd = stream::decoder(&f).unwrap(); parse::build(&f.accession, rd, u64::MAX).unwrap() };
             let query = read_query(Path::new(qpath)).unwrap();
             let mut cfg = Config::default();
+            // `write_gfa` no longer creates a missing scratch directory (WF-17),
+            // so a test that names its own creates it, as a run does.
             cfg.scratch_dir = std::env::temp_dir().join(format!("logan_diag_{}", std::process::id()));
+            std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
             let idx = anchor::index_query(&cfg, &query).unwrap();
             let a = anchor::find(&cfg, &graph, &idx).unwrap();
             let nodes = extract::expand(&cfg, &graph, &a).unwrap();

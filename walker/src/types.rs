@@ -36,14 +36,19 @@ pub struct Query {
     pub record_id: String,
     /// Uppercased sequence with all whitespace removed.
     pub seq: Vec<u8>,
-    /// Path on disk. GraphAligner is never handed this directly: it picks its parser from the
-    /// file name, which is the user's to choose. For a single-record query `align::run` copies
-    /// it byte for byte to a temp `.fa`. A multi-record file has only the selected record
-    /// written out, because GraphAligner would otherwise align every record and the
-    /// best-scoring row across all of them would win.
+    /// Path on disk. Provenance, warnings and error messages only: nothing re-opens it once
+    /// the query has been read, and GraphAligner is never handed it. It picks its parser from
+    /// the file name, which is the user's to choose and may be anything (a Galaxy dataset
+    /// arrives as `dataset_<uuid>.dat`).
+    ///
+    /// Until 0.2.0 `align::run` re-read this path on every accession to hand GraphAligner a
+    /// byte-for-byte copy. That emptied a piped query after the first accession and passed
+    /// the user's header line and any whitespace inside the sequence through to an aligner
+    /// that chokes on both; `align::run` now writes `seq` under `record_id` instead.
     pub path: PathBuf,
-    /// Records present in `path`. With more than one, `align` writes out only this Query's
-    /// record instead of copying the file, so GraphAligner aligns just that one.
+    /// Records present in the source file. `main` uses it to decide whether a single `-q`
+    /// should be read as a whole reference set (multi-anchor mode) rather than as just its
+    /// first record.
     pub n_records: usize,
 }
 

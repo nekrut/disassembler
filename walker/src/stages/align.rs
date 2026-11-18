@@ -128,20 +128,46 @@ pub fn version(bin: &Path) -> Result<String> {
 /// 160-record panel such as `queries/master_planetary_targets.fasta` produced another gene's
 /// path published under the first gene's name, at a coverage above 1.0.
 ///
-/// Multi-anchor mode addresses that head-on: every reference in `queries` is written out as
-/// its own record in a merged temp FASTA, and `parse_gaf_multi` keeps the best row per query
-/// name so the caller can pick a primary against a known reference length. For a single
-/// [`Query`] whose source file already holds exactly one record (the byte-compat path used
-/// by every existing golden fixture) GraphAligner gets a byte-for-byte copy of that source
-/// file, so behaviour is bit-for-bit what it was when it was handed the file directly.
+/// Every reference in `queries` is therefore written out as its own `>record_id` record in a
+/// merged temp FASTA, and `parse_gaf_multi` keeps the best row per query name so the caller
+/// can pick a primary against a known reference length.
+///
+/// # Normalised, not copied
+///
+/// That merged FASTA is built from the sequence `read_query` parsed at startup, never from
+/// the user's file. Until 0.2.0 a single [`Query`] whose source file held exactly one record
+/// took a "byte-compat" path that re-opened that file and copied it through, so GraphAligner
+/// read the user's bytes exactly as it would have if handed the file itself. That cost three
+/// defects, all of them silent:
+///
+/// - **The file was re-read on every accession** and again on every prune realignment. A pipe
+///   (`-q <(zcat ref.fa.gz)`, `-q /dev/stdin`), which `README.md` invites, is empty after the
+///   first read, so GraphAligner got a 0-byte FASTA and every accession came back `no_path`:
+///   a run that looks like a clean biological negative. Editing the query mid-run moved the
+///   reference under the accessions that had not started yet (WA-01).
+/// - **The header reached GraphAligner verbatim.** 1.0.17b takes the whole header line as the
+///   read name and writes it unescaped into GAF column 1, so a tab in `>gene<TAB>desc` shifted
+///   every column and the row was dropped (`no_path` on every accession), and a non-UTF-8
+///   header failed the GAF parse outright (exit 3). `read_query` had already reduced the same
+///   header to its first token, so the two stages disagreed about the reference's name (WA-07).
+/// - **Whitespace inside sequence lines reached GraphAligner.** `read_query` strips it;
+///   1.0.17b strips only a trailing `\r` and trailing spaces, and its seeding restarts at
+///   every non-ACGT byte while a blank in the DP reaches `ambiguousMatch`'s `default:`, which
+///   calls `std::abort()`. Codon-spaced `ATG GCT AAA` gave `no_path` everywhere; GenBank
+///   10-base blocks gave SIGABRT everywhere (WA-08).
+///
+/// Writing `>{record_id}\n{seq}\n` fixes all three at once, and makes the aligner and the
+/// anchoring stage agree on the reference by construction. The sequence is the same bases in
+/// the same order, uppercased and unwrapped, so GraphAligner reads the same read: the golden
+/// fixtures are unchanged by it.
 ///
 /// # Never the user's file name
 ///
 /// GraphAligner chooses its input parser from the file name and aborts on anything that does
 /// not end in `.fa`, `.fasta`, `.fq`, `.fastq` (optionally `.gz`), `.bam` or `.sam`. The walker
 /// already validated the query as FASTA by content in `read_query`, so the name the user's
-/// file happens to have is irrelevant: a Galaxy dataset arrives as `dataset_<uuid>.dat`. Both
-/// paths above therefore write the temp `.fa`, and the user's path never reaches `-f`.
+/// file happens to have is irrelevant: a Galaxy dataset arrives as `dataset_<uuid>.dat`. The
+/// temp `.fa` is what `-f` gets, and the user's path never reaches it.
 pub fn run(
     cfg: &Config,
     subgraph: &Subgraph,
@@ -159,64 +185,92 @@ pub fn run(
     // GraphAligner only sees this file, whatever the user's query is called. The name is
     // keyed on the GAF, which `extract::scratch_stem` makes unique per worker and task.
     let query_fa = gaf_out.with_extension("queries.fa");
-    if queries.len() == 1 && queries[0].n_records == 1 {
-        // Byte-compat path: exactly one Query whose source file holds exactly one record.
-        // Every existing golden fixture is this. The source is copied byte for byte, so
-        // GraphAligner reads exactly what it read when it was handed `query.path` itself.
-        // Read through `read_input`, which returns a plain file's bytes unchanged and
-        // decompresses a gzipped one: a plain copy handed GraphAligner gzip bytes under a
-        // `.fa` name, and it found no alignment, so every accession came back no_path.
-        let bytes = crate::io::input::read_input(&queries[0].path, "query")?;
-        std::fs::write(&query_fa, bytes).map_err(file_err("write", &query_fa))?;
-    } else {
-        // Merged pool: one `>record_id\n<seq>\n` block per query, in input order.
-        // This is written even for a single Query whose source file has extra records,
-        // because we can no longer trust the source file to represent only that record.
-        let mut body: Vec<u8> = Vec::with_capacity(
-            queries.iter().map(|q| q.seq.len() + q.record_id.len() + 3).sum(),
+    // One `>record_id\n<seq>\n` block per query, in input order, built from what
+    // `read_query` parsed at startup. The user's file is never re-opened here; see
+    // "Normalised, not copied" above for the three defects that cost.
+    let mut body: Vec<u8> = Vec::with_capacity(
+        queries.iter().map(|q| q.seq.len() + q.record_id.len() + 3).sum(),
+    );
+    for q in queries {
+        body.push(b'>');
+        body.extend_from_slice(q.record_id.as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(&q.seq);
+        body.push(b'\n');
+    }
+    std::fs::write(&query_fa, &body).map_err(file_err("write", &query_fa))?;
+    // One record out of a panel is the multi-anchor prune pass realigning the winner, on
+    // every accession; it is expected, so it is not logged.
+    if queries.len() > 1 {
+        let names: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
+        eprintln!(
+            "[{}] multi-anchor: aligning against {} references {:?}",
+            subgraph.accession, queries.len(), names
         );
-        for q in queries {
-            body.push(b'>');
-            body.extend_from_slice(q.record_id.as_bytes());
-            body.push(b'\n');
-            body.extend_from_slice(&q.seq);
-            body.push(b'\n');
-        }
-        std::fs::write(&query_fa, &body).map_err(file_err("write", &query_fa))?;
-        // One record out of a panel is the multi-anchor prune pass realigning the winner, on
-        // every accession; it is expected, so it is not logged.
-        if queries.len() > 1 {
-            let names: Vec<&str> = queries.iter().map(|q| q.record_id.as_str()).collect();
-            eprintln!(
-                "[{}] multi-anchor: aligning against {} references {:?}",
-                subgraph.accession, queries.len(), names
-            );
-        }
     }
 
     let mut cmd = command(&bin, cfg, subgraph, &query_fa, gaf_out);
     // GraphAligner is chatty on stdout; only stderr is kept, for error reporting.
     cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    set_up_child(&mut cmd);
 
-    let output = cmd.output().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         let _ = std::fs::remove_file(&query_fa);
         Error::GraphAligner {
             accession: subgraph.accession.clone(),
             detail: format!("could not run {}: {e}", bin.display()),
         }
     })?;
+    // Held until the child has been reaped, so a signal arriving meanwhile can stop it
+    // (WF-15). Every return below happens after the wait.
+    #[cfg(unix)]
+    let watch = crate::scratch::watch_child(child.id());
 
-    if !output.status.success() {
+    // Drain stderr on its own thread. `Command::output`, which this used to be, did that for
+    // us; waiting with a deadline means doing it by hand, and it is not optional. A pipe
+    // nobody reads fills at 64 KiB and blocks the writer there for good, so a chatty aligner
+    // would hit the deadline below and be reported as stuck when what is stuck is us.
+    let mut pipe = child.stderr.take();
+    let drain = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = pipe.as_mut() {
+            let _ = std::io::Read::read_to_end(p, &mut buf);
+        }
+        buf
+    });
+
+    let status = match wait_with_deadline(&mut child, cfg.graphaligner_timeout_secs) {
+        Ok(status) => status,
+        Err(detail) => {
+            #[cfg(unix)]
+            drop(watch);
+            // The child is dead, so the pipe is closed and this returns at once.
+            let _ = drain.join();
+            let _ = std::fs::remove_file(gaf_out);
+            let _ = std::fs::remove_file(&query_fa);
+            return Err(Error::GraphAligner {
+                accession: subgraph.accession.clone(),
+                detail: format!("{detail} on a {}-node graph", subgraph.nodes.len()),
+            });
+        }
+    };
+    #[cfg(unix)]
+    drop(watch);
+    let stderr = drain.join().unwrap_or_default();
+
+    if !status.success() {
         // Remove any partial GAF so a later run cannot read a truncated file.
         let _ = std::fs::remove_file(gaf_out);
         let _ = std::fs::remove_file(&query_fa);
-        let tail = String::from_utf8_lossy(&output.stderr);
+        let tail = String::from_utf8_lossy(&stderr);
         let tail = tail.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
         return Err(Error::GraphAligner {
             accession: subgraph.accession.clone(),
             detail: format!(
                 "exited with {} on a {}-node graph: {tail}",
-                output.status,
+                status,
                 subgraph.nodes.len()
             ),
         });
@@ -262,6 +316,94 @@ pub fn run(
     let mut map = parse_gaf_multi(&bytes, &expects)?;
     discount_ambiguous_matches(&mut map, queries);
     Ok(map)
+}
+
+/// Put the aligner where a signal can reach it, and nothing else can reach the aligner.
+///
+/// **Its own process group** (WF-15). The signal handler can then stop the whole group with
+/// one `kill`, which matters when `--graphaligner` names a wrapper script: killing the process
+/// we spawned leaves its children running, and `wait_with_deadline` has the same limitation
+/// for the same reason. A group also means the terminal no longer delivers Ctrl-C to the
+/// aligner directly, which is why the handler has to do it: that is a change of mechanism, not
+/// of behaviour, and it buys the `kill <walker pid>` and `timeout N logan-walker` cases, where
+/// the aligners used to survive the run, reparented to init, working on deleted files.
+///
+/// **No stdin.** A process in its own group that reads from the controlling terminal is
+/// stopped with SIGTTIN, and GraphAligner has no reason to read stdin: its reads come from
+/// `-f`. Closing it also keeps it clear of the walker's own stdin, which a query may be
+/// arriving on (`-q /dev/stdin`).
+///
+/// **`PR_SET_PDEATHSIG` on Linux.** A SIGKILL or the OOM killer never runs the handler, so the
+/// kernel is asked to kill the aligner when the thread that spawned it dies. That thread is
+/// the compute worker, which blocks in `wait_with_deadline` until the child is reaped, so the
+/// only way it dies first is the walker dying with it. It is set after the fork, so a walker
+/// that dies in the window between fork and `prctl` still leaves that one child; nothing
+/// cheap closes that, and the deadline bounds it.
+#[cfg(unix)]
+fn set_up_child(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.stdin(std::process::Stdio::null());
+    cmd.process_group(0);
+    #[cfg(target_os = "linux")]
+    // SAFETY: `pre_exec` runs between fork and exec, where only async-signal-safe calls are
+    // allowed. `prctl` is a bare syscall with no allocation, no locking and no libc state.
+    unsafe {
+        cmd.pre_exec(|| {
+            // A failure here is not worth refusing the alignment over: the deadline and the
+            // signal handler still cover every case except SIGKILL of the walker.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+}
+
+/// Wait for GraphAligner, giving up after `timeout_secs`. `0` waits forever.
+///
+/// Every other wait in the walker has a deadline; this one did not, and it is the only stage
+/// that hands control to a program the walker did not write. One call that never returns (a
+/// pathological neighbourhood, a stalled filesystem, a wrapper script waiting on a lock) holds
+/// its compute worker for good, and because the walker writes the FASTA, summary and VCF after
+/// `pipeline::run` returns, a scheduler's wall-time kill then throws away every accession the
+/// shard had already finished. The deadline turns that into one errored accession: the rest
+/// finish and every output is written.
+///
+/// `SIGKILL`, not `SIGTERM`: there is nothing to flush, and a process that has stopped
+/// answering is not more likely to answer a polite signal. It is reaped immediately so it
+/// cannot be left as a zombie.
+///
+/// Two limits worth knowing. `kill` reaches the process we spawned, so if `--graphaligner`
+/// names a wrapper script its grandchildren survive it; killing the process group would fix
+/// that and is a larger change. And the walker's own signal handler still does not stop a
+/// running aligner, so a SIGTERM to the walker leaves this child reparented to init.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    timeout_secs: u64,
+) -> std::result::Result<std::process::ExitStatus, String> {
+    let deadline = (timeout_secs > 0).then(|| {
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs)
+    });
+    // Poll quickly at first, then back off. A typical alignment is 0.04 s, so a flat 50 ms
+    // poll would add more latency than the alignment costs; this keeps the common case under
+    // a millisecond and settles at 20 wakeups a second for a long one.
+    let mut nap = std::time::Duration::from_micros(200);
+    let cap = std::time::Duration::from_millis(50);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("could not wait for GraphAligner: {e}")),
+        }
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "timed out after {timeout_secs} s and was killed \
+                 (raise or disable --graphaligner-timeout, 0 waits forever)"
+            ));
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(cap);
+    }
 }
 
 /// Take ambiguous reference bases back out of GAF column 10.
@@ -752,19 +894,50 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
         ]);
     }
 
+    /// `run`, retrying while the stand-in binary is still "Text file busy".
+    ///
+    /// Spawning a script this process wrote moments ago can fail with `ETXTBSY`: another test
+    /// thread forked while the write fd was still open, its child inherited the fd, and the
+    /// kernel refuses to exec a file that anyone holds open for writing. The window closes as
+    /// soon as that child execs, so a short retry settles it. This is a property of a parallel
+    /// test suite that writes its own binaries, not of the walker.
+    #[cfg(unix)]
+    fn run_stand_in(
+        cfg: &Config,
+        sub: &Subgraph,
+        queries: &[Query],
+        gaf: &Path,
+    ) -> Result<HashMap<String, GafPath>> {
+        for _ in 0..50 {
+            match run(cfg, sub, queries, gaf) {
+                Err(Error::GraphAligner { ref detail, .. }) if detail.contains("Text file busy") => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+        run(cfg, sub, queries, gaf)
+    }
+
     /// GraphAligner picks its parser from the file name, so the user's name for the query
     /// must never reach `-f`: a Galaxy dataset is `dataset_<uuid>.dat`, which it refuses. A
     /// stand-in binary records what it was handed.
+    ///
+    /// What it is handed is the query the walker parsed, not the user's bytes (WA-07, WA-08).
+    /// Each source below is a different way of writing the same reference, and all of them
+    /// must arrive as the same two lines. Under the old byte-copy path they did not, and
+    /// 1.0.17b failed differently on each: it takes the whole header line as the read name and
+    /// writes it unescaped into GAF column 1, so the tab shifted every column and the row was
+    /// dropped as `no_path`; it strips only trailing whitespace from a sequence line, so the
+    /// internal blanks survived into the DP, where a blank reaches `ambiguousMatch`'s
+    /// `default:` and calls `std::abort()`; and the Latin-1 byte came back in the GAF, which
+    /// `parse_gaf_multi` reads as UTF-8, failing the accession outright.
     #[cfg(unix)]
     #[test]
-    fn graphaligner_gets_a_fasta_named_byte_copy_of_the_query() {
+    fn graphaligner_gets_the_parsed_query_not_the_users_bytes() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("logan_align_name_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-
-        let src_bytes: &[u8] = b">pol some description\nacgtACGT\r\nAAAA\n";
-        let src = dir.join("dataset_1234.dat");
-        std::fs::write(&src, src_bytes).unwrap();
 
         let fake = dir.join("FakeGraphAligner");
         std::fs::write(&fake, format!(
@@ -789,26 +962,251 @@ some_other_gene\t10\t0\t10\t+\t>2\t10\t0\t10\t900\t1000\t60
             // This test wrote that file, so Drop may remove it.
             owns_gfa: true,
         };
+        let gaf = dir.join("ACC.sub.gaf");
+
+        // The last entry is the first one gzipped: GraphAligner reads plain FASTA only, and
+        // was once handed the gzip bytes under a `.fa` name, which it read as no alignment.
+        let plain: &[u8] = b">pol some description\nacgtACGT\r\nAAAA\n";
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, plain).unwrap();
+        let sources: Vec<(&str, Vec<u8>)> = vec![
+            ("description, mixed case and CRLF", plain.to_vec()),
+            ("a tab in the header", b">pol\tplasmid, 2026\nACGTACGTAAAA\n".to_vec()),
+            ("codon-spaced sequence", b">pol\nACG TAC GTA AAA\n".to_vec()),
+            // GenBank-style blocks, wrapped, with a trailing tab on one line.
+            ("10-base blocks", b">pol\nACGTACGTAA\t\nAA\n".to_vec()),
+            // Latin-1 in the description: not UTF-8, and `read_query` reads it lossily.
+            ("a Latin-1 header", b">pol isolate S\xe3o\nACGTACGTAAAA\n".to_vec()),
+            ("gzipped", gz.finish().unwrap()),
+        ];
+
+        for (what, stored) in sources {
+            // The user's own name for the file, which GraphAligner would refuse outright.
+            let src = dir.join("dataset_1234.dat");
+            std::fs::write(&src, &stored).unwrap();
+            let q = crate::io::input::read_query(&src).unwrap();
+            let got = run_stand_in(&cfg, &sub, std::slice::from_ref(&q), &gaf).unwrap();
+
+            let seen_name = std::fs::read_to_string(dir.join("seen_name")).unwrap();
+            assert!(seen_name.trim_end().ends_with(".fa"),
+                    "{what}: GraphAligner was handed {seen_name:?}");
+            assert_eq!(std::fs::read(dir.join("seen.fa")).unwrap(), b">pol\nACGTACGTAAAA\n",
+                       "{what}: GraphAligner must get the parsed record, normalised");
+            assert!(got.contains_key("pol"), "{what}: no row for the reference");
+            assert!(!dir.join("ACC.sub.queries.fa").exists(),
+                    "{what}: the temp query was left behind");
+        }
+
+        drop(sub);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WA-06: an aligner that never returns fails its own accession rather than holding its
+    /// compute worker for good. Before the deadline, the only thing that ended such a run was
+    /// the scheduler's wall-time kill, and because every output is written after
+    /// `pipeline::run` returns, that kill threw away every accession the shard had finished.
+    ///
+    /// The stand-in `exec`s `sleep` so the process the walker spawned is the one that hangs:
+    /// `kill` reaches our child, not its descendants, which is the limitation recorded on
+    /// `wait_with_deadline`.
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_graphaligner_is_killed_and_fails_only_its_own_accession() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("logan_align_stuck_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fake = dir.join("FakeGraphAligner");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = Config {
+            graphaligner_bin: fake.to_string_lossy().into_owned(),
+            graphaligner_timeout_secs: 1,
+            ..Config::default()
+        };
+        let gfa = dir.join("ACC.sub.gfa");
+        std::fs::write(&gfa, b"H\tVN:Z:1.0\nS\t1\tACGTACGTAAAA\n").unwrap();
+        let sub = Subgraph {
+            accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGTACGTAAAA".to_vec()],
+            gfa_path: gfa, n_edges: 0, owns_gfa: true,
+        };
         let q = Query {
-            name: "dataset_1234".into(), record_id: "pol".into(), seq: b"ACGTACGTAAAA".to_vec(),
-            path: src, n_records: 1,
+            name: "q".into(), record_id: "pol".into(), seq: b"ACGTACGTAAAA".to_vec(),
+            path: dir.join("q.fa"), n_records: 1,
         };
         let gaf = dir.join("ACC.sub.gaf");
 
-        // Plain, then the same file gzipped: GraphAligner reads plain FASTA only, and was
-        // once handed the gzip bytes under a `.fa` name, which it read as no alignment.
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut gz, src_bytes).unwrap();
-        for stored in [src_bytes.to_vec(), gz.finish().unwrap()] {
-            std::fs::write(&q.path, &stored).unwrap();
-            let got = run(&cfg, &sub, std::slice::from_ref(&q), &gaf).unwrap();
+        let started = std::time::Instant::now();
+        // `GafPath` is not `Debug`, so the Ok side cannot be unwrapped away.
+        let err = match run_stand_in(&cfg, &sub, std::slice::from_ref(&q), &gaf) {
+            Err(e) => e,
+            Ok(map) => panic!("expected a timeout, got {} rows", map.len()),
+        };
+        let waited = started.elapsed();
 
-            let seen_name = std::fs::read_to_string(dir.join("seen_name")).unwrap();
-            assert!(seen_name.trim_end().ends_with(".fa"), "GraphAligner was handed {seen_name:?}");
-            assert_eq!(std::fs::read(dir.join("seen.fa")).unwrap(), src_bytes,
-                       "a single-record query must reach GraphAligner byte for byte, decompressed");
-            assert!(got.contains_key("pol"));
-            assert!(!dir.join("ACC.sub.queries.fa").exists(), "the temp query was left behind");
+        let Error::GraphAligner { accession, detail } = &err else {
+            panic!("expected a GraphAligner error, got {err}");
+        };
+        assert_eq!(accession, "ACC");
+        assert!(detail.contains("timed out after 1 s"), "{detail}");
+        assert!(detail.contains("--graphaligner-timeout"), "{detail}");
+        // The 30 s sleep must not have been waited out, and the poll must not have slept
+        // past the deadline either.
+        assert!(waited < std::time::Duration::from_secs(5), "waited {waited:?}");
+        assert!(!gaf.exists(), "a partial GAF was left behind");
+        assert!(!dir.join("ACC.sub.queries.fa").exists(), "the temp query was left behind");
+
+        drop(sub);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0 means wait, which is what every release before 0.2.0 did. The stand-in takes long
+    /// enough that a deadline of 1 s would have killed it.
+    #[cfg(unix)]
+    #[test]
+    fn a_zero_timeout_waits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("logan_align_nodl_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fake = dir.join("FakeGraphAligner");
+        std::fs::write(&fake,
+            "#!/bin/sh\n\
+             while [ $# -gt 0 ]; do case \"$1\" in -a) gaf=\"$2\"; shift 2;; *) shift;; esac; done\n\
+             sleep 2\n\
+             printf 'pol\\t12\\t0\\t12\\t+\\t>1\\t12\\t0\\t12\\t12\\t12\\t60\\n' > \"$gaf\"\n")
+            .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = Config {
+            graphaligner_bin: fake.to_string_lossy().into_owned(),
+            graphaligner_timeout_secs: 0,
+            ..Config::default()
+        };
+        let gfa = dir.join("ACC.sub.gfa");
+        std::fs::write(&gfa, b"H\tVN:Z:1.0\nS\t1\tACGTACGTAAAA\n").unwrap();
+        let sub = Subgraph {
+            accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGTACGTAAAA".to_vec()],
+            gfa_path: gfa, n_edges: 0, owns_gfa: true,
+        };
+        let q = Query {
+            name: "q".into(), record_id: "pol".into(), seq: b"ACGTACGTAAAA".to_vec(),
+            path: dir.join("q.fa"), n_records: 1,
+        };
+        let got = run_stand_in(&cfg, &sub, std::slice::from_ref(&q), &dir.join("ACC.sub.gaf")).unwrap();
+        assert!(got.contains_key("pol"));
+
+        drop(sub);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Waiting with a deadline means reading stderr ourselves, which `Command::output` used to
+    /// do. A pipe nobody reads fills at 64 KiB and blocks the writer there, so without the
+    /// drain thread a chatty aligner would stop dead and then be reported as timed out: a
+    /// stall of our own making, attributed to GraphAligner. The stand-in writes ~256 KiB.
+    #[cfg(unix)]
+    #[test]
+    fn a_chatty_aligner_does_not_deadlock_on_a_full_stderr_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("logan_align_chatty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fake = dir.join("FakeGraphAligner");
+        std::fs::write(&fake,
+            "#!/bin/sh\n\
+             i=0\n\
+             while [ $i -lt 4000 ]; do\n\
+               echo 'progress progress progress progress progress progress progress' >&2\n\
+               i=$((i+1))\n\
+             done\n\
+             echo 'the last thing it said' >&2\n\
+             exit 1\n")
+            .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = Config {
+            graphaligner_bin: fake.to_string_lossy().into_owned(),
+            // Short enough that a deadlock shows up as a timeout rather than as a hung test.
+            graphaligner_timeout_secs: 20,
+            ..Config::default()
+        };
+        let gfa = dir.join("ACC.sub.gfa");
+        std::fs::write(&gfa, b"H\tVN:Z:1.0\nS\t1\tACGTACGTAAAA\n").unwrap();
+        let sub = Subgraph {
+            accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGTACGTAAAA".to_vec()],
+            gfa_path: gfa, n_edges: 0, owns_gfa: true,
+        };
+        let q = Query {
+            name: "q".into(), record_id: "pol".into(), seq: b"ACGTACGTAAAA".to_vec(),
+            path: dir.join("q.fa"), n_records: 1,
+        };
+        let err = match run_stand_in(&cfg, &sub, std::slice::from_ref(&q), &dir.join("ACC.sub.gaf")) {
+            Err(e) => e,
+            Ok(map) => panic!("expected the stand-in's exit 1, got {} rows", map.len()),
+        };
+        let Error::GraphAligner { detail, .. } = &err else {
+            panic!("expected a GraphAligner error, got {err}");
+        };
+        assert!(!detail.contains("timed out"), "the drain thread is not keeping up: {detail}");
+        // The whole pipe was read, so the tail is the end of it and not the first 64 KiB.
+        assert!(detail.contains("the last thing it said"), "{detail}");
+
+        drop(sub);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The query file is read once, at startup, so a query that can only be read once still
+    /// works (WA-01, which shares its cause with WA-07 and WA-08). A FIFO stands in for the
+    /// `<(zcat ref.fa.gz)` and `/dev/stdin` forms `README.md` invites: the second read of one
+    /// blocks or returns nothing, and the byte-copy path did exactly that on every accession
+    /// after the first, so every accession came back `no_path` and the run reported a clean
+    /// biological negative.
+    #[cfg(unix)]
+    #[test]
+    fn a_query_that_can_only_be_read_once_still_aligns_every_accession() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("logan_align_once_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fake = dir.join("FakeGraphAligner");
+        std::fs::write(&fake, "#!/bin/sh\n\
+             while [ $# -gt 0 ]; do case \"$1\" in\n\
+             -f) name=$(head -1 \"$2\" | cut -c2-); shift 2;;\n\
+             -a) gaf=\"$2\"; shift 2;;\n\
+             *) shift;;\n\
+             esac; done\n\
+             printf '%s\\t12\\t0\\t12\\t+\\t>1\\t12\\t0\\t12\\t12\\t12\\t60\\n' \"$name\" > \"$gaf\"\n")
+            .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A FIFO: `read_query` drains it, and anything that reopens it afterwards hangs.
+        let fifo = dir.join("piped.fa");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                let _ = std::fs::write(&fifo, b">pol\nACGTACGTAAAA\n");
+            })
+        };
+        let q = crate::io::input::read_query(&fifo).unwrap();
+        writer.join().unwrap();
+        // Nothing may reopen it from here on; make sure of it.
+        std::fs::remove_file(&fifo).unwrap();
+
+        let cfg = Config { graphaligner_bin: fake.to_string_lossy().into_owned(), ..Config::default() };
+        let gfa = dir.join("ACC.sub.gfa");
+        std::fs::write(&gfa, b"H\tVN:Z:1.0\nS\t1\tACGTACGTAAAA\n").unwrap();
+        let sub = Subgraph {
+            accession: "ACC".into(), nodes: vec![1], seqs: vec![b"ACGTACGTAAAA".to_vec()],
+            gfa_path: gfa, n_edges: 0, owns_gfa: true,
+        };
+
+        // Three accessions' worth of calls, as a run would make, plus the prune realignment.
+        for i in 0..4 {
+            let gaf = dir.join(format!("ACC{i}.sub.gaf"));
+            let got = run_stand_in(&cfg, &sub, std::slice::from_ref(&q), &gaf).unwrap();
+            assert!(got.contains_key("pol"), "call {i} found nothing");
         }
 
         drop(sub);
@@ -841,7 +1239,10 @@ mod align_real {
             return;
         };
         let mut cfg = Config::default();
+        // `write_gfa` no longer creates a missing scratch directory (WF-17),
+        // so a test that names its own creates it, as a run does.
         cfg.scratch_dir = std::env::temp_dir().join(format!("logan_align_{}", std::process::id()));
+        std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
         if resolve_binary(&cfg).is_err() {
             eprintln!("SKIP: GraphAligner not on PATH");
             return;
@@ -896,7 +1297,10 @@ mod align_real {
     #[ignore]
     fn empty_subgraph_short_circuits() {
         let mut cfg = Config::default();
+        // `write_gfa` no longer creates a missing scratch directory (WF-17),
+        // so a test that names its own creates it, as a run does.
         cfg.scratch_dir = std::env::temp_dir().join(format!("logan_align_e_{}", std::process::id()));
+        std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
         if resolve_binary(&cfg).is_err() {
             eprintln!("SKIP: GraphAligner not on PATH");
             return;
@@ -952,7 +1356,10 @@ mod determinism {
                 continue;
             };
             let mut cfg = Config::default();
+            // `write_gfa` no longer creates a missing scratch directory (WF-17),
+            // so a test that names its own creates it, as a run does.
             cfg.scratch_dir = std::env::temp_dir().join(format!("logan_det_{}", std::process::id()));
+            std::fs::create_dir_all(&cfg.scratch_dir).unwrap();
             if resolve_binary(&cfg).is_err() {
                 eprintln!("SKIP: GraphAligner not on PATH");
                 return;

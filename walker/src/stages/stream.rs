@@ -237,6 +237,16 @@ impl Fetcher {
                         detail: format!("cache file is empty: {}", path.display()),
                     });
                 }
+                // WF-13. "Not empty" used to be the whole check, so a proxy's error page
+                // cached under the accession's name failed that accession with `parse
+                // failed: Unknown frame descriptor` on every run, forever, and an online run
+                // never refetched it: the user had to find the file and delete it. Four bytes
+                // say whether this is a zstd stream at all.
+                if !entry_is_zstd(&mut file) {
+                    drop(file);
+                    self.discard_bad_entry(accession, &path)?;
+                    return self.download_recording(index, accession, Some("refetched"));
+                }
                 // Checked before the file is hashed, which is a full pass over it: an
                 // accession that cannot be spooled is not worth reading 11 GB to fingerprint.
                 // A cache hit is exactly where this bites, because the bytes are already
@@ -292,6 +302,19 @@ impl Fetcher {
                 });
             }
             if self.offline {
+                // WF-03. Not every miss is a failure. `disassembler fetch` writes nothing for
+                // an accession Logan has no unitigs for, or one over the cap, because there
+                // is nothing to write; the documented `--offline` run that follows then saw
+                // an ordinary miss and called it an error. The same list and the same flags
+                // gave `no_logan_data` and exit 0 online, `error` and exit 1 or 3 offline,
+                // and since 0.2.0 any error makes the run non-zero, so a shard of 404s now
+                // fails outright. The fetch leaves a one-line note saying which negative it
+                // was, and this reads it back.
+                if let Some(negative) =
+                    read_absent(dir, accession).and_then(|a| a.into_error(accession, self.max_compressed_bytes))
+                {
+                    return Err(negative);
+                }
                 return Err(Error::Fetch {
                     accession: accession.clone(),
                     detail: format!(
@@ -302,7 +325,54 @@ impl Fetcher {
             }
         }
 
-        self.download(index, accession, None)
+        self.download_recording(index, accession, None)
+    }
+
+    /// What to do with a cache entry that is not a zstd stream (WF-13).
+    ///
+    /// Offline there is nothing to replace it with, so it is refused **by name**: the user
+    /// has to be told which file to delete, because the walker will not delete a file it was
+    /// told to treat as the only copy. Online it is removed, with its provenance sidecar,
+    /// and the caller downloads the object again.
+    fn discard_bad_entry(&self, accession: &Accession, path: &Path) -> Result<()> {
+        if self.offline {
+            return Err(Error::Fetch {
+                accession: accession.clone(),
+                detail: format!(
+                    "the cached file {} is not zstd data, so it cannot be the Logan object. \
+                     Delete it, or rerun without --offline to replace it",
+                    path.display()
+                ),
+            });
+        }
+        eprintln!(
+            "[logan-walker] warn: [{accession}] the cached file {} is not zstd data; \
+             removing it and downloading the object again.",
+            path.display()
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(sidecar_path(path));
+        Ok(())
+    }
+
+    /// `download`, recording a negative in the cache so an `--offline` run can tell a 404
+    /// from a failure (WF-03).
+    ///
+    /// Only when there is a cache to record it in, and only for the two outcomes that are
+    /// properties of the accession rather than of this run: no Logan data, and over the cap.
+    /// A success removes any note, because Logan does add data for accessions it had none
+    /// for, and because a cap raised between runs must not keep refusing.
+    fn download_recording(
+        &self,
+        index: usize,
+        accession: &Accession,
+        mark: Option<&'static str>,
+    ) -> Result<FetchedUnitigs> {
+        let out = self.download(index, accession, mark);
+        if let Some(dir) = &self.cache_dir {
+            note_outcome(dir, accession, &out, self.max_compressed_bytes);
+        }
+        out
     }
 
     /// The cold path: fetch the object, with retries, and mark how it came to be fetched.
@@ -318,9 +388,16 @@ impl Fetcher {
     ) -> Result<FetchedUnitigs> {
         let url = unitigs_url(accession);
         let mut last: String = String::from("no attempt made");
+        // One transfer across all the attempts, so an attempt that was interrupted after
+        // real progress resumes where it stopped rather than starting again (WF-09).
+        let mut xfer = Transfer::new(self.open_sink(accession));
+        // Failures that made no progress. `attempt` counts every try, including the free
+        // ones, and only guards against a server that dribbles forever.
+        let mut failures: u32 = 0;
 
-        for attempt in 1..=self.attempts {
-            match self.try_once(index, accession, &url, None) {
+        for _attempt in 1..=MAX_FETCH_ATTEMPTS_EVER {
+            let before = xfer.got;
+            match self.try_once(index, accession, &url, None, &mut xfer) {
                 // No cache write here any more. `try_once` streams the body straight into the
                 // cache entry, so by the time it returns the bytes are already on disk and
                 // already renamed into place. The old shape read the object into a `Vec`,
@@ -346,7 +423,7 @@ impl Fetcher {
                 // panicking, because a proxy inventing one must not take down a run.
                 Err(FetchAttempt::NotModified) => {
                     last = "unconditional request answered 304".to_string();
-                    continue;
+                    failures += 1;
                 }
                 Err(FetchAttempt::TooLarge(detail, payload)) => {
                     return Err(Error::TooLarge {
@@ -355,19 +432,36 @@ impl Fetcher {
                         payload,
                     })
                 }
-                Err(FetchAttempt::Transient(detail)) => {
+                Err(FetchAttempt::Transient(detail, after)) => {
+                    let progressed = xfer.got.saturating_sub(before) >= RESUME_PROGRESS_BYTES;
                     last = detail;
-                    if attempt < self.attempts {
-                        // Linear backoff is enough here; S3 throttling is rare and the
-                        // dominant transient is a dropped connection.
-                        std::thread::sleep(Duration::from_millis(500 * attempt as u64));
+                    if !progressed {
+                        failures += 1;
                     }
+                    if failures >= self.attempts {
+                        break;
+                    }
+                    // A server that asked for a particular wait gets it; otherwise back off.
+                    // An interrupted transfer that is making progress retries at once, since
+                    // the delay is for a server in trouble, not for a dropped connection.
+                    if let Some(wait) = after {
+                        std::thread::sleep(wait);
+                    } else if !progressed {
+                        std::thread::sleep(backoff(failures));
+                    }
+                    continue;
                 }
+            }
+            if failures >= self.attempts {
+                break;
             }
         }
         Err(Error::Fetch {
             accession: accession.clone(),
-            detail: format!("giving up after {} attempts: {last}", self.attempts),
+            detail: format!(
+                "giving up after {failures} failed attempts ({} bytes transferred): {last}",
+                xfer.got
+            ),
         })
     }
 
@@ -389,7 +483,11 @@ impl Fetcher {
         let Some(tag) = read_sidecar(path).and_then(|s| s.etag) else {
             return Revalidation::NoOrigin;
         };
-        match self.try_once(index, accession, url, Some(&tag)) {
+        // A 200 here carries the replacement object, so this needs somewhere to put it. One
+        // attempt only: a revalidation that cannot be completed falls back to the cached
+        // bytes, which is the whole point of `Unavailable`.
+        let mut xfer = Transfer::new(self.open_sink(accession));
+        match self.try_once(index, accession, url, Some(&tag), &mut xfer) {
             Err(FetchAttempt::NotModified) => Revalidation::Current,
             Ok(fresh) => Revalidation::Replaced(Box::new(fresh)),
             // The object is gone from the bucket. The cached copy is still readable and is
@@ -408,7 +506,7 @@ impl Fetcher {
                 );
                 Revalidation::Unavailable
             }
-            Err(FetchAttempt::Permanent(detail)) | Err(FetchAttempt::Transient(detail)) => {
+            Err(FetchAttempt::Permanent(detail)) | Err(FetchAttempt::Transient(detail, _)) => {
                 eprintln!(
                     "[logan-walker] warn: [{accession}] could not revalidate ({detail}); \
                      using the cached copy."
@@ -427,6 +525,7 @@ impl Fetcher {
         accession: &Accession,
         url: &str,
         if_none_match: Option<&str>,
+        xfer: &mut Transfer,
     ) -> std::result::Result<FetchedUnitigs, FetchAttempt> {
         let req = self.agent.get(url);
         // Quoted on the way out: the stored value has them stripped for comparison, but the
@@ -435,20 +534,76 @@ impl Fetcher {
             Some(tag) => req.header("If-None-Match", &format!("\"{tag}\"")),
             None => req,
         };
+        // Resume (WF-09). `If-Match` is what makes it safe: without it a resume could staple
+        // the tail of a replaced object onto the head of the one we started with, and the
+        // Logan objects are mutable (3.1% of a 5,000-key sample were rewritten after the
+        // 2024-03 load). A server that does not know the entity answers 412 and we start over.
+        let resuming = xfer.got > 0;
+        let req = if resuming {
+            let r = req.header("Range", &format!("bytes={}-", xfer.got));
+            match &xfer.etag {
+                Some(tag) => r.header("If-Match", &format!("\"{tag}\"")),
+                None => r,
+            }
+        } else {
+            req
+        };
         let mut resp = req
             .call()
-            .map_err(|e| FetchAttempt::Transient(format!("request failed: {e}")))?;
+            .map_err(|e| FetchAttempt::Transient(format!("request failed: {e}"), None))?;
 
         let status = resp.status().as_u16();
+        // How much of the object this response carries, and from where.
+        let mut range_total: Option<u64> = None;
         match status {
-            200 => {}
+            200 => {
+                // The whole object, whatever we asked for. Anything already transferred is
+                // the head of a different response and cannot be kept.
+                if resuming {
+                    xfer.restart(self.open_sink(accession));
+                }
+            }
+            206 => {
+                let start = header(&resp, ureq::http::header::CONTENT_RANGE)
+                    .as_deref()
+                    .and_then(parse_content_range);
+                match start {
+                    Some((first, total)) if resuming && first == xfer.got => range_total = total,
+                    // A partial response to a request we did not make one for, or one that
+                    // starts somewhere else. Neither can be appended to what we hold.
+                    other => {
+                        xfer.restart(self.open_sink(accession));
+                        return Err(FetchAttempt::Transient(
+                            format!("unusable 206: Content-Range {other:?} for a resume at {}", xfer.got),
+                            None,
+                        ));
+                    }
+                }
+            }
             // Only reachable when `if_none_match` was sent, and it is the answer that run
             // wanted: the cached bytes are the object the bucket still serves.
             304 => return Err(FetchAttempt::NotModified),
             404 => return Err(FetchAttempt::Missing),
-            // 4xx other than 404 is our fault and will not improve on retry.
+            // The object changed under us (412), or the range is no longer inside it (416).
+            // Both mean the bytes in hand are stale; drop them and fetch the object afresh.
+            412 | 416 => {
+                xfer.restart(self.open_sink(accession));
+                return Err(FetchAttempt::Transient(
+                    format!("HTTP {status}: the object changed while it was being fetched"),
+                    None,
+                ));
+            }
+            // Request timeout and "slow down". The server is asking to be asked again, and
+            // may have said when (WF-07); before 0.2.0 both were permanent on the first try.
+            408 | 429 => {
+                return Err(FetchAttempt::Transient(
+                    format!("HTTP {status}"),
+                    retry_after(&resp),
+                ))
+            }
+            // 4xx other than those is our fault and will not improve on retry.
             400..=499 => return Err(FetchAttempt::Permanent(format!("HTTP {status}"))),
-            _ => return Err(FetchAttempt::Transient(format!("HTTP {status}"))),
+            _ => return Err(FetchAttempt::Transient(format!("HTTP {status}"), None)),
         }
 
         // Provenance off the response, read before the body so it survives a refusal: a
@@ -458,19 +613,32 @@ impl Fetcher {
         // `--max-size-mb` (default 1024) keeps the walker well inside. Above that limit S3
         // appends `-<parts>` and the value is opaque; it is recorded either way, and the
         // suffix is self-identifying.
-        let mut payload = Payload {
-            source: PayloadSource::S3,
-            etag: header(&resp, ureq::http::header::ETAG)
-                .map(|v| v.trim_matches('"').to_string()),
-            last_modified: header(&resp, ureq::http::header::LAST_MODIFIED)
-                .as_deref()
-                .and_then(http_date_to_iso8601),
-            fetched_at: Some(crate::io::output::iso8601(std::time::SystemTime::now())),
-            ..Payload::default()
-        };
+        // Captured on the response that opened the object and kept across resumes, so a
+        // transfer that took four connections still reports the identity it was started on.
+        if xfer.payload.etag.is_none() && xfer.payload.last_modified.is_none() {
+            xfer.payload = Payload {
+                source: PayloadSource::S3,
+                etag: header(&resp, ureq::http::header::ETAG)
+                    .map(|v| v.trim_matches('"').to_string()),
+                last_modified: header(&resp, ureq::http::header::LAST_MODIFIED)
+                    .as_deref()
+                    .and_then(http_date_to_iso8601),
+                fetched_at: Some(crate::io::output::iso8601(std::time::SystemTime::now())),
+                ..Payload::default()
+            };
+            xfer.etag = xfer.payload.etag.clone();
+        }
+        let mut payload = xfer.payload.clone();
 
         // Refuse oversized accessions before transferring them, when the server says how big.
-        if let Some(len) = resp.body().content_length() {
+        // On a 206 the content length is what is left, so the object's size is the total from
+        // `Content-Range` when the server gave one, and what we hold plus what is coming
+        // otherwise.
+        let object_len = resp
+            .body()
+            .content_length()
+            .map(|len| range_total.unwrap_or(xfer.got + len));
+        if let Some(len) = object_len {
             payload.bytes = Some(len);
             if len > self.max_compressed_bytes {
                 return Err(FetchAttempt::TooLarge(
@@ -489,9 +657,9 @@ impl Fetcher {
             }
         }
 
-        // Decided before a byte is read, so the bytes have somewhere to go the moment they
-        // arrive and are never assembled in RAM first.
-        let mut sink = self.open_sink(accession);
+        // The sink was opened before the first attempt and survives them, because that is
+        // what a resume appends to. Only a restart replaces it.
+        let sink = xfer.sink.as_mut().expect("the transfer's sink is taken only by finish");
 
         // One pass over the body: counted, hashed and written as it streams. The count is
         // ours rather than ureq's `limit`, so the cap is enforced by code that can say which
@@ -499,30 +667,32 @@ impl Fetcher {
         // here, where the bytes are already in a register; computing it afterwards would be
         // a second full pass over a file that can be 11 GB (the nn1 probe measured that pass
         // at 91 s).
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
+        use sha2::Digest;
         let mut buf = vec![0u8; crate::config::DOWNLOAD_BUFFER_BYTES as usize];
-        let mut total: u64 = 0;
+        // The object's first four bytes, collected across however many reads it takes, so
+        // the zstd check below is about the object and not about one buffer (WF-13). Only
+        // for a transfer that starts at byte 0; a resume already passed it.
+        let mut head: Vec<u8> = Vec::with_capacity(4);
+        let mut checked_magic = xfer.got > 0;
         let mut reader = resp.body_mut().as_reader();
         loop {
             let got = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
-                // A dropped connection mid-body. Worth retrying, and the partial sink is
-                // discarded so the next attempt starts from nothing.
+                // A dropped connection mid-body. Worth retrying, and what has been written
+                // is kept: the next attempt asks for the rest with a `Range` header.
                 Err(e) => {
-                    sink.abandon();
-                    return Err(FetchAttempt::Transient(format!(
-                        "body read failed after {total} bytes: {e}"
-                    )));
+                    return Err(FetchAttempt::Transient(
+                        format!("body read failed after {} bytes: {e}", xfer.got),
+                        None,
+                    ))
                 }
             };
-            total += got as u64;
+            xfer.got += got as u64;
             // The guard for a missing or lying `Content-Length`. A body of exactly the cap
             // passes, as it does the pre-transfer check above; the transfer stops here rather
             // than running to completion first.
-            if total > self.max_compressed_bytes {
-                sink.abandon();
+            if xfer.got > self.max_compressed_bytes {
                 return Err(FetchAttempt::TooLarge(
                     format!(
                         "compressed size exceeds max_compressed_bytes {} (found by \
@@ -535,41 +705,78 @@ impl Fetcher {
                     Box::new(Payload { bytes: None, ..payload.clone() }),
                 ));
             }
-            hasher.update(&buf[..got]);
-            if let Err(e) = sink.write_all(&buf[..got]) {
-                let where_ = sink.describe();
-                sink.abandon();
-                return Err(download_write_error(where_, total, e, &payload));
+            // WF-13: refuse a body that is not a zstd stream, before it can be renamed into
+            // the cache. A proxy's error page used to be cached under the accession's name
+            // and then fail that accession on every run, forever, even online.
+            if !checked_magic {
+                head.extend_from_slice(&buf[..got.min(4 - head.len())]);
+                if head.len() == 4 {
+                    checked_magic = true;
+                    if !looks_like_zstd(&head) {
+                        return Err(FetchAttempt::Transient(
+                            format!(
+                                "the body is not zstd ({:02x?}); a proxy or error page, not \
+                                 a Logan object",
+                                &head[..]
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+            xfer.hasher.update(&buf[..got]);
+            if let Err(e) = xfer.sink.as_mut().expect("sink").write_all(&buf[..got]) {
+                let where_ = xfer.sink.as_ref().expect("sink").describe();
+                return Err(download_write_error(where_, xfer.got, e, &payload));
             }
         }
 
-        if total == 0 {
-            sink.abandon();
-            return Err(FetchAttempt::Transient("empty body".to_string()));
+        if xfer.got == 0 {
+            return Err(FetchAttempt::Transient("empty body".to_string(), None));
+        }
+        // A short read that the connection closed cleanly on: the server said how big the
+        // object is and sent less. Resumable like any other interruption.
+        if let Some(len) = object_len {
+            if xfer.got < len {
+                return Err(FetchAttempt::Transient(
+                    format!("body ended at {} of {len} bytes", xfer.got),
+                    None,
+                ));
+            }
+        }
+        // A one-byte object cannot be zstd, and the loop above only checks once it has four.
+        if !checked_magic && !looks_like_zstd(&head) {
+            return Err(FetchAttempt::Transient(
+                format!("the body is {} bytes and is not zstd", xfer.got),
+                None,
+            ));
         }
 
         // Content-Length is the server's claim; this is the bytes that were actually read,
         // and it is what every downstream stage consumed.
+        let total = xfer.got;
         payload.bytes = Some(total);
 
         // The spool gate again, for a server that sent no `Content-Length`: then the size is
         // only knowable by downloading, and refusing here still beats failing mid-parse with
         // the transfer already spent.
         if let Err(detail) = self.spool_room(total) {
-            sink.abandon();
             return Err(FetchAttempt::TooLarge(detail, Box::new(payload)));
         }
 
         let mut hex = String::with_capacity(64);
+        let hasher = std::mem::replace(&mut xfer.hasher, <sha2::Sha256 as sha2::Digest>::new());
         for b in hasher.finalize() {
             hex.push_str(&format!("{b:02x}"));
         }
         payload.sha256 = Some(hex);
 
         // The rename into the cache happens here, after the last byte and after every
-        // refusal, so a skipped accession never leaves a cache entry behind.
+        // refusal, so a skipped accession never leaves a cache entry behind. Taking the sink
+        // is what marks the transfer finished: `Drop` abandons anything still in it.
+        let sink = xfer.sink.take().expect("sink");
         let compressed = sink.finish(&payload).map_err(|e| {
-            FetchAttempt::Transient(format!("could not commit the downloaded body: {e}"))
+            FetchAttempt::Transient(format!("could not commit the downloaded body: {e}"), None)
         })?;
 
         Ok(FetchedUnitigs {
@@ -699,10 +906,260 @@ fn http_date_to_iso8601(s: &str) -> Option<String> {
     Some(format!("{year}-{month:02}-{day}T{time}Z"))
 }
 
+/// Whether a cache entry opens with the zstd magic (WF-13).
+///
+/// Reads four bytes and rewinds, so the caller's handle is still at the start for the hash
+/// pass that follows. An unreadable handle is treated as "not zstd": the read that follows
+/// would fail anyway, and this way it fails with a message about the file.
+fn entry_is_zstd(file: &mut std::fs::File) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut head = [0u8; 4];
+    let ok = file.read_exact(&mut head).is_ok() && looks_like_zstd(&head);
+    file.seek(SeekFrom::Start(0)).is_ok() && ok
+}
+
+/// The note recording why an accession is absent from the cache (WF-03).
+///
+/// `<DIR>/<ACC>.unitigs.absent`, one line. Deliberately not the provenance sidecar's format:
+/// that one describes an object that exists, and this one exists because no object does.
+/// Deleting it forces the next online run to ask the bucket again.
+pub fn absent_path(dir: &Path, accession: &str) -> PathBuf {
+    dir.join(format!("{accession}.unitigs.absent"))
+}
+
+/// What a `.absent` note says.
+pub enum Absent {
+    /// Logan has no unitigs for this accession.
+    NoLoganData,
+    /// The object was over the cap that was in force when it was recorded, at this size.
+    TooLarge(u64),
+}
+
+impl Absent {
+    /// The error this note stands for, or `None` when it no longer applies.
+    ///
+    /// A `too_large` note stops applying when the run's cap is at least the recorded size,
+    /// which is what happens when the user raises `--max-size-mb` between the fetch and the
+    /// walk. The caller then falls through to its ordinary cache-miss error, which says the
+    /// object is not here, because it is not.
+    pub fn into_error(self, accession: &str, cap: u64) -> Option<Error> {
+        match self {
+            Absent::NoLoganData => Some(Error::NoLoganData { accession: accession.to_string() }),
+            Absent::TooLarge(bytes) if bytes > cap => Some(Error::TooLarge {
+                accession: accession.to_string(),
+                detail: format!(
+                    "compressed size {bytes} exceeds max_compressed_bytes {cap}; recorded \
+                     when the cache was filled, and not fetched"
+                ),
+                payload: Box::new(Payload { bytes: Some(bytes), ..Payload::default() }),
+            }),
+            Absent::TooLarge(_) => None,
+        }
+    }
+}
+
+/// Read a `.absent` note. Anything unparseable is no note at all, so a damaged one degrades
+/// to the ordinary cache-miss error rather than inventing an outcome.
+fn read_absent(dir: &Path, accession: &str) -> Option<Absent> {
+    let text = std::fs::read_to_string(absent_path(dir, accession)).ok()?;
+    let line = text.lines().next()?.trim();
+    if line == "no_logan_data" {
+        return Some(Absent::NoLoganData);
+    }
+    let bytes = line.strip_prefix("too_large ")?.trim().parse().ok()?;
+    Some(Absent::TooLarge(bytes))
+}
+
+/// Update an accession's `.absent` note from what the fetch returned (WF-03).
+///
+/// Only the two outcomes that are properties of the accession rather than of this run are
+/// recorded: no Logan data, and over the cap. A success removes any note, because Logan does
+/// add data for accessions it had none for, and because a cap raised between runs must not
+/// keep refusing. Every other failure leaves the note alone: a transport error says nothing
+/// about the accession.
+fn note_outcome(dir: &Path, accession: &str, out: &Result<FetchedUnitigs>, cap: u64) {
+    match out {
+        Ok(_) => {
+            let _ = std::fs::remove_file(absent_path(dir, accession));
+        }
+        Err(Error::NoLoganData { .. }) => write_absent(dir, accession, "no_logan_data"),
+        Err(Error::TooLarge { payload, .. }) => {
+            // The size is a lower bound when the server sent no Content-Length: all that was
+            // learned is "more than the cap", so record the cap plus one, which is the
+            // weakest true statement and still refuses at this cap.
+            let bytes = payload.bytes.unwrap_or(cap + 1);
+            write_absent(dir, accession, &format!("too_large {bytes}"));
+        }
+        Err(_) => {}
+    }
+}
+
+/// Write a `.absent` note, through a tempfile so a reader never sees half of one.
+///
+/// Failure is ignored: the note is an optimisation of the offline run's diagnosis, and a
+/// cache directory that cannot take it has already produced a louder error elsewhere.
+fn write_absent(dir: &Path, accession: &str, line: &str) {
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{accession}.absent.{}.{ns}.tmp", std::process::id()));
+    if std::fs::write(&tmp, format!("{line}\n")).is_ok()
+        && std::fs::rename(&tmp, absent_path(dir, accession)).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Bytes an attempt must add for the resume to cost nothing against `--fetch-attempts`.
+///
+/// WF-09. A connection that dropped after transferring real data has not failed in the way
+/// the attempt budget is counting; it has made progress and been interrupted. Without this, a
+/// 4 GB object on a link that drops every few minutes exhausts six attempts having downloaded
+/// most of it six times.
+const RESUME_PROGRESS_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Attempts at one object, however much progress each makes.
+///
+/// The free-resume rule above has to stop somewhere, or a server dribbling exactly
+/// `RESUME_PROGRESS_BYTES` and hanging up would loop until the size cap. At the 4 GB default
+/// cap a transfer that keeps making progress needs at most 512 resumes, so this cannot refuse
+/// a download that was going to finish.
+const MAX_FETCH_ATTEMPTS_EVER: u32 = 1000;
+
+/// Whether `b` opens a zstd stream.
+///
+/// WF-13. A cache entry used to be accepted on "not empty", and `try_once` cached any 200
+/// body, so a proxy's HTML error page became a cache entry that failed its accession with
+/// `parse failed: Unknown frame descriptor` on every run, forever, even online. Four bytes
+/// settle it: `28 b5 2f fd` is the frame magic, and `184d2a5?` is a skippable frame, which a
+/// legitimate file may begin with.
+fn looks_like_zstd(b: &[u8]) -> bool {
+    if b.len() < 4 {
+        return false;
+    }
+    let magic = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    magic == 0xFD2F_B528 || (0x184D_2A50..=0x184D_2A5F).contains(&magic)
+}
+
+/// `Retry-After`, in seconds, capped at five minutes.
+///
+/// Only the delta-seconds form is read. The HTTP-date form would need epoch arithmetic
+/// against a clock we do not otherwise trust, and falling back to the backoff is a safe
+/// answer for it: the backoff is never longer than the date would have asked for by more than
+/// a minute. S3 sends delta-seconds.
+fn retry_after<B>(resp: &ureq::http::Response<B>) -> Option<Duration> {
+    header(resp, ureq::http::header::RETRY_AFTER)?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| Duration::from_secs(secs.min(300)))
+}
+
+/// How long to wait before attempt `n` (1-based), with jitter.
+///
+/// WF-07. This was `500 ms * attempt` over three attempts: 1.5 s in total, no jitter. A 60 s
+/// network, proxy or DNS interruption therefore discarded one accession per worker every
+/// 1.5 s, which at the default eight workers marks about 320 accessions `error`, and since
+/// 0.2.0 any error makes the run non-zero. Exponential from 1 s, capped at a minute, so the
+/// default six attempts cover about half a minute of outage and `--fetch-attempts 10` covers
+/// four.
+fn backoff(attempt: u32) -> Duration {
+    let secs = 1u64 << attempt.clamp(1, 6).saturating_sub(1);
+    let millis = (secs.min(60) * 1000) as f64 * jitter_fraction();
+    Duration::from_millis(millis as u64)
+}
+
+/// A number in `0.5..1.5`, to spread retries that would otherwise arrive together.
+///
+/// Every fetch worker tends to fail at the same instant, because they fail for the same
+/// reason, and a fixed backoff then sends them all back at the same instant. The clock alone
+/// is not enough to separate them (they are inside the same microsecond), so a per-call
+/// counter is mixed in and the pair is run through xorshift64*. No `rand` dependency: the
+/// walker's dependency list is deliberately short, and this needs spread, not randomness.
+fn jitter_fraction() -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let mut x = SEQ.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) ^ nanos;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    0.5 + (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// The first byte and the total size out of a `Content-Range: bytes 100-999/1000`.
+///
+/// The total is `None` for the `*` form, which says the server does not know it.
+fn parse_content_range(v: &str) -> Option<(u64, Option<u64>)> {
+    let rest = v.trim().strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, _end) = range.split_once('-')?;
+    Some((start.trim().parse().ok()?, total.trim().parse().ok()))
+}
+
+/// One object's download, carried across attempts so a dropped connection resumes (WF-09).
+///
+/// Before this, a failed attempt threw away everything it had transferred and the next one
+/// issued a bare GET from byte 0. With the default 900 s request timeout that meant any
+/// object whose per-stream rate fell below size/900s could never be fetched at all, however
+/// many attempts it was given: each one timed out at the same place.
+struct Transfer {
+    /// `None` only while a reset is swapping it, and after `finish` has taken it.
+    sink: Option<BodySink>,
+    hasher: sha2::Sha256,
+    /// Bytes committed to the sink so far, which is where a resume asks to continue from.
+    got: u64,
+    /// The object's `ETag` from the first response, sent back as `If-Match` so a resume
+    /// cannot staple the tail of a replaced object onto the head of the old one.
+    etag: Option<String>,
+    /// Provenance from the first response that carried a body.
+    payload: Payload,
+}
+
+impl Transfer {
+    fn new(sink: BodySink) -> Self {
+        Self {
+            sink: Some(sink),
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
+            got: 0,
+            etag: None,
+            payload: Payload::default(),
+        }
+    }
+
+    /// Throw away what has been transferred and start again on `fresh`.
+    ///
+    /// Used when the server answers a resume with the whole object, with a range we did not
+    /// ask for, or with "that object has changed".
+    fn restart(&mut self, fresh: BodySink) {
+        if let Some(old) = self.sink.replace(fresh) {
+            old.abandon();
+        }
+        self.hasher = <sha2::Sha256 as sha2::Digest>::new();
+        self.got = 0;
+    }
+}
+
+impl Drop for Transfer {
+    fn drop(&mut self) {
+        // A download that never completed must not leave a tempfile behind, and must never
+        // leave one renamed into the cache: `abandon` is the only way a sink ends unfinished.
+        if let Some(sink) = self.sink.take() {
+            sink.abandon();
+        }
+    }
+}
+
 /// Whether a failed attempt is worth repeating.
 enum FetchAttempt {
-    /// Transport error or 5xx. Retry.
-    Transient(String),
+    /// Transport error, 5xx, 408 or 429. Retry, after the server's `Retry-After` when it sent
+    /// one and the backoff otherwise (WF-07).
+    Transient(String, Option<Duration>),
     /// A 4xx other than 404. Retrying cannot help.
     Permanent(String),
     /// HTTP 404: Logan has no unitigs for this accession. Not an error of the run.
@@ -1076,6 +1533,24 @@ mod size_cap_tests {
     use crate::config::Config;
     use std::io::{BufRead, BufReader, Write};
 
+    /// One fresh attempt at `url`, with the `Transfer` that `download` would own.
+    fn attempt(
+        f: &Fetcher,
+        acc: &str,
+        url: &str,
+    ) -> std::result::Result<FetchedUnitigs, FetchAttempt> {
+        let acc = acc.to_string();
+        let mut xfer = Transfer::new(f.open_sink(&acc));
+        f.try_once(0, &acc, url, None, &mut xfer)
+    }
+
+    /// A body that is a plausible Logan object: zstd frame magic, then filler (WF-13).
+    fn zbody(n: usize) -> Vec<u8> {
+        let mut v = vec![0x28, 0xb5, 0x2f, 0xfd];
+        v.resize(n.max(4), b'Z');
+        v
+    }
+
     /// Serve one request with `body` and no Content-Length (the body ends when the
     /// connection closes, as with a chunked or HTTP/1.0 response). Returns the URL.
     fn serve_without_length(body: Vec<u8>) -> String {
@@ -1114,9 +1589,9 @@ mod size_cap_tests {
     #[test]
     fn a_body_over_the_cap_without_content_length_is_too_large_not_transient() {
         let url = serve_without_length(vec![b'A'; 100]);
-        match fetcher(10).try_once(0, &"X".to_string(), &url, None) {
+        match attempt(&fetcher(10), "X", &url) {
             Err(FetchAttempt::TooLarge(d, _)) => assert!(d.contains("no Content-Length"), "{d}"),
-            Err(FetchAttempt::Transient(d)) => panic!("retried as transient: {d}"),
+            Err(FetchAttempt::Transient(d, _)) => panic!("retried as transient: {d}"),
             Err(_) => panic!("wrong failure"),
             Ok(f) => panic!("accepted {} bytes over a 10-byte cap", f.compressed_len),
         }
@@ -1145,12 +1620,12 @@ mod size_cap_tests {
         );
         let mut f = fetcher(u64::MAX);
         f.cache_dir = Some(dir.clone());
-        let got = match f.try_once(0, &"CACHED0011".to_string(), &url, None) {
+        let got = match attempt(&f, "CACHED0011", &url) {
             Ok(got) => got,
             Err(FetchAttempt::Missing) => panic!("download failed: missing"),
             Err(FetchAttempt::TooLarge(d, _)) => panic!("download failed, too large: {d}"),
             Err(FetchAttempt::Permanent(d)) => panic!("download failed, permanent: {d}"),
-            Err(FetchAttempt::Transient(d)) => panic!("download failed, transient: {d}"),
+            Err(FetchAttempt::Transient(d, _)) => panic!("download failed, transient: {d}"),
             Err(FetchAttempt::NotModified) => panic!("304 to an unconditional request"),
         };
         assert_eq!(got.payload.etag.as_deref(), Some("d2dd288b238c3c88b46acdcd78860dce"));
@@ -1329,12 +1804,12 @@ mod size_cap_tests {
     /// from the bytes themselves rather than trusted from the header.
     #[test]
     fn a_live_fetch_records_the_object_it_read() {
-        let body = vec![b'Z'; 32];
+        let body = zbody(32);
         let url = serve_once(
             "ETag: \"d2dd288b238c3c88b46acdcd78860dce\"\r\nLast-Modified: Sun, 31 Mar 2024 17:38:36 GMT\r\n",
             body.clone(),
         );
-        let got = fetcher(1024).try_once(0, &"X".to_string(), &url, None).ok().expect("fetch");
+        let got = attempt(&fetcher(1024), "X", &url).ok().expect("fetch");
         let p = &got.payload;
         assert_eq!(p.source, PayloadSource::S3);
         assert_eq!(p.bytes, Some(32));
@@ -1350,9 +1825,8 @@ mod size_cap_tests {
     /// that does not depend on the transport.
     #[test]
     fn a_response_without_those_headers_still_hashes_what_it_read() {
-        let body = vec![b'Q'; 8];
-        let got = fetcher(1024)
-            .try_once(0, &"X".to_string(), &serve_once("", body.clone()), None)
+        let body = zbody(8);
+        let got = attempt(&fetcher(1024), "X", &serve_once("", body.clone()))
             .ok()
             .expect("fetch");
         assert_eq!(got.payload.sha256.as_deref(), Some(crate::types::sha256_hex(&body).as_str()));
@@ -1365,14 +1839,14 @@ mod size_cap_tests {
     #[test]
     fn a_refusal_on_content_length_records_what_was_refused() {
         let url = serve_once("ETag: \"abc123\"\r\n", vec![b'Z'; 100]);
-        match fetcher(10).try_once(0, &"X".to_string(), &url, None) {
+        match attempt(&fetcher(10), "X", &url) {
             Err(FetchAttempt::TooLarge(_, p)) => {
                 assert_eq!(p.bytes, Some(100), "the size that tripped the cap must be a number");
                 assert_eq!(p.etag.as_deref(), Some("abc123"));
                 assert_eq!(p.source, PayloadSource::S3);
                 assert!(p.sha256.is_none(), "no bytes were read, so there is nothing to hash");
             }
-            Err(FetchAttempt::Transient(d)) => panic!("retried as transient: {d}"),
+            Err(FetchAttempt::Transient(d, _)) => panic!("retried as transient: {d}"),
             Err(_) => panic!("wrong failure"),
             Ok(_) => panic!("accepted 100 bytes over a 10-byte cap"),
         }
@@ -1380,9 +1854,408 @@ mod size_cap_tests {
 
     #[test]
     fn a_body_of_exactly_the_cap_is_accepted() {
-        let url = serve_without_length(vec![b'A'; 10]);
-        let got = fetcher(10).try_once(0, &"X".to_string(), &url, None).ok().expect("refused at the cap");
+        // Exactly the cap, and still a zstd stream: the magic is four of the ten bytes.
+        let url = serve_without_length(zbody(10));
+        let got = attempt(&fetcher(10), "X", &url).ok().expect("refused at the cap");
         assert_eq!(got.compressed_len, 10);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::config::Config;
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn zbody(n: usize) -> Vec<u8> {
+        let mut v = vec![0x28, 0xb5, 0x2f, 0xfd];
+        v.resize(n.max(4), b'Z');
+        v
+    }
+
+    /// A fetcher that talks to the loopback server directly (TW-09: no proxy from the env).
+    fn fetcher(cfg: Config) -> Fetcher {
+        let mut f = Fetcher::new(&cfg);
+        f.agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .proxy(None)
+                .http_status_as_error(false)
+                .timeout_global(Some(Duration::from_secs(cfg.fetch_timeout_secs)))
+                .build(),
+        );
+        f
+    }
+
+    /// The `Range: bytes=N-` of a request, if it has one.
+    fn read_request(sock: &std::net::TcpStream) -> Option<u64> {
+        let mut reader = BufReader::new(sock.try_clone().unwrap());
+        let mut line = String::new();
+        let mut from = None;
+        while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                from = v.split('-').next().and_then(|n| n.trim().parse().ok());
+            }
+            line.clear();
+        }
+        from
+    }
+
+    /// Serve `body`, closing the connection after `chunk` bytes of each response, and
+    /// honouring `Range`. The returned counter is the number of connections made.
+    fn serve_resumable(body: Vec<u8>, chunk: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { break };
+                counter.fetch_add(1, Ordering::Relaxed);
+                let from = read_request(&sock).unwrap_or(0) as usize;
+                if from >= body.len() {
+                    let _ = sock.write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                let rest = &body[from..];
+                let head = if from == 0 {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"abc\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        rest.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nETag: \"abc\"\r\nContent-Length: {}\r\n\
+                         Content-Range: bytes {from}-{}/{}\r\nConnection: close\r\n\r\n",
+                        rest.len(),
+                        body.len() - 1,
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(head.as_bytes());
+                // Short by design when there is more to come: this is the dropped connection.
+                let _ = sock.write_all(&rest[..rest.len().min(chunk)]);
+            }
+        });
+        (format!("http://127.0.0.1:{port}/u/X/X.unitigs.fa.zst"), seen)
+    }
+
+    /// Serve one response with a fixed head, for the status-code cases.
+    fn serve_head(head: String, body: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let _ = read_request(&sock);
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(&body);
+        });
+        format!("http://127.0.0.1:{port}/u/X/X.unitigs.fa.zst")
+    }
+
+    /// WF-09. A transfer interrupted after real progress continues where it stopped.
+    ///
+    /// Before this, every attempt reissued a bare GET from byte 0, so an object whose
+    /// per-stream rate fell below size/timeout could never be fetched however many attempts
+    /// it was given: each one timed out in the same place. The chunk here is over
+    /// `RESUME_PROGRESS_BYTES`, so the resumes are free and the run does not back off.
+    #[test]
+    fn an_interrupted_download_resumes_instead_of_starting_again() {
+        let chunk = RESUME_PROGRESS_BYTES as usize + 1;
+        let body = zbody(chunk * 3);
+        let (url, seen) = serve_resumable(body.clone(), chunk);
+        // `download` builds the URL from the accession, so the retry shape is driven here
+        // against the loopback server instead.
+        let f = fetcher(Config::default());
+        let mut xfer = Transfer::new(f.open_sink(&"X".to_string()));
+        let mut attempts = 0;
+        let out = loop {
+            attempts += 1;
+            match f.try_once(0, &"X".to_string(), &url, None, &mut xfer) {
+                Ok(v) => break v,
+                Err(FetchAttempt::Transient(d, _)) if attempts < 10 => {
+                    assert!(xfer.got > 0, "nothing was kept across the attempt: {d}");
+                }
+                Err(FetchAttempt::Transient(d, _)) => panic!("gave up: {d}"),
+                Err(_) => panic!("wrong failure"),
+            }
+        };
+        assert_eq!(out.compressed_len, body.len(), "the whole object must arrive");
+        assert_eq!(
+            out.payload.sha256.as_deref(),
+            Some(crate::types::sha256_hex(&body).as_str()),
+            "a resumed object must hash as the original, not as a concatenation"
+        );
+        assert_eq!(seen.load(Ordering::Relaxed), 3, "one connection per chunk");
+    }
+
+    /// A server that answers a resume with the whole object starts the transfer over, rather
+    /// than appending the object to the part already held.
+    #[test]
+    fn a_200_answer_to_a_resume_starts_over() {
+        let body = zbody(300);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let whole = body.clone();
+        std::thread::spawn(move || {
+            let mut n = 0;
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { break };
+                let _ = read_request(&sock);
+                n += 1;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    whole.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                // First connection: half the object, then hang up. Second: all of it.
+                let send = if n == 1 { 100 } else { whole.len() };
+                let _ = sock.write_all(&whole[..send]);
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/u/X/X.unitigs.fa.zst");
+        let f = fetcher(Config::default());
+        let mut xfer = Transfer::new(f.open_sink(&"X".to_string()));
+        let first = f.try_once(0, &"X".to_string(), &url, None, &mut xfer);
+        assert!(matches!(first, Err(FetchAttempt::Transient(..))), "expected a short body");
+        assert_eq!(xfer.got, 100, "the first attempt kept what it read");
+        let out = f.try_once(0, &"X".to_string(), &url, None, &mut xfer).ok().expect("second");
+        assert_eq!(out.compressed_len, body.len(), "400 bytes would mean the parts were glued");
+        assert_eq!(
+            out.payload.sha256.as_deref(),
+            Some(crate::types::sha256_hex(&body).as_str())
+        );
+    }
+
+    /// WF-07. 408 and 429 are transient, and a `Retry-After` is obeyed.
+    ///
+    /// They used to fall into the `400..=499` arm and fail the accession on the first try,
+    /// so a throttling bucket cost one accession per 429 rather than one pause.
+    #[test]
+    fn throttling_is_transient_and_honours_retry_after() {
+        let f = fetcher(Config::default());
+        for (status, extra, want) in [
+            ("429 Too Many Requests", "Retry-After: 7\r\n", Some(7)),
+            ("429 Too Many Requests", "", None),
+            ("408 Request Timeout", "", None),
+            // Not delta-seconds, so the backoff decides instead of a bad parse.
+            ("429 Too Many Requests", "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n", None),
+            // Absurd values are capped rather than trusted.
+            ("429 Too Many Requests", "Retry-After: 99999\r\n", Some(300)),
+        ] {
+            let url = serve_head(
+                format!("HTTP/1.1 {status}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"),
+                Vec::new(),
+            );
+            let mut xfer = Transfer::new(f.open_sink(&"X".to_string()));
+            match f.try_once(0, &"X".to_string(), &url, None, &mut xfer) {
+                Err(FetchAttempt::Transient(_, after)) => assert_eq!(
+                    after.map(|d| d.as_secs()),
+                    want,
+                    "{status} {extra:?}"
+                ),
+                Err(FetchAttempt::Permanent(d)) => panic!("{status}: permanent: {d}"),
+                _ => panic!("{status}: wrong outcome"),
+            }
+        }
+    }
+
+    /// The backoff grows, is capped, and is not the same number twice.
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        // 1, 2, 4, 8, 16, 32 seconds before jitter, then flat.
+        for (attempt, base) in [(1u32, 1u64), (2, 2), (3, 4), (4, 8), (5, 16), (6, 32), (9, 32)] {
+            let d = backoff(attempt).as_millis() as u64;
+            assert!(
+                d >= base * 500 && d <= base * 1500,
+                "attempt {attempt}: {d} ms is outside +-50% of {base} s"
+            );
+        }
+        let a: Vec<u64> = (0..8).map(|_| backoff(3).as_millis() as u64).collect();
+        assert!(a.windows(2).any(|w| w[0] != w[1]), "no jitter at all: {a:?}");
+    }
+
+    /// WF-13. A body that is not zstd is refused, and never cached.
+    ///
+    /// A proxy's HTML error page used to be written into the cache under the accession's
+    /// name, where it failed that accession with `parse failed: Unknown frame descriptor` on
+    /// every later run, online runs included, until someone found and deleted the file.
+    #[test]
+    fn a_body_that_is_not_zstd_is_refused_and_not_cached() {
+        let dir = std::env::temp_dir().join(format!("logan-wf13-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = b"<html><head><title>502 Bad Gateway</title></head></html>".to_vec();
+        let url = serve_head(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                page.len()
+            ),
+            page,
+        );
+        let f = fetcher(Config { unitigs_cache: Some(dir.clone()), ..Config::default() });
+        let mut xfer = Transfer::new(f.open_sink(&"X".to_string()));
+        match f.try_once(0, &"X".to_string(), &url, None, &mut xfer) {
+            Err(FetchAttempt::Transient(d, _)) => assert!(d.contains("not zstd"), "{d}"),
+            Err(FetchAttempt::Permanent(d)) => panic!("not retryable: {d}"),
+            _ => panic!("an HTML error page was accepted as a Logan object"),
+        }
+        drop(xfer);
+        assert!(!cache_path(&dir, "X").exists(), "the error page was cached");
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(left.is_empty(), "something was left in the cache: {left:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A cache entry that is not zstd is refused by name under `--offline`, and replaced
+    /// when the bucket can be asked.
+    #[test]
+    fn a_cache_entry_that_is_not_zstd_is_named_offline_and_replaced_online() {
+        let dir = std::env::temp_dir().join(format!("logan-wf13b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = cache_path(&dir, "BADENTRY01");
+        std::fs::write(&path, b"<html>502</html>").unwrap();
+
+        let offline = fetcher(Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            ..Config::default()
+        });
+        match offline.fetch(0, &"BADENTRY01".to_string()) {
+            Err(Error::Fetch { detail, .. }) => {
+                assert!(detail.contains("not zstd data"), "{detail}");
+                assert!(detail.contains(&path.display().to_string()), "must name the file: {detail}");
+            }
+            other => panic!("expected a named refusal, got {:?}", other.map(|f| f.compressed_len)),
+        }
+        assert!(path.exists(), "--offline must not delete the user's file");
+
+        // Online the entry is removed so the next download can replace it. Driven through
+        // the decision itself rather than through `fetch`, which would go to the real bucket
+        // and this suite stays offline.
+        let side = sidecar_path(&path);
+        std::fs::write(&side, b"schema 1\n").unwrap();
+        let online = fetcher(Config { unitigs_cache: Some(dir.clone()), ..Config::default() });
+        online.discard_bad_entry(&"BADENTRY01".to_string(), &path).expect("online discards");
+        assert!(!path.exists(), "an online run must remove the entry it cannot use");
+        assert!(!side.exists(), "its provenance describes a file that is gone");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// WF-03. A negative recorded at fetch time keeps its status in the `--offline` run.
+    ///
+    /// `disassembler fetch` writes nothing for an accession Logan has no unitigs for, so the
+    /// documented `--offline` run that follows saw an ordinary cache miss and called it an
+    /// error: the same list and the same flags gave `no_logan_data` and exit 0 online, and
+    /// `error` plus exit 1 or 3 offline. Since 0.2.0 any error makes the run non-zero, so a
+    /// shard whose accessions are all 404s fails outright.
+    #[test]
+    fn an_offline_miss_with_a_negative_note_keeps_its_status() {
+        let dir = std::env::temp_dir().join(format!("logan-wf03-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Config {
+            unitigs_cache: Some(dir.clone()),
+            offline: true,
+            max_compressed_bytes: 1000,
+            ..Config::default()
+        };
+
+        write_absent(&dir, "NODATA0001", "no_logan_data");
+        match fetcher(cfg.clone()).fetch(0, &"NODATA0001".to_string()) {
+            Err(Error::NoLoganData { accession }) => assert_eq!(accession, "NODATA0001"),
+            other => panic!("expected NoLoganData, got {:?}", other.map(|f| f.compressed_len)),
+        }
+
+        write_absent(&dir, "TOOBIG0001", "too_large 5000");
+        match fetcher(cfg.clone()).fetch(0, &"TOOBIG0001".to_string()) {
+            Err(Error::TooLarge { detail, payload, .. }) => {
+                assert_eq!(payload.bytes, Some(5000));
+                assert!(detail.contains("5000"), "{detail}");
+            }
+            other => panic!("expected TooLarge, got {:?}", other.map(|f| f.compressed_len)),
+        }
+
+        // The cap was raised since the cache was filled, so the note no longer applies and
+        // this is an ordinary miss again: the object really is not here.
+        let raised = Config { max_compressed_bytes: 1_000_000, ..cfg.clone() };
+        match fetcher(raised).fetch(0, &"TOOBIG0001".to_string()) {
+            Err(Error::Fetch { detail, .. }) => assert!(detail.contains("cache miss"), "{detail}"),
+            other => panic!("expected a plain miss, got {:?}", other.map(|f| f.compressed_len)),
+        }
+
+        // A damaged note says nothing, rather than inventing an outcome.
+        std::fs::write(absent_path(&dir, "GARBLED001"), b"\x00\x01 not a note at all\n").unwrap();
+        match fetcher(cfg).fetch(0, &"GARBLED001".to_string()) {
+            Err(Error::Fetch { detail, .. }) => assert!(detail.contains("cache miss"), "{detail}"),
+            other => panic!("expected a plain miss, got {:?}", other.map(|f| f.compressed_len)),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What each fetch outcome does to the note.
+    ///
+    /// A success clears it, because Logan does add data for accessions it had none for, and
+    /// because a cap raised between runs must not keep refusing. A transport failure leaves
+    /// it alone: it says nothing about the accession.
+    #[test]
+    fn the_note_follows_the_outcome_and_a_failure_does_not_invent_one() {
+        let dir = std::env::temp_dir().join(format!("logan-wf03b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let acc = "ONCEGONE01";
+        let note = absent_path(&dir, acc);
+
+        note_outcome(&dir, acc, &Err(Error::NoLoganData { accession: acc.into() }), 1000);
+        assert_eq!(std::fs::read_to_string(&note).unwrap().trim(), "no_logan_data");
+
+        note_outcome(
+            &dir,
+            acc,
+            &Err(Error::TooLarge {
+                accession: acc.into(),
+                detail: String::new(),
+                payload: Box::new(Payload { bytes: Some(4096), ..Payload::default() }),
+            }),
+            1000,
+        );
+        assert_eq!(std::fs::read_to_string(&note).unwrap().trim(), "too_large 4096");
+
+        // Nothing is known about the accession from a dropped connection, so the note stands.
+        note_outcome(
+            &dir,
+            acc,
+            &Err(Error::Fetch { accession: acc.into(), detail: "connection reset".into() }),
+            1000,
+        );
+        assert_eq!(std::fs::read_to_string(&note).unwrap().trim(), "too_large 4096");
+
+        // A size with no Content-Length behind it is recorded as "more than the cap".
+        note_outcome(
+            &dir,
+            acc,
+            &Err(Error::TooLarge {
+                accession: acc.into(),
+                detail: String::new(),
+                payload: Box::new(Payload::default()),
+            }),
+            1000,
+        );
+        assert_eq!(std::fs::read_to_string(&note).unwrap().trim(), "too_large 1001");
+
+        note_outcome(
+            &dir,
+            acc,
+            &Ok(FetchedUnitigs {
+                index: 0,
+                accession: acc.into(),
+                compressed_len: 4,
+                compressed: Compressed::Memory(zbody(4)),
+                fetch_secs: 0.0,
+                payload: Payload::default(),
+            }),
+            1000,
+        );
+        assert!(!note.exists(), "a successful fetch must clear the note");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -1485,7 +2358,9 @@ mod cache_tests {
         // Over the spill threshold once multiplied by SPOOL_BYTES_PER_COMPRESSED_BYTE: a
         // smaller file never reaches disk and must not be gated. Contents are irrelevant,
         // because the refusal happens before anything decodes them.
-        let big = vec![0u8; 16 * 1024 * 1024];
+        // A cache entry has to look like a zstd object before anything else is asked of it.
+        let mut big = vec![0x28u8, 0xb5, 0x2f, 0xfd];
+        big.resize(16 * 1024 * 1024, 0);
         std::fs::write(cache_path(&dir, "BIGACC0001"), &big).unwrap();
         let acc = "BIGACC0001".to_string();
 
@@ -1538,7 +2413,8 @@ mod cache_tests {
     #[test]
     fn an_accession_too_small_to_spill_is_never_gated() {
         let dir = tempdir("spool-gate-small");
-        let small = vec![0u8; 1024 * 1024];
+        let mut small = vec![0x28u8, 0xb5, 0x2f, 0xfd];
+        small.resize(1024 * 1024, 0);
         std::fs::write(cache_path(&dir, "SMALLACC01"), &small).unwrap();
         // The same unsatisfiable demand as above; only the file size differs.
         let cfg = Config {
@@ -1855,7 +2731,7 @@ mod cache_tests {
     /// need one outside tests.
     fn kind_of(a: &FetchAttempt) -> &'static str {
         match a {
-            FetchAttempt::Transient(_) => "Transient",
+            FetchAttempt::Transient(..) => "Transient",
             FetchAttempt::Permanent(_) => "Permanent",
             FetchAttempt::Missing => "Missing",
             FetchAttempt::TooLarge(..) => "TooLarge",

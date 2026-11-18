@@ -345,9 +345,30 @@ fn results_are_stored_in_input_order_not_completion_order() {
 /// pool blocked on a full channel that nothing would drain again.
 #[test]
 fn a_closed_stdout_ends_the_run_instead_of_hanging() {
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
-    let fx = Fixture::new("pipe", 300);
-    let mut child = fx.cmd("cache", &[])
+    let fx = Fixture::matching("pipe", 4);
+    let base = fx.dir.join("scratch");
+    let base_arg = base.to_string_lossy().into_owned();
+    let pids = fx.dir.join("aligner_pids");
+
+    // SRRFAKE0's alignment never returns; the other three take a second and then report. It
+    // is that first progress line, written to a pipe nobody is reading, that ends the run,
+    // so there is always an aligner running when the signal arrives.
+    let script = fx.dir.join("ga_pipe");
+    std::fs::write(&script, format!(
+        "#!/bin/sh\n\
+         [ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n\
+         for a in \"$@\"; do case \"$a\" in *SRRFAKE0.*) echo $$ >> '{pids}'; exec sleep 60;; esac; done\n\
+         sleep 1\n\
+         exec '{ga}' \"$@\"\n",
+        pids = pids.display(),
+        ga = fx.dir.join("ga_align").display(),
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut child = fx
+        .cmd_ga("ga_pipe", "cache", &["--scratch-dir", &base_arg])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -355,6 +376,59 @@ fn a_closed_stdout_ends_the_run_instead_of_hanging() {
     drop(child.stdout.take()); // the reader goes away, as `head` does
     let status = wait_or_kill(&mut child, Duration::from_secs(60)).expect("walker hung on a closed stdout");
     assert_eq!(status.signal(), Some(13), "expected to end on SIGPIPE, got {status:?}");
+
+    // WF-17 and WP-26: this ending used to skip cleanup altogether. The scratch directory
+    // stayed in /dev/shm holding RAM until some later run over the same base swept it, and
+    // the aligners carried on writing GAFs into it.
+    assert_eq!(run_dirs(&base), Vec::<PathBuf>::new(), "SIGPIPE left the scratch directory");
+    let started = wait_for_aligner_pids(&pids);
+    assert_all_gone(&started, "after SIGPIPE");
+}
+
+/// WF-17: the signals a scheduler uses to announce a limit clean up like SIGTERM.
+///
+/// SGE announces a soft wall-time limit with SIGUSR1 or SIGUSR2, LSF with SIGUSR2, and a CPU
+/// ulimit or a cgroup sends SIGXCPU. The handler watched only SIGINT, SIGTERM and SIGHUP, so
+/// each of these killed the walker with its directory still in `/dev/shm`. SIGQUIT is in the
+/// list too but is not exercised here: its default action dumps core, and a test that writes
+/// core files is its own problem.
+#[test]
+fn a_schedulers_limit_signal_cleans_up_like_sigterm() {
+    use std::os::unix::process::ExitStatusExt;
+    for (name, number) in [
+        ("USR1", libc::SIGUSR1),
+        ("USR2", libc::SIGUSR2),
+        ("XCPU", libc::SIGXCPU),
+    ] {
+        let fx = Fixture::matching(&format!("sig{name}"), 4);
+        let base = fx.dir.join("scratch");
+        let base_arg = base.to_string_lossy().into_owned();
+        let pids = fx.dir.join("aligner_pids");
+        pid_recording_aligner(&fx.dir, "ga_children", &pids);
+
+        let mut child = fx
+            .cmd_ga("ga_children", "cache", &["--scratch-dir", &base_arg])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = wait_for_aligner_pids(&pids);
+
+        let ok = Command::new("kill")
+            .args([&format!("-{name}"), &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let status = wait_or_kill(&mut child, Duration::from_secs(60))
+            .unwrap_or_else(|| panic!("walker ignored SIG{name}"));
+        assert_eq!(status.signal(), Some(number), "SIG{name}: {status:?}");
+        assert_eq!(
+            run_dirs(&base),
+            Vec::<PathBuf>::new(),
+            "SIG{name} left the scratch directory behind"
+        );
+        assert_all_gone(&started, &format!("after SIG{name}"));
+    }
 }
 
 #[test]
@@ -416,6 +490,156 @@ fn an_accession_that_errors_fails_the_run_that_reconstructed_the_others() {
     let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
     assert!(summary.contains("\"status\": \"partial\""), "{summary}");
     assert!(summary.contains("\"exit_code\": 4"), "{summary}");
+}
+
+/// WA-01: a query that can only be read once is read once.
+///
+/// `README.md` says every input file may be a pipe, and `cat q.fa | logan-walker -q /dev/stdin`
+/// is the form it invites. Two places reopened the path after the first read: `align::run`, on
+/// every accession (fixed with WA-07 and WA-08, and covered by an `align` unit test), and
+/// `main`, which read the file to count its records and then read it again to load the whole
+/// set when there was more than one. On a pipe that second read returned nothing, so a
+/// multi-record query failed with "no FASTA records found" naming a file that was perfectly
+/// good. Both record counts go through here, since the two are one decision in `main` now.
+#[test]
+fn a_query_arriving_on_a_pipe_is_read_once_whatever_its_record_count() {
+    let f = Fixture::matching("pipe-query", 1);
+
+    for (what, body, multi) in [
+        ("one record", format!(">gene\n{QUERY}\n"), false),
+        ("two records", format!(">gene\n{QUERY}\n>other\n{QUERY}TTT\n"), true),
+    ] {
+        // `/dev/stdin` on a pipe: the second open sees EOF, which is the whole defect. A
+        // process substitution behaves the same way and is harder to arrange from a test.
+        let mut child = Command::new(BIN)
+            .env_remove("LOGAN_KEEP_SCRATCH")
+            .arg("--scratch-dir").arg(f.dir.join("scratch"))
+            .arg("--graphaligner").arg(f.dir.join("ga_fast"))
+            .arg("-l").arg(f.dir.join("accs.txt"))
+            .arg("-q").arg("/dev/stdin")
+            .arg("--unitigs-cache").arg(f.dir.join("cache"))
+            .arg("--offline")
+            .arg("-o").arg(f.dir.join("out"))
+            .arg("-f").arg(f.dir.join("out").join("r.fasta"))
+            // `ga_fast` writes no GAF, so the accession is `no_path` and the run is empty.
+            // What is under test is the query reaching the walker at all.
+            .arg("--allow-empty")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            // Dropped at the end of this block, which is the EOF the walker reads to.
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(body.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(!stderr.contains("no FASTA records found"),
+                "{what}: the query was opened a second time:\n{stderr}");
+        assert_eq!(out.status.code(), Some(0), "{what}: stderr:\n{stderr}");
+        assert_eq!(stderr.contains("multi-anchor mode: 2 references"), multi,
+                   "{what}: wrong pool size:\n{stderr}");
+    }
+}
+
+/// WA-06: a GraphAligner call that never returns fails its own accession instead of holding a
+/// compute worker for the rest of the job.
+///
+/// Every output is written after the run loop finishes, so before the deadline the only thing
+/// that ended such a run was the scheduler's wall-time kill, and that kill discarded every
+/// accession the shard had already reconstructed: no FASTA, no summary, no VCF. Here the stuck
+/// accession becomes one `error` row and the other two are written, which is exit 4.
+#[test]
+fn a_stuck_alignment_fails_its_own_accession_and_the_rest_are_still_written() {
+    let f = Fixture::matching("ga-timeout", 3);
+
+    // Aligns like `ga_align`, except on SRRFAKE1, where it hangs. `exec` so the process the
+    // walker spawned is the one that stalls: `kill` reaches our child, not its descendants.
+    let stall = f.dir.join("ga_stall");
+    std::fs::write(&stall, format!(
+        "#!/bin/sh\n\
+         [ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n\
+         for a in \"$@\"; do case \"$a\" in *SRRFAKE1.*) exec sleep 60;; esac; done\n\
+         exec '{ga}' \"$@\"\n",
+        ga = f.dir.join("ga_align").display(),
+    )).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stall, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let started = std::time::Instant::now();
+    let out = f
+        .cmd_ga("ga_stall", "cache", &["--graphaligner-timeout", "1"])
+        .output()
+        .unwrap();
+    let waited = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(4), "stderr:\n{stderr}");
+    assert!(waited < std::time::Duration::from_secs(30), "waited {waited:?} for a 1 s deadline");
+    assert!(stderr.contains("2/3 accessions reconstructed"), "{stderr}");
+
+    let outdir = f.dir.join("out");
+    let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
+    for acc in ["SRRFAKE0", "SRRFAKE2"] {
+        assert!(recon.contains(&format!(">{acc}_primary")), "{acc} was lost:\n{recon}");
+    }
+    assert!(!recon.contains("SRRFAKE1"), "the stuck accession has no haplotype:\n{recon}");
+
+    let skipped = std::fs::read_to_string(outdir.join("q.skipped.tsv")).unwrap();
+    assert!(skipped.contains("SRRFAKE1\terror\t"), "{skipped}");
+    // The row has to say what happened and which knob changes it: the per-accession detail
+    // is the only place that reaches a workflow, since the run log carries the tally only.
+    assert!(skipped.contains("timed out after 1 s"), "{skipped}");
+    assert!(skipped.contains("--graphaligner-timeout"), "the row must name the knob:\n{skipped}");
+
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
+    assert!(summary.contains("\"status\": \"partial\""), "{summary}");
+    assert!(summary.contains("\"exit_code\": 4"), "{summary}");
+}
+
+/// WF-03: an accession the cache has a recorded negative for keeps that negative offline.
+///
+/// `disassembler fetch` writes no object for an accession Logan has no unitigs for, because
+/// there is nothing to write. The documented `--offline` run that follows then saw an
+/// ordinary cache miss and reported `error`: the same list and the same flags gave
+/// `no_logan_data` and exit 0 online. Since 0.2.0 any error makes the run non-zero, so a
+/// shard whose accessions are all 404s fails outright rather than reporting what it found.
+#[test]
+fn an_offline_miss_with_a_recorded_negative_keeps_its_status() {
+    let f = Fixture::matching("absent-note", 1);
+    // SRRFAKE0 is cached and reconstructs; the other two are not, and the cache says why.
+    std::fs::write(f.dir.join("accs.txt"), "SRRFAKE0\nSRRNODATA1\nSRRTOOBIG1\n").unwrap();
+    std::fs::write(f.dir.join("cache").join("SRRNODATA1.unitigs.absent"), "no_logan_data\n").unwrap();
+    std::fs::write(f.dir.join("cache").join("SRRTOOBIG1.unitigs.absent"), "too_large 9000000000\n").unwrap();
+
+    let out = f.cmd_ga("ga_align", "cache", &[]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "a run of negatives must not fail:\n{stderr}");
+
+    let outdir = f.dir.join("out");
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
+    assert!(summary.contains("\"no_logan_data\": 1"), "{summary}");
+    assert!(summary.contains("\"too_large\": 1"), "{summary}");
+    assert!(summary.contains("\"error\": 0"), "neither is a failure of the run:\n{summary}");
+
+    let skipped = std::fs::read_to_string(outdir.join("q.skipped.tsv")).unwrap();
+    assert!(skipped.contains("SRRNODATA1\tno_logan_data\t"), "{skipped}");
+    assert!(skipped.contains("SRRTOOBIG1\ttoo_large\t"), "{skipped}");
+
+    // A note for an accession that is over a cap this run has raised past no longer applies:
+    // the object really is absent, and that is a plain miss. SRRFAKE0 still reconstructs and
+    // SRRNODATA1 is still a negative, so this is the one-success-one-error case, exit 4.
+    let out = f
+        .cmd_ga("ga_align", "cache", &["--max-size-mb", "16384"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "a raised cap turns the note back into a miss:\n{err}");
+    assert!(err.contains("cache miss under --offline"), "{err}");
 }
 
 /// `--revalidate` is refused where it cannot do anything, rather than silently ignored.
@@ -521,6 +745,126 @@ fn sigterm_removes_the_scratch_directory() {
     let status = wait_or_kill(&mut child, Duration::from_secs(60)).expect("walker ignored SIGTERM");
     assert_eq!(status.signal(), Some(15), "{status:?}");
     assert_eq!(run_dirs(&base), Vec::<PathBuf>::new(), "the run's scratch directory was left behind");
+}
+
+/// Whether `pid` names a process that is still running.
+///
+/// A reaped child's PID is gone, but an orphan whose reaper has not got to it yet is a zombie,
+/// and `kill(pid, 0)` succeeds for a zombie. That would make the tests below pass or fail on
+/// the host's init rather than on the walker, so on Linux the state is read directly.
+fn process_is_alive(pid: u32) -> bool {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // "pid (comm) state ...", and `comm` may itself hold spaces and brackets.
+        return match stat.rsplit_once(") ") {
+            Some((_, rest)) => !rest.starts_with('Z'),
+            None => true,
+        };
+    }
+    if std::path::Path::new("/proc").is_dir() {
+        return false; // Linux, and the process is gone
+    }
+    // SAFETY: signal 0 only checks for the process; `kill` has no other preconditions.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Write a stand-in aligner that records its PID and then hangs, and return its path.
+fn pid_recording_aligner(dir: &std::path::Path, name: &str, pids: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join(name);
+    std::fs::write(&script, format!(
+        "#!/bin/sh\n\
+         [ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n\
+         echo $$ >> '{pids}'\n\
+         exec sleep 60\n",
+        pids = pids.display(),
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// Every PID recorded in `pids`, once at least one is there.
+fn wait_for_aligner_pids(pids: &std::path::Path) -> Vec<u32> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        if let Ok(text) = std::fs::read_to_string(pids) {
+            let found: Vec<u32> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+            if !found.is_empty() {
+                return found;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("no aligner recorded a PID in {}", pids.display());
+}
+
+/// Assert every PID is gone, allowing a moment for the signal to land.
+fn assert_all_gone(pids: &[u32], how: &str) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if pids.iter().all(|&p| !process_is_alive(p)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let left: Vec<u32> = pids.iter().copied().filter(|&p| process_is_alive(p)).collect();
+    panic!("{how}: aligners still running: {left:?}");
+}
+
+/// WF-15: the signal that ends the run ends the aligners it started.
+///
+/// The handler used to remove the scratch directory and exit, and nothing tracked the
+/// children, so after `kill <walker pid>` or `timeout N logan-walker` up to `-w` GraphAligner
+/// processes kept burning CPU and RAM, reparented to init, working on files that had just been
+/// deleted. Ctrl-C hid it, because a terminal signals the whole foreground process group.
+#[test]
+fn sigterm_stops_the_aligners_the_run_started() {
+    use std::os::unix::process::ExitStatusExt;
+    let fx = Fixture::matching("ga-children", 4);
+    let base = fx.dir.join("scratch");
+    let base_arg = base.to_string_lossy().into_owned();
+    let pids = fx.dir.join("aligner_pids");
+    pid_recording_aligner(&fx.dir, "ga_children", &pids);
+
+    let mut child = fx
+        .cmd_ga("ga_children", "cache", &["--scratch-dir", &base_arg])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = wait_for_aligner_pids(&pids);
+
+    let ok = Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    assert!(ok.success());
+    let status = wait_or_kill(&mut child, Duration::from_secs(60)).expect("walker ignored SIGTERM");
+    assert_eq!(status.signal(), Some(15), "{status:?}");
+
+    assert_all_gone(&started, "after SIGTERM to the walker");
+    assert_eq!(run_dirs(&base), Vec::<PathBuf>::new(), "the scratch directory went too");
+}
+
+/// SIGKILL never runs the handler, so the kernel is asked to do it: the aligner is spawned
+/// with `PR_SET_PDEATHSIG`, which fires when the thread that spawned it dies. Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn sigkill_of_the_walker_still_takes_the_aligners_with_it() {
+    let fx = Fixture::matching("ga-pdeath", 4);
+    let base = fx.dir.join("scratch");
+    let base_arg = base.to_string_lossy().into_owned();
+    let pids = fx.dir.join("aligner_pids");
+    pid_recording_aligner(&fx.dir, "ga_children", &pids);
+
+    let mut child = fx
+        .cmd_ga("ga_children", "cache", &["--scratch-dir", &base_arg])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = wait_for_aligner_pids(&pids);
+
+    child.kill().unwrap(); // SIGKILL: no handler runs, and the scratch directory stays
+    child.wait().unwrap();
+
+    assert_all_gone(&started, "after SIGKILL of the walker");
 }
 
 /// A run killed outright (SIGKILL, the OOM killer) cannot clean up after itself; the next run

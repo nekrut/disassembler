@@ -411,14 +411,60 @@ pub struct Config {
     /// every thread count. It appears where the alignment is ambiguous enough to search.
     pub graphaligner_threads: usize,
 
+    /// Deadline for one GraphAligner call, in seconds. `0` waits forever, which is what every
+    /// release before 0.2.0 did.
+    ///
+    /// GraphAligner is the one stage the walker hands to a program it did not write, and it
+    /// was also the one wait with no deadline: the HTTP timeouts below covered fetching, and
+    /// nothing covered aligning. A call that never returns holds its compute worker until the
+    /// scheduler's wall-time kill, which then discards every accession the shard had already
+    /// finished, because the FASTA, summary and VCF are written after `pipeline::run` returns.
+    /// With a deadline it is one errored accession and the rest are kept.
+    ///
+    /// **Default 3600 s**, which is three orders of magnitude above anything measured: the
+    /// largest subgraph in the bench set (34,582 nodes) aligns in 0.47 s, and the two 11 GB
+    /// accessions probed on nn1 spent their 16 minutes fetching and extracting, not aligning.
+    /// It is a stall detector, not a budget, so it is set where it cannot refuse an alignment
+    /// that was going to succeed. A run that wants a tighter one (a shared queue, a short
+    /// wall-time) sets `--graphaligner-timeout`; a run that would rather wait sets it to 0.
+    ///
+    /// Not in the summary's `settings` block, by that block's own rule: a timeout does not
+    /// change what an accession produces, only whether it gets to produce it.
+    pub graphaligner_timeout_secs: u64,
+
     // ---- fetch ----
-    /// Whole-request timeout, including body transfer. A 343 MB accession at the measured
-    /// 6.9 MB/s single-stream rate takes ~50 s, so this must be generous.
+    /// Whole-request timeout, including body transfer. **One attempt's budget, not one
+    /// accession's.**
+    ///
+    /// It was 900 s and had no flag, which made it a hard floor on transfer rate: an object
+    /// whose per-stream rate fell below size/900s could not be fetched at all, however many
+    /// attempts it was given, because every attempt restarted from byte 0 and timed out in
+    /// the same place. At the 4 GB cap that floor is 4.7 MB/s per stream, which a shared
+    /// link or a node far from us-east-1 does not always clear.
+    ///
+    /// Since 0.2.0 an interrupted transfer **resumes** (`Range` plus `If-Match`, WF-09), so a
+    /// shorter budget costs nothing and buys earlier detection of a stalled connection: a
+    /// transfer that is moving picks up where it stopped, and one that is not is retried
+    /// sooner. **Default 300 s**, which at the measured 6.9 MB/s single-stream rate carries
+    /// 2 GB per attempt, so every object below the cap needs at most two.
+    ///
+    /// Raising it does not make a stalled connection finish; it only delays noticing.
     pub fetch_timeout_secs: u64,
     /// TCP + TLS connect timeout, kept short so a dead connection fails fast and retries.
     pub fetch_connect_timeout_secs: u64,
-    /// Attempts per accession before giving up. Retries apply to transport errors and 5xx
-    /// only; a 404 means the accession has no Logan unitigs and is not retried.
+    /// Failed attempts per accession before giving up. A 404 means the accession has no Logan
+    /// unitigs and is not retried; 408, 429, 5xx and transport errors are.
+    ///
+    /// **Default 6**, raised from 3. Three attempts with the old fixed `500 ms x attempt`
+    /// backoff gave up after **1.5 s**, so a 60-second network, proxy or DNS interruption
+    /// discarded one accession per fetch worker every 1.5 s: about 320 accessions marked
+    /// `error` at the default eight workers, and since 0.2.0 any error makes the run
+    /// non-zero. Six attempts with the jittered exponential backoff cover about half a
+    /// minute, and `--fetch-attempts 10` covers about four.
+    ///
+    /// Only **failed** attempts count. One that transferred at least
+    /// `RESUME_PROGRESS_BYTES` before the connection dropped is a resume, not a failure, so a
+    /// large object on a flaky link is not refused for making slow progress.
     pub fetch_attempts: u32,
     /// Refuse accessions whose compressed size exceeds this.
     ///
@@ -837,9 +883,10 @@ impl Default for Config {
             compute_workers: 8,
             channel_capacity: 0,
             graphaligner_threads: 1,
-            fetch_timeout_secs: 900,
+            graphaligner_timeout_secs: 3600,
+            fetch_timeout_secs: 300,
             fetch_connect_timeout_secs: 15,
-            fetch_attempts: 3,
+            fetch_attempts: 6,
             max_compressed_bytes: 4096 * 1024 * 1024,
             scratch_dir: std::env::temp_dir().join("logan-walker-test"),
             graphaligner_bin: String::from("GraphAligner"),

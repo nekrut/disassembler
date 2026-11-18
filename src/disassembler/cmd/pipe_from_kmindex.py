@@ -176,7 +176,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                                "(walker's own default: 0.01).")
     g_walker.add_argument("--max-size-mb", type=positive_int, default=None,
                           help="Skip any accession whose compressed SRA size exceeds this "
-                               "many MB (walker's own default: 1024).")
+                               "many MB (walker's own default: 4096).")
     g_walker.add_argument("--no-prefer-majority", action="store_true",
                           help="Keep the primary haplotype on the reference allele instead "
                                "of the majority allele at each variant site.")
