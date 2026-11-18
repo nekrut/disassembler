@@ -85,9 +85,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                           help="Reference in-frame CDS FASTA used as the walker's anchor. "
                                "Repeatable, and each file may hold multiple records; "
                                "passing more than one record (across one or more -q flags) "
-                               "activates the walker's multi-anchor mode. In multi-anchor "
-                               "mode the MSA step still needs one reference, defaulting to "
-                               "the first -q unless --msa-reference overrides it.")
+                               "activates the walker's multi-anchor mode. Those records must "
+                               "be strains of ONE gene: the walker keeps one primary per "
+                               "accession, so a pool of different genes reports only the "
+                               "winner. In multi-anchor mode the MSA step still needs one "
+                               "reference, defaulting to the first -q unless --msa-reference "
+                               "overrides it.")
     g_walker.add_argument("--msa-reference", default=None,
                           help="FASTA to use as the reference for the MSA/tree stage in "
                                "multi-anchor mode (default: the first -q). Ignored under "
@@ -123,7 +126,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                                "of the majority allele at each variant site.")
     g_walker.add_argument("--min-abund", type=positive_float, default=None,
                           help="Minimum ka:f (k-mer abundance) for a variant to be kept "
-                               "(walker's own default: 5.0).")
+                               "(walker's own default: 5.0). This is the allele floor only; "
+                               "the prune's lower bound is the walker's --prune-min-abund, "
+                               "which you can pass after a literal `--`.")
     g_walker.add_argument("--min-vaf", type=fraction, default=None,
                           help="Minimum variant allele fraction for an alternative branch "
                                "to be emitted (walker's own default: 0.10).")

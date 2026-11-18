@@ -11,9 +11,18 @@
 //! 4,708 - (30 x 114) = 1,288 bp    == GAF column 7
 //! ```
 //!
-//! Requiring a connected path is what keeps chimeras out. Concatenating BLAST hits in
-//! coordinate order instead produces sequences that never existed in any organism, which
+//! Requiring a connected path is what keeps *unsupported joins* out. Concatenating BLAST hits
+//! in coordinate order instead produces sequences that never existed in any organism, which
 //! then read as strong positive selection downstream.
+//!
+//! It does not make the primary a phased haplotype, and WA-04 is the correction to the claim
+//! that it does. In a k = 31 graph, two allele sites more than 30 bases apart are joined
+//! through unitigs both strains share, so every combination of their alleles is a connected
+//! path and the walk picks one branch at each site independently. On a sample holding two
+//! strains at 60/40 and 40/60 over the two halves of a gene, the published primary matched
+//! neither strain at 3 of 900 sites. `_primary` is a majority-consensus path, not a molecule.
+//! What the walker can do is say so: `variants::find_alts` counts the two-allele sites the
+//! route passes, and the header carries `min_vaf=` and, from two sites up, `mixed=1`.
 //!
 //! IN   GafPath, Subgraph, Query
 //! OUT  Haplotype, if coverage clears `cfg.min_cov`
@@ -61,7 +70,113 @@ pub fn revcomp(seq: &[u8]) -> Vec<u8> {
 /// Concatenating BLAST hits in coordinate order instead produces sequences assembled from
 /// fragments of different strains, which never existed in any organism. README section 4
 /// measures that at 87% chimeric artifacts, and a chimera looks exactly like a rapidly
-/// evolving gene to a selection test. Requiring a connected path makes them impossible.
+/// evolving gene to a selection test. Requiring a connected path makes a join **no k-mer
+/// supports** impossible, which is the defect that measured at 87%.
+///
+/// It does not phase sites further apart than k - 1 (WA-04). Those are linked only through
+/// unitigs the strains share, so a mixture still yields a connected path that may combine
+/// alleles no molecule carries. The primary's header reports what the route passed through,
+/// `min_vaf=` and `mixed=`, rather than claiming the question does not arise.
+/// How long `stitch_steps` would make this walk, without building it.
+///
+/// Exactly `stitch_steps`' rule: the first unitig whole, each later one minus the k - 1 bases
+/// it shares with its predecessor, and a unitig no longer than the overlap contributing
+/// nothing. `usize::MAX` when a step names a unitig the subgraph does not hold, which is a
+/// length no real walk can have and which every caller treats as a mismatch.
+///
+/// Used by `check_gaf_walk` to compare a GAF's declared path length against the graph, and by
+/// `variants` to measure a splice before deciding whether to build it.
+pub fn stitched_len(cfg: &Config, steps: &[PathStep], subgraph: &Subgraph) -> usize {
+    let overlap = cfg.graph_k.saturating_sub(1);
+    let mut total = 0usize;
+    for (i, step) in steps.iter().enumerate() {
+        let Ok(idx) = subgraph.nodes.binary_search(&step.node) else {
+            return usize::MAX;
+        };
+        let len = subgraph.seqs[idx].len();
+        total += if i == 0 { len } else { len.saturating_sub(overlap) };
+    }
+    total
+}
+
+/// Check that a GAF row describes a walk this graph can actually support.
+///
+/// WA-12. `stitch_steps` appends `&s[k_overlap..]` for every step without asking whether
+/// consecutive steps are joined by an edge, and `stitch` clamps a window that runs past the
+/// end instead of refusing it. So a GAF that disagrees with the GFA it was produced from, a
+/// different aligner build, a wrapper that rewrites node names, a truncated file, is stitched
+/// into a sequence anyway and published with the identity the row claims: the review's
+/// stand-in emitting `>0>1>2` where the real walk is `>0<1>2` produced a primary with 89
+/// differences from the truth at `pident=100.0`.
+///
+/// Four questions, all cheap against a route of a few thousand steps:
+///
+/// 1. every step names a unitig that is in the subgraph the aligner was handed;
+/// 2. every consecutive pair is an edge of the graph, in the orientations the row gives;
+/// 3. the stitched length is the `path_len` the row declares (GAF column 7);
+/// 4. the alignment window lies inside that length.
+///
+/// **Only for rows that come from an aligner.** A spliced path (an alternative allele, the
+/// majority-corrected route) carries the original row's `path_len` by design, so (3) would
+/// reject it; those paths are built from the graph's own edges and need no check.
+pub fn check_gaf_walk(
+    cfg: &Config,
+    graph: &UnitigGraph,
+    subgraph: &Subgraph,
+    path: &GafPath,
+) -> std::result::Result<(), String> {
+    if path.steps.is_empty() {
+        return Ok(());
+    }
+    let sign = |o: Orient| if matches!(o, Orient::Forward) { '>' } else { '<' };
+    for (i, step) in path.steps.iter().enumerate() {
+        if subgraph.nodes.binary_search(&step.node).is_err() {
+            return Err(format!(
+                "step {i} is {}{}, which is not a segment of the subgraph the aligner was                  given ({} segments)",
+                sign(step.orient),
+                step.node,
+                subgraph.nodes.len()
+            ));
+        }
+    }
+    for (i, pair) in path.steps.windows(2).enumerate() {
+        let (a, b) = (&pair[0], &pair[1]);
+        let (want_src, want_dst) = (
+            matches!(a.orient, Orient::Forward),
+            matches!(b.orient, Orient::Forward),
+        );
+        let joined = graph.edges(a.node).iter().any(|&packed| {
+            let (target, src_fwd, dst_fwd) = crate::stages::parse::unpack_edge(packed);
+            target == b.node && src_fwd == want_src && dst_fwd == want_dst
+        });
+        if !joined {
+            return Err(format!(
+                "steps {i} and {} ({}{} then {}{}) are not joined by an edge in the graph, so                  this row is not a walk of the subgraph it was aligned against",
+                i + 1,
+                sign(a.orient),
+                a.node,
+                sign(b.orient),
+                b.node
+            ));
+        }
+    }
+    let len = stitched_len(cfg, &path.steps, subgraph);
+    if len != path.path_len {
+        return Err(format!(
+            "the row's {} steps stitch to {len} bases but it declares path_len {}",
+            path.steps.len(),
+            path.path_len
+        ));
+    }
+    if path.path_start > path.path_end || path.path_end > len {
+        return Err(format!(
+            "the alignment window {}..{} is not inside the {len}-base path",
+            path.path_start, path.path_end
+        ));
+    }
+    Ok(())
+}
+
 /// Concatenate unitigs along path steps with k-1 overlap removed.
 pub fn stitch_steps(
     k_overlap: usize,
@@ -267,6 +382,12 @@ pub fn stitch(
         // Was hardcoded 0.0 while being published in every FASTA header and in summary.json.
         mean_ka: crate::stages::extract::path_mean_ka(graph, &path.steps),
         vaf: 1.0,
+        // WA-04. `stitch` has the path but not the fork frequencies along it: those come from
+        // `variants::find_alts`, which runs after the majority correction has settled which
+        // route is published. The pipeline copies them in. Until then this says what an
+        // unexamined route can honestly say, that no two-allele site is known on it.
+        two_allele_sites: 0,
+        min_site_vaf: 1.0,
         // stitch does not know how big the anchor pool is; the pipeline sets this field
         // to the winning reference id only when a pool of >1 reference is in play.
         anchor_used: None,
@@ -322,6 +443,72 @@ mod tests {
         gph(&[10.0; 78])
     }
 
+    /// A diamond with real edges: `0 -> {1,2} -> 3`, every link written in both endpoints'
+    /// headers as Logan writes them. `gph` above has no links at all, which is fine for
+    /// `stitch` (it reads only abundance) but not for a check about adjacency.
+    fn diamond_graph() -> UnitigGraph {
+        let fa = ">T_0 ka:f:10.0  L:+:1:+  L:+:2:+\nACGT\n\
+                  >T_1 ka:f:10.0  L:-:0:-  L:+:3:+\nCGTA\n\
+                  >T_2 ka:f:10.0  L:-:0:-  L:+:3:+\nCGTC\n\
+                  >T_3 ka:f:10.0  L:-:1:-  L:-:2:-\nGTAG\n";
+        crate::stages::parse::build(
+            &"T".into(),
+            Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())),
+            u64::MAX,
+        )
+        .unwrap()
+    }
+
+    /// WA-12. A GAF row is believed about a graph the walker wrote itself, and nothing
+    /// checked that the row describes a walk of it. `stitch_steps` appends `&s[k_overlap..]`
+    /// for each step whatever the step is, so a row from a different aligner build, a wrapper
+    /// that renames segments, or a truncated file is stitched into a sequence anyway and
+    /// published carrying the identity the row claims. The review's reproducer: `>0>1>2`
+    /// where the real walk is `>0<1>2` gave a primary with 89 differences at `pident=100.0`.
+    #[test]
+    fn a_gaf_row_that_is_not_a_walk_of_this_graph_is_refused() {
+        let g = diamond_graph();
+        let sub = sub(vec![0, 1, 2, 3], vec!["ACGT", "CGTA", "CGTC", "GTAG"]);
+        let c = cfg(4, 0.0);
+        use Orient::{Forward as F, Reverse as R};
+
+        // The real walk: 4 bases, then one new base per step at a 3-base overlap.
+        let good = path(&[(F, 0), (F, 1), (F, 3)], 6, 0, 6);
+        assert_eq!(check_gaf_walk(&c, &g, &sub, &good), Ok(()));
+        // And it is the length the checker computes, so the fixture is honest.
+        assert_eq!(stitched_len(&c, &good.steps, &sub), 6);
+
+        // Two branches of the same fork are not joined to each other.
+        let err = check_gaf_walk(&c, &g, &sub, &path(&[(F, 0), (F, 1), (F, 2)], 6, 0, 6))
+            .expect_err("1 and 2 are siblings, not neighbours");
+        assert!(err.contains("not joined by an edge"), "{err}");
+
+        // The edge exists, but not in the orientation the row gives. This is the review's
+        // case: one character of difference, 89 bases of consequence.
+        let err = check_gaf_walk(&c, &g, &sub, &path(&[(F, 0), (R, 1), (F, 3)], 6, 0, 6))
+            .expect_err("0+ -> 1- is not an edge of this graph");
+        assert!(err.contains("not joined by an edge"), "{err}");
+
+        // A row whose declared path length is not what those steps stitch to.
+        let err = check_gaf_walk(&c, &g, &sub, &path(&[(F, 0), (F, 1), (F, 3)], 7, 0, 6))
+            .expect_err("path_len must match the graph");
+        assert!(err.contains("declares path_len 7"), "{err}");
+
+        // A window that runs past the end of the path. `stitch` clamps this rather than
+        // failing, which is right for a spliced path and wrong for a row off an aligner.
+        let err = check_gaf_walk(&c, &g, &sub, &path(&[(F, 0), (F, 1), (F, 3)], 6, 0, 9))
+            .expect_err("the window must be inside the path");
+        assert!(err.contains("not inside"), "{err}");
+
+        // A segment name this subgraph never contained.
+        let err = check_gaf_walk(&c, &g, &sub, &path(&[(F, 0), (F, 9)], 5, 0, 5))
+            .expect_err("9 is not in the subgraph");
+        assert!(err.contains("not a segment of the subgraph"), "{err}");
+
+        // A single-step row has no pair to check and is a legitimate alignment.
+        assert_eq!(check_gaf_walk(&c, &g, &sub, &path(&[(F, 1)], 4, 0, 4)), Ok(()));
+    }
+
     #[test]
     fn revcomp_is_correct_and_involutive() {
         assert_eq!(revcomp(b"ACGT"), b"ACGT".to_vec(), "ACGT is its own reverse complement");
@@ -358,6 +545,8 @@ mod tests {
             nodes: 1,
             mean_ka: 0.0,
             vaf: 1.0,
+            two_allele_sites: 0,
+            min_site_vaf: 1.0,
             anchor_used: None,
         };
         Candidate {
@@ -604,7 +793,7 @@ mod tests {
         let h = stitch(&c, &g, &p, &s, &q("ACGTACCGT")).unwrap().unwrap();
         assert!((h.mean_ka - 101.0).abs() < 1e-9, "mean of 1,2,300, got {}", h.mean_ka);
         assert_eq!(
-            crate::stages::extract::path_depth(&g, &p.steps),
+            crate::stages::extract::path_depth(&c, &g, &p.steps),
             2.0,
             "path_depth stays the median and must not move with the outlier"
         );

@@ -84,6 +84,64 @@ the run with `no FASTA records found`, naming a file that was perfectly good. Bo
 now one, so `cat panel.fa | logan-walker -q /dev/stdin` works for any record count and
 `README.md`'s "so does a pipe" is true of the query as it is of the other inputs.
 
+### The alignment is checked against the graph
+
+GraphAligner is handed a GFA the walker wrote, and the row that comes back is checked against
+that same graph before anything is stitched from it: every segment must be one the subgraph
+holds, every consecutive pair must be joined by an edge in the orientations the row gives, the
+steps must stitch to the `path_len` the row declares, and the alignment window must lie inside
+it. A row that fails is an `error` for that accession, not a primary.
+
+This matters because stitching cannot notice. The walk is concatenation with the k - 1 overlap
+removed, so a row naming two branches of the same fork in series produces a clean sequence that
+exists in no organism, and it is published carrying the identity the row itself claimed: the
+review built one with 89 differences from the truth at `pident=100.0`. The causes are a
+different GraphAligner build, a wrapper that renames segments, or a truncated GAF. On the
+second pass the same check applies to the pruned graph, where a failure refuses the prune and
+keeps the first pass rather than losing the accession.
+
+The path column is read strictly for the same reason: `>` or `<` then a unitig id, or GAF's `*`
+for "no alignment". Anything else used to be skipped silently, which turned a row the walker
+could not read into a shorter walk rather than into a question.
+
+## What the primary is
+
+`<ACC>_primary` is the **majority-consensus path** through the accession's subgraph, not a
+phased haplotype, and the difference matters whenever a sample holds more than one strain.
+
+Requiring a connected path is what keeps out joins that no k-mer supports, which is the defect
+that makes concatenated BLAST hits unusable (87% chimeric artifacts, README section 4). It does
+not phase anything. In a k = 31 graph, two allele sites more than 30 bases apart are joined
+through unitigs both strains carry, so every combination of their alleles is a connected path,
+and the walk chooses at each site independently. A sample carrying strain A at 60% over the 5'
+half and strain B at 60% over the 3' half yields a primary that matches neither.
+
+So the walker reports what the route passed through, in the FASTA header where the sequence is:
+
+- `min_vaf=` is the lowest frequency of any allele this sequence carries, measured at its own
+  fork. `vaf=` beside it is the constant 1.0 that primaries have always carried and is kept
+  for one release; `min_vaf=` is the measured one.
+- `mixed=1` appears when the route crosses **two or more** two-allele sites, which is the point
+  at which the published sequence is a combination nothing in the data links. One such site is
+  a variant, not a phasing problem, and is not flagged.
+- A site counts only when its second allele is a **substitution** that rejoins the route. A
+  length-changing branch in a de Bruijn graph is usually an artifact rather than a second
+  population: 190 of 203 length-changing calls across the project's panel are plus or minus
+  one base in a homopolymer, and the large ones are the route being sent through a different
+  stretch of graph. `ERR2028820`, the clonal control gated in `bench/golden/`, has four
+  branches clearing both frequency floors and all four are length-changing or never rejoin, so
+  a looser rule would have labelled it a mixture.
+- `summary.json` carries the same numbers per record as `variants.two_allele_sites` and
+  `variants.min_site_vaf`, and `cohort.mixed` counts the accessions flagged.
+
+Both are measured whatever the output flags say, including under `--no-emit-alts`: a mixture
+flag that is only computed when alternatives were requested would read `mixed=0` on a sequence
+nothing examined.
+
+What to do with a flagged record depends on the question. For a selection analysis, excess
+substitutions in a mixed record are not one organism's divergence, and
+`alt_haplotypes.fasta` and the VCF carry the alleles it had to choose between.
+
 ## Multi-anchor mode
 
 Give the walker more than one reference, by repeating `-q` or with a FASTA that holds several
@@ -100,6 +158,16 @@ such as `panels/sarscov2_spike_11strains.fa`:
 
 The choice matters for more than the tag: GraphAligner walks the graph differently against
 each reference, so the primary's sequence depends on which reference wins.
+
+**One gene per pool.** Multi-anchor mode ranks every reference against every other and keeps
+one primary per accession, so a pool holding two different genes reports whichever scored
+higher and leaves the other as an unselected candidate: an accession carrying both `bla_KPC`
+and `bla_NDM` comes back with one of them and exit 0. The walker checks the pool at startup by
+grouping references that share at least 1% of their canonical 21-mers, and warns when there is
+more than one group, naming them. It warns rather than refuses, because a deliberately
+divergent panel also splits and only the user knows which was meant. `queries/master_planetary_targets.fasta`
+is a catalogue, not a panel: its 160 records fall into 49 groups, and it should be used one
+gene at a time.
 
 **Ambiguous reference bases never count as matched.** GraphAligner treats `N` as matching any
 base, and each IUPAC code as matching every base it stands for, so a reference padded with `N`
@@ -158,9 +226,9 @@ must now span as much of the reference as the unpruned one (see `--prune-frac` b
 
 | file | when | contents |
 |---|---|---|
-| `-f` (default `reconstructed_haplotypes.fasta`) | always | one primary per reconstructed accession, `>ACC_primary cov=… pident=… nodes=…` (plus `anchor=` in multi-anchor mode) |
+| `-f` (default `reconstructed_haplotypes.fasta`) | always | one primary per reconstructed accession, `>ACC_primary cov=… pident=… nodes=… ka=… vaf=… min_vaf=…` (plus ` mixed=1` when the route crosses two or more two-allele sites, and `anchor=` in multi-anchor mode) |
 | `<out-dir>/alt_haplotypes.fasta` | unless `--no-emit-alts` | intra-host alternatives, `>ACC_altN …` with their VAF and fork, at most 32 per accession |
-| `<out-dir>/bubbles.json` | always | bubbles in the local subgraph |
+| `<out-dir>/bubbles.json` | always | two-allele sites in the local subgraph, one record per allele set with the flanks it was found between |
 | `<out-dir>/<query stem>.summary.json` | always | the run's provenance, settings, totals, discards and cohort statistics, then one record per accession (below) |
 | `<out-dir>/<query stem>.skipped.tsv` | always | one row per accession that produced no haplotype: `accession`, `outcome`, `bytes`, `detail`. Written even when empty, so it can be read without first testing whether it exists |
 | `<out-dir>/<ACC>.vcf` | `--emit-vcf` | intra-host SNVs of one accession, written only when it has at least one (a VCF an earlier run left for an accession with none is removed) |
@@ -244,8 +312,8 @@ reference's id, length and sha256, and whether the unitigs came from S3 or a cac
 `run` (status, wall clock, per-stage seconds, totals), `discards`, `cohort` and `records`.
 
 `discards` counts everything the run rejected, in two groups: `accessions` (`never_reached`,
-which covers duplicates dropped from the list, plus `no_anchors`, `no_path`, `no_logan_data`,
-`too_large` and `error`) and `alleles` (`no_rejoin`, `not_substitution`, `over_indel_cap`,
+which covers duplicates dropped from the list, plus `no_anchors`, `no_path`, `no_links`,
+`no_logan_data`, `too_large`, `subgraph_too_large` and `error`) and `alleles` (`no_rejoin`, `not_substitution`, `over_indel_cap`,
 `frameshifting`, `window_not_shiftable`, `identical`). Every key is written even at zero, so a
 reader can tell "this did not happen" from "this version did not measure it". Before 0.2.0
 every one of these numbers existed only as a line on stderr.
@@ -276,8 +344,25 @@ Each accession also records two decisions that earlier versions only printed:
   20,000-accession SARS-CoV-2 run that guard flagged 9,440 of 9,448 successes while the 8 it
   cleared were no better.
 - `prune` is how the pruning pass ended (`null` when it did not run): `outcome` is `applied`,
-  `nothing_to_remove`, `would_empty`, `refused_shorter_span` or `refused_no_haplotype`, with the
-  gene's depth, the floor, the unitigs kept, and the reference span of each alignment.
+  `nothing_to_remove`, `would_empty`, `refused_shorter_span`, `refused_no_haplotype`,
+  `refused_trimmed` or `refused_error`, with the gene's depth, the floor, the unitigs kept,
+  and the reference span of each alignment.
+- `bias_uncorrected` is true when the prune ran and its result was thrown away, so the
+  first-pass route stands. That route is the one the aligner produced on the unpruned graph,
+  where its pull toward the reference is strongest, and `prefer_majority` skips sites whose
+  alternative is below the variant floor, so nothing else corrects them either. It is derived
+  from `prune.outcome` rather than stored separately, and `cohort.bias_uncorrected` counts it
+  across the run, which is the form that is readable at 5,000 accessions.
+
+Two of those outcomes are new in 0.2.0. **`refused_trimmed`** is a realignment that is the
+first pass's haplotype with up to three bases off an end and nothing else changed: the
+three-base tolerance below exists so that one terminal codon cannot keep a reference-biased
+primary, and it is worth paying only when the prune changed something. A shorter copy of the
+same sequence is pure loss, and a lost terminal base can be a truncated stop codon.
+**`refused_error`** is a second pass that failed outright: GraphAligner aborted, the scratch
+filesystem filled, the pruned GFA could not be written. Until 0.2.0 that was not a prune
+outcome at all, it was the accession's: an error propagated and a result that had already been
+reconstructed became `error`, absent from the FASTA, with `prune: null`.
 
 The run's last lines count the prune outcomes and the provisional results.
 
@@ -293,6 +378,34 @@ merged multi-sample VCF becomes a huge, nearly empty matrix. A worked example is
 `bubbles.json` is computed from the graph, not from the alignment, so it is written even for
 accessions with no path, and most of its bubbles are off the walked path. The VCF, the SNV table
 and the alternatives come from forks on the walked path, not from `bubbles.json`.
+
+Three things about how it is counted, all changed in 0.2.0:
+
+- **One record per allele set, not per pair of flanks.** The same two alleles can be reachable
+  between several forks and merges, and each pair used to be its own record: `SRR8209082`
+  reported 3,632 records for 317 distinct allele sets, one of them sixteen times, and two SNPs
+  exactly k apart form a bow-tie that counted as four. A record now carries a `flanks` list,
+  whose first entry is the `fork`/`merge` it still reports as its own fields. `n_bubbles`
+  therefore counts sites, which is what anyone comparing it across samples was assuming.
+- **The floor is the gene's own depth, not an absolute 5x.** A branch must clear the strictest
+  of `--prune-frac` of depth, `--min-abund-frac` of depth, and `--min-abund`, and the stage now
+  runs after the prune, on the graph the prune left. Before 0.2.0 it ran on the neighbourhood as
+  extracted with the flat 5x floor, so on `SRR8209082` every one of those 3,632 bubbles had its
+  strongest allele at 66x or less against a 15,000x gene, a median of 11.9x. A default run on
+  that accession now reports **none**, which is the honest answer: nothing in its neighbourhood
+  is a second population by its own depth. An accession that reconstructed nothing keeps the
+  absolute floor, because without a route there is no depth to be a fraction of, so a `no_path`
+  record's bubble count is still the old, permissive one.
+- **The two alleles must be two unitigs.** An inverted repeat, where one unitig end links to
+  both strands of a neighbour, used to produce a bubble whose alleles were one sequence and its
+  reverse complement at 0.5 each, and a self-looping unitig could be both an allele and a flank.
+
+A site can be in the VCF and not in `bubbles.json`. The two stages look for different things:
+this one finds diamonds, where the alternatives rejoin in a single step, while the variant
+stages follow an alternative for up to `--alt-max-detour` unitigs. `SRR8209082`'s real second
+population is one of those: its allele rejoins after **31** unitigs (`detour=31` on the alt
+record), so it is in the VCF, the SNV table and `alt_haplotypes.fasta`, and it was never in
+`bubbles.json`, before this change or after it.
 
 ## Offline cache
 
@@ -415,8 +528,8 @@ Options that are on by default are turned off with a `--no-…` form.
 
 | flag | default | meaning |
 |---|---|---|
-| `-a, --accession <ACC>` | | one SRA accession. At most 64 characters: the value becomes `<out-dir>/<ACC>.vcf`, and a longer one exceeds the filesystem's name limit |
-| `-l, --accession-list <FILE>` | | file with one accession per line, plain or gzipped; a repeated accession is processed once. Give `-a` or `-l`, not both |
+| `-a, --accession <ACC>` | | one SRA accession. At most 64 characters: the value becomes `<out-dir>/<ACC>.vcf`, and a longer one exceeds the filesystem's name limit. An SRA run accession given in lowercase is read as the accession it spells and the run says so; Logan's bucket is case-sensitive, so `srr8209082` fetched as written is a 404, which would be reported as `no_logan_data` for a run Logan has |
+| `-l, --accession-list <FILE>` | | file with one accession per line, plain or gzipped; a repeated accession is processed once, and lowercase SRA accessions are read as above, counted and warned about once for the file. Give `-a` or `-l`, not both |
 | `-q, --query <FASTA>` | | reference CDS, plain or gzipped; repeatable, and more than one record switches on multi-anchor mode |
 | `-o, --out-dir <DIR>` | `walker_output` | output directory |
 | `-f, --out-fasta <FILE>` | `reconstructed_haplotypes.fasta` | primary haplotypes |
@@ -441,14 +554,15 @@ Options that are on by default are turned off with a `--no-…` form.
 | `--min-cov <F>` | `0.85` | minimum fraction of the reference a primary must cover, measured as the reference span of the alignment (`ref_cov`) and not as the length of what was walked. See [Outputs](#outputs) |
 | `--primary-metric <M>` | `matched` | multi-anchor primary selection: `matched`, `cov`, `pident` or `cov_x_pident` |
 | `--primary-tie-eps <F>` | `0.002` | references scoring within this of the best are treated as tied and the deepest route wins; `0` restores pre-0.2.0 panel-order behaviour (see [Multi-anchor mode](#multi-anchor-mode)) |
-| `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables. The re-aligned result is kept only if it spans as much of the reference as the first, give or take 3 bases: a strict rule refused a prune over one terminal base |
+| `--prune-frac <F>` | `0.01` | drop unitigs below this fraction of the gene's depth and re-align; `0.0` disables. The re-aligned result is kept only if it spans as much of the reference as the first, give or take 3 bases, **and** only if it differs from the first by more than those bases. Unitigs on the first-pass route with no deeper alternative are never dropped: see [The prune pass](#the-prune-pass) |
+| `--prune-min-abund <F>` | `5.0` | floor under `--prune-frac`: a unitig at or above this `ka:f` survives the prune whatever the fraction works out to. On a gene shallower than `prune-min-abund / prune-frac` it is the whole rule, so at 180x and the default 1% the prune happens at 5.0 and not at 1.8 |
 | `--no-prefer-majority` | | keep the reference-matching allele on the primary at two-allele sites |
 
 ### Intra-host variants
 
 | flag | default | meaning |
 |---|---|---|
-| `--min-abund <F>` | `5.0` | minimum `ka:f` for a branch to count as an allele. When the prune is refused, the variant stages inherit the prune's floor instead, since the sub-floor branches it meant to remove are still in the graph |
+| `--min-abund <F>` | `5.0` | minimum `ka:f` for a branch to count as an allele. **The allele floor only**: until 0.2.0 it was also the prune's lower bound, so raising it moved the floor unitigs are deleted at and could change the published primary. That is `--prune-min-abund` now. When the prune is refused, the variant stages inherit the prune's floor instead, since the sub-floor branches it meant to remove are still in the graph |
 | `--min-vaf <F>` | `0.10` | minimum variant allele frequency for an alternative |
 | `--min-abund-frac <F>` | `0.0` (off) | raise the floor to this fraction of the gene's depth (median `ka:f` on the path) |
 | `--alt-max-detour <N>` | `100` | unitigs an alternative may traverse before rejoining the path |
@@ -843,6 +957,44 @@ backoff, which covers about half a minute, and `--fetch-attempts 10` covers abou
 jitter matters because fetch workers fail together, for the same reason, and would otherwise
 all return together.
 
+### The prune pass
+
+The floor is one number for the whole gene, a fraction of the gene's own sequencing depth, and
+the pass removes every unitig in the neighbourhood below it and re-aligns. That is right for a
+reference-matching error branch sitting beside a deeper true allele, which is what the pass
+exists to remove.
+
+It is wrong for a stretch of the gene that is genuinely covered below the floor: amplicon
+dropout, a 3' fall-off, any uneven coverage. Removing it cuts the route in two, the
+realignment cannot span the reference, the prune is refused, and the first-pass route stands
+with the aligner's reference pull still in it. On ARTIC-style amplicon data that is routine,
+not a corner case.
+
+So a unitig on the first-pass route is kept, whatever the floor says, when the route had **no
+choice** at that point: no sibling at or above the floor leaving the predecessor by the end the
+route leaves by, and none entering the successor by the end it enters by. If there is a deeper
+sibling the aligner could have gone that way, and the unitig is a droppable alternative. If
+there is not, the unitig is the gene, thinly covered. The ends of a route count as having no
+sibling, because there is nothing there to choose between.
+
+When the prune is refused anyway, the record says so as `bias_uncorrected`.
+
+The floor is `max(--prune-frac x depth, --prune-min-abund)`. The two settings are separate,
+and `--min-abund` is neither of them: it gates which branches count as alleles, and a run that
+raises it to be stricter about variants no longer deletes unitigs at the higher number as a
+side effect. The lower bound matters more often than it looks, because on anything shallower
+than about 500x the default 1% works out below 5.0, so the prune happens at 5.0: `ERR2028820`
+at 180x prunes at 5.0 and loses 268 of its 747 neighbourhood unitigs, all of them off the
+route, with a byte-identical haplotype.
+
+The depth the floor is a fraction of is the **median `ka:f` over the route's steps**, not
+weighted by unitig length. A k-mer-weighted median was tried and measured: on `SRR8209082`,
+whose depth is independently known to be about 14,500x, the step median gives 15,000x and the
+weighted one gives 91.7x, which collapses the floor to `--min-abund` and stops the prune
+removing anything. A tangled neighbourhood's route threads long, low-coverage unitigs that are
+not the gene, while the gene itself is cut into short high-coverage pieces by its own
+variation, so weighting by sequence weights the noise.
+
 ## Reproducibility
 
 - **Input bytes.** See [Input provenance](#input-provenance). Reproducing a run means
@@ -869,11 +1021,12 @@ Each accession ends with one status, printed as it finishes and recorded in the 
 |---|---|---|
 | `success` | a primary haplotype was reconstructed | |
 | `no_anchors` | no unitig shares enough k-mers with the reference: the gene is not there | nothing found |
-| `no_path` | anchors were found, but no alignment through the subgraph spans `--min-cov` of the reference | nothing found |
+| `no_path` | GraphAligner ran, wrote its GAF, and either found no alignment or none spanning `--min-cov` of the reference | nothing found |
+| `no_links` | nothing was reconstructed **and** the unitig file carried no `L:` adjacency at all, so no walk could span more than one unitig. A fact about the Logan object, not about the sample: Logan publishes such objects (0 links in 15,864 records for `ERR3988483`). An accession whose gene fits inside a single unitig still reconstructs and is `success` | nothing found |
 | `no_logan_data` | Logan has no unitigs for the accession: the bucket returns 404, or it serves an object that decompresses to nothing (a 55-byte empty zstd frame, which about 0.4% of accessions have) | nothing found |
 | `too_large` | over `--max-size-mb`, so skipped before downloading; or its parsed graph would exceed the per-accession graph budget; or its spooled adjacency will not fit under `--spool-dir` (see [Disk](#disk)) | nothing found |
 | `subgraph_too_large` | the gene's neighbourhood is over `--max-subgraph-nodes` | nothing found |
-| `error` | anything else: a network or cache failure, a corrupt file, GraphAligner crashing, or one GraphAligner call passing `--graphaligner-timeout` | error |
+| `error` | anything else: a network or cache failure, a corrupt file, a cached object that is truncated (a link naming a record the file does not hold, which is what a copy cut at a zstd frame boundary looks like), a GAF row that is not a walk of the graph it was aligned against, GraphAligner crashing, one GraphAligner call passing `--graphaligner-timeout`, or a program on `--graphaligner` that exits 0 without writing a GAF at all (1.0.17b creates the file before it aligns, so that is not an alignment result) | error |
 
 One bad accession does not stop the run: the others are still walked, and whatever was
 reconstructed is still written. **It does make the run fail, though.** An accession that
@@ -924,8 +1077,16 @@ Logan's unitigs are BCALM2 output from a k = 31 compacted de Bruijn graph. A hea
 ```
 
 - The unitig id is the text after the last `_`. Ids run from 0 to n-1 with no gaps.
-- `ka:f` is the unitig's mean k-mer abundance; the walker uses it as depth. **It is clipped at
-  25,000.** Measured on three cached accessions: `ERR2028820` has 664 unitigs at exactly
+- `ka:f` is the unitig's mean k-mer abundance; the walker uses it as depth. Logan's own format
+  notes say that in some large accessions this field is spelled `km:f` instead and that the two
+  carry the same information, so the walker reads either. A record carrying neither is not read
+  as 0x coverage: those records are counted, warned about once per accession, and reported as
+  `abundance_missing` in `summary.json` (per record, and as a count of affected accessions in
+  the `cohort` block). The field is written only when the count is non-zero. It matters because
+  an abundance the walker cannot read leaves every depth-based stage inert: the prune floor
+  collapses, no fork has a majority to correct towards, no branch clears `--min-abund`, and the
+  VCF comes back empty, none of which is an error.
+- `ka:f` **is clipped at 25,000.** Measured on three cached accessions: `ERR2028820` has 664 unitigs at exactly
   25000.0 against 4 at the next value down, `SRR8209082` has 802 against 24, and
   `SRR12363134` has one at 25000.0 whose next-highest neighbour is 14500.0. Where a branch is
   clipped, the fork total is a lower bound and every frequency drawn from it is **overstated**:
@@ -937,6 +1098,10 @@ Logan's unitigs are BCALM2 output from a k = 31 compacted de Bruijn graph. A hea
   rows, which is the intended behaviour and a change from 0.1.x, where they passed unmarked.
 - `L:s1:t:s2` in unitig `u`'s header is the traversal from `u` on strand `s1` to `t` on strand
   `s2`. Every edge appears in both endpoints' headers, so the graph is closed under reversal.
+  Some objects carry no `L:` field at all, in any record. That is not an error and the walker
+  parses them, but nothing can be walked across unitigs, so an accession that reconstructs
+  nothing from one is reported as `no_links` rather than `no_path` (see
+  [Exit status](#exit-status)).
 - Consecutive unitigs overlap by k - 1 = 30 bases, which the walker removes when it stitches a
   path into a sequence.
 - Sequences are plain uppercase `ACGT`; anything else is an error.

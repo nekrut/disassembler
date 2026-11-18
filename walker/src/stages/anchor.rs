@@ -381,12 +381,241 @@ pub fn find(cfg: &Config, graph: &UnitigGraph, index: &QueryIndex) -> Result<Anc
     Ok(scanner.finish())
 }
 
+/// The canonical k-mers of one sequence, sorted and deduplicated.
+///
+/// Same definition of "canonical" as [`index_query_set`]: `min(kmer, revcomp(kmer))`, with any
+/// window holding a non-ACGT base skipped. The rolling registers are written out again here
+/// rather than shared, because the indexer carries per-query bookkeeping this has no use for;
+/// `the_kmer_set_agrees_with_the_index` pins the two together so they cannot drift.
+///
+/// Used by [`reference_groups`], which needs each reference's k-mers separately. The index is
+/// the union and cannot answer which reference a k-mer came from.
+pub fn canonical_kmers(k: usize, seq: &[u8]) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    if k == 0 || k > 32 || seq.len() < k {
+        return out;
+    }
+    let shift = 2 * (k as u64 - 1);
+    let mask = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let (mut fwd, mut rev, mut run) = (0u64, 0u64, 0usize);
+    for &b in seq {
+        match base_code(b) {
+            Some(code) => {
+                fwd = ((fwd << 2) | code) & mask;
+                rev = (rev >> 2) | ((3 - code) << shift);
+                run += 1;
+            }
+            None => {
+                run = 0;
+                fwd = 0;
+                rev = 0;
+            }
+        }
+        if run >= k {
+            out.push(fwd.min(rev));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Elements two sorted, deduplicated k-mer lists have in common.
+fn shared(a: &[u64], b: &[u64]) -> usize {
+    let (mut i, mut j, mut n) = (0usize, 0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                n += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The share of the smaller reference's k-mers two references must have in common to count
+/// as the same gene (WP-02).
+///
+/// 1%. Strains of one gene share far more than this (the SARS-CoV-2 spike panel is one group
+/// at any threshold up to 50%), and unrelated genes share far less: two random coding
+/// sequences share none, and the 160-record, 25-gene master target file splits into 49
+/// groups. The gap is wide enough that the exact value does not matter much, and low enough
+/// that a divergent but legitimate panel is not split.
+pub const GROUP_MIN_SHARE: f64 = 0.01;
+
+/// Partition the anchor pool into groups of references that look like the same gene.
+///
+/// WP-02. Multi-anchor mode ranks every `-q` record against one another and keeps a single
+/// primary per accession, which is right for strains of one gene and wrong for a panel of
+/// different genes: an accession carrying both `bla_KPC` and `bla_NDM` comes back with one of
+/// them, exit 0, and the other visible only as an unselected candidate in the summary. The
+/// walker cannot tell which the user meant, so it does not refuse; it says what it sees.
+///
+/// Two references are linked when they share at least `min_share` of the smaller one's
+/// canonical k-mers, and groups are the connected components of that relation. The fraction
+/// is of the smaller set so that a short reference and a long one holding it are linked.
+///
+/// Returned groups are sorted, each ascending by index, so the warning text is deterministic.
+///
+/// Cost is one k-mer list per reference and a merge per pair. The widest panel in the
+/// repository is 160 records, which is 12,720 merges of about 1,500 k-mers each.
+pub fn reference_groups(k: usize, seqs: &[&[u8]], min_share: f64) -> Vec<Vec<usize>> {
+    let n = seqs.len();
+    let kmers: Vec<Vec<u64>> = seqs.iter().map(|s| canonical_kmers(k, s)).collect();
+    // Union-find, by index, with path halving.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            let smaller = kmers[i].len().min(kmers[j].len());
+            if smaller == 0 {
+                continue;
+            }
+            if shared(&kmers[i], &kmers[j]) as f64 >= min_share * smaller as f64 {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                if a != b {
+                    parent[a] = b;
+                }
+            }
+        }
+    }
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for i in 0..n {
+        let r = root(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+    let mut out: Vec<Vec<usize>> = groups.into_values().collect();
+    out.sort();
+    out
+}
+
 // The anchor-fraction guard that used to live here has been removed. It was calibrated on
 // BLAST anchor counts and then applied to k-mer anchors, so at the default
 // `min_shared_kmers = 3` it sat 9x below its own threshold and stayed silent on the one
 // accession it existed to catch. `Anchors::fraction_of_graph` is still reported for
 // diagnostics. The real guard is `extract::exceeds_guard`, which measures the neighbourhood
 // after expansion.
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn q(seq: &str) -> Query {
+        Query {
+            name: "q".into(),
+            record_id: "q".into(),
+            seq: seq.as_bytes().to_vec(),
+            path: PathBuf::from("q.fa"),
+            n_records: 1,
+        }
+    }
+
+    /// `canonical_kmers` rolls the same registers `index_query_set` does, written out a second
+    /// time because the indexer carries bookkeeping this has no use for. If the two ever
+    /// disagreed about what a canonical k-mer is, the grouping would be measuring something
+    /// the anchoring does not use.
+    #[test]
+    fn the_kmer_set_agrees_with_the_index() {
+        let seq = "ACGTTGCAACGGATCCGTANACGTTTGCAGCATCGGATCAGGCATCAG";
+        let c = Config { k: 7, ..Config::default() };
+        let idx = index_query(&c, &q(seq)).unwrap();
+        let set = canonical_kmers(c.k, seq.as_bytes());
+        assert_eq!(set.len(), idx.len(), "same number of distinct canonical k-mers");
+        for km in &set {
+            assert!(idx.contains(*km), "index is missing a k-mer the set found");
+        }
+        // The N must have cost both of them the same windows.
+        assert!(idx.n_skipped > 0, "the fixture must exercise the ambiguity path");
+    }
+
+    /// A sequence and a 1%-mutated copy of it are one gene; two unrelated sequences are two.
+    #[test]
+    fn related_references_group_and_unrelated_ones_do_not() {
+        // Deterministic pseudo-random sequences, so the test cannot flake.
+        let gen = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    b"ACGT"[((x >> 33) & 3) as usize]
+                })
+                .collect()
+        };
+        let a = gen(1, 900);
+        let b = gen(2, 900);
+        let mut a_mut = a.clone();
+        for i in (0..a_mut.len()).step_by(100) {
+            a_mut[i] = if a_mut[i] == b'A' { b'C' } else { b'A' };
+        }
+
+        let two = reference_groups(21, &[&a[..], &b[..]], GROUP_MIN_SHARE);
+        assert_eq!(two.len(), 2, "unrelated sequences must not be one gene: {two:?}");
+
+        let one = reference_groups(21, &[&a[..], &a_mut[..]], GROUP_MIN_SHARE);
+        assert_eq!(one.len(), 1, "a 1%-mutated copy is the same gene: {one:?}");
+
+        // Grouping is transitive through a shared member, which is what makes a strain panel
+        // one group even when its extremes are divergent.
+        let three = reference_groups(21, &[&a[..], &a_mut[..], &b[..]], GROUP_MIN_SHARE);
+        assert_eq!(three, vec![vec![0, 1], vec![2]]);
+    }
+
+    /// The repository's own reference files, which are what a user is told to start from: the
+    /// strain panel must be one gene and the master target file must not. Skips, loudly,
+    /// where the files are not beside the walker (a packaged build).
+    #[test]
+    fn the_shipped_panels_group_the_way_they_read() {
+        let read = |path: &str| -> Option<Vec<Vec<u8>>> {
+            let text = std::fs::read_to_string(path).ok()?;
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            for line in text.lines() {
+                if line.starts_with('>') {
+                    out.push(Vec::new());
+                } else if let Some(last) = out.last_mut() {
+                    last.extend(line.trim().bytes().map(|b| b.to_ascii_uppercase()));
+                }
+            }
+            Some(out)
+        };
+
+        match read("../panels/sarscov2_spike_11strains.fa") {
+            Some(recs) if recs.len() > 1 => {
+                let seqs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
+                let groups = reference_groups(21, &seqs, GROUP_MIN_SHARE);
+                assert_eq!(
+                    groups.len(),
+                    1,
+                    "the spike strain panel is one gene and must not warn: {groups:?}"
+                );
+            }
+            _ => eprintln!("SKIP: panels/sarscov2_spike_11strains.fa not readable from here"),
+        }
+
+        match read("../queries/master_planetary_targets.fasta") {
+            Some(recs) if recs.len() > 1 => {
+                let seqs: Vec<&[u8]> = recs.iter().map(|r| r.as_slice()).collect();
+                let groups = reference_groups(21, &seqs, GROUP_MIN_SHARE);
+                eprintln!("master_planetary_targets.fasta: {} records, {} groups", recs.len(), groups.len());
+                assert!(
+                    groups.len() > 1,
+                    "the master target file is a catalogue of different genes, not a -q panel"
+                );
+            }
+            _ => eprintln!("SKIP: queries/master_planetary_targets.fasta not readable from here"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod find_tests {

@@ -57,6 +57,16 @@ const BUBBLE_N0: &str = "CACGATACAATAAGAGTAGTGATTGGCCAGTTGTGATTGTAGGAACCCATGCCTG
 const BUBBLE_N1: &str = "TTGTGATTGTAGGAACCCATGCCTGCCTGAACCTACAACTCCTGAGACTGGAGATCCCGCA";
 const BUBBLE_N2: &str = "TTGTGATTGTAGGAACCCATGCCTGCCTGAGCCTACAACTCCTGAGACTGGAGATCCCGCA";
 const BUBBLE_N3: &str = "CCTACAACTCCTGAGACTGGAGATCCCGCACAGCCTCGATCAGACGGTGCCTAGTCCAAG";
+/// WA-04: the same reference with 61 more bases, so the graph can carry **two** bubbles with
+/// a shared unitig between them. 182 bases; the two allele sites are at offsets 60 and 121,
+/// which is further apart than k - 1 = 30, so no k-mer links them.
+/// Four unitigs for the WG-03 fixture's off-route diamond: arbitrary sequence, since nothing
+/// stitches through them. Only their abundances and the edges between them matter.
+const OFF_N4: &str = "TGGGCGAACTTGGTCACCCCGAAGTATCTGATGAGATGATCACCGAGAGCCGGGGCGAGGA";
+const OFF_N5: &str = "AGATGTACGGATACTTTCCGCACAGGGACTAGGTTAACCGCGATTTCTTATCCTGCGATAG";
+const OFF_N6: &str = "CCGGCCGTGTAAACCTTTCTTAGGCATGGCAGAAAATGCAATCATATAACGGGGTTAGAAG";
+const OFF_N7: &str = "GGAGCCTGTAGCATGCTGCCCGATTTCCCGTGTACCCCTGTCGCTGCGAAGTATATCCAG";
+const MIX_QUERY: &str = "CACGATACAATAAGAGTAGTGATTGGCCAGTTGTGATTGTAGGAACCCATGCCTGCCTGAACCTACAACTCCTGAGACTGGAGATCCCGCACAGCCTCGATCAGACGGTGCCTAGTCCAAGTTACGGATCAGCTTAGCCATGGACTTCAGATCCGTTAACGGCATTAGCCTGAATCGGTACA";
 
 struct Fixture {
     dir: PathBuf,
@@ -82,7 +92,15 @@ impl Fixture {
         std::fs::write(dir.join("q.fasta"), format!(">gene\n{QUERY}\n")).unwrap();
         // Stand-in GraphAligners: both answer --version; `ga_fast` then finds no alignment,
         // `ga_slow` sleeps, so a test can catch the walker mid-alignment.
-        for (name, body) in [("ga_fast", "exit 0"), ("ga_slow", "sleep 5")] {
+        //
+        // `ga_fast` writes an EMPTY GAF rather than exiting 0 with no file at all. Those are
+        // different answers since WA-10: an empty GAF is "the tool ran and found nothing",
+        // which is what this stand-in is for, while no file is "that was not GraphAligner"
+        // and is now an error. It used to be a bare `exit 0`, which is the second.
+        for (name, body) in [
+            ("ga_fast", "while [ $# -gt 0 ]; do [ \"$1\" = -a ] && { : > \"$2\"; exit 0; }; shift; done\nexit 0"),
+            ("ga_slow", "sleep 5"),
+        ] {
             let script = dir.join(name);
             std::fs::write(&script, format!(
                 "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n{body}\n"
@@ -194,28 +212,139 @@ impl Fixture {
         )
         .unwrap();
 
-        let script = dir.join("ga_replay");
+        write_replay_script(&dir);
+        Fixture { dir }
+    }
+
+    /// WG-03: a deep gene with a shallow diamond hanging off its neighbourhood.
+    ///
+    /// The route is two unitigs at 15,000x with no fork of its own, so nothing about the
+    /// primary, the alts or the VCF depends on the diamond. The diamond is 6x against 8x,
+    /// five hops away: on `SRR8209082` that is the shape of all 3,632 bubbles the absolute
+    /// 5x floor reported, none above 0.5% of the gene's depth.
+    fn offpath_diamond(name: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("logan-walker-cli-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        let q = &BUBBLE_QUERY[0..90];
+        std::fs::write(dir.join("q.fasta"), format!(">gene\n{q}\n")).unwrap();
+        std::fs::write(dir.join("accs.txt"), "SRRDEEP\n").unwrap();
+        let unitigs = format!(
+            ">SRRDEEP_0 ka:f:15000.0  L:+:3:+\n{}\n\
+             >SRRDEEP_1 ka:f:15000.0\n{OFF_N4}\n\
+             >SRRDEEP_2 ka:f:15000.0\n{OFF_N7}\n\
+             >SRRDEEP_3 ka:f:15000.0  L:-:0:-  L:+:4:+\n{}\n\
+             >SRRDEEP_4 ka:f:15000.0  L:-:3:-  L:+:5:+  L:+:6:+\n{OFF_N4}\n\
+             >SRRDEEP_5 ka:f:6.0      L:-:4:-  L:+:7:+\n{OFF_N5}\n\
+             >SRRDEEP_6 ka:f:8.0      L:-:4:-  L:+:7:+\n{OFF_N6}\n\
+             >SRRDEEP_7 ka:f:15000.0  L:-:5:-  L:-:6:-\n{OFF_N7}\n",
+            &BUBBLE_QUERY[0..60],
+            &BUBBLE_QUERY[30..90],
+        );
+        let zst = zstd::encode_all(unitigs.as_bytes(), 3).unwrap();
+        std::fs::write(dir.join("cache").join("SRRDEEP.unitigs.fa.zst"), zst).unwrap();
         std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 [ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n\
-                 gaf=\n\
-                 while [ $# -gt 0 ]; do\n\
-                 \x20 case \"$1\" in\n\
-                 \x20   -a) gaf=$2; shift 2 ;;\n\
-                 \x20   *) shift ;;\n\
-                 \x20 esac\n\
-                 done\n\
-                 cat '{}' > \"$gaf\"\n",
-                dir.join("gaf.txt").display()
-            ),
+            dir.join("gaf.txt"),
+            "gene\t90\t0\t90\t+\t>0>3\t90\t0\t90\t90\t90\t60\n",
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
+        write_replay_script(&dir);
         Fixture { dir }
+    }
+
+    /// WG-07: a Logan object with no `L:` token anywhere, so the graph has no adjacency.
+    ///
+    /// Logan publishes these. The review found 0 links in 15,864 headers for `ERR3988483`
+    /// and 0 in 21,370 for `ERR3988478`, against 9,752 of 10,070 for `SRR8209082`.
+    ///
+    /// `split` chooses what the accession can still do. Split across two unitigs, no walk can
+    /// span the gene and there is nothing to find; in one unitig the gene needs no edge and
+    /// reconstructs normally, which is why the outcome cannot be decided at parse time.
+    fn unlinked(name: &str, split: bool) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("logan-walker-cli-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(dir.join("q.fasta"), format!(">gene\n{BUBBLE_QUERY}\n")).unwrap();
+        std::fs::write(dir.join("accs.txt"), "SRRNOLINK\n").unwrap();
+        let unitigs = if split {
+            format!(
+                ">SRRNOLINK_0 ka:f:50.0\n{}\n>SRRNOLINK_1 ka:f:50.0\n{}\n",
+                &BUBBLE_QUERY[0..70],
+                &BUBBLE_QUERY[51..121]
+            )
+        } else {
+            format!(">SRRNOLINK_0 ka:f:50.0\n{BUBBLE_QUERY}\n")
+        };
+        let zst = zstd::encode_all(unitigs.as_bytes(), 3).unwrap();
+        std::fs::write(dir.join("cache").join("SRRNOLINK.unitigs.fa.zst"), zst).unwrap();
+        for (script, body) in [
+            ("ga_fast", "while [ $# -gt 0 ]; do [ \"$1\" = -a ] && { : > \"$2\"; exit 0; }; shift; done\nexit 0".to_string()),
+            ("ga_align", String::new()),
+        ] {
+            let path = dir.join(script);
+            let text = if script == "ga_align" {
+                GA_ALIGN.to_string()
+            } else {
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n{body}\n"
+                )
+            };
+            std::fs::write(&path, text).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Fixture { dir }
+    }
+
+    /// WA-04's shape, end to end: two bubbles joined through a unitig both strains carry.
+    ///
+    /// `0 -> {1,2} -> 3 -> {4,5} -> 6`, with the branch pairs at 40/60 and 45/55 of their
+    /// forks. The stand-in replays `>0>1>3>4>6`, the reference-matching route, so the
+    /// majority correction moves the primary onto the deeper allele at both sites and the
+    /// published sequence is a combination of two sites that nothing phases.
+    fn two_forks(name: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("logan-walker-cli-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        std::fs::write(dir.join("q.fasta"), format!(">gene\n{MIX_QUERY}\n")).unwrap();
+        std::fs::write(dir.join("accs.txt"), "SRRMIX\n").unwrap();
+
+        let (n0, a1) = (&MIX_QUERY[0..60], &MIX_QUERY[30..91]);
+        let (mid, b1, tail) = (&MIX_QUERY[61..121], &MIX_QUERY[91..152], &MIX_QUERY[122..182]);
+        let a2 = flip(a1, 30);
+        let b2 = flip(b1, 30);
+        let unitigs = format!(
+            ">SRRMIX_0 ka:f:100.0  L:+:1:+  L:+:2:+\n{n0}\n\
+             >SRRMIX_1 ka:f:40.0   L:-:0:-  L:+:3:+\n{a1}\n\
+             >SRRMIX_2 ka:f:60.0   L:-:0:-  L:+:3:+\n{a2}\n\
+             >SRRMIX_3 ka:f:100.0  L:-:1:-  L:-:2:-  L:+:4:+  L:+:5:+\n{mid}\n\
+             >SRRMIX_4 ka:f:45.0   L:-:3:-  L:+:6:+\n{b1}\n\
+             >SRRMIX_5 ka:f:55.0   L:-:3:-  L:+:6:+\n{b2}\n\
+             >SRRMIX_6 ka:f:100.0  L:-:4:-  L:-:5:-\n{tail}\n"
+        );
+        let zst = zstd::encode_all(unitigs.as_bytes(), 3).unwrap();
+        std::fs::write(dir.join("cache").join("SRRMIX.unitigs.fa.zst"), zst).unwrap();
+
+        let n = MIX_QUERY.len();
+        std::fs::write(
+            dir.join("gaf.txt"),
+            format!("gene\t{n}\t0\t{n}\t+\t>0>1>3>4>6\t{n}\t0\t{n}\t{n}\t{n}\t60\n"),
+        )
+        .unwrap();
+        write_replay_script(&dir);
+        Fixture { dir }
+    }
+
+    /// Rewrite the cached unitig file, re-compressing it. Used to spell the same graph with
+    /// Logan's `km:f:` abundance alias, or to strip a record's abundance tag entirely.
+    fn retag(&self, accession: &str, edit: impl Fn(&str) -> String) {
+        let path = self.dir.join("cache").join(format!("{accession}.unitigs.fa.zst"));
+        let plain = zstd::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap();
+        let edited = edit(std::str::from_utf8(&plain).unwrap());
+        std::fs::write(&path, zstd::encode_all(edited.as_bytes(), 3).unwrap()).unwrap();
     }
 
     /// Overwrite the GAF row the `ga_replay` stand-in serves, so a test can choose the
@@ -300,7 +429,12 @@ fn results_are_stored_in_input_order_not_completion_order() {
     let slow_first = fx.dir.join("ga_order");
     std::fs::write(
         &slow_first,
-        "#!/bin/sh\n         [ \"$1\" = --version ] && { echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }\n         case \"$*\" in *SRRFAKE0*) sleep 2;; esac\n         exit 0\n",
+        // Writes an empty GAF, as `ga_fast` does: no alignment, not a missing tool (WA-10).
+        "#!/bin/sh\n\
+         [ \"$1\" = --version ] && { echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }\n\
+         case \"$*\" in *SRRFAKE0*) sleep 2;; esac\n\
+         while [ $# -gt 0 ]; do [ \"$1\" = -a ] && { : > \"$2\"; exit 0; }; shift; done\n\
+         exit 0\n",
     )
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -689,6 +823,127 @@ fn a_deletion_still_reconstructs_and_the_summary_says_what_the_gate_measured() {
     assert!(summary.contains("\"ref_span\": [0, 63]"), "{summary}");
 }
 
+/// Write a stand-in that replays one GAF row on the first pass and another on the second.
+///
+/// `ga_replay` serves the same row to both, which is right for most tests and useless for the
+/// ones about what the second pass returns.
+fn two_pass_aligner(dir: &std::path::Path, name: &str, pass2: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join(name);
+    std::fs::write(&script, format!(
+        "#!/bin/sh\n\
+         [ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n\
+         gaf=\n\
+         while [ $# -gt 0 ]; do case \"$1\" in -a) gaf=$2; shift 2 ;; *) shift ;; esac; done\n\
+         case \"$gaf\" in\n\
+           *.pass2.gaf) {pass2} ;;\n\
+           *) cat '{first}' > \"$gaf\" ;;\n\
+         esac\n",
+        first = dir.join("gaf.txt").display(),
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// WP-04: a second pass that fails leaves the first pass's haplotype standing.
+///
+/// Every step of the prune's realignment used to be `?`, so GraphAligner aborting or being
+/// OOM-killed on the pruned graph turned an accession that was already reconstructed into
+/// `error`: missing from the FASTA, `prune: null` in the summary, and exit 3 for a
+/// one-accession run. That contradicts the stage's own contract, that pruning can improve an
+/// accession and cannot break one.
+#[test]
+fn a_prune_whose_realignment_fails_keeps_the_first_pass() {
+    let f = Fixture::bubble("prune-error");
+    two_pass_aligner(&f.dir, "ga_pass2_dies", "exit 134");
+
+    let out = f
+        .cmd_ga("ga_pass2_dies", "cache", &["--prune-frac", "0.5"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "the first pass is still good:\n{stderr}");
+    assert!(stderr.contains("prune: realignment failed"), "{stderr}");
+
+    let outdir = f.dir.join("out");
+    let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
+    assert!(recon.contains(">SRRFAKE0_primary"), "the haplotype must survive:\n{recon}");
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
+    assert!(summary.contains("\"outcome\": \"refused_error\""), "{summary}");
+    // A refused prune means the first-pass route stands, reference pull and all (WP-01).
+    assert!(summary.contains("\"bias_uncorrected\": true"), "{summary}");
+}
+
+/// WA-09: a realignment that is the first pass minus an end base is refused, not "applied".
+///
+/// `pruned_covers_as_much` allows three reference bases of slack, because a strict rule kept a
+/// reference-biased primary over one terminal codon. But the slack was the whole test, so a
+/// realignment that changed nothing else was accepted and logged as `applied`: pure loss, and
+/// a lost terminal base can be a truncated stop codon.
+///
+/// The floor here is above the off-route branch and above the route's thin unitig, so the
+/// route survives the prune only because WP-01 protects it, which is what lets the second
+/// pass walk the same route and return a trimmed copy of the first.
+#[test]
+fn a_prune_that_only_trims_an_end_base_is_refused() {
+    let f = Fixture::bubble("prune-trim");
+    let n = BUBBLE_QUERY.len();
+    // Same route, one base shorter.
+    let row = format!(
+        "printf 'gene\\t{n}\\t0\\t{m}\\t+\\t>0>1>3\\t{n}\\t0\\t{m}\\t{m}\\t{m}\\t60\\n' > \"$gaf\"",
+        m = n - 1
+    );
+    two_pass_aligner(&f.dir, "ga_pass2_trims", &row);
+
+    let out = f
+        .cmd_ga("ga_pass2_trims", "cache", &["--prune-frac", "0.7"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("otherwise identical"), "{stderr}");
+
+    let outdir = f.dir.join("out");
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
+    assert!(summary.contains("\"outcome\": \"refused_trimmed\""), "{summary}");
+    let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
+    let seq: String = recon.lines().filter(|l| !l.starts_with('>')).collect();
+    assert_eq!(seq.len(), n, "the full-length first pass is what gets published");
+}
+
+/// WA-10: a program that exits 0 without writing a GAF is not a biological negative.
+///
+/// GraphAligner 1.0.17b creates the GAF before it aligns anything and aborts if it cannot, so
+/// this state means the thing on `--graphaligner` is not GraphAligner, or a wrapper swallowed
+/// its failure. The startup `--version` probe accepts any program that prints a line and exits
+/// 0, which `/usr/bin/true` does; the run then reported `no_path` for every accession and, with
+/// `--allow-empty`, exited 0, which reads as "the gene is in none of them".
+#[test]
+fn an_aligner_that_writes_no_gaf_is_an_error_not_a_negative() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::matching("no-gaf", 2);
+    let ga = f.dir.join("ga_silent");
+    std::fs::write(&ga, "#!/bin/sh\n\
+         [ \"$1\" = --version ] && { echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }\n\
+         exit 0\n").unwrap();
+    std::fs::set_permissions(&ga, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // `--allow-empty` forgives "nothing was found". This is not that.
+    let out = f.cmd_ga("ga_silent", "cache", &["--allow-empty"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+
+    let skipped = std::fs::read_to_string(f.dir.join("out").join("q.skipped.tsv")).unwrap();
+    assert!(skipped.contains("exited 0 but wrote no GAF"), "{skipped}");
+    assert!(!skipped.contains("no_path"), "this is not a negative result:\n{skipped}");
+
+    // An EMPTY GAF still is one: the tool ran, wrote its file and found nothing.
+    let ok = f.cmd_ga("ga_fast", "cache", &["--allow-empty"]).output().unwrap();
+    assert_eq!(ok.status.code(), Some(0), "{}", String::from_utf8_lossy(&ok.stderr));
+    let s2 = std::fs::read_to_string(f.dir.join("out").join("q.summary.json")).unwrap();
+    assert!(s2.contains("\"no_path\": 2"), "{s2}");
+}
+
 /// `--revalidate` is refused where it cannot do anything, rather than silently ignored.
 ///
 /// A flag that quietly does nothing is worse than one that is rejected: the summary records
@@ -1011,7 +1266,11 @@ fn the_default_walk_reconstructs_and_writes_every_output() {
     let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
     assert_eq!(
         recon,
-        format!(">SRRFAKE0_primary cov=1.000 pident=100.0 nodes=1 ka=5.0 vaf=1.00\n{QUERY}\n"),
+        // WA-04 added `min_vaf=`, the measured counterpart of the constant `vaf=`. This
+        // route passes no fork at all, so it is 1.000 and there is no `mixed=` tag.
+        format!(
+            ">SRRFAKE0_primary cov=1.000 pident=100.0 nodes=1 ka=5.0 vaf=1.00 min_vaf=1.000\n{QUERY}\n"
+        ),
         "the primary record changed"
     );
 
@@ -1144,6 +1403,458 @@ fn a_fork_is_phased_and_the_majority_allele_becomes_the_primary() {
         // so its frequencies are real ratios rather than lower bounds (WV-03).
         // Trailing empty `block`: one substitution, so it is not part of a linked block.
         "gene\t61\tA\tG\tSRRFAKE0\t0.6000\t60.0\t40.0\t0\t0\t"
+    );
+}
+
+/// One base changed, so a branch spells a different allele than its sibling.
+fn flip(s: &str, i: usize) -> String {
+    let mut v = s.as_bytes().to_vec();
+    v[i] = if v[i] == b'A' { b'G' } else { b'A' };
+    String::from_utf8(v).unwrap()
+}
+
+/// The stand-in GraphAligner shared by the bubble fixtures: it replays `gaf.txt` into
+/// whatever `-a` names, so a test chooses the route by writing that file.
+fn write_replay_script(dir: &std::path::Path) {
+    let script = dir.join("ga_replay");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             [ \"$1\" = --version ] && {{ echo 'GraphAligner bioconda 1.0.17b-'; exit 0; }}\n\
+             gaf=\n\
+             while [ $# -gt 0 ]; do\n\
+             \x20 case \"$1\" in\n\
+             \x20   -a) gaf=$2; shift 2 ;;\n\
+             \x20   *) shift ;;\n\
+             \x20 esac\n\
+             done\n\
+             cat '{}' > \"$gaf\"\n",
+            dir.join("gaf.txt").display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// WG-03: `bubbles.json` is gated against the gene's own depth, not an absolute 5x.
+///
+/// The gate was `ka:f >= --min-abund`, an absolute 5x, applied to the whole unpruned
+/// neighbourhood before the alignment even ran. On a 15,000x sample that admits anything two
+/// erroneous reads agree on, anywhere near the gene: `SRR8209082` reported 3,632 bubbles whose
+/// strongest allele was 66x, median 11.9x, while the 3,600x second population it does have was
+/// not among them. Read as quasispecies evidence, which is what the file is for, that is noise.
+///
+/// Same graph, same alignment, same primary in all three runs here. Two things changed, and
+/// the runs separate them: the stage now runs AFTER the prune, on the graph the prune left,
+/// and its floor is depth-relative rather than an absolute 5x.
+#[test]
+fn a_shallow_diamond_beside_a_deep_gene_is_not_reported_as_a_bubble() {
+    let bubbles_of = |f: &Fixture, flags: &[&str]| -> String {
+        let out = f.cmd_ga("ga_replay", "cache", flags).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let recon = std::fs::read_to_string(f.dir.join("out").join("r.fasta")).unwrap();
+        assert_eq!(recon.lines().nth(1).unwrap(), &BUBBLE_QUERY[0..90], "the primary moved");
+        std::fs::read_to_string(f.dir.join("out").join("bubbles.json")).unwrap()
+    };
+
+    // A default run prunes at 1% of 15,000x, so the 6x and 8x unitigs are not in the graph
+    // the stage sees at all. This is the ordering half of the fix: the stage used to run
+    // before the alignment, on the neighbourhood as extracted.
+    let f = Fixture::offpath_diamond("deep");
+    assert!(
+        bubbles_of(&f, &[]).contains("\"n_bubbles\": 0"),
+        "a pruned graph has nothing to report here"
+    );
+
+    // With the prune off, the graph still holds the diamond, and the absolute 5x floor
+    // admits it. This is what `bubbles.json` held for every sample, however deep.
+    let g = Fixture::offpath_diamond("deep-unpruned");
+    let kept = bubbles_of(&g, &["--prune-frac", "0"]);
+    assert!(kept.contains("\"n_bubbles\": 1"), "{kept}");
+    assert!(kept.contains("\"ka\": 6.0"), "{kept}");
+    // The record says where that allele set was found (WG-04).
+    assert!(kept.contains("\"flanks\": [{\"fork\": 4"), "{kept}");
+
+    // Same unpruned graph, same alignment, a depth-relative floor: this is the floor half,
+    // and it is what covers a refused prune, where the graph keeps its sub-floor branches.
+    let h = Fixture::offpath_diamond("deep-relative");
+    assert!(
+        bubbles_of(&h, &["--prune-frac", "0", "--min-abund-frac", "0.01"])
+            .contains("\"n_bubbles\": 0"),
+        "1% of 15,000x is 150x, and the branches are 6x and 8x"
+    );
+}
+
+/// WF-12: a lowercase accession is the accession it spells, not a missing one.
+///
+/// Logan's bucket is case-sensitive, so `srr8209082` is fetched verbatim, 404s, and the 404 is
+/// recorded as `no_logan_data`: "Logan has nothing for this run". For a run Logan does have
+/// that is a false negative nothing in the output distinguishes from a real one, and
+/// `--allow-empty` turns it into exit 0 with an empty FASTA. The fixture here is a cache hit,
+/// which is the same lookup by name without needing the network.
+#[test]
+fn a_lowercase_accession_finds_the_run_it_names() {
+    let dir = std::env::temp_dir().join(format!("logan-walker-cli-{}-lowercase", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("cache")).unwrap();
+    std::fs::write(dir.join("q.fasta"), format!(">gene\n{BUBBLE_QUERY}\n")).unwrap();
+    // The list is lowercase; the cached object, as on the bucket, is not.
+    std::fs::write(dir.join("accs.txt"), "srr9999001\n").unwrap();
+    let unitigs = format!(">SRR9999001_0 ka:f:50.0\n{BUBBLE_QUERY}\n");
+    std::fs::write(
+        dir.join("cache").join("SRR9999001.unitigs.fa.zst"),
+        zstd::encode_all(unitigs.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("ga_align"), GA_ALIGN).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("ga_align"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let f = Fixture { dir };
+
+    let out = f.cmd_ga("ga_align", "cache", &[]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("were not uppercase"),
+        "the run must say it changed the spelling; stderr:\n{stderr}"
+    );
+    let recon = std::fs::read_to_string(f.dir.join("out").join("r.fasta")).unwrap();
+    assert!(
+        recon.starts_with(">SRR9999001_primary"),
+        "the output names the accession in its canonical form:\n{recon}"
+    );
+    let summary = std::fs::read_to_string(f.dir.join("out").join("q.summary.json")).unwrap();
+    assert!(summary.contains(r#""acc": "SRR9999001""#), "{summary}");
+    assert!(
+        summary.contains(r#""status": "success""#)
+            && !summary.contains(r#""status": "no_logan_data""#),
+        "a run Logan holds must not be reported as absent:\n{summary}"
+    );
+}
+
+/// WA-12: a GAF row that is not a walk of the graph is an error, not a primary.
+///
+/// The walker writes the GFA, hands it to GraphAligner and then believes the row that comes
+/// back. `stitch_steps` appends each step's sequence minus the k - 1 overlap whatever the
+/// step is, so a row naming two branches of the same fork in series stitches cleanly into a
+/// sequence that exists nowhere, and publishes it with the row's own `pident`. The review
+/// reproduced a primary with 89 differences from the truth at `pident=100.0`.
+///
+/// This fixture's graph is `0 -> {1,2} -> 3`. The stand-in is told to emit `>0>1>2`: every
+/// segment is real and the lengths work out, but 1 and 2 are siblings and nothing joins them.
+#[test]
+fn a_gaf_row_that_is_not_a_walk_of_the_graph_fails_the_accession() {
+    let f = Fixture::bubble("bad-walk");
+    let n = BUBBLE_QUERY.len();
+    std::fs::write(
+        f.dir.join("gaf.txt"),
+        format!("gene\t{n}\t0\t{n}\t+\t>0>1>2\t{n}\t0\t{n}\t{n}\t{n}\t60\n"),
+    )
+    .unwrap();
+    let out = f.cmd_ga("ga_replay", "cache", &[]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // One accession, and it errored: the run did not work (exit 3), rather than reporting a
+    // sequence nobody can check.
+    assert_eq!(out.status.code(), Some(3), "stderr:\n{stderr}");
+
+    let outdir = f.dir.join("out");
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
+    assert!(summary.contains(r#""status": "error""#), "{summary}");
+    assert!(
+        summary.contains("not joined by an edge in the graph"),
+        "the record must say what was wrong with the row:\n{summary}"
+    );
+    // Nothing was published from it.
+    let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap_or_default();
+    assert!(!recon.contains(">SRRFAKE0_primary"), "a chimera reached the FASTA:\n{recon}");
+
+    // The same fixture with the real walk still reconstructs, so the check is about the row
+    // and not about this graph.
+    let g = Fixture::bubble("good-walk");
+    let out = g.cmd_ga("ga_replay", "cache", &[]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// WG-07: an object with no adjacency is `no_links`, not "the gene is absent".
+///
+/// `parse` builds edges only from `L:` header fields and never checked that any record had
+/// one. A file with none parses into an edgeless graph, the BFS adds no neighbours, the GFA
+/// comes out with `S` lines and no `L` lines, and the accession ends `no_path`, which is the
+/// same word the walker uses for a sample that does not carry the gene. Logan publishes such
+/// objects, so a cohort counting them as absences understates gene presence.
+#[test]
+fn an_object_with_no_links_is_its_own_outcome_not_a_biological_negative() {
+    let f = Fixture::unlinked("no-links", true);
+    // Without --allow-empty a run that reconstructed nothing still exits 1: the outcome is a
+    // negative, which is about this accession, not a verdict on the run.
+    let out = f.cmd_ga("ga_fast", "cache", &[]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("no L: adjacency"),
+        "the run must say what it found; stderr:\n{stderr}"
+    );
+
+    let outdir = f.dir.join("out");
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
+    assert!(summary.contains(r#""status": "no_links""#), "{summary}");
+    assert!(summary.contains(r#""no_links": 1"#), "the discard counter:\n{summary}");
+    assert!(
+        !summary.contains(r#""status": "no_path""#),
+        "no_path would claim something about the sample:\n{summary}"
+    );
+    // The tabular form a workflow branches on carries it too.
+    let skipped = std::fs::read_to_string(outdir.join("q.skipped.tsv")).unwrap();
+    assert!(skipped.contains("SRRNOLINK\tno_links"), "{skipped}");
+
+    // It is a negative like the others, so --allow-empty accepts a run of them.
+    let g = Fixture::unlinked("no-links-allow", true);
+    let (code, _) = g.code("cache", &["--allow-empty"]);
+    assert_eq!(code, 0, "no_links must be tolerated like no_path and too_large");
+}
+
+/// WG-07's other half: an edgeless graph is not refused, because a gene that fits inside one
+/// unitig needs no edge. Refusing at parse time, which the review proposed, would have turned
+/// these into negatives.
+#[test]
+fn a_gene_inside_one_unitig_still_reconstructs_without_any_links() {
+    let f = Fixture::unlinked("no-links-one-unitig", false);
+    let out = f.cmd_ga("ga_align", "cache", &[]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    let recon = std::fs::read_to_string(f.dir.join("out").join("r.fasta")).unwrap();
+    assert_eq!(recon.lines().nth(1).unwrap(), BUBBLE_QUERY, "{recon}");
+    let summary = std::fs::read_to_string(f.dir.join("out").join("q.summary.json")).unwrap();
+    assert!(summary.contains(r#""status": "success""#), "{summary}");
+    assert!(summary.contains(r#""no_links": 0"#), "{summary}");
+}
+
+/// WA-04: a primary stitched through two unphased sites says so./// WA-04: a primary stitched through two unphased sites says so.
+///
+/// `stitch.rs` claimed that requiring a connected path "makes chimeras impossible". That holds
+/// for a join no k-mer supports, which is the 87% artifact rate the README measures against
+/// concatenated BLAST hits. It does not hold across sites further apart than k - 1: those are
+/// linked only through unitigs both strains carry, so every combination of their alleles is a
+/// connected path, the walk picks one at each site independently, and the published sequence
+/// can be one no molecule carries. The header said `vaf=1.00` and nothing else.
+///
+/// This fixture is that shape: two bubbles at 40/60 and 45/55, joined through a shared
+/// unitig. The primary ends up carrying the 60% allele and the 55% allele, a pair nothing in
+/// the graph links.
+#[test]
+fn a_primary_crossing_two_unphased_sites_is_labelled_mixed() {
+    let f = Fixture::two_forks("mixed");
+    let out = f.cmd_ga("ga_replay", "cache", &[]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+
+    let recon = std::fs::read_to_string(f.dir.join("out").join("r.fasta")).unwrap();
+    let header = recon.lines().next().unwrap();
+    assert!(
+        header.contains(" min_vaf=0.550"),
+        "the weakest allele the sequence carries is the 55% one; header:\n{header}"
+    );
+    assert!(
+        header.ends_with(" mixed=1"),
+        "two unphased sites is a mixture and must be flagged; header:\n{header}"
+    );
+    // `vaf=` keeps its old constant for one release, which is exactly why `min_vaf=` had to
+    // exist: the two numbers are in the same header and only one of them was ever measured.
+    assert!(header.contains(" vaf=1.00 "), "{header}");
+
+    // The sequence is the combination: both majority alleles, carried by no observed molecule.
+    let expect = flip(&flip(MIX_QUERY, 60), 121);
+    assert_eq!(recon.lines().nth(1).unwrap(), expect, "the primary is not the mosaic");
+
+    let summary = std::fs::read_to_string(f.dir.join("out").join("q.summary.json")).unwrap();
+    assert!(
+        summary.contains(r#""two_allele_sites": 2, "min_site_vaf": 0.5500"#),
+        "the record must carry the numbers the header is drawn from:\n{summary}"
+    );
+    assert!(summary.contains(r#""mixed": 1,"#), "the cohort count:\n{summary}");
+
+    // One site is a variant, not a phasing problem: the single-bubble fixture must not be
+    // flagged, and must still publish the measured frequency rather than 1.00.
+    let g = Fixture::bubble("mixed-one-site");
+    let out = g.cmd_ga("ga_replay", "cache", &[]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let recon = std::fs::read_to_string(g.dir.join("out").join("r.fasta")).unwrap();
+    let header = recon.lines().next().unwrap();
+    assert!(!header.contains("mixed="), "one site is not a mixture; header:\n{header}");
+    assert!(header.contains(" min_vaf=0.600"), "header:\n{header}");
+}
+
+/// WA-04: the flag must not depend on whether alternatives were asked for.
+///
+/// `find_alts` used to return early when no variant output was wanted, so under
+/// `--no-emit-alts` nothing scanned the route and a mixed primary would have been published
+/// with the same header a clonal one gets.
+#[test]
+fn the_mixed_flag_survives_no_emit_alts() {
+    let f = Fixture::two_forks("mixed-quiet");
+    let out = f.cmd_ga("ga_replay", "cache", &["--no-emit-alts"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let recon = std::fs::read_to_string(f.dir.join("out").join("r.fasta")).unwrap();
+    let header = recon.lines().next().unwrap();
+    assert!(header.ends_with(" mixed=1"), "header:\n{header}");
+    assert!(header.contains(" min_vaf=0.550"), "header:\n{header}");
+    assert!(
+        !f.dir.join("out").join("alt_haplotypes.fasta").exists(),
+        "no allele file was asked for"
+    );
+}
+
+/// WP-02: a `-q` pool that is not one gene must say so./// WP-02: a `-q` pool that is not one gene must say so.
+///
+/// Multi-anchor mode ranks every reference together and keeps one primary per accession. For
+/// strains of a gene that is the feature; for a panel of different genes it answers a
+/// different question than the user asked, and 0.1.1 did it silently (0.1.0 at least printed
+/// "One gene per query"). The accession here carries the first gene only, which is the
+/// ordinary case: the second gene is simply absent, and the user has no way to tell that from
+/// a gene that lost the ranking.
+#[test]
+fn a_multi_anchor_pool_of_unrelated_genes_warns() {
+    let f = Fixture::bubble("mixed-genes");
+    // An unrelated coding sequence, in frame and long enough to carry 21-mers of its own.
+    let other = "ATGGCTGCTAAAGAAGGCGTTCTGGAAATCGGTCAGTGGATCAAAGAGCTGCTGAAAGGCTAAATGGCTGCTAAAGAAGGC";
+    std::fs::write(f.dir.join("other.fasta"), format!(">bla_NDM\n{other}\n")).unwrap();
+    let mut c = f.cmd_ga("ga_replay", "cache", &[]);
+    c.arg("-q").arg(f.dir.join("other.fasta"));
+    let out = c.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("[warn] multi-anchor:") && stderr.contains("2 groups"),
+        "a two-gene pool must be called out before the run; stderr:\n{stderr}"
+    );
+    assert!(stderr.contains("[bla_NDM]"), "the warning must name the genes; stderr:\n{stderr}");
+
+    // The same run with one reference, or with a panel of one gene, stays quiet.
+    let g = Fixture::bubble("one-gene");
+    let out = g.cmd_ga("ga_replay", "cache", &[]).output().unwrap();
+    let quiet = String::from_utf8_lossy(&out.stderr);
+    assert!(!quiet.contains("multi-anchor"), "single-anchor runs must not warn:\n{quiet}");
+}
+
+/// WG-05: `--min-abund` is the allele floor and must not move the prune floor.
+///
+/// `depth_floor` returned `max(prune_frac * depth, min_abund)`, so a user tightening the
+/// variant gate also raised the coverage at which unitigs are deleted from the graph the
+/// primary is walked on. Nothing said so: the `--min-abund` help calls it the minimum for a
+/// variant, the `--prune-frac` help calls the prune a fraction of depth, and `summary.json`
+/// reported one `floor` without saying which setting had set it.
+///
+/// This fixture's route is 100x, 40x, 100x, so the default floor is the 5.0 lower bound. Under
+/// the old rule `--min-abund 50` moved it to 50.0 and deleted the 40x branch the aligner
+/// walked; under the new one the floor is still 5.0, and `--prune-min-abund 50` is how a user
+/// asks for the old effect on purpose.
+#[test]
+fn the_allele_floor_does_not_move_the_prune_floor() {
+    let f = Fixture::bubble("prune-floor");
+    let out = f.cmd_ga("ga_replay", "cache", &["--min-abund", "50"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    let summary = std::fs::read_to_string(f.dir.join("out").join("q.summary.json")).unwrap();
+    // The two floors, side by side in one record: the allele gate is where the user put it,
+    // and the prune is where its own default puts it.
+    assert!(
+        summary.contains(r#""prune": {"outcome": "nothing_to_remove", "depth": 100.0, "floor": 5.0, "unitigs": 4, "unitigs_kept": 4"#),
+        "--min-abund 50 must leave the prune floor and the graph alone:\n{summary}"
+    );
+    assert!(summary.contains(r#""variants": {"depth": 100.0, "floor": 50.0"#), "{summary}");
+    assert!(summary.contains(r#""min_abund": 50.0"#), "{summary}");
+    assert!(summary.contains(r#""prune_min_abund": 5.0"#), "{summary}");
+
+    // The prune's own lower bound still does what the joined setting used to do.
+    let g = Fixture::bubble("prune-floor-explicit");
+    let out = g
+        .cmd_ga("ga_replay", "cache", &["--prune-min-abund", "50"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let summary = std::fs::read_to_string(g.dir.join("out").join("q.summary.json")).unwrap();
+    assert!(
+        summary.contains(r#""floor": 50.0, "unitigs": 4, "unitigs_kept": 3"#),
+        "--prune-min-abund must be the setting that moves the floor and deletes the 40x \
+         branch:\n{summary}"
+    );
+}
+
+/// WG-02: Logan's `km:f:` abundance alias must be read as the abundance it is.
+///
+/// Logan's `Unitigs.md` says the `ka:f:` field "is replaced by `km:f:`" in some large
+/// accessions and that they are the same information. The parser matched only `ka:f:`, so such
+/// an accession parsed cleanly with every unitig at 0x. Nothing downstream calls that an
+/// error: it is simply a gene with no coverage, so the prune floor collapses, no fork has a
+/// majority to correct towards, no branch clears `--min-abund`, and the VCF comes back empty,
+/// while `status` stays `success`.
+///
+/// Same graph, same frequencies and same default flags as
+/// `a_fork_is_phased_and_the_majority_allele_becomes_the_primary`. Only the spelling of the
+/// tag differs, so every assertion below is that one test's, and the alias must not change a
+/// single byte of the answer.
+#[test]
+fn the_km_f_abundance_alias_is_read_like_ka_f() {
+    let f = Fixture::bubble("km-alias");
+    f.retag("SRRFAKE0", |fa| fa.replace("ka:f:", "km:f:"));
+    let out = f.cmd_ga("ga_replay", "cache", &["--emit-vcf"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("consensus: 1 site(s) where the route carried the minority allele, corrected"),
+        "the alias left the graph at 0x, so the majority correction never ran; stderr:\n{stderr}"
+    );
+
+    let outdir = f.dir.join("out");
+    let recon = std::fs::read_to_string(outdir.join("r.fasta")).unwrap();
+    assert_eq!(
+        recon.lines().nth(1).unwrap(),
+        BUBBLE_MAJORITY,
+        "with the alias read, the primary must still carry the 60% allele"
+    );
+    // The depth-based stages are the ones that go silent, so check one of each: phasing,
+    // the alt recovery and the variant writer.
+    let bubbles = std::fs::read_to_string(outdir.join("bubbles.json")).unwrap();
+    assert!(bubbles.contains("\"n_bubbles\": 1"), "{bubbles}");
+    assert!(bubbles.contains(r#"{"node": 2, "strand": "+", "ka": 60.0, "vaf": 0.6000}"#), "{bubbles}");
+    let alts = std::fs::read_to_string(outdir.join("alt_haplotypes.fasta")).unwrap();
+    assert!(alts.contains("alt_kaf=40.0"), "{alts}");
+    let vcf = std::fs::read_to_string(outdir.join("SRRFAKE0.vcf")).unwrap();
+    assert!(vcf.contains("AF=0.6000;AO=60.0;RO=40.0"), "{vcf}");
+
+    // Every record carries an abundance, so the WG-02 counter stays silent and the summary
+    // keeps the shape an ordinary run has.
+    let summary = std::fs::read_to_string(outdir.join("q.summary.json")).unwrap();
+    assert!(!summary.contains("abundance_missing"), "{summary}");
+    assert!(!stderr.contains("carry no ka:f/km:f abundance"), "{stderr}");
+}
+
+/// WG-02's other half: an accession whose records carry neither tag is not a 0x gene, it is an
+/// accession whose abundances are unknown, and the run must say so somewhere a machine reads.
+#[test]
+fn unitigs_with_no_abundance_tag_are_reported_not_read_as_zero() {
+    let f = Fixture::bubble("no-abundance");
+    // Strip the tag from the two branch unitigs, leaving the flanks tagged: a partial loss is
+    // the case a whole-file check would miss.
+    f.retag("SRRFAKE0", |fa| fa.replace("ka:f:40.0  ", "").replace("ka:f:60.0  ", ""));
+    let out = f.cmd_ga("ga_replay", "cache", &[]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("2 of 4 unitigs carry no ka:f/km:f abundance"),
+        "the run must warn about the records it could not read a depth from; stderr:\n{stderr}"
+    );
+    let summary =
+        std::fs::read_to_string(f.dir.join("out").join("q.summary.json")).unwrap();
+    assert!(
+        summary.contains("\"abundance_missing\": 2"),
+        "the count must reach summary.json:\n{summary}"
     );
 }
 

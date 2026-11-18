@@ -23,6 +23,7 @@
     "primary_metric": "matched",
     "primary_tie_eps": 0.002,
     "prune_frac": 0.01,
+    "prune_min_abund": 5.0,
     "prefer_majority": true,
     "min_abund": 5.0,
     "min_abund_frac": 0.0,
@@ -43,20 +44,22 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-18T04:13:30Z",
-    "wall_seconds": 10.683,
-    "stage_seconds": {"stream": 9.734, "parse": 0.743, "anchor": 0.000, "extract": 0.150, "align": 0.053, "stitch": 0.000, "phase": 0.000},
+    "started": "2026-11-18T16:21:07Z",
+    "wall_seconds": 9.619,
+    "stage_seconds": {"stream": 8.638, "parse": 0.763, "anchor": 0.000, "extract": 0.162, "align": 0.053, "stitch": 0.000, "phase": 0.000},
     "n_records": 1,
     "n_ok": 1
   },
   "discards": {
-    "accessions": {"never_reached": 0, "no_anchors": 0, "no_path": 0, "no_logan_data": 0, "too_large": 0, "subgraph_too_large": 0, "error": 0},
+    "accessions": {"never_reached": 0, "no_anchors": 0, "no_path": 0, "no_links": 0, "no_logan_data": 0, "too_large": 0, "subgraph_too_large": 0, "error": 0},
     "alleles": {"beyond_max_alts": 0, "no_rejoin": 1, "not_substitution": 0, "over_indel_cap": 2, "frameshifting": 1, "window_not_shiftable": 0, "identical": 0},
     "minority_sites": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 0, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0}
   },
   "cohort": {
     "reconstructed": 1,
     "provisional": 0,
+    "bias_uncorrected": 0,
+    "mixed": 0,
     "majority_corrected": 0,
     "majority_corrections": 0,
     "minority_rescues": 0,
@@ -73,12 +76,13 @@
     {
       "acc": "ERR2028820",
       "status": "success",
-      "payload": {"source": "s3", "bytes": 34016719, "sha256": "a03b08561b2f7233f3ac48c08825199d37ed801cfa8264151e04b6f7c92f187f", "etag": "89d0255e8d9b262f4f0ec26bcf53ae20", "last_modified": "2024-03-31T15:36:42Z", "fetched_at": "2026-11-18T04:13:30Z"},
+      "payload": {"source": "s3", "bytes": 34016719, "sha256": "a03b08561b2f7233f3ac48c08825199d37ed801cfa8264151e04b6f7c92f187f", "etag": "89d0255e8d9b262f4f0ec26bcf53ae20", "last_modified": "2024-03-31T15:36:42Z", "fetched_at": "2026-11-18T16:21:07Z"},
       "n_unitigs": 1277362,
       "n_anchors": 220,
       "subgraph_nodes": 747,
       "subgraph_fraction": 0.000585,
       "provisional": false,
+      "bias_uncorrected": false,
       "ka_max": 25000.0,
       "depth_saturated": true,
       "snv_sites": 0,
@@ -90,9 +94,9 @@
       "majority_corrections": 0,
       "minority_rescues": 0,
       "hit_pass_cap": false,
-      "variants": {"depth": 180.0, "floor": 5.0, "forks": 11, "biallelic": 4, "recovered": 0, "beyond_cap": 0, "indels": 0, "no_rejoin": 1, "not_substitution": 0, "over_indel_cap": 2, "frameshifting": 1, "window_not_shiftable": 0, "identical": 0},
+      "variants": {"depth": 180.0, "floor": 5.0, "forks": 11, "biallelic": 4, "two_allele_sites": 0, "min_site_vaf": 1.0000, "recovered": 0, "beyond_cap": 0, "indels": 0, "no_rejoin": 1, "not_substitution": 0, "over_indel_cap": 2, "frameshifting": 1, "window_not_shiftable": 0, "identical": 0},
       "prune": {"outcome": "applied", "depth": 180.0, "floor": 5.0, "unitigs": 747, "unitigs_kept": 479, "unpruned_span": [0, 1275], "pruned_span": [0, 1275]},
-      "timing": {"stream": 9.734, "parse": 0.743, "anchor": 0.000, "extract": 0.150, "align": 0.053, "stitch": 0.000, "phase": 0.000, "total": 0.946}
+      "timing": {"stream": 8.638, "parse": 0.763, "anchor": 0.000, "extract": 0.162, "align": 0.053, "stitch": 0.000, "phase": 0.000, "total": 0.979}
     }
   ]
 }

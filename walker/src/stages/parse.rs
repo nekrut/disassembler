@@ -219,6 +219,13 @@ pub fn scan_in<S: RecordSink>(
     // The ceiling warning used to scan the stored abundances. Nothing stores them here, so the
     // maximum is tracked as it streams past and the warning is unchanged.
     let mut max_abundance = 0.0f32;
+    // WG-02: records carrying neither `ka:f:` nor `km:f:`. Pass 1 is where this is countable,
+    // because pass 2 only reads the neighbourhood's records.
+    let mut abundance_missing: u64 = 0;
+    // WG-10: the largest link target seen. Compared against the record count at the end,
+    // where the count is finally known. Tracked as rows are appended rather than scanned at
+    // the end, because `targets` is a flush buffer once adjacency spills.
+    let mut max_target: u32 = 0;
     // Adjacency may end up on disk, so `offsets` cannot be indexed by `targets.len()`: the
     // Vecs are flush buffers and get cleared. This is the only running count of edges.
     let mut n_targets: u64 = 0;
@@ -269,6 +276,9 @@ pub fn scan_in<S: RecordSink>(
                 .map_err(|_| bad("edge count exceeds u32 addressing".into()))?;
             let before = targets.len();
             let h = header(&line, expected_id, Some(&mut targets), &bad)?;
+            for &packed in &targets[before..] {
+                max_target = max_target.max(unpack_edge(packed).0);
+            }
             n_targets += (targets.len() - before) as u64;
             offsets.push(edges_before);
 
@@ -302,6 +312,9 @@ pub fn scan_in<S: RecordSink>(
             if h.abundance > max_abundance {
                 max_abundance = h.abundance;
             }
+            if !h.has_abundance {
+                abundance_missing += 1;
+            }
             sink.begin(h.id);
             expected_id += 1;
             in_record = true;
@@ -324,7 +337,11 @@ pub fn scan_in<S: RecordSink>(
     offsets.push(
         u32::try_from(n_targets).map_err(|_| bad("edge count exceeds u32 addressing".into()))?,
     );
+    if n_targets > 0 && max_target as u64 >= expected_id {
+        return Err(truncated_error(accession, max_target, expected_id));
+    }
     warn_ka_ceiling(accession, max_abundance);
+    warn_missing_abundance(accession, abundance_missing, expected_id);
 
     if let Some(s) = spool.as_mut() {
         s.push_offsets(&offsets).map_err(|e| spill_error(accession, "offsets", expected_id, e))?;
@@ -343,6 +360,10 @@ pub fn scan_in<S: RecordSink>(
         seq_2bit: Vec::new(),
         seq_offset: Vec::new(),
         spool,
+        abundance_missing,
+        // WG-07. The running count, not `targets.len()`: once adjacency spills, the Vec is a
+        // flush buffer that gets cleared, and on a spilled accession it is empty here.
+        n_links: n_targets,
     })
 }
 
@@ -524,10 +545,87 @@ fn warn_ka_ceiling(accession: &Accession, max_abundance: f32) {
     }
 }
 
+/// WG-10. A link whose target is past the last record the file holds.
+///
+/// Logan objects are several concatenated zstd frames, and a copy cut exactly at a frame
+/// boundary decodes **without error**: zstd has no idea more frames were meant to follow. The
+/// graph that comes out is smaller and internally plausible, so the walk runs on it and the
+/// accession comes back `no_anchors`, or with a partial gene, with nothing saying the input
+/// was half a file. `write_gfa` drops the dangling links in silence, so even the GFA looks
+/// well formed.
+///
+/// The links are what give it away: ids are dense and sequential, so a link to a unitig the
+/// file does not hold means records are missing. The walker cannot write such a file itself
+/// (the cache entry is renamed into place only once the body is complete, and the hash is
+/// checked against the object's ETag), so this is about a cache directory filled by something
+/// else: a Galaxy-staged dataset, a partial copy, a shared cache.
+fn truncated_error(accession: &Accession, target: u32, n_unitigs: u64) -> Error {
+    Error::Parse {
+        accession: accession.clone(),
+        detail: format!(
+            "a link names unitig {target} but the file holds only {n_unitigs} records, so              records are missing: this copy of the object is truncated or incomplete. A zstd              stream cut at a frame boundary decodes cleanly, which is why this is caught here              rather than by the decoder"
+        ),
+    }
+}
+
+/// WG-02. A file whose records carry no abundance tag parses cleanly and reconstructs, but
+/// with every depth-based stage inert: the prune floor is 0 so nothing is pruned, no fork has
+/// a majority to correct towards, no branch clears `--min-abund`, and the VCF is empty. None
+/// of that is an error, and before 0.2.0 the only trace was `mean_ka: 0.0` in a summary nobody
+/// reads per accession. Counted over the whole file in pass 1, which is the only pass that
+/// sees every record.
+fn warn_missing_abundance(accession: &Accession, missing: u64, total: u64) {
+    if missing == 0 {
+        return;
+    }
+    eprintln!(
+        "[{accession}] WARNING: {missing} of {total} unitigs carry no ka:f/km:f abundance, so          the prune, the majority correction, bubbles and the variant stages see 0x there.          `abundance_missing` in summary.json carries this count."
+    );
+}
+
 /// What one header line carries.
 struct Header {
     id: u32,
     abundance: f32,
+    /// Whether the record carried an abundance tag at all, `ka:f:` or its `km:f:` alias.
+    ///
+    /// WG-02: a record with neither keeps abundance 0, which is indistinguishable from a real
+    /// zero and silently disables every depth-based stage. `scan` and `build` count these;
+    /// `header_light` leaves the flag false when it was not asked for an abundance, because
+    /// pass 2 does not count anything.
+    has_abundance: bool,
+}
+
+/// Whether this header field is an abundance tag.
+///
+/// WG-02. Logan's `Unitigs.md` says that "in some large accessions, the `ka:f:[xx]` field is
+/// replaced by `km:f:[xx]` ... consider that they are the same information". Reading only
+/// `ka:f:` left every unitig of such an accession at abundance 0, which is an error nowhere:
+/// the prune, the majority correction, bubble detection and the variant stages all simply
+/// have nothing to work with, and the run reports `status: success` with `mean_ka: 0.0` and
+/// empty alts. Both tags are five bytes, so the value starts at the same offset.
+#[inline]
+fn is_abundance_tag(f: &[u8]) -> bool {
+    f.starts_with(b"ka:f:") || f.starts_with(b"km:f:")
+}
+
+/// The value of an abundance tag, rejecting what cannot be a coverage.
+///
+/// WV-15: `parse::<f32>()` accepts `inf` and `nan`, and both then flow into every VAF, the
+/// prune floor and `summary.json`, where they are written as bare tokens no JSON parser
+/// accepts. A negative abundance is equally meaningless. One definition, so the three decodes
+/// of a file cannot disagree about which values it holds.
+fn abundance_value(f: &[u8], id: u32, bad: &impl Fn(String) -> Error) -> Result<f32> {
+    std::str::from_utf8(&f[5..])
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .ok_or_else(|| {
+            bad(format!(
+                "record {id}: bad abundance {:?}",
+                String::from_utf8_lossy(f)
+            ))
+        })
 }
 
 /// `collect`'s header reader: the id always, the abundance only when asked, the links never.
@@ -580,26 +678,19 @@ fn header_light(
         )));
     }
     if !want_abundance {
-        return Ok(Header { id, abundance: 0.0 });
+        return Ok(Header { id, abundance: 0.0, has_abundance: false });
     }
-    // Same default as `header`: a record with no `ka:f:` field has abundance 0.
+    // Same default as `header`: a record with no `ka:f:`/`km:f:` field has abundance 0.
     let mut abundance = 0.0f32;
+    let mut has_abundance = false;
     for f in rest[name_end..].split(|b| b.is_ascii_whitespace()).filter(|f| !f.is_empty()) {
-        if f.starts_with(b"ka:f:") {
-            abundance = std::str::from_utf8(&f[5..])
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|v| v.is_finite() && *v >= 0.0)
-                .ok_or_else(|| {
-                    bad(format!(
-                        "record {id}: bad abundance {:?}",
-                        String::from_utf8_lossy(f)
-                    ))
-                })?;
+        if is_abundance_tag(f) {
+            abundance = abundance_value(f, id, bad)?;
+            has_abundance = true;
             break;
         }
     }
-    Ok(Header { id, abundance })
+    Ok(Header { id, abundance, has_abundance })
 }
 
 /// Parse one `>` line, pushing its links into `targets` when given one.
@@ -641,22 +732,12 @@ fn header(
     }
 
     let mut abundance = 0.0f32;
+    let mut has_abundance = false;
     let mut sink = targets;
     for f in fields {
-        if f.starts_with(b"ka:f:") {
-            // WV-15: `parse::<f32>()` accepts `inf` and `nan`, and both then flow into every
-            // VAF, the prune floor and `summary.json`, where they are written as bare tokens
-            // no JSON parser accepts. A negative abundance is equally meaningless.
-            abundance = std::str::from_utf8(&f[5..])
-                .ok()
-                .and_then(|s| s.parse::<f32>().ok())
-                .filter(|v| v.is_finite() && *v >= 0.0)
-                .ok_or_else(|| {
-                    bad(format!(
-                        "record {id}: bad abundance {:?}",
-                        String::from_utf8_lossy(f)
-                    ))
-                })?;
+        if is_abundance_tag(f) {
+            abundance = abundance_value(f, id, bad)?;
+            has_abundance = true;
         } else if f.starts_with(b"L:") {
             let mut parts = f[2..].split(|&b| b == b':');
             let s1 = parts.next().unwrap_or(b"");
@@ -677,7 +758,7 @@ fn header(
             }
         }
     }
-    Ok(Header { id, abundance })
+    Ok(Header { id, abundance, has_abundance })
 }
 
 /// Heap held by the five CSR arrays, including the slack doubling leaves behind.
@@ -748,6 +829,8 @@ pub fn build(
     let mut total_bases: u64 = 0;
     // As in `scan_in`: absent data and unreadable data are different outcomes.
     let mut bytes_read: u64 = 0;
+    // WG-02, as in `scan_in`.
+    let mut abundance_missing: u64 = 0;
     let mut in_record = false;
     let mut iters: u64 = 0;
 
@@ -805,6 +888,9 @@ pub fn build(
                     .map_err(|_| bad("total sequence exceeds u32 addressing".into()))?,
             );
             abundance.push(h.abundance);
+            if !h.has_abundance {
+                abundance_missing += 1;
+            }
             expected_id += 1;
             in_record = true;
         } else {
@@ -835,10 +921,17 @@ pub fn build(
         u32::try_from(total_bases).map_err(|_| bad("total sequence exceeds u32 addressing".into()))?,
     );
 
+    if let Some(t) = targets.iter().map(|&p| unpack_edge(p).0).max() {
+        if t as u64 >= expected_id {
+            return Err(truncated_error(accession, t, expected_id));
+        }
+    }
     warn_ka_ceiling(
         accession,
         abundance.iter().copied().fold(0.0f32, f32::max),
     );
+    warn_missing_abundance(accession, abundance_missing, expected_id);
+    let n_links = targets.len() as u64;
 
     Ok(UnitigGraph {
         accession: accession.clone(),
@@ -853,6 +946,8 @@ pub fn build(
         seq_offset,
         // `build` never spills: it is the test and fixture path, and it keeps everything.
         spool: None,
+        abundance_missing,
+        n_links,
     })
 }
 
@@ -935,6 +1030,133 @@ mod tests {
 
     fn cursor(s: &str) -> Box<dyn Read> {
         Box::new(std::io::Cursor::new(s.as_bytes().to_vec()))
+    }
+
+    /// WG-10. A Logan object is several concatenated zstd frames, and a copy cut exactly at a
+    /// frame boundary decodes **without error**: zstd sees a complete frame and stops. The
+    /// graph that comes out is smaller and internally plausible, so the accession used to come
+    /// back `no_anchors` or with a partial gene and nothing saying half the file was missing.
+    ///
+    /// The links give it away, because ids are dense and sequential: a link to a record the
+    /// file does not hold can only mean records are missing.
+    #[test]
+    fn a_file_cut_at_a_frame_boundary_is_refused_as_truncated() {
+        let first = ">T_0 ka:f:9.0 L:+:1:+\nACGT\n>T_1 ka:f:9.0 L:-:0:- L:+:2:+\nACGT\n";
+        let second = ">T_2 ka:f:9.0 L:-:1:- L:+:3:+\nACGT\n>T_3 ka:f:9.0 L:-:2:-\nACGT\n";
+        let mut whole = zstd::encode_all(first.as_bytes(), 3).unwrap();
+        whole.extend(zstd::encode_all(second.as_bytes(), 3).unwrap());
+
+        // The whole object is four unitigs and parses.
+        let all = zstd::decode_all(&whole[..]).expect("two frames decode");
+        assert_eq!(
+            build(&"T".into(), Box::new(std::io::Cursor::new(all)), u64::MAX)
+                .expect("the whole file")
+                .n_unitigs,
+            4
+        );
+
+        // Cut after the first frame. This is the part that makes the defect invisible: zstd
+        // reports no error at all, so nothing upstream of the parser can catch it.
+        let cut = zstd::encode_all(first.as_bytes(), 3).unwrap();
+        let half = zstd::decode_all(&cut[..]).expect("a frame boundary decodes cleanly");
+        assert_eq!(half, first.as_bytes(), "the cut decodes to exactly the first frame");
+
+        for pass in ["build", "scan"] {
+            let rd: Box<dyn Read> = Box::new(std::io::Cursor::new(half.clone()));
+            let got = if pass == "build" {
+                build(&"T".into(), rd, u64::MAX).map(|g| g.n_unitigs)
+            } else {
+                scan(&"T".to_string(), rd, u64::MAX, &mut ()).map(|g| g.n_unitigs)
+            };
+            match got {
+                Err(Error::Parse { detail, .. }) => {
+                    assert!(detail.contains("truncated or incomplete"), "{pass}: {detail}");
+                    assert!(detail.contains("unitig 2"), "{pass}: name the target: {detail}");
+                }
+                Err(e) => panic!("{pass}: wrong error kind: {e}"),
+                Ok(n) => panic!("{pass}: parsed {n} unitigs from half a file"),
+            }
+        }
+    }
+
+    /// WG-07. A file with no `L:` token anywhere parses into a graph with no adjacency. That
+    /// is legal input and the parser keeps accepting it, because a gene inside a single
+    /// unitig needs no edge; what changed is that the count survives to the pipeline, which
+    /// reports `no_links` rather than the biological negative `no_path`.
+    #[test]
+    fn a_file_with_no_links_parses_and_says_it_has_none() {
+        let linkless = ">T_0 ka:f:9.0\nACGT\n>T_1 ka:f:9.0\nACGT\n>T_2 ka:f:9.0\nACGT\n";
+        let g = build_str(linkless).expect("a link-less file is still parseable");
+        assert_eq!(g.n_unitigs, 3);
+        assert_eq!(g.n_links, 0, "nothing in the file links anything");
+        // Pass 1 is where the production path learns it, and it must agree with `build`.
+        let skeleton = scan(&"T".to_string(), cursor(linkless), u64::MAX, &mut ()).expect("scan");
+        assert_eq!(skeleton.n_links, 0);
+
+        // The same records with links report them, counted in both endpoints' headers as
+        // Logan writes them.
+        let linked = ">T_0 ka:f:9.0 L:+:1:+\nACGT\n>T_1 ka:f:9.0 L:-:0:-\nACGT\n";
+        assert_eq!(build_str(linked).expect("build").n_links, 2);
+        assert_eq!(
+            scan(&"T".to_string(), cursor(linked), u64::MAX, &mut ()).expect("scan").n_links,
+            2
+        );
+    }
+
+    /// WG-02. Logan documents `km:f:` as an alias of `ka:f:` "in some large accessions", and
+    /// the parser read only the first. A file using the alias parsed cleanly with every
+    /// abundance at 0, which is not an error anywhere downstream: it is a 0x gene, so the
+    /// prune floor collapses, no fork has a majority, nothing clears `--min-abund`, and the
+    /// run reports success with an empty VCF. The two spellings must be the same file.
+    #[test]
+    fn km_f_is_read_as_abundance_exactly_like_ka_f() {
+        let ka = MIXED;
+        let km = MIXED.replace("ka:f:", "km:f:");
+        let a = build_str(ka).expect("ka:f");
+        let b = build_str(&km).expect("km:f");
+        assert_eq!(a.abundance, b.abundance, "the alias must carry the same abundances");
+        assert!(a.abundance.iter().any(|v| *v > 0.0), "the fixture must have real abundances");
+        assert_eq!(a.offsets, b.offsets, "offsets");
+        assert_eq!(a.targets, b.targets, "targets");
+        assert_eq!(a.seq_2bit, b.seq_2bit, "sequence");
+        // Pass 1 and pass 2 read the alias through different functions (`header` and
+        // `header_light`), so a fix to one and not the other would be a silent disagreement
+        // between the two decodes of the same file.
+        let skeleton = scan(&"T".to_string(), cursor(&km), u64::MAX, &mut ()).expect("scan");
+        let all: Vec<UnitigId> = (0..b.n_unitigs as UnitigId).collect();
+        let two = collect(skeleton, cursor(&km), &all, u64::MAX).expect("collect");
+        assert_eq!(b.abundance, two.abundance, "pass 2 must read the alias too");
+    }
+
+    /// The alias is validated exactly as `ka:f:` is: WV-15's non-finite and negative values
+    /// are rejected rather than flowing into the floor, the VAFs and `summary.json`.
+    #[test]
+    fn a_bad_km_f_value_is_refused_like_a_bad_ka_f() {
+        for bad in ["nan", "inf", "-7.5", "x"] {
+            let fa = format!(">T_0 km:f:{bad}\nACGT\n");
+            match build_str(&fa) {
+                Err(Error::Parse { detail, .. }) => {
+                    assert!(detail.contains("bad abundance"), "{detail}");
+                }
+                other => panic!("km:f:{bad} must be refused, got {:?}", other.map(|g| g.abundance)),
+            }
+        }
+    }
+
+    /// WG-02's second half: a file carrying neither tag is counted, so the summary can say
+    /// that the depth-based stages ran against zeros rather than against a 0x gene.
+    #[test]
+    fn records_with_no_abundance_tag_are_counted_not_guessed() {
+        let fa = ">T_0 ka:f:9.0 L:+:1:+\nACGT\n>T_1\nACGT\n>T_2 km:f:4.0\nACGT\n";
+        let one = build_str(fa).expect("build");
+        assert_eq!(one.abundance_missing, 1, "one of three records has no tag");
+        assert_eq!(one.abundance, vec![9.0, 0.0, 4.0]);
+        // Counted in pass 1 as well, which is the production path and the only pass that
+        // sees every record.
+        let skeleton = scan(&"T".to_string(), cursor(fa), u64::MAX, &mut ()).expect("scan");
+        assert_eq!(skeleton.abundance_missing, 1);
+        // An ordinary object leaves it at zero, which is what keeps the summary field absent.
+        assert_eq!(build_str(MIXED).expect("build").abundance_missing, 0);
     }
 
     /// Two decodes must produce exactly what one did.

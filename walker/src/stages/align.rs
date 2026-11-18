@@ -287,7 +287,12 @@ pub fn run(
         // So check what is actually missing. If the INPUTS are gone too, nothing was aligned
         // and this is not a negative result; it is an error, and the run must say so.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if !subgraph.gfa_path.exists() || !query_fa.exists() {
+            // Asked before the cleanup below removes the query: this branch is distinguishing
+            // "our scratch was deleted under us" from "the tool wrote nothing", and removing
+            // one of the two files it tests would answer its own question.
+            let inputs_gone = !subgraph.gfa_path.exists() || !query_fa.exists();
+            let _ = std::fs::remove_file(&query_fa);
+            if inputs_gone {
                 return Err(Error::GraphAligner {
                     accession: subgraph.accession.to_string(),
                     detail: format!(
@@ -299,8 +304,25 @@ pub fn run(
                     ),
                 });
             }
-            let _ = std::fs::remove_file(&query_fa);
-            return Ok(HashMap::new());
+            // WA-10. Not a negative result: GraphAligner 1.0.17b creates the GAF before it
+            // aligns anything and aborts if it cannot, so a clean exit with no file at all
+            // means the program on `--graphaligner` is not GraphAligner, or a wrapper
+            // swallowed its failure. The startup `--version` probe accepts any program that
+            // prints a line and exits 0, which `/usr/bin/true` does; until 0.2.0 that run
+            // reported `no_path` for every accession and exited 0 with `--allow-empty`, which
+            // reads as "the gene is in none of them".
+            //
+            // An EMPTY GAF is the real negative and still is: the tool ran, wrote its file,
+            // and found nothing.
+            return Err(Error::GraphAligner {
+                accession: subgraph.accession.to_string(),
+                detail: format!(
+                    "{} exited 0 but wrote no GAF to {}; a program that is not GraphAligner, \
+                     or a wrapper that hid a failure",
+                    bin.display(),
+                    gaf_out.display()
+                ),
+            });
         }
         Err(e) => {
             let _ = std::fs::remove_file(gaf_out);
@@ -504,7 +526,9 @@ pub fn parse_gaf_multi(
                 Error::Usage(format!("GAF column {} is not a number: {e}", i + 1))
             })
         };
-        let steps = parse_path(best[5]);
+        let steps = parse_path(best[5]).map_err(|e| {
+            Error::Usage(format!("GAF row {name:?}: {e} ({:?})", best[5]))
+        })?;
         if steps.is_empty() {
             continue; // path with no nodes: no usable alignment against this ref
         }
@@ -538,7 +562,17 @@ pub fn parse_gaf(gaf_bytes: &[u8], expect: &str) -> Result<Option<GafPath>> {
 
 /// Split a GAF path string into oriented steps. `>` is forward, `<` reverse-complement.
 /// No regex: the grammar is a sign followed by digits, repeated.
-fn parse_path(s: &str) -> Vec<PathStep> {
+/// WA-12. Strict: the walker writes the GFA this path refers to, and it names every segment
+/// with a plain unitig id, so `>` or `<` then digits is the whole language. A byte outside it
+/// means the row was not produced against the graph the walker handed out, and the old reader
+/// silently skipped such bytes and dropped oversize ids, which turned a mis-parsed row into a
+/// shorter walk that then stitched into a published sequence. Say so instead.
+fn parse_path(s: &str) -> std::result::Result<Vec<PathStep>, String> {
+    // GAF's own placeholder for a record that did not align. Not a malformed path: it is the
+    // format saying there is no path, and the caller drops the row.
+    if s == "*" {
+        return Ok(Vec::new());
+    }
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -546,23 +580,38 @@ fn parse_path(s: &str) -> Vec<PathStep> {
         let orient = match b[i] {
             b'>' => Orient::Forward,
             b'<' => Orient::Reverse,
-            _ => {
-                i += 1;
-                continue;
+            c => {
+                return Err(format!(
+                    "expected '>' or '<' at byte {i} of the path column, found {:?}",
+                    c as char
+                ))
             }
         };
         i += 1;
         let start = i;
         let mut id: u64 = 0;
+        let mut overflow = false;
         while i < b.len() && b[i].is_ascii_digit() {
-            id = id * 10 + (b[i] - b'0') as u64;
+            id = id.saturating_mul(10).saturating_add((b[i] - b'0') as u64);
+            overflow |= id > u32::MAX as u64;
             i += 1;
         }
-        if i > start && id <= u32::MAX as u64 {
-            out.push(PathStep { orient, node: id as u32 });
+        if i == start {
+            return Err(format!(
+                "no segment name after {:?} at byte {} of the path column",
+                b[start - 1] as char,
+                start - 1
+            ));
         }
+        if overflow {
+            return Err(format!(
+                "segment name {:?} in the path column is not a unitig id this graph can hold",
+                &s[start..i]
+            ));
+        }
+        out.push(PathStep { orient, node: id as u32 });
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -589,12 +638,39 @@ mod tests {
 
     #[test]
     fn path_parsing_handles_long_mixed_orientation() {
-        let steps = parse_path(">1<22>333<4444>5");
+        let steps = parse_path(">1<22>333<4444>5").expect("a well-formed path column");
         let got: Vec<(Orient, u32)> = steps.iter().map(|s| (s.orient, s.node)).collect();
         assert_eq!(got, vec![
             (Orient::Forward, 1), (Orient::Reverse, 22), (Orient::Forward, 333),
             (Orient::Reverse, 4444), (Orient::Forward, 5),
         ]);
+    }
+
+    /// WA-12. The walker writes the GFA these names come from and names every segment with a
+    /// plain unitig id, so anything else means the row was produced against some other graph.
+    /// The old reader skipped unknown bytes and dropped ids over `u32::MAX`, turning such a
+    /// row into a SHORTER walk, which then stitched into a sequence and was published with
+    /// the identity the row claimed.
+    #[test]
+    fn a_path_column_that_is_not_a_walk_of_this_graph_is_refused() {
+        // `*` stays what GAF says it is: no alignment, not a malformed row.
+        assert!(parse_path("*").expect("GAF's no-path placeholder").is_empty());
+        for bad in [
+            "chr1:100-200",        // a wrapper's own naming
+            ">1,>2",               // a separator this reader never understood
+            ">1>",                 // an orientation with no segment
+            ">18446744073709551616", // an id no graph can hold
+            "1>2",                 // no leading orientation
+        ] {
+            assert!(
+                parse_path(bad).is_err(),
+                "{bad:?} must be refused rather than silently mis-parsed"
+            );
+        }
+        // And the refusal reaches the caller as a failed parse of that GAF, not as a shorter
+        // path: the row below would otherwise have yielded the single step `>1`.
+        let gaf = "q\t10\t0\t10\t+\t>1,>2\t10\t0\t10\t9\t10\t60\n";
+        assert!(parse_gaf(gaf.as_bytes(), "q").is_err());
     }
 
     /// Best row is the one with the most residue matches (column 10), not the first.
@@ -779,7 +855,8 @@ mod tests {
                 id: name.into(), seq: vec![], cov: 1.0,
                 ref_cov: 1.0, ref_span: (0, 300),
                 pident: matches as f64 / 300.0 * 100.0,
-                pident_inherited: false, nodes: 1, mean_ka: 100.0, vaf: 1.0, anchor_used: None,
+                pident_inherited: false, nodes: 1, mean_ka: 100.0, vaf: 1.0,
+                two_allele_sites: 0, min_site_vaf: 1.0, anchor_used: None,
             };
             Candidate {
                 record_id: name.into(), pool_index: pool, ref_len: 300,

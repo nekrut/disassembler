@@ -56,7 +56,10 @@ INPUT:
     -q, --query <FASTA>           Reference CDS FASTA. Repeatable, and each file may hold
                                   multiple records; two or more references switches on
                                   multi-anchor mode (union anchor pool, primary is the
-                                  reference whose alignment gives the best cov/pident)
+                                  reference whose alignment gives the best cov/pident).
+                                  References must be strains of ONE gene: one primary is kept
+                                  per accession, so a pool of different genes reports only the
+                                  winner. The walker warns when the pool splits into groups
 
 OUTPUT:
     -o, --out-dir <DIR>           Working directory
@@ -65,7 +68,9 @@ OUTPUT:
 TUNING:
     -k, --k <N>                   Anchor k-mer size, 1..=32 [default: 21]
         --hops <N>                Hop radius for subgraph expansion [default: 5]
-        --min-abund <F>           Minimum ka:f for a variant [default: 5.0]
+        --min-abund <F>           Minimum ka:f for a variant [default: 5.0]. The allele
+                                  floor only: it does not move the prune floor, which is
+                                  --prune-min-abund
         --min-vaf <F>             Minimum VAF for an alternative branch [default: 0.10]
         --min-abund-frac <F>      Raise the variant floor to this fraction of gene depth,
                                   median ka:f on the walked path [default: 0.0 = off]
@@ -103,6 +108,10 @@ TUNING:
                                   realignment is kept only if it spans as much of the
                                   reference, give or take a terminal codon. 0.0 disables it
                                   [default: 0.01]
+        --prune-min-abund <F>     Floor under --prune-frac: a unitig at or above this ka:f
+                                  survives the prune whatever the fraction works out to
+                                  [default: 5.0]. On a gene shallower than
+                                  prune-min-abund / prune-frac this is the whole rule
         --alt-max-detour <N>      Unitigs an alternative allele may traverse before it must
                                   rejoin the main route [default: 100]
     -t, --threads <N>             Threads per GraphAligner invocation, at least 1 [default: 1;
@@ -274,6 +283,10 @@ fn parse_args(argv: &[String]) -> error::Result<Args> {
             }
             "--hops" => {
                 args.cfg.hops = value()?.parse().map_err(|e| error::Error::Usage(format!("--hops: {e}")))?;
+            }
+            "--prune-min-abund" => {
+                args.cfg.prune_min_abund =
+                    finite_in("--prune-min-abund", &value()?, 0.0, f64::MAX)? as f32;
             }
             "--min-abund" => {
                 args.cfg.min_abund = finite_in("--min-abund", &value()?, 0.0, f64::MAX)? as f32;
@@ -574,6 +587,55 @@ fn decision_lines(results: &[types::AccessionResult], guard: f64) -> Vec<String>
     lines
 }
 
+/// WP-02. Say so when the `-q` pool is not one gene.
+///
+/// Multi-anchor mode ranks every reference against every other and keeps one primary per
+/// accession. That is what it is for across strains of a gene; across *different* genes it
+/// silently answers a different question than the user asked, because an accession carrying
+/// both genes comes back with whichever scored higher, exit 0, and the other one appears only
+/// as an unselected candidate in `summary.json`. 0.1.0 printed "One gene per query" for a
+/// multi-record `-q`; 0.1.1 dropped the warning and put nothing in its place, while the README
+/// goes on listing the 25-gene master target file among the references to start from.
+///
+/// A warning and not a refusal: a deliberately divergent panel also splits, and the walker
+/// cannot know which the user meant. Returns the line to print, or `None` when the pool is one
+/// group, so a test can read it without running the binary.
+fn mixed_gene_warning(cfg: &config::Config, queries: &[types::Query]) -> Option<String> {
+    let seqs: Vec<&[u8]> = queries.iter().map(|q| q.seq.as_slice()).collect();
+    let groups = stages::anchor::reference_groups(cfg.k, &seqs, stages::anchor::GROUP_MIN_SHARE);
+    if groups.len() < 2 {
+        return None;
+    }
+    // Named by the first record of each group, which is enough to recognise the gene, with
+    // the rest of the group as a count: a 25-gene panel must stay one readable line.
+    const SHOWN: usize = 6;
+    let names: Vec<String> = groups
+        .iter()
+        .take(SHOWN)
+        .map(|g| match g.len() {
+            1 => format!("[{}]", queries[g[0]].record_id),
+            n => format!("[{} +{}]", queries[g[0]].record_id, n - 1),
+        })
+        .collect();
+    let more = if groups.len() > SHOWN {
+        format!(" and {} more", groups.len() - SHOWN)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "[warn] multi-anchor: the {} references fall into {} groups sharing under {:.0}% of \
+         their {}-mers ({}{}); one primary is kept per accession, so an accession carrying \
+         more than one of these genes reports only the winner and the rest stay unselected \
+         candidates in summary.json",
+        queries.len(),
+        groups.len(),
+        stages::anchor::GROUP_MIN_SHARE * 100.0,
+        cfg.k,
+        names.join(" "),
+        more
+    ))
+}
+
 fn check_run(results: &[types::AccessionResult], allow_empty: bool) -> error::Result<()> {
     let total = results.len();
     let success = results.iter().filter(|r| r.outcome == types::Outcome::Success).count();
@@ -692,8 +754,15 @@ fn real_main(mut args: Args) -> error::Result<()> {
         (Some(a), None) => {
             // The list path has always validated; `-a` did not, though the value reaches the
             // same URL and the same two filesystem paths.
-            io::input::validate_accession(a, "--accession")?;
-            (vec![a.clone()], 1)
+            let acc = io::input::validate_accession(a, "--accession")?;
+            // WF-12: `-a srr8209082` used to 404 and be recorded as `no_logan_data`, a
+            // biological negative about a run Logan does have.
+            if acc != *a {
+                eprintln!(
+                    "[warn] --accession {a:?} read as {acc:?}: Logan's bucket is                      case-sensitive, and the output files use the uppercase form"
+                );
+            }
+            (vec![acc], 1)
         }
         (None, Some(p)) => io::input::read_accession_list_counted(p)?,
         (None, None) => {
@@ -1001,6 +1070,9 @@ fn real_main(mut args: Args) -> error::Result<()> {
             args.query.len(),
             args.cfg.primary_metric.as_str()
         );
+        if let Some(line) = mixed_gene_warning(&args.cfg, &queries) {
+            eprintln!("{line}");
+        }
     }
 
     let mut summary = pipeline::run(&args.cfg, accessions, &queries)?;
@@ -1114,7 +1186,7 @@ mod flag_tests {
             match flag {
                 "--min-cov" | "--min-vaf" | "--prune-frac" | "--min-abund-frac"
                 | "--primary-tie-eps" => Some("0.5"),
-                "--min-abund" => Some("5"),
+                "--min-abund" | "--prune-min-abund" => Some("5"),
                 "--max-alts" | "--max-alt-indel" | "--alt-max-detour" | "--hops"
                 | "--min-shared-kmers" | "--max-size-mb" | "-w" | "--workers"
                 | "--fetch-workers" | "-t" | "--threads" | "-k" | "--graph-k"
@@ -1240,7 +1312,7 @@ mod range_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{at_least_one, check_fetch, check_run, decision_lines, parse_args};
+    use super::{at_least_one, check_fetch, check_run, decision_lines, mixed_gene_warning, parse_args};
     use crate::error::Error;
     use crate::types::{AccessionResult, Outcome};
 
@@ -1254,6 +1326,53 @@ mod tests {
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    /// WP-02. Two unrelated genes in the anchor pool must draw a warning naming them, and a
+    /// panel of one gene's strains must not. A pool of different genes is not refused: the
+    /// walker cannot know whether the user meant a catalogue or a panel, and only one of the
+    /// two is a mistake.
+    #[test]
+    fn a_pool_of_different_genes_is_called_out_and_a_strain_panel_is_not() {
+        let seq = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed;
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    b"ACGT"[((x >> 33) & 3) as usize]
+                })
+                .collect()
+        };
+        let query = |id: &str, s: Vec<u8>| crate::types::Query {
+            name: "panel".into(),
+            record_id: id.into(),
+            seq: s,
+            path: std::path::PathBuf::from("panel.fa"),
+            n_records: 2,
+        };
+        let cfg = crate::config::Config::default();
+
+        let gene_a = seq(11, 900);
+        let gene_b = seq(22, 900);
+        let line = mixed_gene_warning(&cfg, &[
+            query("bla_KPC", gene_a.clone()),
+            query("bla_NDM", gene_b),
+        ])
+        .expect("two unrelated genes must warn");
+        assert!(line.starts_with("[warn] multi-anchor:"), "{line}");
+        assert!(line.contains("2 groups"), "{line}");
+        assert!(line.contains("[bla_KPC]") && line.contains("[bla_NDM]"), "{line}");
+        assert!(line.contains("21-mers"), "the threshold is in anchor k-mers: {line}");
+
+        // Two strains of one gene: 9 substitutions in 900 bases.
+        let mut strain = gene_a.clone();
+        for i in (0..strain.len()).step_by(100) {
+            strain[i] = if strain[i] == b'A' { b'C' } else { b'A' };
+        }
+        assert!(
+            mixed_gene_warning(&cfg, &[query("wuhan", gene_a), query("jn1", strain)]).is_none(),
+            "a strain panel is exactly what multi-anchor mode is for"
+        );
     }
 
     #[test]

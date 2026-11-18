@@ -173,9 +173,11 @@ cmp_fixture() {  # got fixture label
   fi
 }
 
-# bubbles.json is gated by content where it is small and by sha256 where it is not:
-# SRR8209082 has 3,632 bubbles and a 1 MB file, which does not belong in the repository and
-# could not be read as a diff anyway. It is regenerable, so a checksum is the right gate.
+# bubbles.json is gated by content where it is small and by sha256 where it is not. All three
+# are gated by content now: SRR8209082's file was 1 MB of 3,632 bubbles, none of whose alleles
+# reached 0.5% of the gene's depth, and WG-03 took it to zero, so the checksum it used to be
+# gated by has been replaced with the file itself. The sha256 branch is kept for the next
+# accession whose file is too large to read as a diff.
 cmp_bubbles() {  # got tag
   local got="$1" tag="$2"
   local body="$ROOT/bench/golden/default/$tag.bubbles.json"

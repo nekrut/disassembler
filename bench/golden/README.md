@@ -83,6 +83,55 @@ record and the VCF and SNV table each gain a row, which is the other half of WV-
 alleles were previously neither corrected nor reported. `ERR2028820` and `SRR12363134` are
 byte-identical through the change; only their summaries moved, for the new fields.
 
+### The bubble fixtures, and one that stopped needing a checksum (2026-11-18)
+
+WG-03, WG-04 and WG-11 changed what `bubbles.json` holds. `ERR2028820` keeps its single bubble
+(7.7x against 46.3x in a 180x gene, which clears a depth-relative floor as easily as the old
+absolute one) and gains the new `flanks` list. `SRR12363134` is unchanged at none.
+
+`SRR8209082` goes from **3,632 bubbles to none**, and its summary's `bubbles` count with it.
+That file was 1 MB and was gated by sha256 for exactly that reason; it is now eight lines, so
+the checksum fixture is gone and the file itself is committed and diffable. Worth stating why
+zero is the right answer: every one of the 3,632 had its strongest allele at 66x or less
+against a 15,000x gene, a median of 11.9x, and the accession's one real second population was
+never among them. That one rejoins the route after 31 unitigs (`detour=31` on its alt record),
+which is a detour this stage does not follow, so it is in the VCF, the SNV table and the alt
+FASTA, exactly as before.
+
+Every other gated output is byte-identical across this change.
+
+### Re-captured again for the mixture fields (2026-11-18)
+
+WA-04 added `min_vaf=` to the primary's FASTA header, the measured counterpart of the constant
+`vaf=1.00`, plus `mixed=1` when the route crosses two or more two-allele sites. WG-07 added the
+`no_links` outcome. So the three `primary.fasta` headers and the three summaries moved again:
+the headers gain `min_vaf=`, `discards.accessions` gains `no_links`, `cohort` gains `mixed`,
+and each `variants` block gains `two_allele_sites` and `min_site_vaf`. **Every sequence, alt,
+bubble, SNV table and VCF is byte-identical.**
+
+The numbers are worth recording, because the gated fixtures are what set the mixture rule.
+`ERR2028820` and `SRR12363134` come back `min_vaf=1.000` with no `mixed` tag, which is what a
+clonal isolate should say. `SRR8209082` reports `min_vaf=0.690`: it has exactly one two-allele
+site, the 69/31 fork its alt record already described, and one site is a variant rather than a
+phasing problem, so it is not flagged either.
+
+An earlier, looser rule (any second allele over both frequency floors) labelled `ERR2028820`
+`mixed=1` on the strength of four branches that are all length-changing or never rejoin: 2 over
+the 30 nt indel cap, 1 frameshifting, 1 no rejoin. Those are de Bruijn artifacts, not a second
+population. The rule counts substitution alleles only, and this fixture is the measurement that
+set it.
+
+### The summaries were re-captured for the split prune floor (2026-11-18)
+
+WG-05 gave the prune its own lower bound, `--prune-min-abund`, so that `--min-abund` no longer
+moves the floor unitigs are deleted at. The setting appears in the `settings` block, which is
+gated, so all three summary fixtures were re-captured from a cold (uncached) run. **Every other
+gated output is byte-identical**: the only change in the three files is the line
+`"prune_min_abund": 5.0`, which is the same value `min_abund` supplied before, so a default run
+prunes exactly as it did. WG-02 landed in the same batch and changed nothing here, which is
+itself worth recording: all three accessions tag every record with `ka:f`, so none of them
+carries the new `abundance_missing` field.
+
 ### The summary is gated too (new in 0.2.0)
 
 Each default-flag accession also has a `<tag>.summary.json` fixture, compared with its

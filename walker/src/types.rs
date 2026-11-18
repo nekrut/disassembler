@@ -595,6 +595,23 @@ pub struct UnitigGraph {
     /// That saves the ~1.9 MB of padding byte-alignment would cost on a 1.28M-unitig
     /// accession, at the price of a shift in `decode_seq`.
     pub seq_offset: Vec<u32>,
+    /// WG-07: `L:` link tokens read from the whole file, counted in pass 1.
+    ///
+    /// Zero means the graph has no adjacency at all, which is a property of the object rather
+    /// than of the neighbourhood: nothing can be walked across unitigs, the GFA comes out with
+    /// `S` lines and no `L` lines, and an accession that finds no path is reporting the file
+    /// and not the sample. See [`Outcome::NoLinks`]. Counted rather than stored as a flag
+    /// because `offsets`/`targets` are rewritten to the neighbourhood by `collect`, so by the
+    /// time the outcome is decided the graph no longer holds the answer.
+    pub n_links: u64,
+    /// WG-02: records in the whole file that carried neither `ka:f:` nor `km:f:`.
+    ///
+    /// Counted over every record by `parse::scan`, not over the neighbourhood, because the
+    /// question it answers is whether this accession's abundances can be believed at all.
+    /// A non-zero count means the depth-based stages ran against zeros for those unitigs:
+    /// the prune floor collapses, no fork has a majority, no branch clears `--min-abund`.
+    /// Reported as `abundance_missing` in `summary.json` and warned about once per accession.
+    pub abundance_missing: u64,
 }
 
 impl UnitigGraph {
@@ -909,7 +926,23 @@ pub struct Haplotype {
     /// used to decide prune floors, see `stages::extract::path_depth`, which is a median.
     pub mean_ka: f64,
     /// Variant allele frequency at the defining fork (1.0 if primary backbone).
+    ///
+    /// For the primary this is the constant 1.0 and always has been, which is the WA-04
+    /// defect: see `min_site_vaf` for the measured number. Kept for one release because it is
+    /// in every parser written against the header so far.
     pub vaf: f64,
+    /// WA-04: forks on this haplotype's route carrying a second allele over both floors.
+    ///
+    /// Copied from [`VariantStats::two_allele_sites`] by the pipeline, after the majority
+    /// correction has settled which route is published. Two or more means the sequence is a
+    /// combination of alleles nothing phases, so it is reported as `mixed=1` in the FASTA
+    /// header: a connected path cannot be a chimera of unsupported joins, but it can be a
+    /// chimera of unlinked sites, and downstream it reads as excess substitutions and
+    /// recombination.
+    pub two_allele_sites: usize,
+    /// WA-04: the lowest frequency of any allele this haplotype carries, 1.0 when its route
+    /// passes no two-allele site. Published as `min_vaf=` in the FASTA header.
+    pub min_site_vaf: f64,
     /// Reference record id this haplotype was scored against. `None` on the single-anchor
     /// path (byte-identical output legacy contract); `Some(record_id)` in multi-anchor mode,
     /// where downstream tools need to know which of the pool the `cov` and `pident` numbers
@@ -987,6 +1020,17 @@ pub struct Bubble {
     pub fork_strand: Strand,
     pub merge: UnitigId,
     pub merge_strand: Strand,
+    /// Every pair of flanks this same allele set was found between, the first of which is
+    /// `fork`/`merge` above.
+    ///
+    /// WG-04. One record used to be emitted per (fork, merge) pair, so an allele set
+    /// reachable between several flanks was reported several times with identical branches
+    /// and VAFs: `SRR8209082` gave 3,632 records for 317 distinct allele sets, one of them
+    /// repeated 16 times, and two SNPs exactly k apart form a bow-tie that counted as four
+    /// bubbles. Since `n_bubbles` is read as a diversity signal, that inflation was a
+    /// property of local topology rather than of the sample. The record is now keyed on the
+    /// alleles and the flanks are listed.
+    pub flanks: Vec<(UnitigId, Strand, UnitigId, Strand)>,
     pub branches: Vec<Branch>,
     /// A branch of this bubble is at [`KA_CEILING`], so every `vaf` on it is computed against
     /// a lower-bound total and is overstated (WV-03).
@@ -1063,6 +1107,21 @@ pub enum Outcome {
     /// term left after `--max-size-mb` stops governing. Its own status, because the remedy is
     /// different: a bigger cap or a more specific reference, not a bigger machine.
     SubgraphTooLarge,
+    /// The whole unitig file carried no `L:` link, so the graph has no adjacency to walk.
+    ///
+    /// WG-07. Logan publishes such objects: the first 256 KiB of `ERR3988483` has 0 links in
+    /// 15,864 headers and `ERR3988478` 0 in 21,370, against 9,752 of 10,070 for `SRR8209082`.
+    /// A gene that spans more than one unitig cannot be reconstructed from an edgeless graph,
+    /// and the walker used to report that as `no_path`, which is the same word it uses for
+    /// "this accession does not carry the gene". They are different findings: one is about
+    /// the sample, the other about the file, and a cohort report that cannot tell them apart
+    /// understates how often the gene is present.
+    ///
+    /// A negative, not an error, for the same reason `no_logan_data` is: the walker read what
+    /// Logan published and Logan published a graph with no edges. An accession whose gene
+    /// fits inside a single unitig still reconstructs and is still `success`; this outcome is
+    /// reported only when nothing was walked.
+    NoLinks,
     Failed,
 }
 
@@ -1078,6 +1137,7 @@ impl Outcome {
                 | Outcome::NoLoganData
                 | Outcome::TooLarge
                 | Outcome::SubgraphTooLarge
+                | Outcome::NoLinks
         )
     }
 }
@@ -1100,7 +1160,7 @@ pub struct Timing {
 /// Until 0.2.0 every one of these numbers existed only as an `eprintln!`, so a run that
 /// recovered nothing because every candidate was refused and a run with no candidates at all
 /// produced identical summaries. `docs/summaries.md` rule 3: everything printed is recorded.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct VariantStats {
     /// Depth and floor the gates were applied at.
     pub depth: f32,
@@ -1108,6 +1168,28 @@ pub struct VariantStats {
     /// Forks the walked route passes through, and how many had exactly one viable alternative.
     pub forks: usize,
     pub biallelic: usize,
+    /// WA-04. Forks ON the published route carrying a second allele that clears both floors
+    /// **and is a substitution**, counted as **sites** rather than as alleles (`biallelic`
+    /// counts a three-branch fork twice). Two or more of them is a mixture: the alleles are
+    /// further apart than k - 1, so no k-mer links them, the primary takes one branch at each
+    /// independently, and the combination it publishes may be carried by no molecule.
+    ///
+    /// Substitutions only, because a length-changing branch in a de Bruijn graph is usually
+    /// an artifact rather than a population: 190 of 203 length-changing calls across the
+    /// project's panel are plus or minus one base in a homopolymer. `ERR2028820`, the clonal
+    /// control, has four branches over both floors and every one of them is length-changing
+    /// or never rejoins, so a rule that counted them would have called it a mixture.
+    ///
+    /// Measured whether or not any variant output was asked for, because a `mixed=0` that was
+    /// never computed is the defect this field exists to close.
+    pub two_allele_sites: usize,
+    /// The lowest frequency any allele the primary carries has at its own site, or 1.0 when
+    /// the route passes no two-allele site.
+    ///
+    /// This is what the FASTA header's hard-coded `vaf=1.00` always claimed and never
+    /// measured: a primary stitched through a 55% and a 60% allele is not a clonal sequence,
+    /// and a reader of `reconstructed.fasta` had no field that said so.
+    pub min_site_vaf: f64,
     /// Alternatives actually emitted.
     pub recovered: usize,
     /// Credible alleles that cleared every gate but did not fit under `--max-alts`
@@ -1122,6 +1204,31 @@ pub struct VariantStats {
     pub frameshifting: usize,
     pub window_not_shiftable: usize,
     pub identical: usize,
+}
+
+impl Default for VariantStats {
+    /// Hand-written for one field: `min_site_vaf` is a frequency, and "no site" is 1.0, not
+    /// 0.0. A derived default would publish `min_vaf=0.00` on every clonal primary, which
+    /// reads as the opposite of what it means.
+    fn default() -> Self {
+        Self {
+            depth: 0.0,
+            floor: 0.0,
+            forks: 0,
+            biallelic: 0,
+            two_allele_sites: 0,
+            min_site_vaf: 1.0,
+            recovered: 0,
+            beyond_cap: 0,
+            indels: 0,
+            no_rejoin: 0,
+            not_substitution: 0,
+            over_indel_cap: 0,
+            frameshifting: 0,
+            window_not_shiftable: 0,
+            identical: 0,
+        }
+    }
 }
 
 /// The value Logan's `ka:f` stops at.
@@ -1225,6 +1332,13 @@ pub struct AccessionResult {
     pub accession: Accession,
     pub outcome: Outcome,
     pub n_unitigs: usize,
+    /// WG-02: unitigs in this accession's file carrying neither `ka:f:` nor `km:f:`.
+    ///
+    /// Copied from [`UnitigGraph::abundance_missing`], so it is a count over the whole file
+    /// rather than the neighbourhood. Written to `summary.json` only when non-zero: an
+    /// ordinary Logan object tags every record, and a reader should not have to learn a field
+    /// that is always 0.
+    pub abundance_missing: u64,
     pub n_anchors: usize,
     pub subgraph_nodes: usize,
     pub haplotype: Option<Haplotype>,
@@ -1294,9 +1408,46 @@ pub enum PruneResult {
     RefusedShorterSpan,
     /// The realignment produced no haplotype; the first stands.
     RefusedNoHaplotype,
+    /// The realignment produced the first pass's haplotype with bases trimmed off an end and
+    /// nothing else changed; the first stands (WA-09).
+    ///
+    /// `pruned_covers_as_much` lets a prune give up up to three reference bases, because a
+    /// strict rule kept a reference-biased primary over one terminal codon. That tolerance is
+    /// worth paying only when the prune changed something; a shorter copy of the same
+    /// sequence is pure loss, and a lost terminal base can be a truncated stop codon.
+    RefusedTrimmed,
+    /// The second pass itself failed: GraphAligner aborted, the scratch filesystem filled, or
+    /// the pruned GFA could not be written. The first pass stands (WP-04).
+    ///
+    /// Before 0.2.0 this was not a prune outcome at all: the error propagated and an
+    /// accession that was already reconstructed became `error`, with no FASTA record and
+    /// `prune: null`.
+    RefusedError,
 }
 
 impl PruneResult {
+    /// Whether the prune ran and its result was thrown away, so the first-pass route stands.
+    ///
+    /// WP-01. That route is the one the aligner produced on the unpruned graph, which is
+    /// where its reference pull is strongest: the low-depth reference-matching branches the
+    /// prune exists to remove are still in the search space, and `prefer_majority` skips
+    /// sites whose alternative is below the variant floor, so nothing else corrects them
+    /// either. A refused prune is therefore a quality statement about the haplotype, not just
+    /// a note about a stage, and `summary.json` says so as `bias_uncorrected`.
+    ///
+    /// `WouldEmpty` counts: the floor was above every unitig, so no sub-floor branch was
+    /// removed. `NothingToRemove` does not: there was nothing to remove in the first place.
+    pub fn is_refusal(self) -> bool {
+        matches!(
+            self,
+            Self::WouldEmpty
+                | Self::RefusedShorterSpan
+                | Self::RefusedNoHaplotype
+                | Self::RefusedTrimmed
+                | Self::RefusedError
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Applied => "applied",
@@ -1304,6 +1455,8 @@ impl PruneResult {
             Self::WouldEmpty => "would_empty",
             Self::RefusedShorterSpan => "refused_shorter_span",
             Self::RefusedNoHaplotype => "refused_no_haplotype",
+            Self::RefusedTrimmed => "refused_trimmed",
+            Self::RefusedError => "refused_error",
         }
     }
 }
@@ -1340,6 +1493,7 @@ impl AccessionResult {
             accession,
             outcome,
             n_unitigs: 0,
+            abundance_missing: 0,
             n_anchors: 0,
             subgraph_nodes: 0,
             haplotype: None,
@@ -1446,6 +1600,7 @@ mod tests {
             Outcome::NoLoganData,
             Outcome::TooLarge,
             Outcome::SubgraphTooLarge,
+            Outcome::NoLinks,
             Outcome::Failed,
         ] {
             let expected = match o {
@@ -1454,7 +1609,8 @@ mod tests {
                 | Outcome::NoPath
                 | Outcome::NoLoganData
                 | Outcome::TooLarge
-                | Outcome::SubgraphTooLarge => true,
+                | Outcome::SubgraphTooLarge
+                | Outcome::NoLinks => true,
                 // Not negatives: one worked, the other broke.
                 Outcome::Success | Outcome::Failed => false,
             };
@@ -1481,6 +1637,8 @@ mod tests {
             seq_2bit: Vec::with_capacity(4096),
             seq_offset: Vec::new(),
             spool: None,
+            abundance_missing: 0,
+            n_links: 0,
         };
         g.seq_2bit.push(0);
         assert!(

@@ -14,8 +14,11 @@ gene's sequence in each run, and aligns the results in frame. It has two routes:
 - **The walker route** (kmindex, then `logan-walker`). A
   [kmindex](https://github.com/tlemane/kmindex) search names the candidate runs. For each run,
   `logan-walker` streams Logan's unitig graph from S3, anchors the reference by shared k-mers,
-  walks the local subgraph with GraphAligner, and reconstructs the full-length haplotype. It also
+  walks the local subgraph with GraphAligner, and reconstructs the full-length gene. It also
   recovers intra-host alternative alleles and can report them as VCFs or one long SNV table.
+  The sequence it publishes is a majority-consensus path, not a phased haplotype: where a
+  sample holds two strains differing at sites the graph does not link, the walker says so with
+  `mixed=1` in the FASTA header rather than presenting the combination as clonal.
 - **The LexicMap route.** A [LexicMap](https://github.com/IndexThePlanet/LexicMap) search of
   Logan's contigs is tiled onto the reference, checked for premature stop codons, sorted into
   clean and flagged tiers, and collapsed into unique haplotypes. It is much faster, because it
@@ -73,7 +76,10 @@ disassembler from-lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.
 ```
 
 `queries/` holds reference CDSs to start from: PfCRT, HIV-1 *pol*, 26 marker genes under
-`queries/markers/`, and a 160-record panel.
+`queries/markers/`, and `master_planetary_targets.fasta`, a 160-record catalogue spanning 25
+genes. The catalogue is a place to take a reference from, not a `-q` panel: the walker keeps
+one primary per accession, so a pool of different genes reports only one of them. Pass
+references that are strains of a single gene, as `panels/sarscov2_spike_11strains.fa` is.
 
 ## Commands
 

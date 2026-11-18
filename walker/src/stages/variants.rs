@@ -540,12 +540,13 @@ pub fn find_alts(
     path: &GafPath,
     query: &Query,
 ) -> Result<(Vec<AltHaplotype>, VariantStats)> {
-    // The sites feed both alt_haplotypes.fasta and the VCF, so compute them when either is
-    // wanted. Skipping the work only when neither output will use it.
-    if (!cfg.emit_alts && !cfg.emit_vcf && !cfg.emit_snv_table)
-        || path.steps.len() < 2
-        || subgraph.nodes.is_empty()
-    {
+    // WA-04. The fork scan now runs whatever the output flags say, and only the splicing is
+    // conditional. The scan is what decides `mixed=` and `min_vaf=` on the primary's own
+    // header, and a mixture flag that is computed only when alternatives were asked for is
+    // worse than none: `--no-emit-alts` would publish `mixed=0` for a sequence nobody looked
+    // at. A path with fewer than two steps, or no subgraph, genuinely has no fork.
+    let want_alts = cfg.emit_alts || cfg.emit_vcf || cfg.emit_snv_table;
+    if path.steps.len() < 2 || subgraph.nodes.is_empty() {
         return Ok((Vec::new(), VariantStats::default()));
     }
 
@@ -575,6 +576,9 @@ pub fn find_alts(
     // to know which gate is doing the work, not just the total.
     let (mut forks, mut biallelic, mut no_rejoin, mut not_substitution, mut identical) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
+    // WA-04: sites, not alleles, and the weakest allele the published route carries.
+    let mut two_allele_sites = 0usize;
+    let mut min_site_vaf = 1.0f64;
     let (mut rejected_large, mut rejected_frameshift, mut rejected_window, mut indels) =
         (0usize, 0usize, 0usize, 0usize);
     let mut deltas: Vec<i64> = Vec::new();
@@ -609,6 +613,7 @@ pub fn find_alts(
             continue;
         }
 
+        let mut second_allele_here = false;
         for &alt in branches {
             if alt == taken {
                 continue;
@@ -619,12 +624,6 @@ pub fn find_alts(
                 continue;
             }
             biallelic += 1;
-            // Counted after the gates, so this is "credible alleles we could not emit", not
-            // "branches we did not look at" (WV-06).
-            if alts.len() >= cfg.max_alts {
-                beyond_cap += 1;
-                continue;
-            }
             let Some((rejoin_at, detour)) = rejoin(&out, &at, alt, i, cfg.alt_max_detour) else {
                 no_rejoin += 1;
                 continue;
@@ -647,6 +646,34 @@ pub fn find_alts(
             // nothing that rejoins far downstream, which would be a shortcut deleting gene.
             let spliced_len = stitched_len(cfg, &steps, subgraph);
             let delta = spliced_len as i64 - baseline_len as i64;
+
+            // WA-04. A mixture site is one where the sample holds two POPULATIONS, and in a
+            // de Bruijn graph a length-changing branch is usually not one: the project's own
+            // panel found 190 of 203 length-changing calls to be plus or minus one base in a
+            // homopolymer, and this stage's own comment on large deltas says they are the
+            // route being sent through a different stretch of graph rather than an edited
+            // gene. So only an equal-length rejoining branch, a substitution, makes this fork
+            // count towards `mixed=`.
+            //
+            // Measured on the gated fixtures: `ERR2028820` has four branches that clear the
+            // abundance and frequency floors, and all four are length-changing or never
+            // rejoin (2 over the 30 nt indel cap, 1 frameshifting, 1 no rejoin). Counting
+            // those would have labelled the repository's clonal control a mixture, which is
+            // the measurement that set this rule.
+            if delta == 0 {
+                second_allele_here = true;
+            }
+            // Everything below builds the allele as a sequence, which only an output needs.
+            if !want_alts {
+                continue;
+            }
+            // Counted after the gates, so this is "credible alleles we could not emit", not
+            // "branches we did not look at" (WV-06). After the rejoin test too, so it means
+            // an allele the cap displaced rather than one that was never emittable.
+            if alts.len() >= cfg.max_alts {
+                beyond_cap += 1;
+                continue;
+            }
 
             // An allele that changes the length is an indel, and three things have to hold
             // before one is trustworthy enough to emit. See `shifted_window` for the first.
@@ -738,6 +765,14 @@ pub fn find_alts(
                 replaced_span,
             });
         }
+        // WA-04. One site, however many substitution alleles it holds, and the frequency of
+        // the one the primary took: two such sites more than k - 1 apart are independent
+        // choices that no read links, so the published sequence is a combination that may
+        // exist in no molecule. `vaf=1.00` in the header never said any of this.
+        if second_allele_here {
+            two_allele_sites += 1;
+            min_site_vaf = min_site_vaf.min(taken_vaf);
+        }
     }
     eprintln!(
         "[{}] variants: depth {:.1}x, floor {:.1}x; {} on-path fork(s), \
@@ -751,6 +786,14 @@ pub fn find_alts(
         rejected_large, cfg.max_alt_indel, rejected_frameshift, rejected_window,
         identical
     );
+    if !want_alts {
+        eprintln!(
+            "[{}] variants: no variant output requested, so alleles were counted and not \
+             built; the {} two-allele site(s) on the route are still reported as mixed= and \
+             min_vaf= on the primary",
+            subgraph.accession, two_allele_sites
+        );
+    }
     // WV-06: say it, rather than leaving the caller to infer truncation from a bubble count.
     if beyond_cap > 0 {
         eprintln!(
@@ -768,6 +811,8 @@ pub fn find_alts(
         floor,
         forks,
         biallelic,
+        two_allele_sites,
+        min_site_vaf,
         recovered: alts.len(),
         beyond_cap,
         indels,
@@ -879,20 +924,7 @@ fn shifted_window(
 }
 
 fn stitched_len(cfg: &Config, steps: &[PathStep], subgraph: &Subgraph) -> usize {
-    let overlap = cfg.graph_k.saturating_sub(1);
-    let mut total = 0usize;
-    for (i, step) in steps.iter().enumerate() {
-        let Ok(idx) = subgraph.nodes.binary_search(&step.node) else {
-            return usize::MAX;
-        };
-        let len = subgraph.seqs[idx].len();
-        total += if i == 0 {
-            len
-        } else {
-            len.saturating_sub(overlap)
-        };
-    }
-    total
+    stitch::stitched_len(cfg, steps, subgraph)
 }
 
 /// Shortest way from `alt` back onto the walked path, strictly after the fork.
@@ -995,6 +1027,109 @@ mod tests {
         query: &Query,
     ) -> Result<Option<GafPath>> {
         super::prefer_majority(cfg, graph, subgraph, path, query).map(|(path, _)| path)
+    }
+
+    /// Two diamonds in series: `0 -> {1,2} -> 3 -> {4,5} -> 6`, k=4. The walk takes 1 and 4.
+    ///
+    /// WA-04's shape. The two sites are joined only through node 3, which both strains carry,
+    /// so every combination of their alleles is a connected path and nothing in the graph
+    /// says which pairs occur together in a molecule.
+    fn two_diamonds(a_taken: f32, a_alt: f32, b_taken: f32, b_alt: f32) -> UnitigGraph {
+        let fa = format!(
+            ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n\
+             >T_1 ka:f:{a_taken}  L:-:0:-  L:+:3:+\nCGTA\n\
+             >T_2 ka:f:{a_alt}  L:-:0:-  L:+:3:+\nCGTC\n\
+             >T_3 ka:f:100.0  L:-:1:-  L:-:2:-  L:+:4:+  L:+:5:+\nGTAG\n\
+             >T_4 ka:f:{b_taken}  L:-:3:-  L:+:6:+\nTAGA\n\
+             >T_5 ka:f:{b_alt}  L:-:3:-  L:+:6:+\nTAGC\n\
+             >T_6 ka:f:100.0  L:-:4:-  L:-:5:-\nAGAT\n"
+        );
+        parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.into_bytes())), u64::MAX).unwrap()
+    }
+
+    /// The route through both diamonds, taking branch 1 and then branch 4.
+    fn walked_two() -> GafPath {
+        GafPath {
+            steps: vec![
+                PathStep { orient: Orient::Forward, node: 0 },
+                PathStep { orient: Orient::Forward, node: 1 },
+                PathStep { orient: Orient::Forward, node: 3 },
+                PathStep { orient: Orient::Forward, node: 4 },
+                PathStep { orient: Orient::Forward, node: 6 },
+            ],
+            query_start: 0,
+            query_end: 8,
+            path_len: 8,
+            path_start: 0,
+            path_end: 8,
+            num_matches: 99,
+            aln_len: 100,
+        }
+    }
+
+    /// WA-04. A primary that passes two two-allele sites is a combination of alleles nothing
+    /// links: in a k = 31 graph the sites are joined through unitigs both strains carry, so
+    /// the walk chooses at each independently and may publish a sequence carried by no
+    /// molecule. The header said `vaf=1.00` and nothing said this.
+    #[test]
+    fn two_sites_on_the_route_are_counted_and_the_weakest_allele_is_reported() {
+        let g = two_diamonds(60.0, 40.0, 55.0, 45.0);
+        let sub = subgraph_of(&g);
+        let (_, stats) =
+            super::find_alts(&cfg(true), &g, &sub, &walked_two(), &q("ACGTAGAT")).expect("find_alts");
+        assert_eq!(stats.forks, 2, "the route passes two forks");
+        assert_eq!(stats.two_allele_sites, 2, "both carry a credible second allele");
+        assert!(
+            (stats.min_site_vaf - 0.55).abs() < 1e-9,
+            "the weakest allele the primary carries is the 55% one, got {}",
+            stats.min_site_vaf
+        );
+        // Sites, not alleles: `biallelic` counts one per alternative and is the number the
+        // alt writer needs. Here they agree, which is what makes the distinction checkable
+        // in the three-branch case below.
+        assert_eq!(stats.biallelic, 2);
+    }
+
+    /// A site is one fork however many alleles hang off it, and a clonal route has none.
+    #[test]
+    fn a_three_branch_fork_is_one_site_and_a_clonal_route_is_none() {
+        // Node 0 forks three ways: 1 (taken, 50), 2 (30) and a third at 20, all rejoining.
+        let fa = ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+  L:+:4:+\nACGT\n\
+                  >T_1 ka:f:50.0  L:-:0:-  L:+:3:+\nCGTA\n\
+                  >T_2 ka:f:30.0  L:-:0:-  L:+:3:+\nCGTC\n\
+                  >T_3 ka:f:100.0  L:-:1:-  L:-:2:-  L:-:4:-\nGTAG\n\
+                  >T_4 ka:f:20.0  L:-:0:-  L:+:3:+\nCGTG\n";
+        let g = parse::build(&"ACC".into(), Box::new(std::io::Cursor::new(fa.as_bytes().to_vec())), u64::MAX).unwrap();
+        let sub = subgraph_of(&g);
+        let (_, stats) =
+            super::find_alts(&cfg(true), &g, &sub, &walked(), &q("ACGTAG")).expect("find_alts");
+        assert_eq!(stats.two_allele_sites, 1, "one fork is one site");
+        assert_eq!(stats.biallelic, 2, "two alternatives hang off it");
+        assert!((stats.min_site_vaf - 0.5).abs() < 1e-9);
+
+        // The clonal case: the alternative is sequencing error, under the floor.
+        let g = diamond(100.0, 1.0);
+        let sub = subgraph_of(&g);
+        let (_, stats) =
+            super::find_alts(&cfg(true), &g, &sub, &walked(), &q("ACGTAG")).expect("find_alts");
+        assert_eq!(stats.two_allele_sites, 0);
+        assert_eq!(stats.min_site_vaf, 1.0, "no site means no weakest allele, which is 1.0");
+    }
+
+    /// WA-04. The mixture scan must not depend on the output flags. It decides `mixed=` on
+    /// the primary's own header, and `--no-emit-alts` used to skip the whole stage, so the
+    /// flag would have been computed for a run that asked for alternatives and guessed for
+    /// one that did not.
+    #[test]
+    fn the_mixture_is_measured_even_when_no_variant_output_is_wanted() {
+        let g = two_diamonds(60.0, 40.0, 55.0, 45.0);
+        let sub = subgraph_of(&g);
+        let quiet = Config { emit_alts: false, emit_vcf: false, emit_snv_table: false, ..cfg(true) };
+        let (alts, stats) =
+            super::find_alts(&quiet, &g, &sub, &walked_two(), &q("ACGTAGAT")).expect("find_alts");
+        assert!(alts.is_empty(), "no allele file was asked for");
+        assert_eq!(stats.two_allele_sites, 2, "the sites are still counted");
+        assert!((stats.min_site_vaf - 0.55).abs() < 1e-9);
     }
 
     /// A diamond: node 0 forks to either 1 or 2, both rejoin at 3. k=4, so overlap is 3 and

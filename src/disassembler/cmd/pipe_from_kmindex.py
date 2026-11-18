@@ -148,7 +148,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                                "Repeatable, and each file may hold multiple records; "
                                "passing more than one record activates the walker's "
                                "multi-anchor mode (union anchor pool, primary is the "
-                               "reference whose alignment gives the best cov/pident).")
+                               "reference whose alignment gives the best cov/pident). Those "
+                               "records must be strains of ONE gene: one primary is kept per "
+                               "accession, so a pool of different genes reports only the "
+                               "winner.")
     g_walker.add_argument("--msa-reference", default=None,
                           help="FASTA to use as the reference for the MSA/tree stage in "
                                "multi-anchor mode (default: the first -q). Ignored under "
@@ -182,7 +185,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                                "of the majority allele at each variant site.")
     g_walker.add_argument("--min-abund", type=positive_float, default=None,
                           help="Minimum ka:f (k-mer abundance) for a variant to be kept "
-                               "(walker's own default: 5.0).")
+                               "(walker's own default: 5.0). This is the allele floor only; "
+                               "the prune's lower bound is the walker's --prune-min-abund, "
+                               "which you can pass after a literal `--`.")
     g_walker.add_argument("--min-vaf", type=fraction, default=None,
                           help="Minimum variant allele fraction for an alternative branch "
                                "to be emitted (walker's own default: 0.10).")

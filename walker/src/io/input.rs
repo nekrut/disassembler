@@ -68,14 +68,28 @@ pub fn read_accession_list_counted(path: &Path) -> Result<(Vec<Accession>, usize
     })?;
 
     let mut out = Vec::new();
+    let mut uppercased = 0usize;
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
         // Trimming first is forgiving and treats an indented comment as a comment.
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        validate_accession(line, &format!("{}:{}", path.display(), lineno + 1))?;
-        out.push(line.to_string());
+        let acc = validate_accession(line, &format!("{}:{}", path.display(), lineno + 1))?;
+        // WF-12: counted rather than warned per line, because a 5,000-accession list written
+        // in lowercase would otherwise print 5,000 warnings.
+        if acc != line {
+            uppercased += 1;
+        }
+        out.push(acc);
+    }
+    if uppercased > 0 {
+        eprintln!(
+            "[warn] {uppercased} accession(s) in {} were not uppercase and have been read as \
+             SRA run accessions (srr123 as SRR123); Logan's bucket is case-sensitive, and the \
+             output files use the uppercase form",
+            path.display()
+        );
     }
 
     if out.is_empty() {
@@ -107,7 +121,7 @@ pub fn read_accession_list_counted(path: &Path) -> Result<(Vec<Accession>, usize
 /// to take a path and a line number, which is why only the `--accession-list` path could call
 /// it: `-a` therefore accepted anything, and the value reaches `s3://logan-pub/u/<acc>/…`,
 /// the scratch GFA name and `<out_dir>/<acc>.vcf`, so `-a ../../foo` escaped both directories.
-pub fn validate_accession(s: &str, source: &str) -> Result<()> {
+pub fn validate_accession(s: &str, source: &str) -> Result<String> {
     if s.is_empty() {
         return Err(Error::Usage(format!("{source}: empty accession")));
     }
@@ -130,13 +144,27 @@ pub fn validate_accession(s: &str, source: &str) -> Result<()> {
     }
     // Logan run accessions are SRR/ERR/DRR followed by digits. Warn rather than reject,
     // since the bucket's naming is not ours to constrain.
-    let looks_right = s.len() > 3
-        && matches!(&s[..3], "SRR" | "ERR" | "DRR")
-        && s[3..].bytes().all(|b| b.is_ascii_digit());
-    if !looks_right {
-        eprintln!("[warn] {source}: {s:?} does not look like an SRA run accession");
+    let sra_shaped = |x: &str| {
+        x.len() > 3
+            && matches!(&x[..3], "SRR" | "ERR" | "DRR")
+            && x[3..].bytes().all(|b| b.is_ascii_digit())
+    };
+    if sra_shaped(s) {
+        return Ok(s.to_string());
     }
-    Ok(())
+    // WF-12. The bucket is case-sensitive, so `srr8209082` fetched verbatim is a 404, and a
+    // 404 is `no_logan_data`: "Logan has nothing for this accession". For a run Logan does
+    // have, that is a silent false negative, and `--allow-empty` turns it into exit 0 with an
+    // empty FASTA. Uppercasing is safe because the SRA's own run accessions are uppercase, so
+    // a value that is one only once uppercased was meant to be one. The canonical form is
+    // returned rather than only checked, so the URL, the cache path, the dedup and the output
+    // file names all agree on a single spelling.
+    let upper = s.to_ascii_uppercase();
+    if sra_shaped(&upper) {
+        return Ok(upper);
+    }
+    eprintln!("[warn] {source}: {s:?} does not look like an SRA run accession");
+    Ok(s.to_string())
 }
 
 /// Read the reference CDS: the first record, with `n_records` saying how many the file holds.
@@ -668,6 +696,28 @@ mod repo_files {
 #[cfg(test)]
 mod validation_tests {
     use super::validate_accession;
+
+    /// WF-12. The bucket is case-sensitive, so a lowercase accession 404s, and a 404 is
+    /// `no_logan_data`: a statement that Logan holds nothing for this run. For a run Logan
+    /// does hold, that is a false negative the output cannot be told apart from a real one,
+    /// and `--allow-empty` makes it exit 0.
+    #[test]
+    fn a_lowercase_sra_accession_is_read_as_the_accession_it_is() {
+        for (given, want) in [
+            ("srr8209082", "SRR8209082"),
+            ("Err2028820", "ERR2028820"),
+            ("drr286894", "DRR286894"),
+        ] {
+            assert_eq!(validate_accession(given, "--accession").unwrap(), want);
+        }
+        // Already canonical: returned unchanged, so nothing about today's runs moves.
+        assert_eq!(validate_accession("SRR8209082", "--accession").unwrap(), "SRR8209082");
+        // Not SRA-shaped either way: left exactly as given, because the bucket's naming is
+        // not the walker's to constrain and uppercasing could invent a different object.
+        for odd in ["odd_but_safe-1", "srr_8209082", "x123", "SRRabc"] {
+            assert_eq!(validate_accession(odd, "--accession").unwrap(), odd);
+        }
+    }
 
     /// The value reaches `s3://logan-pub/u/<acc>/…`, the scratch GFA name and
     /// `<out_dir>/<acc>.vcf`, so anything that can leave a directory must be refused.

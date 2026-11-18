@@ -131,7 +131,22 @@ pub fn expand(cfg: &Config, graph: &UnitigGraph, anchors: &Anchors) -> Result<Ve
 /// Every floor derived from the anchor set collapsed to `min_abund` and could not be swept.
 ///
 /// Median rather than mean, so one repeat-collapsed unitig cannot drag it.
-pub fn path_depth(graph: &UnitigGraph, steps: &[PathStep]) -> f32 {
+///
+/// **Unweighted, deliberately.** WP-01 asks for a k-mer-weighted median, on the reasoning that
+/// a route is not a list of equal things and short error unitigs can drag the estimate down.
+/// That was implemented and **measured, and it is wrong on this walker's data**: on
+/// `SRR8209082`, whose true depth is about 14,500x (see above), the step median gives 15,000x
+/// and the k-mer-weighted median gives **91.7x**, which collapses the floor to `--min-abund`
+/// and stops the prune removing anything. Forks went 136 -> 1,303, the primary changed, and
+/// its identity to the reference rose from 97.48% to 98.50%, which on a less-pruned graph is
+/// the reference pull the prune exists to remove rather than a better answer.
+///
+/// The reason is that a tangled neighbourhood's route threads long, low-coverage unitigs that
+/// are not the gene, while the gene itself is cut into short high-coverage pieces by its own
+/// variation. Weighting by sequence therefore weights the noise. Reconsider only with a
+/// measurement on an accession whose depth is independently known.
+pub fn path_depth(cfg: &Config, graph: &UnitigGraph, steps: &[PathStep]) -> f32 {
+    let _ = cfg;
     median_abundance(steps.iter().map(|s| graph.abundance_of(s.node)).collect())
 }
 
@@ -169,9 +184,16 @@ pub fn path_mean_ka(graph: &UnitigGraph, steps: &[PathStep]) -> f64 {
 
 /// The coverage a unitig must carry to survive a prune, given the gene's depth.
 ///
-/// Never below `min_abund`: this can only tighten the existing floor, never loosen it.
+/// `prune_frac` of the gene's depth, never below `prune_min_abund`, which is why a shallow
+/// gene is not pruned at a fraction of a read.
+///
+/// WG-05: the lower bound used to be `min_abund`, the *allele* floor, so `--min-abund 20` on
+/// a 60x gene silently moved this floor from 5.0 to 20.0 and could change the published
+/// primary, while on a gene under 500x every `--prune-frac` below `5/depth` meant the same
+/// thing. The two are separate settings now, with the same default each, so a default run
+/// prunes exactly as it did.
 pub fn depth_floor(cfg: &Config, depth: f32) -> f32 {
-    relative_floor(cfg.prune_frac, depth, cfg.min_abund)
+    relative_floor(cfg.prune_frac, depth, cfg.prune_min_abund)
 }
 
 /// A floor at `frac` of the gene's depth, never below `min_abund`.
@@ -207,16 +229,108 @@ pub fn prune_nodes(
     nodes: Vec<UnitigId>,
     seqs: Vec<Vec<u8>>,
     floor: f32,
+    protected: &std::collections::HashSet<UnitigId>,
 ) -> (Vec<UnitigId>, Vec<Vec<u8>>) {
     let mut kn = Vec::with_capacity(nodes.len());
     let mut ks = Vec::with_capacity(seqs.len());
     for (id, seq) in nodes.into_iter().zip(seqs) {
-        if survives(graph.abundance_of(id), floor) {
+        if kept_by_prune(graph, id, floor, protected) {
             kn.push(id);
             ks.push(seq);
         }
     }
     (kn, ks)
+}
+
+/// Whether a prune at `floor` keeps unitig `id`. **The one predicate**: `prune_nodes` and the
+/// surviving-node count in `pipeline::run_one` must agree, or the count the summary reports
+/// describes a different prune from the one performed (TW-06).
+pub fn kept_by_prune(
+    graph: &UnitigGraph,
+    id: UnitigId,
+    floor: f32,
+    protected: &std::collections::HashSet<UnitigId>,
+) -> bool {
+    survives(graph.abundance_of(id), floor) || protected.contains(&id)
+}
+
+/// Route unitigs that are below `floor` but are the only way through at that point (WP-01).
+///
+/// The prune floor is one number for the whole gene, and `prune_nodes` drops every unitig
+/// below it. That is right for a reference-matching error branch sitting beside a deep true
+/// allele, which is what the prune exists to remove. It is wrong for a stretch of the gene
+/// that is genuinely covered below the floor: amplicon dropout, a 3' fall-off, any uneven
+/// coverage. Removing it cuts the route in two, the realignment cannot span the reference,
+/// the prune is refused, and the reference-pulled first-pass route stands with its reference
+/// alleles intact. `prefer_majority` then skips those sites too, so nothing corrects them and
+/// the only trace is `prune.outcome`.
+///
+/// The test is whether the route had a **choice**. For each sub-floor route unitig, look at
+/// the branch points on either side of it: the edges leaving the predecessor from the end the
+/// route leaves by, and the edges entering the successor from the end the route enters by. If
+/// any sibling there clears the floor, the aligner could have gone that way and this unitig is
+/// a droppable alternative. If no sibling does, this unitig is the gene and it is protected.
+///
+/// Route ends count as "no sibling": there is nothing on that side to choose between.
+pub fn protected_route_nodes(
+    graph: &UnitigGraph,
+    steps: &[PathStep],
+    floor: f32,
+) -> Result<std::collections::HashSet<UnitigId>> {
+    let mut protected = std::collections::HashSet::new();
+    let mut row: Vec<u32> = Vec::new();
+    let read = |graph: &UnitigGraph, id: UnitigId, row: &mut Vec<u32>| -> Result<()> {
+        graph.edges_by_id_into(id, row).map_err(|e| Error::Parse {
+            accession: graph.accession.clone(),
+            detail: format!("reading adjacency for unitig {id}: {e}"),
+        })
+    };
+    for (i, step) in steps.iter().enumerate() {
+        if survives(graph.abundance_of(step.node), floor) {
+            continue; // clears the floor on its own; nothing to protect it from
+        }
+        let mut has_alternative = false;
+        // Leaving the predecessor: siblings are the other targets of the edges that leave the
+        // predecessor by the same end this step was reached through.
+        if let Some(prev) = steps.get(i.wrapping_sub(1)) {
+            read(graph, prev.node, &mut row)?;
+            let by = row
+                .iter()
+                .map(|&p| crate::stages::parse::unpack_edge(p))
+                .find(|&(t, _, _)| t == step.node)
+                .map(|(_, src_fwd, _)| src_fwd);
+            if let Some(src_fwd) = by {
+                has_alternative |= row
+                    .iter()
+                    .map(|&p| crate::stages::parse::unpack_edge(p))
+                    .any(|(t, s, _)| {
+                        s == src_fwd && t != step.node && survives(graph.abundance_of(t), floor)
+                    });
+            }
+        }
+        // Entering the successor: the mirror image, read from the successor's own row because
+        // Logan records every edge from both endpoints.
+        if let Some(next) = steps.get(i + 1) {
+            read(graph, next.node, &mut row)?;
+            let by = row
+                .iter()
+                .map(|&p| crate::stages::parse::unpack_edge(p))
+                .find(|&(t, _, _)| t == step.node)
+                .map(|(_, src_fwd, _)| src_fwd);
+            if let Some(src_fwd) = by {
+                has_alternative |= row
+                    .iter()
+                    .map(|&p| crate::stages::parse::unpack_edge(p))
+                    .any(|(t, s, _)| {
+                        s == src_fwd && t != step.node && survives(graph.abundance_of(t), floor)
+                    });
+            }
+        }
+        if !has_alternative {
+            protected.insert(step.node);
+        }
+    }
+    Ok(protected)
 }
 
 /// Share of the whole graph pulled into the local neighbourhood.
@@ -924,13 +1038,39 @@ mod gfa_tests {
     /// search space and cannot quietly drop part of it, while the writer is emitting the
     /// space already chosen, and a target outside the graph cannot be one of `nodes`, so
     /// there is nothing to emit and nothing to report.
+    ///
+    /// The fixture is assembled by hand because **the parser no longer hands one over**:
+    /// WG-10 made a link past the last record a parse error, since the dense id rule means
+    /// such a link can only mean records are missing. These two guards stay because they are
+    /// what keeps a structural fault from becoming an out-of-bounds index, and the parser
+    /// being strict is not a reason to stop testing them.
     #[test]
     fn an_edge_past_the_end_of_the_graph_is_refused_then_skipped() {
         use crate::types::Anchors;
-        let g = graph(concat!(
+        // WG-10: the same text through the parser is now refused outright.
+        let text = concat!(
             ">ACC_0 ka:f:10.0  L:+:1:+  L:+:99:+\nACGT\n",
             ">ACC_1 ka:f:10.0  L:-:0:-\nTTTT\n",
+        );
+        match parse::build(
+            &"ACC".into(),
+            Box::new(std::io::Cursor::new(text.as_bytes().to_vec())),
+            u64::MAX,
+        ) {
+            Err(e) => assert!(e.to_string().contains("truncated or incomplete"), "{e}"),
+            Ok(g) => panic!("a link past the last record was parsed into {} unitigs", g.n_unitigs),
+        }
+
+        // So build the valid graph and splice the dangling edge into node 0's CSR row.
+        let mut g = graph(concat!(
+            ">ACC_0 ka:f:10.0  L:+:1:+\nACGT\n",
+            ">ACC_1 ka:f:10.0  L:-:0:-\nTTTT\n",
         ));
+        let row_end = g.offsets[1] as usize;
+        g.targets.insert(row_end, parse::pack_edge(99, true, true));
+        for o in g.offsets[1..].iter_mut() {
+            *o += 1;
+        }
         assert_eq!(g.n_unitigs, 2);
 
         let (cfg, _d) = tmp_cfg("oob");
@@ -1062,6 +1202,74 @@ mod depth_tests {
         ids.iter().map(|&node| PathStep { node, orient: Orient::Forward }).collect()
     }
 
+    /// WP-01 asked for a k-mer-weighted median here. It was implemented and then removed:
+    /// see `path_depth`'s own note for the measurement that refutes it. This pins the
+    /// statistic that survived, so a future attempt starts from the number it has to beat.
+    #[test]
+    fn depth_is_the_step_median_not_the_kmer_weighted_one() {
+        let c = Config { graph_k: 4, ..Config::default() };
+        let g = graph(concat!(
+            ">T_0 ka:f:10.0\nACGT\n",
+            ">T_1 ka:f:10.0\nACGT\n",
+            ">T_2 ka:f:1000.0\n",
+            "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n",
+        ));
+        assert_eq!(
+            path_depth(&c, &g, &steps(&[0, 1, 2])),
+            10.0,
+            "two steps at 10 outvote one at 1000, however long that one is"
+        );
+    }
+
+    /// WP-01. A sub-floor route unitig with a deeper sibling is an error branch and is
+    /// pruned; one with no deeper sibling is the only way through and is kept.
+    ///
+    /// Removing the second cuts the gene's route in two. The realignment then cannot span the
+    /// reference, the prune is refused, and the reference-pulled first-pass route stands with
+    /// its reference alleles intact, with nothing in the output but `prune.outcome` to say so.
+    #[test]
+    fn a_thin_stretch_of_the_gene_is_protected_but_an_error_branch_is_not() {
+        // 0 -> 1 -> 2 is the route; 3 is a sibling of 1, reachable from 0 by the same end.
+        let with_sibling_at = |ka: &str| {
+            graph(&format!(
+                ">T_0 ka:f:100.0   L:+:1:+  L:+:3:+\nACGTACGTACGT\n\
+                 >T_1 ka:f:1.0   L:-:0:-  L:+:2:+\nACGTACGTACGT\n\
+                 >T_2 ka:f:100.0   L:-:1:-\nACGTACGTACGT\n\
+                 >T_3 ka:f:{ka}   L:-:0:-\nACGTACGTACGT\n"
+            ))
+        };
+        let route = steps(&[0, 1, 2]);
+
+        // The sibling clears the floor, so the aligner could have gone that way: unitig 1 is
+        // a droppable alternative, which is exactly what the prune is for.
+        let deep = with_sibling_at("100.0");
+        assert!(
+            protected_route_nodes(&deep, &route, 10.0).unwrap().is_empty(),
+            "an error branch beside a deep sibling must still be pruned"
+        );
+
+        // The sibling is below the floor too, so there is no deeper way round: unitig 1 is
+        // the gene, thinly covered.
+        let thin = with_sibling_at("1.0");
+        let protected = protected_route_nodes(&thin, &route, 10.0).unwrap();
+        assert_eq!(protected.len(), 1);
+        assert!(protected.contains(&1), "{protected:?}");
+
+        // And the predicate the prune and its reported count share honours it.
+        assert!(!kept_by_prune(&thin, 1, 10.0, &Default::default()));
+        assert!(kept_by_prune(&thin, 1, 10.0, &protected));
+    }
+
+    /// A route whose every unitig clears the floor protects nothing: there is nothing at risk.
+    #[test]
+    fn nothing_is_protected_when_the_route_clears_the_floor() {
+        let g = graph(concat!(
+            ">T_0 ka:f:100.0   L:+:1:+\nACGTACGTACGT\n",
+            ">T_1 ka:f:100.0   L:-:0:-\nACGTACGTACGT\n",
+        ));
+        assert!(protected_route_nodes(&g, &steps(&[0, 1]), 10.0).unwrap().is_empty());
+    }
+
     #[test]
     fn depth_is_the_median_along_the_alignment() {
         let g = graph(concat!(
@@ -1069,7 +1277,7 @@ mod depth_tests {
             ">T_1 ka:f:200.0\nACGT\n",
             ">T_2 ka:f:300.0\nACGT\n",
         ));
-        assert_eq!(path_depth(&g, &steps(&[0, 1, 2])), 200.0);
+        assert_eq!(path_depth(&Config::default(), &g, &steps(&[0, 1, 2])), 200.0);
     }
 
     /// One repeat-collapsed unitig must not drag the estimate, which is why this is a
@@ -1081,13 +1289,13 @@ mod depth_tests {
             ">T_1 ka:f:100.0\nACGT\n",
             ">T_2 ka:f:25000.0\nACGT\n",
         ));
-        assert_eq!(path_depth(&g, &steps(&[0, 1, 2])), 100.0, "mean would be 8400");
+        assert_eq!(path_depth(&Config::default(), &g, &steps(&[0, 1, 2])), 100.0, "mean would be 8400");
     }
 
     #[test]
     fn an_empty_alignment_has_no_depth() {
         let g = graph(">T_0 ka:f:100.0\nACGT\n");
-        assert_eq!(path_depth(&g, &[]), 0.0);
+        assert_eq!(path_depth(&Config::default(), &g, &[]), 0.0);
     }
 
     /// At the floor exactly, a unitig is kept (TW-06).
@@ -1113,7 +1321,7 @@ mod depth_tests {
             ">T_2 ka:f:145.1\nGGGG\n",
         ));
         let (kept, seqs) =
-            prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A'], vec![b'C'], vec![b'G']], floor);
+            prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A'], vec![b'C'], vec![b'G']], floor, &Default::default());
         assert_eq!(kept, vec![0, 2], "only the unitig under the floor is removed");
         assert_eq!(seqs, vec![vec![b'A'], vec![b'G']], "sequences stay paired with their nodes");
     }
@@ -1124,7 +1332,7 @@ mod depth_tests {
     fn the_floor_is_off_when_prune_frac_is_zero() {
         assert_eq!(Config::default().prune_frac, 0.01, "the panel-calibrated default");
         let off = Config { prune_frac: 0.0, ..Config::default() };
-        assert_eq!(depth_floor(&off, 14500.0), off.min_abund);
+        assert_eq!(depth_floor(&off, 14500.0), off.prune_min_abund);
         assert_eq!(depth_floor(&Config::default(), 14500.0), 145.0);
     }
 
@@ -1133,15 +1341,54 @@ mod depth_tests {
     fn the_floor_scales_with_depth() {
         let c = Config { prune_frac: 0.01, ..Config::default() };
         assert_eq!(depth_floor(&c, 14500.0), 145.0);
-        assert_eq!(depth_floor(&c, 180.0), 5.0, "1% of 180x is under min_abund, which holds");
+        assert_eq!(
+            depth_floor(&c, 180.0),
+            5.0,
+            "1% of 180x is under prune_min_abund, which holds"
+        );
     }
 
     #[test]
-    fn the_floor_never_drops_below_min_abund() {
-        let c = Config { prune_frac: 0.9, min_abund: 5.0, ..Config::default() };
+    fn the_floor_never_drops_below_prune_min_abund() {
+        let c = Config { prune_frac: 0.9, prune_min_abund: 5.0, ..Config::default() };
         for d in [0.0, 1.0, 5.0, 5.5, 1000.0] {
             assert!(depth_floor(&c, d) >= 5.0, "floor dipped at depth {d}");
         }
+    }
+
+    /// WG-05. `--min-abund` is the allele floor. It used to be the prune's lower bound as
+    /// well, so a user raising it to be stricter about which forks count as variants also
+    /// raised the coverage at which unitigs are deleted from the graph the primary is walked
+    /// on. On a 60x gene with a 42x/18x fork that moved the floor from 5.0 to 20.0, removed
+    /// the reference-matching branch and published a different sequence, with nothing in the
+    /// help text, the docs or the summary saying the two settings were one.
+    #[test]
+    fn min_abund_does_not_move_the_prune_floor() {
+        let strict = Config { min_abund: 20.0, ..Config::default() };
+        assert_eq!(
+            depth_floor(&strict, 60.0),
+            depth_floor(&Config::default(), 60.0),
+            "the allele floor must not decide which unitigs the prune deletes"
+        );
+        assert_eq!(depth_floor(&strict, 60.0), 5.0);
+
+        // The prune's own setting still does move it, which is the point of splitting them.
+        let pruned_hard = Config { prune_min_abund: 20.0, ..Config::default() };
+        assert_eq!(depth_floor(&pruned_hard, 60.0), 20.0);
+
+        // And the difference is visible where it matters: the 18x branch of a 60x gene.
+        let g = graph(concat!(
+            ">T_0 ka:f:60.0\nAAAA\n",
+            ">T_1 ka:f:18.0\nCCCC\n",
+            ">T_2 ka:f:42.0\nGGGG\n",
+        ));
+        let seqs = || vec![vec![b'A'], vec![b'C'], vec![b'G']];
+        let floor = depth_floor(&strict, 60.0);
+        let (kept, _) = prune_nodes(&g, vec![0, 1, 2], seqs(), floor, &Default::default());
+        assert_eq!(kept, vec![0, 1, 2], "--min-abund 20 must leave the 18x unitig in the graph");
+        let floor = depth_floor(&pruned_hard, 60.0);
+        let (kept, _) = prune_nodes(&g, vec![0, 1, 2], seqs(), floor, &Default::default());
+        assert_eq!(kept, vec![0, 2], "--prune-min-abund 20 is how that unitig is removed");
     }
 
     /// A clonal sample sits above its own floor everywhere, so nothing is removed.
@@ -1153,8 +1400,8 @@ mod depth_tests {
             ">T_2 ka:f:190.0\nACGT\n",
         ));
         let c = Config { prune_frac: 0.01, ..Config::default() };
-        let floor = depth_floor(&c, path_depth(&g, &steps(&[0, 1, 2])));
-        let (kept, seqs) = prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A']; 3], floor);
+        let floor = depth_floor(&c, path_depth(&c, &g, &steps(&[0, 1, 2])));
+        let (kept, seqs) = prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A']; 3], floor, &Default::default());
         assert_eq!(kept, vec![0, 1, 2]);
         assert_eq!(seqs.len(), 3);
     }
@@ -1169,9 +1416,9 @@ mod depth_tests {
         ));
         let c = Config { prune_frac: 0.01, ..Config::default() };
         // median of an even-length list takes the upper middle, so depth is 15000 here
-        let floor = depth_floor(&c, path_depth(&g, &steps(&[0, 1])));
+        let floor = depth_floor(&c, path_depth(&c, &g, &steps(&[0, 1])));
         assert_eq!(floor, 150.0);
-        let (kept, _) = prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A']; 3], floor);
+        let (kept, _) = prune_nodes(&g, vec![0, 1, 2], vec![vec![b'A']; 3], floor, &Default::default());
         assert_eq!(kept, vec![0, 1], "the 2x branch is 0.014% of depth and goes");
     }
 
@@ -1186,6 +1433,7 @@ mod depth_tests {
         let (kept, seqs) = prune_nodes(
             &g, vec![0, 1, 2],
             vec![b"AAAA".to_vec(), b"CCCC".to_vec(), b"GGGG".to_vec()], 10.0,
+            &Default::default(),
         );
         assert_eq!(kept, vec![0, 2]);
         assert_eq!(seqs, vec![b"AAAA".to_vec(), b"GGGG".to_vec()]);

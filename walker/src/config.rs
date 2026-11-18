@@ -67,6 +67,14 @@ pub struct Config {
     /// Hop radius for the local subgraph BFS.
     pub hops: usize,
     /// Minimum `ka:f` for a bubble branch to count as a real variant.
+    ///
+    /// The **allele** floor, and nothing else. Until 0.2.0 it was also the prune's lower bound
+    /// (`depth_floor` returned `max(prune_frac * depth, min_abund)`), so raising it to be
+    /// stricter about which forks count as variants also raised the floor the prune deletes
+    /// unitigs at, removed unitigs from the first route, and could publish a different
+    /// primary. Nothing said so: every help string, doc table and wrapper description
+    /// presented the two as independent. `prune_min_abund` is now the prune's own lower bound
+    /// and this setting no longer moves it (WG-05).
     pub min_abund: f32,
     /// Minimum variant allele frequency for a bubble branch.
     pub min_vaf: f64,
@@ -128,7 +136,10 @@ pub struct Config {
     ///   1% floor (145x)                6930     1    0.9993    147.5          2
     ///   5% floor (725x)                5343     1    0.9993   7000.0          0
     ///
-    /// ERR2028820 (PfCRT, 180x)        identical haplotype at every setting, 0 nodes lost
+    /// ERR2028820 (PfCRT, 180x)        identical haplotype at every setting, 0 path nodes
+    ///                                 lost (268 of the 747 neighbourhood unitigs are
+    ///                                 removed: 1% of 180x is under the 5.0 lower bound,
+    ///                                 so this one prunes at `prune_min_abund`)
     /// ```
     ///
     /// Three alignments collapsing to one is the intended outcome: they were three routes
@@ -144,6 +155,19 @@ pub struct Config {
     /// 0.01 is the value to start from. Pruning never regresses an accession: if the second
     /// alignment fails, the first pass's haplotype stands.
     pub prune_frac: f64,
+    /// The prune's lower bound: no `--prune-frac` setting takes the floor below this.
+    ///
+    /// WG-05. Defaults to **5.0**, which is what `min_abund` defaulted to when the two were
+    /// one setting, so a default run prunes exactly as it did before. Splitting them is what
+    /// makes either one usable: with them joined, `--min-abund 20` on a 60x gene moved the
+    /// prune floor from 5.0 to 20.0 and changed which allele the primary carried, while any
+    /// `--prune-frac` below `5/depth` was the same setting as any other, so a sweep from
+    /// 0.0001 to 0.02 was a no-op on genes under 500x.
+    ///
+    /// It exists as a floor at all because `prune_frac * depth` on a shallow gene is a
+    /// fraction of a read: at 60x, 1% is 0.6, which would delete nothing and does not mean
+    /// anything. 5.0 is the smallest coverage the project treats as evidence anywhere.
+    pub prune_min_abund: f32,
     /// Raise the variant abundance floor to this fraction of the gene's own depth.
     ///
     /// `0.0` disables it, which is the default and leaves `min_abund` alone. Otherwise the
@@ -867,6 +891,9 @@ impl Default for Config {
             k: 21,
             hops: 5,
             min_abund: 5.0,
+            // WG-05: the same 5.0, kept as its own setting so that changing the allele floor
+            // no longer moves the prune floor. A default run is unchanged.
+            prune_min_abund: 5.0,
             min_vaf: 0.10,
             min_cov: 0.85,
             primary_metric: PrimaryMetric::Matched,

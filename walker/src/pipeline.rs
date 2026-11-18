@@ -170,6 +170,25 @@ fn pruned_covers_as_much(unpruned: &GafPath, pruned: &GafPath) -> bool {
     pruned.query_span() + PRUNE_SPAN_TOLERANCE >= unpruned.query_span()
 }
 
+/// Whether the pruned haplotype is the unpruned one with bases trimmed off an end (WA-09).
+///
+/// `pruned_covers_as_much` allows a pruned realignment to give up `PRUNE_SPAN_TOLERANCE`
+/// reference bases, because a strict rule kept a reference-biased primary over one terminal
+/// codon. But that tolerance was the whole test: a realignment that changed *nothing else*
+/// was accepted and logged as `applied`, which is pure loss. The maintainers' own count says
+/// it happens: of 511 refusals in a 20,000-accession run, 33 gave up three reference bases or
+/// fewer, 21 of them exactly one, and a lost terminal base can be a truncated stop codon.
+///
+/// So the tolerance now buys a shorter result only when the prune actually changed the
+/// haplotype. A strict substring test, not an end-trim test: a prune that removed an interior
+/// unitig cannot leave the rest contiguous and identical, so anything that is still a
+/// substring of the first pass is trimming and nothing else.
+fn trimmed_copy(pruned: &[u8], unpruned: &[u8]) -> bool {
+    pruned.len() < unpruned.len()
+        && !pruned.is_empty()
+        && unpruned.windows(pruned.len()).any(|w| w == pruned)
+}
+
 /// Reference bases a pruned realignment may lose and still replace the unpruned one.
 ///
 /// The rule above was strict through 0.1.0, which meant one terminal base was enough to keep a
@@ -479,6 +498,10 @@ fn report(done: usize, total: usize, r: &AccessionResult) {
         }
         Outcome::NoAnchors => crate::outln!("[{done}/{total}] {}: no_anchors", r.accession),
         Outcome::NoPath => crate::outln!("[{done}/{total}] {}: no_path", r.accession),
+        Outcome::NoLinks => crate::outln!(
+            "[{done}/{total}] {}: no_links (the unitig file carries no L: adjacency)",
+            r.accession
+        ),
         Outcome::NoLoganData => crate::outln!(
             "[{done}/{total}] {}: no_logan_data (no Logan unitigs for this accession)",
             r.accession
@@ -634,6 +657,10 @@ fn run_one(
     timing.parse = t.elapsed().as_secs_f64();
     timing.anchor = 0.0;
     let n_unitigs = graph.n_unitigs;
+    // WG-02 and WG-07. Read off the graph now: `collect` rewrites the graph down to the
+    // neighbourhood, and both of these are statements about the file.
+    let abundance_missing = graph.abundance_missing;
+    let graph_has_links = graph.n_links > 0;
     let anchors = scanner.finish();
 
     // No anchors means the gene is not present in this accession. A legitimate outcome,
@@ -648,6 +675,7 @@ fn run_one(
             payload: crate::types::Payload::default(),
             outcome: Outcome::NoAnchors,
             n_unitigs,
+            abundance_missing,
             n_anchors: 0,
             subgraph_nodes: 0,
             haplotype: None,
@@ -733,12 +761,6 @@ fn run_one(
     timing.extract = t.elapsed().as_secs_f64();
     let subgraph_nodes = subgraph.nodes.len();
 
-    // phase does not depend on the GAF, so it is computed regardless of whether a path was
-    // found, and a no_path accession still reports its bubbles.
-    let t = Instant::now();
-    let bubbles = stages::phase::phase(cfg, &graph, &subgraph)?;
-    timing.phase = t.elapsed().as_secs_f64();
-
     // align now returns one best GafPath per reference in the anchor pool. Multi-anchor
     // mode fans out over the pool: stitch each reference against its own length and let
     // `pick_primary` choose the winning haplotype. Under the single-anchor path (the
@@ -759,7 +781,19 @@ fn run_one(
         .map(|(pool_index, q)| {
             let path = gaf_by_ref.remove(q.record_id.as_str());
             let hap = match &path {
-                Some(p) => stages::stitch::stitch(cfg, &graph, p, &subgraph, q)?,
+                Some(p) => {
+                    // WA-12. The first point a row from the aligner is believed. A row that
+                    // is not a walk of the GFA we handed out stitches into a sequence anyway,
+                    // and carries the identity the row claims while describing a different
+                    // molecule, so it is refused here rather than published.
+                    stages::stitch::check_gaf_walk(cfg, &graph, &subgraph, p).map_err(
+                        |detail| crate::error::Error::GraphAligner {
+                            accession: graph.accession.clone(),
+                            detail: format!("GAF row for {:?}: {detail}", q.record_id),
+                        },
+                    )?;
+                    stages::stitch::stitch(cfg, &graph, p, &subgraph, q)?
+                }
                 None => None,
             };
             Ok::<_, crate::error::Error>(stages::stitch::Candidate {
@@ -855,9 +889,14 @@ fn run_one(
     //
     // # Why it is safe on clonal samples
     //
-    // The floor is a fraction of the sample's *own* depth, so a 180x isolate gets a 1.8x
-    // floor and nothing is removed. Measured on `ERR2028820` at every setting from 0.01 to
-    // 0.05: byte-identical haplotype, same alignment count, zero nodes dropped from the path.
+    // The floor is a fraction of the sample's *own* depth, never below `--prune-min-abund`,
+    // so on a shallow isolate the lower bound is the whole rule: `ERR2028820` at 180x gets
+    // 1.8x from the fraction and prunes at 5.0. That is not "nothing is removed", which this
+    // comment used to claim (WG-05): it removes 268 of the neighbourhood's 747 unitigs. What
+    // is measured, and what makes it safe, is that the *haplotype* does not move. At every
+    // setting from 0.01 to 0.05 `ERR2028820` comes back byte-identical, with the same
+    // alignment count and no node dropped from the walked path; the 268 are unitigs hanging
+    // off the route, which is what the prune is for.
     //
     // # Never a regression
     //
@@ -867,7 +906,7 @@ fn run_one(
     let mut prune: Option<PruneReport> = None;
     if cfg.prune_frac > 0.0 {
         if let (Some(path), Some(_)) = (&final_path, &haplotype) {
-            let depth = stages::extract::path_depth(&graph, &path.steps);
+            let depth = stages::extract::path_depth(cfg, &graph, &path.steps);
             let floor = stages::extract::depth_floor(cfg, depth);
             let before = subgraph.nodes.len();
 
@@ -881,12 +920,31 @@ fn run_one(
             // out keeps the unpruned subgraph in that branch, which is the same "never a
             // regression" rule the failed-realign path applies.
             //
-            // The predicate is `extract::survives`, the same function `prune_nodes` calls,
-            // so this count cannot drift from the pruning it reports on (TW-06).
+            // Route unitigs the floor would remove although the route had no deeper way
+            // round them: a genuinely thin stretch of the gene rather than an error branch
+            // (WP-01). Computed before the count below, because they are part of the
+            // predicate it must agree with.
+            //
+            // A failure to read adjacency here is not worth the accession: it means the prune
+            // cannot be sized, and an unpruned result is the "never a regression" answer.
+            let protected = match stages::extract::protected_route_nodes(&graph, &path.steps, floor) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "[{}] prune: could not check the route against the floor ({e}); \
+                         keeping the unpruned result",
+                        graph.accession
+                    );
+                    Default::default()
+                }
+            };
+
+            // The predicate is `extract::kept_by_prune`, the same function `prune_nodes`
+            // calls, so this count cannot drift from the pruning it reports on (TW-06).
             let surviving = subgraph
                 .nodes
                 .iter()
-                .filter(|&&id| stages::extract::survives(graph.abundance_of(id), floor))
+                .filter(|&&id| stages::extract::kept_by_prune(&graph, id, floor, &protected))
                 .count();
 
             let unpruned_span = (path.query_start, path.query_end);
@@ -919,33 +977,79 @@ fn run_one(
                 );
                 }
                 PruneOutcome::Prune => {
-                // Both subgraphs live at the same scratch path, so the first must be dropped
-                // (which deletes its GFA) before the second is written.
+                // The first subgraph is consumed here: its node and sequence vectors move
+                // into the prune, and its `Drop` deletes its GFA. The refusal paths below
+                // rebuild it from `graph`, which still holds every decoded sequence.
                 let nodes = std::mem::take(&mut subgraph.nodes);
                 let seqs = std::mem::take(&mut subgraph.seqs);
                 let (kept_nodes, kept_seqs) =
-                    stages::extract::prune_nodes(&graph, nodes, seqs, floor);
+                    stages::extract::prune_nodes(&graph, nodes, seqs, floor, &protected);
                 let dropped = before - kept_nodes.len();
                 drop(subgraph);
-                let pruned =
-                    stages::extract::write_gfa(cfg, &graph, kept_nodes, kept_seqs)?;
-                let gaf2 = pruned.gfa_path.with_extension("pass2.gaf");
                 let t = Instant::now();
-                let mut gaf2_map = stages::align::run(cfg, &pruned, std::slice::from_ref(query), &gaf2)?;
-                let second = match gaf2_map.remove(query.record_id.as_str()) {
-                    Some(p) => stages::stitch::stitch(cfg, &graph, &p, &pruned, query)?.map(|h| (p, h)),
-                    None => None,
-                };
+                // WP-04. Every step of the second pass used to be `?`, so GraphAligner
+                // aborting or being OOM-killed on the pruned graph, or a full tmpfs during
+                // the second GFA write, turned an accession that was already reconstructed
+                // into `ERROR`: missing from the FASTA, `prune: null` in the summary, and
+                // exit 3 for a one-accession run. That breaks this stage's own contract, that
+                // pruning can improve an accession and cannot break one. The second pass is
+                // now fallible as a whole, and failing it is a refusal like any other.
+                type PassTwo = (
+                    crate::types::Subgraph,
+                    Option<(GafPath, crate::types::Haplotype)>,
+                );
+                let attempt = (|| -> Result<PassTwo> {
+                    let pruned = stages::extract::write_gfa(cfg, &graph, kept_nodes, kept_seqs)?;
+                    let gaf2 = pruned.gfa_path.with_extension("pass2.gaf");
+                    let mut gaf2_map =
+                        stages::align::run(cfg, &pruned, std::slice::from_ref(query), &gaf2)?;
+                    let second = match gaf2_map.remove(query.record_id.as_str()) {
+                        Some(p) => {
+                            // WA-12, on the pruned graph this time. An inconsistent second row
+                            // is an `Err` out of this closure, which WP-04 turns into a
+                            // refused prune: the first pass's haplotype stands and the
+                            // accession is not lost.
+                            stages::stitch::check_gaf_walk(cfg, &graph, &pruned, &p).map_err(
+                                |detail| crate::error::Error::GraphAligner {
+                                    accession: graph.accession.clone(),
+                                    detail: format!("pass 2 GAF row: {detail}"),
+                                },
+                            )?;
+                            stages::stitch::stitch(cfg, &graph, &p, &pruned, query)?
+                                .map(|h| (p, h))
+                        }
+                        None => None,
+                    };
+                    Ok((pruned, second))
+                })();
                 timing.align += t.elapsed().as_secs_f64();
+                if let Err(e) = &attempt {
+                    eprintln!(
+                        "[{}] prune: realignment failed ({e}); keeping the unpruned result",
+                        graph.accession
+                    );
+                    prune = Some(report(PruneResult::RefusedError, None));
+                }
+                let (pruned, second) = match attempt {
+                    Ok(v) => (Some(v.0), v.1),
+                    Err(_) => (None, None),
+                };
+                let failed = pruned.is_none();
                 let pruned_span = second.as_ref().map(|(p, _)| (p.query_start, p.query_end));
                 match second {
-                    Some((p, h)) if pruned_covers_as_much(path, &p) => {
+                    Some((p, h))
+                        if pruned_covers_as_much(path, &p)
+                            && !trimmed_copy(
+                                &h.seq,
+                                haplotype.as_ref().map(|u| u.seq.as_slice()).unwrap_or(&[]),
+                            ) =>
+                    {
                         prune = Some(report(PruneResult::Applied, pruned_span));
                         eprintln!(
                             "[{}] prune: depth {:.0}x, floor {:.1}x, {} of {} unitigs kept; \
                              realigned, min coverage on the route now {:.1}x",
                             graph.accession, depth, floor, before - dropped, before,
-                            stages::extract::path_depth(&graph, &p.steps).min(
+                            stages::extract::path_depth(cfg, &graph, &p.steps).min(
                                 p.steps.iter()
                                     .map(|s| graph.abundance_of(s.node))
                                     .fold(f32::INFINITY, f32::min)
@@ -953,31 +1057,51 @@ fn run_one(
                         );
                         haplotype = Some(h);
                         final_path = Some(p);
-                        subgraph = pruned;
+                        subgraph = pruned.expect("an applied prune has a pruned subgraph");
                     }
                     rejected => {
-                        let result = if rejected.is_some() {
-                            PruneResult::RefusedShorterSpan
-                        } else {
-                            PruneResult::RefusedNoHaplotype
-                        };
-                        prune = Some(report(result, pruned_span));
-                        match rejected {
-                            Some((p, _)) => eprintln!(
-                                "[{}] prune: depth {:.0}x, floor {:.1}x; the realigned route \
-                                 spans reference bases {}-{} of {}, {} short of the unpruned \
-                                 {}-{} and past the {}-base tolerance; keeping the unpruned \
-                                 result",
-                                graph.accession, depth, floor, p.query_start, p.query_end,
-                                query.seq.len(),
-                                path.query_span().saturating_sub(p.query_span()),
-                                path.query_start, path.query_end, PRUNE_SPAN_TOLERANCE
-                            ),
-                            None => eprintln!(
-                                "[{}] prune: depth {:.0}x, floor {:.1}x cost the alignment; \
-                                 keeping the unpruned result",
-                                graph.accession, depth, floor
-                            ),
+                        // `failed` has already logged and recorded `RefusedError`; the rest
+                        // of this arm is the rebuild, which every refusal needs.
+                        if !failed {
+                            let trimmed = rejected.as_ref().is_some_and(|(p, h)| {
+                                pruned_covers_as_much(path, p)
+                                    && trimmed_copy(
+                                        &h.seq,
+                                        haplotype.as_ref().map(|u| u.seq.as_slice()).unwrap_or(&[]),
+                                    )
+                            });
+                            let result = match (&rejected, trimmed) {
+                                (Some(_), true) => PruneResult::RefusedTrimmed,
+                                (Some(_), false) => PruneResult::RefusedShorterSpan,
+                                (None, _) => PruneResult::RefusedNoHaplotype,
+                            };
+                            prune = Some(report(result, pruned_span));
+                            match (&rejected, trimmed) {
+                                (Some((_, h)), true) => eprintln!(
+                                    "[{}] prune: depth {:.0}x, floor {:.1}x; the realigned \
+                                     haplotype is the unpruned one {} base(s) shorter and \
+                                     otherwise identical, so the prune changed nothing worth \
+                                     the loss; keeping the unpruned result",
+                                    graph.accession, depth, floor,
+                                    haplotype.as_ref().map_or(0, |u| u.seq.len())
+                                        .saturating_sub(h.seq.len())
+                                ),
+                                (Some((p, _)), false) => eprintln!(
+                                    "[{}] prune: depth {:.0}x, floor {:.1}x; the realigned \
+                                     route spans reference bases {}-{} of {}, {} short of the \
+                                     unpruned {}-{} and past the {}-base tolerance; keeping \
+                                     the unpruned result",
+                                    graph.accession, depth, floor, p.query_start, p.query_end,
+                                    query.seq.len(),
+                                    path.query_span().saturating_sub(p.query_span()),
+                                    path.query_start, path.query_end, PRUNE_SPAN_TOLERANCE
+                                ),
+                                (None, _) => eprintln!(
+                                    "[{}] prune: depth {:.0}x, floor {:.1}x cost the \
+                                     alignment; keeping the unpruned result",
+                                    graph.accession, depth, floor
+                                ),
+                            }
                         }
                         // Redo pass 1's subgraph so later stages have it. Cheap: the
                         // sequences are already decoded, only the GFA is rewritten.
@@ -1049,7 +1173,45 @@ fn run_one(
         let (found, stats) = stages::variants::find_alts(vcfg, &graph, &subgraph, path, query)?;
         alts = found;
         variant_stats = stats;
+        // WA-04. The mixture numbers belong to the sequence that is published, so they are
+        // read off the route AFTER `prefer_majority` has decided what that route is, and
+        // copied onto the haplotype the FASTA writer will see. They describe the primary;
+        // an alt is one allele changed at one site and carries its own frequencies already.
+        if let Some(h) = haplotype.as_mut() {
+            h.two_allele_sites = stats.two_allele_sites;
+            h.min_site_vaf = stats.min_site_vaf;
+        }
     }
+    // Bubbles are computed here, after the route is settled, for two reasons (WG-03): the
+    // floor they are gated at comes from the gene's depth, and there is no depth without a
+    // route; and `subgraph` is the pruned graph by now when the prune applied. The stage
+    // itself still never looks at the GAF, it reports the neighbourhood's diamonds, which is
+    // why a `no_path` accession still reports bubbles, at the absolute floor, since nothing
+    // measured its depth.
+    //
+    // The floor is the strictest of the three the run already uses: `--prune-frac` of depth
+    // (a branch the prune would delete is not an allele), `--min-abund-frac` of depth (the
+    // variant stages' own relative floor), and the absolute `--min-abund`.
+    //
+    // Two things decide what is left to report, and it is worth being clear about which does
+    // the work. The ORDER does most of it: an applied prune replaces `subgraph` with the
+    // pruned one above, so by here the sub-floor branches are gone and the diamonds built
+    // from them cannot be found. Running before the alignment, as this stage used to, meant
+    // reporting the neighbourhood as extracted, including everything the prune then deleted.
+    //
+    // The FLOOR covers the cases where no prune cleaned the graph: `--prune-frac 0`, where it
+    // reduces to the variant stages' own floor, and a refused prune, where WV-05 raises their
+    // floor to this same number because the sub-floor branches are still there. Taking the
+    // prune's fraction is that same argument: a branch the prune judged to be error is not an
+    // allele, whether or not the prune got to act on it.
+    let t = Instant::now();
+    let bubble_floor = final_path.as_ref().map_or(cfg.min_abund, |p| {
+        let depth = stages::extract::path_depth(cfg, &graph, &p.steps);
+        stages::extract::relative_floor(cfg.prune_frac.max(cfg.min_abund_frac), depth, cfg.min_abund)
+    });
+    let bubbles = stages::phase::phase_with_floor(cfg, &graph, &subgraph, bubble_floor)?;
+    timing.phase = t.elapsed().as_secs_f64();
+
     // Tag the primary with the winning reference when the anchor pool held more than one.
     // Single-anchor mode leaves anchor_used = None on Haplotype, alts, and AccessionResult
     // so the FASTA header, alt header, snvs.tsv and summary.json stay byte-identical to
@@ -1080,6 +1242,21 @@ fn run_one(
     let haplotype = haplotypes.first().cloned();
     let outcome = if !haplotypes.is_empty() {
         Outcome::Success
+    } else if !graph_has_links {
+        // WG-07. The file carried no `L:` token anywhere, so there was no adjacency to walk
+        // and nothing could have spanned more than one unitig. Reporting that as `no_path`
+        // says "this accession does not carry the gene", which is a claim about the sample
+        // this run is in no position to make. Logan publishes such objects: 0 links in 15,864
+        // headers for `ERR3988483`.
+        //
+        // Checked only when nothing was reconstructed. A gene that fits inside a single
+        // unitig needs no edge and is a `success` like any other.
+        eprintln!(
+            "[{accession}] no_links: the unitig file carries no L: adjacency ({n_unitigs} \
+             records, 0 links), so no path spanning more than one unitig exists. This is a \
+             property of the Logan object, not evidence that the gene is absent."
+        );
+        Outcome::NoLinks
     } else {
         Outcome::NoPath
     };
@@ -1091,6 +1268,7 @@ fn run_one(
         outcome,
         alts,
         n_unitigs,
+        abundance_missing,
         n_anchors: anchors.ids.len(),
         subgraph_nodes,
         haplotype,
@@ -1234,7 +1412,7 @@ mod ordering_tests {
 
 #[cfg(test)]
 mod prune_outcome_tests {
-    use super::{prune_outcome, pruned_covers_as_much, PruneOutcome};
+    use super::{prune_outcome, pruned_covers_as_much, trimmed_copy, PruneOutcome};
     use crate::config::Config;
     use crate::stages::extract::{depth_floor, prune_nodes};
     use crate::stages::parse;
@@ -1323,7 +1501,26 @@ mod prune_outcome_tests {
 
         // And the predicate above matches what prune_nodes would actually do.
         let seqs = vec![b"ACGT".to_vec(); 3];
-        let (kept, _) = prune_nodes(&g, nodes, seqs, floor);
+        let (kept, _) = prune_nodes(&g, nodes, seqs, floor, &Default::default());
         assert!(kept.is_empty(), "prune_nodes agrees the subgraph would be emptied");
+    }
+
+    /// WA-09. The three-base tolerance buys a shorter result only when the prune changed the
+    /// haplotype; a shorter copy of the same sequence is pure loss.
+    #[test]
+    fn a_shorter_copy_of_the_same_sequence_is_trimming_and_nothing_else() {
+        let unpruned = b"ACGTACGTAA";
+        // Trimmed at either end, or both.
+        assert!(trimmed_copy(b"ACGTACGTA", unpruned), "one base off the 3' end");
+        assert!(trimmed_copy(b"CGTACGTAA", unpruned), "one base off the 5' end");
+        assert!(trimmed_copy(b"CGTACGTA", unpruned), "both ends");
+        // Same length, so nothing was given up: not this rule's business.
+        assert!(!trimmed_copy(unpruned, unpruned));
+        // Shorter AND different: the prune did something, which is what the tolerance is for.
+        assert!(!trimmed_copy(b"ACGTAGGTA", unpruned), "an interior substitution");
+        assert!(!trimmed_copy(b"ACGTCGTAA", unpruned), "an interior deletion");
+        // Degenerate inputs must not claim a match.
+        assert!(!trimmed_copy(b"", unpruned));
+        assert!(!trimmed_copy(b"ACGT", b""));
     }
 }

@@ -63,6 +63,28 @@ use std::collections::HashMap;
 ///
 /// The golden fixtures pin the old numbers and must be regenerated, with the diff reviewed.
 pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<Vec<Bubble>> {
+    phase_with_floor(cfg, graph, subgraph, cfg.min_abund)
+}
+
+/// [`phase`] with the coverage an allele must carry given explicitly.
+///
+/// WG-03. The gate used to be `cfg.min_abund` alone, an absolute 5x, and the stage ran before
+/// the alignment, so it was applied to the neighbourhood as extracted. On a 15,000x sample
+/// that admits anything carried by a handful of erroneous reads, anywhere near the gene:
+/// `SRR8209082` reported **3,632 bubbles whose strongest allele was at most 66x**, a median of
+/// 11.9x, none of them above 0.5% of the gene's depth, while the real second population at
+/// 3,600x was not among them. A reader taking `bubbles.json` for quasispecies evidence was
+/// reading sequencing error.
+///
+/// The caller passes the floor the rest of the run is using, which is depth-relative, so what
+/// counts as an allele here is what counts as one in the prune and the variant stages. A run
+/// that found no path has no depth estimate and keeps the absolute floor.
+pub fn phase_with_floor(
+    cfg: &Config,
+    graph: &UnitigGraph,
+    subgraph: &Subgraph,
+    floor: f32,
+) -> Result<Vec<Bubble>> {
     let n = subgraph.nodes.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -98,7 +120,9 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
         (subgraph.nodes[i], s)
     };
 
-    let mut bubbles = Vec::new();
+    // WG-04: keyed on the mirror-canonical allele set, so one set is one record however many
+    // flank pairs it sits between.
+    let mut by_alleles: std::collections::BTreeMap<Vec<u32>, Bubble> = Default::default();
     for fork in 0..(n * 2) {
         let branches = &out[fork];
         if branches.len() < 2 {
@@ -165,6 +189,27 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
                 continue;
             }
 
+            // WG-11. The alleles must be two different unitigs, and neither may be a flank.
+            // The reconvergence test excludes only the fork's own oriented node, so a unitig
+            // end linking to both strands of one neighbour (an inverted repeat) produced a
+            // "bubble" whose two alleles are the same unitig at 0.5 each, and a self-looping
+            // unitig could be both an allele and the merge. `ERR2028820`'s full graph has 61
+            // foldback ends and 1,746 self-edge ends; none is in the golden subgraphs, which
+            // is why the data-backed test asserting this invariant passed while nothing
+            // enforced it.
+            //
+            // `merge == f ^ 1` is NOT rejected: a hairpin whose two arms are distinct unitigs
+            // is a real bubble, read from one end and back.
+            let mut allele_unitigs: Vec<u32> = in_bubble.iter().map(|&b| b >> 1).collect();
+            allele_unitigs.sort_unstable();
+            allele_unitigs.dedup();
+            if allele_unitigs.len() < in_bubble.len()
+                || allele_unitigs.contains(&(f >> 1))
+                || allele_unitigs.contains(&(merge >> 1))
+            {
+                continue;
+            }
+
             // Coverage share is computed over every branch of this bubble, then the gates are
             // applied. The order matters: a branch filtered out by a gate still contributed to
             // the total.
@@ -181,7 +226,7 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
                 let (node, strand) = unlocal(b);
                 let ab = graph.abundance_of(node);
                 let vaf = ab as f64 / total;
-                if extract::survives(ab, cfg.min_abund) && vaf >= cfg.min_vaf {
+                if extract::survives(ab, floor) && vaf >= cfg.min_vaf {
                     kept.push(Branch { node, strand, abundance: ab, vaf });
                 }
             }
@@ -197,19 +242,37 @@ pub fn phase(cfg: &Config, graph: &UnitigGraph, subgraph: &Subgraph) -> Result<V
 
             let (fork_id, fork_strand) = unlocal(f);
             let (merge_id, merge_strand) = unlocal(merge);
-            bubbles.push(Bubble {
-                fork: fork_id,
-                fork_strand,
-                merge: merge_id,
-                merge_strand,
-                branches: kept,
-                ka_saturated,
-            });
+
+            // WG-04. The alleles identify the bubble; the flanks are where it was found. The
+            // key is mirror-canonical so that a set and its reverse complement, which are the
+            // same two sequences read from the other end, cannot be two records.
+            let key = {
+                let mut a: Vec<u32> = in_bubble.clone();
+                a.sort_unstable();
+                let mut m: Vec<u32> = a.iter().map(|x| x ^ 1).collect();
+                m.sort_unstable();
+                a.min(m)
+            };
+            let flank = (fork_id, fork_strand, merge_id, merge_strand);
+            by_alleles
+                .entry(key)
+                .and_modify(|b| b.flanks.push(flank))
+                .or_insert_with(|| Bubble {
+                    fork: fork_id,
+                    fork_strand,
+                    merge: merge_id,
+                    merge_strand,
+                    flanks: vec![flank],
+                    branches: kept,
+                    ka_saturated,
+                });
         }
     }
 
-    // A fork can now contribute more than one bubble, so the merge is part of the key or the
-    // order would depend on discovery.
+    // A fork can contribute more than one bubble, so the merge is part of the key or the
+    // order would depend on discovery. The flank lists are built in fork order, which is
+    // deterministic for the same reason.
+    let mut bubbles: Vec<Bubble> = by_alleles.into_values().collect();
     bubbles.sort_by_key(|a| (a.fork, a.fork_strand, a.merge, a.merge_strand));
     Ok(bubbles)
 }
@@ -307,12 +370,111 @@ mod tests {
         }
     }
 
-    /// A fork with two reconvergence points must report BOTH bubbles.
+    /// WG-03. The same diamond is noise beside a deep gene and a variant beside a shallow
+    /// one, and only a depth-relative floor can tell them apart.
+    #[test]
+    fn a_shallow_diamond_beside_a_deep_gene_is_not_an_allele() {
+        let (c, _d) = cfg();
+        // 6x and 8x branches: on `SRR8209082` this is the shape of all 3,632 bubbles the
+        // absolute 5x floor reported, whose strongest allele was 66x against 15,000x depth.
+        let g = build(concat!(
+            ">T_0 ka:f:15000.0  L:+:1:+  L:+:2:+\nACGT\n",
+            ">T_1 ka:f:6.0      L:-:0:-  L:+:3:+\nTTTT\n",
+            ">T_2 ka:f:8.0      L:-:0:-  L:+:3:+\nGGGG\n",
+            ">T_3 ka:f:15000.0  L:-:1:-  L:-:2:-\nCCCC\n",
+        ));
+        let sub = whole(&c, &g);
+        // 1% of 15,000x, which is what a default run passes in.
+        assert!(
+            phase_with_floor(&c, &g, &sub, 150.0).unwrap().is_empty(),
+            "6x and 8x in a 15,000x gene are sequencing error"
+        );
+        // The same graph at the absolute floor: this is what the file used to hold.
+        assert_eq!(phase_with_floor(&c, &g, &sub, 5.0).unwrap().len(), 1);
+        // And the same two branches ARE a variant when the gene itself is shallow, which is
+        // the case the absolute floor was chosen for.
+        let shallow = build(concat!(
+            ">T_0 ka:f:14.0  L:+:1:+  L:+:2:+\nACGT\n",
+            ">T_1 ka:f:6.0   L:-:0:-  L:+:3:+\nTTTT\n",
+            ">T_2 ka:f:8.0   L:-:0:-  L:+:3:+\nGGGG\n",
+            ">T_3 ka:f:14.0  L:-:1:-  L:-:2:-\nCCCC\n",
+        ));
+        let sub2 = whole(&c, &shallow);
+        assert_eq!(phase_with_floor(&c, &shallow, &sub2, 5.0).unwrap().len(), 1);
+        cleanup(&sub);
+        cleanup(&sub2);
+    }
+
+    /// WG-11. A unitig end linking to BOTH strands of one neighbour is an inverted repeat,
+    /// not a two-allele site: the "two alleles" are one sequence and its reverse complement,
+    /// and the VAFs would split one unitig's coverage in half against itself.
+    #[test]
+    fn a_foldback_is_not_a_bubble() {
+        let (c, _d) = cfg();
+        // (0,+) -> (1,+) and (0,+) -> (1,-), each mirrored in 1's header.
+        let g = build(concat!(
+            ">T_0 ka:f:100.0  L:+:1:+  L:+:1:-\nACGT\n",
+            ">T_1 ka:f:50.0   L:-:0:-  L:+:0:-\nTTTT\n",
+        ));
+        assert_reversal_closed(&g);
+        let sub = whole(&c, &g);
+        let b = phase(&c, &g, &sub).unwrap();
+        cleanup(&sub);
+        assert!(b.is_empty(), "one unitig cannot be two alleles ({} bubbles)", b.len());
+    }
+
+    /// WG-11. A unitig that is both an allele and the merge is a loop, not a choice between
+    /// two sequences.
+    #[test]
+    fn a_unitig_that_is_both_allele_and_flank_is_not_a_bubble() {
+        let (c, _d) = cfg();
+        let g = build(concat!(
+            ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
+            ">T_1 ka:f:60.0   L:-:0:-  L:+:1:-  L:+:2:-\nTTTT\n",
+            ">T_2 ka:f:40.0   L:-:0:-  L:+:1:-\nGGGG\n",
+        ));
+        assert_reversal_closed(&g);
+        let sub = whole(&c, &g);
+        let b = phase(&c, &g, &sub).unwrap();
+        cleanup(&sub);
+        for x in &b {
+            let alleles: Vec<UnitigId> = x.branches.iter().map(|y| y.node).collect();
+            assert!(
+                !alleles.contains(&x.merge) && !alleles.contains(&x.fork),
+                "an allele is also a flank: alleles {alleles:?}, fork {}, merge {}",
+                x.fork,
+                x.merge
+            );
+        }
+    }
+
+    /// A plain diamond is still a bubble: the WG-11 filter must reject the degenerate shapes
+    /// and nothing else.
+    #[test]
+    fn the_filter_leaves_an_ordinary_diamond_alone() {
+        let (c, _d) = cfg();
+        let g = build(concat!(
+            ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
+            ">T_1 ka:f:60.0   L:-:0:-  L:+:3:+\nTTTT\n",
+            ">T_2 ka:f:40.0   L:-:0:-  L:+:3:+\nGGGG\n",
+            ">T_3 ka:f:100.0  L:-:1:-  L:-:2:-\nCCCC\n",
+        ));
+        let sub = whole(&c, &g);
+        let b = phase(&c, &g, &sub).unwrap();
+        cleanup(&sub);
+        assert_eq!(b.len(), 1, "{} bubbles", b.len());
+        assert_eq!(b[0].branches.iter().map(|x| x.node).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// A fork with two reconvergence points keeps both, now as flanks of one bubble.
     ///
     /// The loop used to sort `reconverged` and take element 0, so every reconvergence point
-    /// but the smallest was discarded before the dedup was even reached.
+    /// but the smallest was discarded before the dedup was even reached. WG-04 then changed
+    /// what "both" means: the same two alleles between two pairs of flanks is one site with
+    /// two ways through it, not two sites, and counting it twice is what made `n_bubbles`
+    /// track local topology instead of the sample.
     #[test]
-    fn a_fork_with_two_merges_reports_both() {
+    fn a_fork_with_two_merges_keeps_both_as_flanks_of_one_bubble() {
         let (c, _d) = cfg();
         // 0+ forks to 1+ and 2+; both reach 3+ AND both reach 4+. Two genuine diamonds
         // sharing one fork.
@@ -328,12 +490,53 @@ mod tests {
         let b = phase(&c, &g, &sub).unwrap();
         cleanup(&sub);
 
-        let merges: Vec<UnitigId> = b
+        assert_eq!(b.len(), 1, "one allele set is one record, got {} records", b.len());
+        assert_eq!(
+            b[0].branches.iter().map(|x| x.node).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the alleles are what identifies it"
+        );
+        let merges: Vec<UnitigId> = b[0]
+            .flanks
             .iter()
-            .filter(|x| x.fork == 0 && x.fork_strand == Strand::Forward)
-            .map(|x| x.merge)
+            .filter(|(f, fs, _, _)| *f == 0 && *fs == Strand::Forward)
+            .map(|&(_, _, m, _)| m)
             .collect();
         assert_eq!(merges, vec![3, 4], "both reconvergence points, got {merges:?}");
+        assert_eq!(b[0].merge, 3, "the smallest pair stays in the named fields");
+    }
+
+    /// Two SNPs exactly k apart: a bow-tie, `0 -> {1,2} -> {3,4} -> 5`, where each allele of
+    /// the first site links to each allele of the second because the unitigs between them are
+    /// shorter than a k-mer.
+    ///
+    /// WG-04: four (fork, merge) pairs, two allele sets. The old count of four was the
+    /// clearest case of the inflation, because nothing about the sample changed between the
+    /// two SNPs: only the distance between them.
+    #[test]
+    fn a_bow_tie_is_two_sites_not_four() {
+        let (c, _d) = cfg();
+        let g = build(concat!(
+            ">T_0 ka:f:100.0  L:+:1:+  L:+:2:+\nACGT\n",
+            ">T_1 ka:f:60.0   L:-:0:-  L:+:3:+  L:+:4:+\nTTTT\n",
+            ">T_2 ka:f:40.0   L:-:0:-  L:+:3:+  L:+:4:+\nGGGG\n",
+            ">T_3 ka:f:55.0   L:-:1:-  L:-:2:-  L:+:5:+\nCCCC\n",
+            ">T_4 ka:f:45.0   L:-:1:-  L:-:2:-  L:+:5:+\nAAAA\n",
+            ">T_5 ka:f:100.0  L:-:3:-  L:-:4:-\nACAC\n",
+        ));
+        assert_reversal_closed(&g);
+        let sub = whole(&c, &g);
+        let b = phase(&c, &g, &sub).unwrap();
+        cleanup(&sub);
+
+        let sets: Vec<Vec<UnitigId>> = b
+            .iter()
+            .map(|x| x.branches.iter().map(|y| y.node).collect())
+            .collect();
+        assert_eq!(sets, vec![vec![1, 2], vec![3, 4]], "two sites, got {sets:?}");
+        // Each is reachable between two pairs of flanks, which is what used to double it.
+        assert_eq!(b[0].flanks.len(), 2, "{:?}", b[0].flanks);
+        assert_eq!(b[1].flanks.len(), 2, "{:?}", b[1].flanks);
     }
 
     /// A bubble whose two traversal directions choose different merges survives.

@@ -24,6 +24,9 @@ fn outcome_str(o: Outcome) -> &'static str {
         Outcome::Success => "success",
         Outcome::NoAnchors => "no_anchors",
         Outcome::NoPath => "no_path",
+        // WG-07: the file had no adjacency, which is not the same finding as "the sample does
+        // not carry this gene".
+        Outcome::NoLinks => "no_links",
         Outcome::NoLoganData => "no_logan_data",
         Outcome::TooLarge => "too_large",
         Outcome::SubgraphTooLarge => "subgraph_too_large",
@@ -60,8 +63,15 @@ fn esc(s: &str) -> String {
 /// `AccessionResult::index` before they reach here, so the file is byte-reproducible.
 ///
 /// Header format is part of the output contract (downstream parsers, `bench/golden/`):
-/// `>{id} cov={:.3} pident={:.1} nodes={} ka={:.1} vaf={:.2}`, plus ` anchor={rid}` in
-/// multi-anchor mode, sequence on a single line.
+/// `>{id} cov={:.3} pident={:.1} nodes={} ka={:.1} vaf={:.2} min_vaf={:.3}`, then ` mixed=1`
+/// when the route passes two or more two-allele sites, then ` anchor={rid}` in multi-anchor
+/// mode, sequence on a single line.
+///
+/// WA-04: `vaf=` on a primary is the constant 1.0 and always was. `min_vaf=` is the measured
+/// number, the lowest frequency of any allele this sequence carries, and `mixed=1` says the
+/// sequence combines alleles from sites nothing links, so it may match no molecule in the
+/// sample. `vaf=` stays for one release because parsers key on it; new readers want
+/// `min_vaf=`.
 ///
 /// WV-24: this doc stopped at `nodes=` while the writer has emitted `ka=` and `vaf=` for some
 /// time, so anyone writing a parser from it got the fields wrong.
@@ -77,9 +87,13 @@ pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
             // runs keep the header byte-identical to the pre-multi-anchor shape so all
             // golden fixtures diff clean.
             let anchor_suffix = anchor_suffix(h);
+            // Emitted only above one site: one two-allele site is a variant, two are a
+            // phasing problem, and a flag that fires on every heterozygous accession would be
+            // ignored within a week.
+            let mixed = if h.two_allele_sites >= 2 { " mixed=1" } else { "" };
             writeln!(
                 w,
-                ">{} cov={:.3} {}={:.1} nodes={} ka={:.1} vaf={:.2}{}",
+                ">{} cov={:.3} {}={:.1} nodes={} ka={:.1} vaf={:.2} min_vaf={:.3}{}{}",
                 h.id,
                 h.cov,
                 if h.pident_inherited { "inherited_pident" } else { "pident" },
@@ -87,6 +101,8 @@ pub fn write_fasta(summary: &Summary, path: &Path) -> Result<()> {
                 h.nodes,
                 h.mean_ka,
                 h.vaf,
+                h.min_site_vaf,
+                mixed,
                 anchor_suffix,
             )?;
             w.write_all(&h.seq)?;
@@ -167,6 +183,22 @@ pub fn write_bubbles(summary: &Summary, path: &Path) -> Result<()> {
             writeln!(w, "      {{")?;
             writeln!(w, "        \"fork\": {}, \"fork_strand\": \"{}\",", b.fork, strand_str(b.fork_strand))?;
             writeln!(w, "        \"merge\": {}, \"merge_strand\": \"{}\",", b.merge, strand_str(b.merge_strand))?;
+            // WG-04. One record per allele set, and this says where that set was found. The
+            // first entry is the `fork`/`merge` above, kept as their own fields so a reader
+            // written against the old shape still works. More than one entry means the same
+            // two alleles are reachable between several flank pairs, which used to be that
+            // many separate bubbles.
+            write!(w, "        \"flanks\": [")?;
+            for (k, (f, fs, m, ms)) in b.flanks.iter().enumerate() {
+                write!(
+                    w,
+                    "{}{{\"fork\": {f}, \"fork_strand\": \"{}\", \"merge\": {m}, \"merge_strand\": \"{}\"}}",
+                    if k == 0 { "" } else { ", " },
+                    strand_str(*fs),
+                    strand_str(*ms)
+                )?;
+            }
+            writeln!(w, "],")?;
             // WV-03. Written always, including false, so a consumer can tell an unsaturated
             // bubble from one produced before the flag existed.
             writeln!(w, "        \"ka_saturated\": {},", b.ka_saturated)?;
@@ -511,7 +543,7 @@ fn write_settings(w: &mut impl Write, run: &RunInfo) -> Result<()> {
     let c = run.cfg;
     // Everything that changes which accessions are processed or what they produce. Workers,
     // timeouts and paths change neither, and are left out.
-    let settings: [(&str, String); 26] = [
+    let settings: [(&str, String); 27] = [
         ("k", c.k.to_string()),
         ("graph_k", c.graph_k.to_string()),
         ("min_shared_kmers", c.min_shared_kmers.to_string()),
@@ -522,6 +554,9 @@ fn write_settings(w: &mut impl Write, run: &RunInfo) -> Result<()> {
         ("primary_metric", format!("\"{}\"", c.primary_metric.as_str())),
         ("primary_tie_eps", jf(c.primary_tie_eps)),
         ("prune_frac", jf(c.prune_frac)),
+        // WG-05: the prune's own lower bound. It shared `min_abund` until 0.2.0, so a summary
+        // from an older run cannot tell which of the two a non-default value was meant for.
+        ("prune_min_abund", jf(c.prune_min_abund as f64)),
         ("prefer_majority", c.prefer_majority.to_string()),
         ("min_abund", jf(c.min_abund as f64)),
         ("min_abund_frac", jf(c.min_abund_frac)),
@@ -605,11 +640,14 @@ fn write_discards(w: &mut impl Write, s: &Summary, run: &RunInfo) -> Result<()> 
     writeln!(
         w,
         "    \"accessions\": {{\"never_reached\": {}, \"no_anchors\": {}, \"no_path\": {}, \
-         \"no_logan_data\": {}, \"too_large\": {}, \"subgraph_too_large\": {}, \
-         \"error\": {}}},",
+         \"no_links\": {}, \"no_logan_data\": {}, \"too_large\": {}, \
+         \"subgraph_too_large\": {}, \"error\": {}}},",
         run.n_requested.saturating_sub(s.results.len()),
         count(Outcome::NoAnchors),
         count(Outcome::NoPath),
+        // WG-07: beside `no_path` rather than inside it, because the two answer different
+        // questions and a cohort report that merges them understates gene presence.
+        count(Outcome::NoLinks),
         count(Outcome::NoLoganData),
         count(Outcome::TooLarge),
         count(Outcome::SubgraphTooLarge),
@@ -694,6 +732,34 @@ fn write_cohort(w: &mut impl Write, s: &Summary) -> Result<()> {
         w,
         "    \"provisional\": {},",
         s.results.iter().filter(|r| r.provisional).count()
+    )?;
+    // The cohort-scale form of the per-record flag. On a 5,000-accession run nobody reads
+    // 5,000 `prune.outcome` fields, and this is the number that says how much of the cohort
+    // kept a route the prune wanted to correct and could not.
+    writeln!(
+        w,
+        "    \"bias_uncorrected\": {},",
+        s.results
+            .iter()
+            .filter(|r| r.prune.as_ref().is_some_and(|p| p.result.is_refusal()))
+            .count()
+    )?;
+    // WG-02 at cohort scale: accessions whose abundances cannot be believed. Omitted when
+    // there are none, like the per-record field it counts.
+    let no_abundance = s.results.iter().filter(|r| r.abundance_missing > 0).count();
+    if no_abundance > 0 {
+        writeln!(w, "    \"abundance_missing\": {no_abundance},")?;
+    }
+    // WA-04 at cohort scale: primaries that combine alleles from two or more sites nothing
+    // phases. These are the records whose substitutions a selection test should not read as
+    // one organism's.
+    writeln!(
+        w,
+        "    \"mixed\": {},",
+        s.results
+            .iter()
+            .filter(|r| r.haplotype.as_ref().is_some_and(|h| h.two_allele_sites >= 2))
+            .count()
     )?;
     writeln!(
         w,
@@ -782,6 +848,12 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
     writeln!(w, "      \"status\": \"{}\",", outcome_str(r.outcome))?;
     write_payload(w, &r.payload)?;
     writeln!(w, "      \"n_unitigs\": {},", r.n_unitigs)?;
+    // WG-02. Omitted when every record carried an abundance, which is every ordinary Logan
+    // object, so its presence is itself the signal: the depth-based stages saw 0x for this
+    // many unitigs and whatever they did or did not do must be read in that light.
+    if r.abundance_missing > 0 {
+        writeln!(w, "      \"abundance_missing\": {},", r.abundance_missing)?;
+    }
     writeln!(w, "      \"n_anchors\": {},", r.n_anchors)?;
     writeln!(w, "      \"subgraph_nodes\": {},", r.subgraph_nodes)?;
     match r.subgraph_fraction {
@@ -789,6 +861,14 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
         None => writeln!(w, "      \"subgraph_fraction\": null,")?,
     }
     writeln!(w, "      \"provisional\": {},", r.provisional)?;
+    // Derived from `prune.result` rather than stored, so there is one source of truth. It
+    // names what a refused prune means for this haplotype: the first-pass route stands, and
+    // that is the route with the aligner's reference pull still in it (WP-01).
+    writeln!(
+        w,
+        "      \"bias_uncorrected\": {},",
+        r.prune.as_ref().is_some_and(|p| p.result.is_refusal())
+    )?;
     // WV-03. `ka_max` at the ceiling means every VAF, the prune floor and the majority calls
     // on this accession are computed against lower bounds.
     writeln!(w, "      \"ka_max\": {:.1},", r.ka_max)?;
@@ -867,11 +947,17 @@ fn write_result(w: &mut impl Write, cfg: &Config, r: &AccessionResult, last: boo
         writeln!(
             w,
             "      \"variants\": {{\"depth\": {:.1}, \"floor\": {:.1}, \"forks\": {}, \
-             \"biallelic\": {}, \"recovered\": {}, \"beyond_cap\": {}, \
+             \"biallelic\": {}, \"two_allele_sites\": {}, \"min_site_vaf\": {:.4}, \
+             \"recovered\": {}, \"beyond_cap\": {}, \
              \"indels\": {}, \"no_rejoin\": {}, \
              \"not_substitution\": {}, \"over_indel_cap\": {}, \"frameshifting\": {}, \
              \"window_not_shiftable\": {}, \"identical\": {}}},",
-            v.depth, v.floor, v.forks, v.biallelic, v.recovered, v.beyond_cap,
+            v.depth, v.floor, v.forks, v.biallelic,
+            // WA-04: sites rather than alleles, and the weakest allele the primary carries.
+            // `biallelic` counts a three-branch fork twice, which is right for "alleles we
+            // could emit" and wrong for "places the sequence had to choose".
+            v.two_allele_sites, v.min_site_vaf,
+            v.recovered, v.beyond_cap,
             v.indels, v.no_rejoin,
             v.not_substitution, v.over_indel_cap, v.frameshifting, v.window_not_shiftable,
             v.identical
@@ -1825,6 +1911,8 @@ mod vcf_tests {
             nodes: 1,
             mean_ka: 0.0,
             vaf: 1.0,
+            two_allele_sites: 0,
+            min_site_vaf: 1.0,
             anchor_used: None,
         }
     }
@@ -1854,6 +1942,7 @@ mod vcf_tests {
             payload: crate::types::Payload::default(),
             outcome: Outcome::Success,
             n_unitigs: 0,
+            abundance_missing: 0,
             n_anchors: 0,
             subgraph_nodes: 0,
             haplotype: Some(hap(primary)),
@@ -2221,6 +2310,8 @@ mod identity_label_tests {
             nodes: 1,
             mean_ka: 12.0,
             vaf: 1.0,
+            two_allele_sites: 0,
+            min_site_vaf: 1.0,
             anchor_used: None,
         }
     }
@@ -2235,6 +2326,7 @@ mod identity_label_tests {
                 payload: crate::types::Payload::default(),
                 outcome: Outcome::Success,
                 n_unitigs: 0,
+                abundance_missing: 0,
                 n_anchors: 0,
                 subgraph_nodes: 0,
                 haplotype: Some(primary.clone()),
@@ -2332,8 +2424,8 @@ mod identity_label_tests {
             "\"n_ok\": 1",
             // Every discard key is present even at zero, so "did not happen" is readable.
             "\"accessions\": {\"never_reached\": 0, \"no_anchors\": 0, \"no_path\": 0, \
-             \"no_logan_data\": 0, \"too_large\": 0, \"subgraph_too_large\": 0, \
-             \"error\": 0}",
+             \"no_links\": 0, \"no_logan_data\": 0, \"too_large\": 0, \
+             \"subgraph_too_large\": 0, \"error\": 0}",
             "\"alleles\": {\"beyond_max_alts\": 0, \
              \"no_rejoin\": 0, \"not_substitution\": 0, \"over_indel_cap\": 0, \
              \"frameshifting\": 0, \"window_not_shiftable\": 0, \"identical\": 0}",

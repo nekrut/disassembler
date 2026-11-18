@@ -23,6 +23,7 @@
     "primary_metric": "matched",
     "primary_tie_eps": 0.002,
     "prune_frac": 0.01,
+    "prune_min_abund": 5.0,
     "prefer_majority": true,
     "min_abund": 5.0,
     "min_abund_frac": 0.0,
@@ -43,20 +44,22 @@
   "run": {
     "status": "ok",
     "exit_code": 0,
-    "started": "2026-11-18T04:13:57Z",
-    "wall_seconds": 1.276,
-    "stage_seconds": {"stream": 0.615, "parse": 0.044, "anchor": 0.000, "extract": 0.032, "align": 0.557, "stitch": 0.004, "phase": 0.013},
+    "started": "2026-11-18T17:00:24Z",
+    "wall_seconds": 1.418,
+    "stage_seconds": {"stream": 0.719, "parse": 0.045, "anchor": 0.000, "extract": 0.033, "align": 0.608, "stitch": 0.002, "phase": 0.001},
     "n_records": 1,
     "n_ok": 1
   },
   "discards": {
-    "accessions": {"never_reached": 0, "no_anchors": 0, "no_path": 0, "no_logan_data": 0, "too_large": 0, "subgraph_too_large": 0, "error": 0},
+    "accessions": {"never_reached": 0, "no_anchors": 0, "no_path": 0, "no_links": 0, "no_logan_data": 0, "too_large": 0, "subgraph_too_large": 0, "error": 0},
     "alleles": {"beyond_max_alts": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
-    "minority_sites": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 10, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0}
+    "minority_sites": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 11, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0}
   },
   "cohort": {
     "reconstructed": 1,
     "provisional": 1,
+    "bias_uncorrected": 0,
+    "mixed": 0,
     "majority_corrected": 0,
     "majority_corrections": 0,
     "minority_rescues": 0,
@@ -65,35 +68,36 @@
     "distinct_primaries": 1,
     "singleton_primaries": 1,
     "alts_recovered": 1,
-    "bubbles": 3632,
+    "bubbles": 0,
     "cov": {"p10": 0.9996, "p25": 0.9996, "p50": 0.9996, "p75": 0.9996, "p90": 0.9996, "mean": 0.9996},
-    "pident": {"p10": 97.4808, "p25": 97.4808, "p50": 97.4808, "p75": 97.4808, "p90": 97.4808, "mean": 97.4808}
+    "pident": {"p10": 97.5173, "p25": 97.5173, "p50": 97.5173, "p75": 97.5173, "p90": 97.5173, "mean": 97.5173}
   },
   "records": [
     {
       "acc": "SRR8209082",
       "status": "success",
-      "payload": {"source": "s3", "bytes": 1861058, "sha256": "8c52ec34f0a599f99871dc719b640fde794e0cd0dbbe0cdc6d469ecad1b8c41d", "etag": "d2dd288b238c3c88b46acdcd78860dce", "last_modified": "2024-03-31T17:38:36Z", "fetched_at": "2026-11-18T04:13:58Z"},
+      "payload": {"source": "s3", "bytes": 1861058, "sha256": "8c52ec34f0a599f99871dc719b640fde794e0cd0dbbe0cdc6d469ecad1b8c41d", "etag": "d2dd288b238c3c88b46acdcd78860dce", "last_modified": "2024-03-31T17:38:36Z", "fetched_at": "2026-11-18T17:00:24Z"},
       "n_unitigs": 81534,
       "n_anchors": 12876,
       "subgraph_nodes": 34582,
       "subgraph_fraction": 0.424142,
       "provisional": true,
+      "bias_uncorrected": false,
       "ka_max": 25000.0,
       "depth_saturated": true,
       "snv_sites": 1,
       "reconstructed": [
-        {"haplotype_id": "SRR8209082_primary", "seq_sha256": "7fea6934df9fb529abc046bf69325ea20fd6b072ab73a9c81c32054b85859343", "length": 2738, "cov": 0.9996, "ref_cov": 0.9996, "ref_span": [0, 2738], "pident": 97.4808, "pident_inherited": false, "nodes": 2506, "mean_ka": 16986.7, "vaf": 1.00}
+        {"haplotype_id": "SRR8209082_primary", "seq_sha256": "08304bd63171ac86253ade334c7a3144c6903d98a7f34bc62c40f858195ec1df", "length": 2738, "cov": 0.9996, "ref_cov": 0.9996, "ref_span": [0, 2738], "pident": 97.5173, "pident_inherited": false, "nodes": 2479, "mean_ka": 16859.3, "vaf": 1.00}
       ],
       "alts": 1,
-      "bubbles": 3632,
+      "bubbles": 0,
       "majority_corrections": 0,
       "minority_rescues": 0,
       "hit_pass_cap": false,
-      "minority_left": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 10, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0},
-      "variants": {"depth": 16000.0, "floor": 5.0, "forks": 136, "biallelic": 1, "recovered": 1, "beyond_cap": 0, "indels": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
-      "prune": {"outcome": "applied", "depth": 15000.0, "floor": 150.0, "unitigs": 34582, "unitigs_kept": 6901, "unpruned_span": [0, 2738], "pruned_span": [0, 2738]},
-      "timing": {"stream": 0.615, "parse": 0.044, "anchor": 0.000, "extract": 0.032, "align": 0.557, "stitch": 0.004, "phase": 0.013, "total": 0.653}
+      "minority_left": {"alt_below_floor": 0, "not_outright_majority": 0, "exempt_minority": 11, "saturated": 0, "no_rejoin": 0, "length_refused": 0, "window_not_shiftable": 0, "coverage_gate": 0, "identical": 0},
+      "variants": {"depth": 16000.0, "floor": 5.0, "forks": 134, "biallelic": 1, "two_allele_sites": 1, "min_site_vaf": 0.6897, "recovered": 1, "beyond_cap": 0, "indels": 0, "no_rejoin": 0, "not_substitution": 0, "over_indel_cap": 0, "frameshifting": 0, "window_not_shiftable": 0, "identical": 0},
+      "prune": {"outcome": "applied", "depth": 15000.0, "floor": 150.0, "unitigs": 34582, "unitigs_kept": 6946, "unpruned_span": [0, 2738], "pruned_span": [0, 2738]},
+      "timing": {"stream": 0.719, "parse": 0.045, "anchor": 0.000, "extract": 0.033, "align": 0.608, "stitch": 0.002, "phase": 0.001, "total": 0.695}
     }
   ]
 }

@@ -147,9 +147,13 @@ impl Fetcher {
     ///
     /// With `--unitigs-cache`: read from `<dir>/<ACC>.unitigs.fa.zst` if present, otherwise
     /// (under `--offline`) fail, otherwise download straight into a tempfile that is renamed
-    /// into place once the body is complete. A cached file's contents are trusted, because a
-    /// truncated file could only have arrived from a killed writer and the rename prevents
-    /// that. **Its size is not**, and that check outlived the reason it was added: see
+    /// into place once the body is complete. A cached file's contents are trusted as far as
+    /// this layer goes: the walker's own writer cannot leave a short file behind, because the
+    /// rename happens only after the body is complete. It is not the only writer, though, and
+    /// a directory filled by something else (a staged dataset, a partial copy) can hold one.
+    /// WF-13 catches an entry that is not zstd at all, and WG-10 catches one cut at a frame
+    /// boundary, which decodes cleanly and is caught in `parse` from the links. **The size is
+    /// not trusted**, and that check outlived the reason it was added: see
     /// `the_size_cap_decides_the_same_way_wherever_the_bytes_came_from`.
     ///
     /// Returns the compressed bytes only. Decompression is `decoder`'s job, and happens in
@@ -1358,6 +1362,13 @@ fn open_cache_tmp(dir: &Path, accession: &str) -> std::io::Result<BodySink> {
 /// Only the frame header is validated here, so this returns `Ok` for a stream that is
 /// corrupt further in. Truncated or damaged data surfaces as an `io::Error` from `read()`
 /// during `parse::build`. Callers must not treat a short read as a clean end of file.
+///
+/// **One truncation does not surface here at all** (WG-10). A file cut exactly at a frame
+/// boundary is a complete, valid zstd stream of the frames it still has, so every read
+/// succeeds and the decode ends cleanly on what is half an object. Nothing in this layer can
+/// tell that apart from a small accession. `parse` catches it instead, from the links: unitig
+/// ids are dense and sequential, so a link naming a record the file does not hold means
+/// records are missing.
 ///
 /// # Reading
 ///
