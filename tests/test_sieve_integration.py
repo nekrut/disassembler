@@ -734,23 +734,17 @@ class TestSieveAdmissionAndHeaders(unittest.TestCase):
         finally:
             ro.chmod(0o700)
 
-    def test_an_input_that_would_hang_the_binary_is_refused(self):
-        # The promoted set's LSH index is a fixed 2^20-slot open-addressing table
-        # that is never grown, and lookup stops only at an empty slot, so past about 65,536
-        # admitted records the binary can loop forever at 100% CPU. That is upstream's code
-        # and is not patched here; the wrapper refuses rather than hanging a Galaxy job
-        # until its walltime. The guard is checked without building such a cohort.
-        self.assertEqual(self.sieve.LSH_TABLE_LIMIT, 65536)
-        rep = self.sieve.DedupReport(n_in=70000, n_out=70000, n_empty=0, headers=[],
-                                     short=0, gappy=0)
-        self.assertGreater(rep.n_out - rep.short - rep.gappy, self.sieve.LSH_TABLE_LIMIT)
-
-    def test_the_admission_gate_is_disarmed_in_the_command_line(self):
-        # The flag the binary is actually given, since everything above depends on it.
-        self.assertEqual(self.sieve.ADMISSION_OFF_WARMUP, 2 ** 31 - 1)
+    def test_the_wrapper_no_longer_arms_the_gate_or_refuses_large_cohorts(self):
+        # The three upstream defects PM-01, PM-02 and PM-08 are fixed in the sieve binary
+        # itself, so the wrapper no longer overrides the warmup, refuses large inputs or
+        # warns about long records. If this test breaks, check that the submodule pin still
+        # names a binary >= v0.2.0.
+        self.assertFalse(hasattr(self.sieve, "LSH_TABLE_LIMIT"))
+        self.assertFalse(hasattr(self.sieve, "SKETCH_LENGTH_LIMIT"))
+        self.assertFalse(hasattr(self.sieve, "ADMISSION_OFF_WARMUP"))
         records = [(f"r{i}", self.mutate(self.base, 2)) for i in range(3)]
         _rc, _out, log, _e = self.run_sieve(records)
-        self.assertIn(f"--warmup {2 ** 31 - 1}", log)
+        self.assertNotIn("--warmup", log)
 
 
 if __name__ == "__main__":

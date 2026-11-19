@@ -62,31 +62,7 @@ def auto_min_len(ref: Path) -> int | None:
     return int(length * 0.95)
 
 
-# `--warmup` is read with `atoi` and the admission test is `n_mine > warmup`, so a
-# value nothing can exceed disarms the gate. After 2,000 records the binary used to reject a
-# record whose count of never-seen k-mers exceeded `mean + outlier_sd*sqrt(var) + 0.5`, and a
-# rejected record is never sketched, promoted or counted, so the rest of its clade was
-# rejected with it: in a cohort of near-identical unique haplotypes the cut-off is about
-# 1/(3*sqrt(n)) novel divergence, 0.5% at n = 5,000, whatever the gene length. A divergent
-# lineage placed after record 2,000 vanished from the MSA and tree at exit 0, and which
-# lineages survived depended on file order. `--outlier-sd 1e9` is not the fix: it still
-# rejects when the variance is 0.
-ADMISSION_OFF_WARMUP = 2 ** 31 - 1
 _REJECT_RE = re.compile(r"REJECT \(error\)\s*:\s*(\d+)")
-
-# The promoted set's LSH index is a 2^20-slot open-addressing table that is never
-# grown, and lookup stops only at an empty slot, so once 2^20 distinct band keys are stored
-# the next lookup of an absent key loops forever at 100% CPU. Each promoted record inserts up
-# to 16 band keys; 65,536 records with fully distinct bands is the worst case, and closer
-# cohorts fill at roughly 150k to 430k promoted. This is upstream's code
-# (github.com/stevenweaver/kmer-diversity-sieve) and is not patched here; the wrapper refuses
-# rather than hanging. The upstream fix is to grow the table at half load.
-LSH_TABLE_LIMIT = 65536
-
-# The per-record k-mer buffer is a fixed 1<<16 entries and is never grown, so k-mers
-# past position ~65,550 are dropped without a message and two records identical over their
-# first 65.5 kb are judged near-duplicates. Also upstream's; warned about here.
-SKETCH_LENGTH_LIMIT = 65550
 
 
 def report_rc(rc: int, what: str, prog: str) -> int:
@@ -365,38 +341,12 @@ def sieve_run(
                   f"{max_gap_frac:.0%} gaps or other non-ACGT characters (--max-gap-frac)",
                   flush=True)
 
-        # The binary's per-record k-mer buffer is a fixed 1<<16 entries and is never
-        # grown, so k-mers past position ~65,550 are dropped silently and two records
-        # identical over their first 65.5 kb are judged near-duplicates: one is dropped at
-        # exit 0 with nothing on stderr. Upstream's code, so this warns rather than patching.
-        if rep.longest > SKETCH_LENGTH_LIMIT:
-            print(f"[warn] the longest record is {rep.longest:,} nt and the sieve binary "
-                  f"sketches only the first {SKETCH_LENGTH_LIMIT:,} of each record "
-                  f"(upstream bug, kmer-diversity-sieve): records identical over that "
-                  f"prefix are judged near-duplicates whatever follows it.", file=sys.stderr)
-
-        # Refuse rather than hand the binary an input it will hang on. Only admitted
-        # records reach the LSH table.
-        admitted = n_unique - short - gappy
-        if admitted > LSH_TABLE_LIMIT:
-            msg = (f"{admitted:,} records would be admitted, and the sieve binary's LSH "
-                   f"index is a fixed 2^20-slot table that is never grown: past "
-                   f"{LSH_TABLE_LIMIT:,} admitted records it can loop forever instead of "
-                   f"finishing (upstream bug, kmer-diversity-sieve). Raise --min-len or "
-                   f"--max-gap-frac to admit fewer, or sieve a subset. Chunking and "
-                   f"re-sieving is not a way round it: the union can exceed the limit again.")
-            print(f"sieve: {msg}", file=sys.stderr)
-            emit_summary("failed", n_in=n_in, n_unique=n_unique, short=short, gappy=gappy,
-                         error=msg)
-            return 1
-
         cmd = [
             resolved,
             "--input", str(deduped),
             "--min-len", str(min_len),
             "--max-n-frac", str(max_gap_frac),
             "--threshold", str(threshold),
-            "--warmup", str(ADMISSION_OFF_WARMUP),
             "--sketch", str(sketch),
             "--emit-promoted", str(emit_prefix),
         ]

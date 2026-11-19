@@ -28,8 +28,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from disassembler.cmd.sieve import ADMISSION_OFF_WARMUP
-
 REPO = Path(__file__).resolve().parent.parent
 SIEVE_BIN = REPO / "extern" / "kmer-diversity-sieve" / "l1_pipeline_serial"
 FIXTURE = Path(__file__).resolve().parent / "fixture_reconstructed.fasta"
@@ -79,7 +77,6 @@ def _run_sieve(input_fa: Path, output_fa: Path, min_len: int):
         "--min-len", str(min_len),
         "--max-n-frac", "0.05",
         "--threshold", "0.005",
-        "--warmup", str(ADMISSION_OFF_WARMUP),
         "--sketch", "256",
         "--emit-promoted", str(emit_prefix),
     ]
