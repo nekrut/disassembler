@@ -173,6 +173,18 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     g_lex.add_argument("--non-coding", action="store_true", help="Treat the reference as non-coding: no stop scan, no frame rule, and haplotypes are classed NonCoding_*. A length that is not a multiple of 3 already implies this; pass it for a non-coding target whose length happens to be one, which is one target in three.")
     g_lex.add_argument("--allow-mixed", action="store_true",
                        help="Let accessions whose own HSPs disagree about a base into the clean tiers instead of FLAGGED_MIXED_HSPS. Logan leaves an unpopped SNP bubble as two contigs, both of which align; the tiler picks the one each position lies deeper inside and records the disagreement, because which allele the sample carries is not something it can know. Off by default.")
+    g_lex.add_argument("--min-conflict-hsp-bp", type=non_negative_int,
+                       default=lexicmap_cmd.CONFLICT_MIN_HSP_BP,
+                       help="Record a conflict only when at least one of the two disagreeing "
+                            "HSPs spans this many reference bases "
+                            f"(default: {lexicmap_cmd.CONFLICT_MIN_HSP_BP}; capped at a tenth "
+                            "of the reference, so a reference under 1 kb uses less). A "
+                            "conserved gene's termini match short fragments throughout a Logan "
+                            "assembly, and two such fragments disagreeing say nothing about the "
+                            "sample's allele. A short Logan bubble branch is still heard, "
+                            "because the contig spanning the gene is the other voter. 0 lets "
+                            "every pair count, which is the pre-0.2.0 behaviour. This changes "
+                            "only which disagreements are reported, never which base is tiled.")
     g_lex.add_argument("--require-full-length", action="store_true",
                        help="Require 100%% reference coverage (every position tiled) for "
                             "the clean full-length tier, instead of the --min-cov "
@@ -391,6 +403,7 @@ def _run(args, stages) -> int:
         max_internal_stops=args.max_internal_stops,
         allow_frameshift_alts=args.allow_frameshift_alts,
         allow_mixed=args.allow_mixed,
+        min_conflict_hsp_bp=args.min_conflict_hsp_bp,
         genetic_code=args.genetic_code,
         non_coding=args.non_coding,
         require_full_length=args.require_full_length,

@@ -310,8 +310,8 @@ at another summary, and it points by relative path so the set can be moved toget
 - Additive, listed here because consumers ask: `records[].variants` gained
   `two_allele_sites` and `min_site_vaf`; `cohort` gained `mixed` and `bias_uncorrected`;
   `records[]` gained `abundance_missing` (written only when non-zero), `majority_corrections`
-  and `minority_rescues`; haplotypes gained `ref_cov` and `ref_span`; `settings` gained
-  `prune_min_abund`.
+  and `minority_rescues`; haplotypes gained `ref_cov` and `ref_span`; the walker's `settings`
+  gained `prune_min_abund` and the lexicmap `settings` gained `min_conflict_hsp_bp`.
 
 ## Migration from the 0.1.x summaries
 

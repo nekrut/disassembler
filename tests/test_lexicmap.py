@@ -1104,6 +1104,104 @@ class TestMixedHsps(unittest.TestCase):
         self.assertEqual(rows[1].split("\t")[-1], "150")
 
 
+# Long enough that the floor is the full CONFLICT_MIN_HSP_BP rather than a tenth of the
+# reference, which is what every coding gene in the shipped panels looks like.
+CDS1500 = "ATG" + "GCT" * 498 + "TAA"
+
+
+class TestShortHspsCannotRaiseAConflictAlone(unittest.TestCase):
+    """A position contested only by fragments is not a mixed sample.
+
+    C. auris EF1A, 840,143 accessions, 0.2.0 defaults: all 6,502 flagged accessions conflicted
+    on four reference positions out of 1,377, two within 54 bases of the start and two within 33
+    of the end, and 99.9% of those positions lay outside the accession's own longest HSP. The
+    gene's conserved termini match short fragments throughout a Logan assembly, so the contest at
+    position 24 was between two scraps of 64 and 84 bases on unrelated contigs, while the 1,353
+    base alignment that covered the rest of the gene did not reach it. Ten bases of depth fit
+    inside a 64 base scrap, so the edge-window guard let it through.
+
+    `SRR7140015` is the shape these fixtures copy: one HSP from query 25 to the end, and two more
+    covering query 1 to 64 and nothing else.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_hsps(self, name, ref, rows, **kw):
+        """`rows` are (qstart, qend, qseq, sseq); pident and coverage follow from them."""
+        ref_path = self.dir / f"{name}.fasta"
+        ref_path.write_text(f">{name}\n{ref}\n")
+        tsv = self.dir / f"{name}.tsv"
+        with tsv.open("w") as fh:
+            fh.write("sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n")
+            for qs, qe, qseq, sseq in rows:
+                pid = 100.0 * sum(a == b for a, b in zip(qseq, sseq)) / len(qseq)
+                cov = 100.0 * (qe - qs + 1) / len(ref)
+                fh.write(f"SRR1\t{pid:.2f}\t{cov:.2f}\t{qs}\t{qe}\t{qseq}\t{sseq}\n")
+        prefix = str(self.dir / name)
+        lms.stream_lexicmap_to_msa(ref_path=str(ref_path), file_path=str(tsv),
+                                   out_prefix=prefix, **kw)
+        return json.loads(Path(f"{prefix}.summary.json").read_text())["records"][0]
+
+    def ef1a_shape(self, ref):
+        """A spanning HSP that starts at 25, and two fragments over 1-64 that differ at 24."""
+        frag_a = ref[:64]
+        frag_b = ref[:23] + ("A" if ref[23] != "A" else "C") + ref[24:64]
+        return [(25, len(ref), ref[24:], ref[24:]),
+                (1, 64, ref[:64], frag_a),
+                (1, 64, ref[:64], frag_b)]
+
+    def test_two_short_fragments_disagreeing_are_not_a_conflict(self):
+        rec = self.run_hsps("frags", CDS1500, self.ef1a_shape(CDS1500))
+        self.assertEqual(rec["n_conflicts"], 0, "64 bp scraps do not get to flag an accession")
+        self.assertEqual(rec["conflict_sites"], "None")
+        self.assertEqual(rec["status"], "CLEAN_FULL_LENGTH")
+
+    def test_zero_lets_every_pair_count_again(self):
+        rec = self.run_hsps("frags_off", CDS1500, self.ef1a_shape(CDS1500),
+                            min_conflict_hsp_bp=0)
+        self.assertEqual(rec["n_conflicts"], 1, "the pre-0.2.0 behaviour, on request")
+        self.assertEqual(rec["conflict_sites"], "24")
+        self.assertEqual(rec["status"], "FLAGGED_MIXED_HSPS")
+
+    def test_a_short_bubble_branch_still_conflicts_with_a_spanning_contig(self):
+        """The case the tier exists for, and the reason the rule is "at least one", not "both".
+
+        An unpopped Logan SNP bubble is a short branch by nature: the fixture in
+        TestLoganBubbleBranchDoesNotOverrideTheVariant is 61 bases, over LexicMap's -l 50.
+        Requiring both HSPs to clear 100 would silence it on any reference of 1 kb or more.
+        """
+        snv = CDS1500[:749] + ("A" if CDS1500[749] != "A" else "C") + CDS1500[750:]
+        branch = (720, 780, CDS1500[719:780], CDS1500[719:780])
+        rec = self.run_hsps("bubble", CDS1500, [(1, 1500, CDS1500, snv), branch])
+        self.assertEqual(len(branch[2]), 61, "a bubble branch is short, and must still be heard")
+        self.assertEqual(rec["n_conflicts"], 1)
+        self.assertEqual(rec["conflict_sites"], "750")
+        self.assertEqual(rec["status"], "FLAGGED_MIXED_HSPS")
+
+    def test_the_floor_is_capped_at_a_tenth_of_the_reference(self):
+        """On a 300 bp reference the floor is 30, so the same two 64 bp fragments do conflict.
+
+        Without the cap a short reference would lose conflict detection outright, since every
+        HSP over it is shorter than 100 bases.
+        """
+        rec = self.run_hsps("capped", CDS300, self.ef1a_shape(CDS300))
+        self.assertEqual(rec["n_conflicts"], 1)
+        self.assertEqual(rec["conflict_sites"], "24")
+
+    def test_the_base_that_wins_does_not_depend_on_the_floor(self):
+        """The floor decides what is reported, never what is tiled."""
+        rows = self.ef1a_shape(CDS1500)
+        a = self.run_hsps("seq_on", CDS1500, rows)
+        b = self.run_hsps("seq_off", CDS1500, rows, min_conflict_hsp_bp=0)
+        self.assertEqual(a["seq_sha256"], b["seq_sha256"])
+        self.assertEqual(a["coverage"], b["coverage"])
+
+
 CDS120 = "ATG" + "GCT" * 38 + "TAA"
 
 

@@ -26,9 +26,16 @@ as `qcovHSP >= 80%`, even though together they cover all of it.
    and aligned `qseq`/`sseq`. Where HSPs overlap, each position is decided on its own, by
    depth: the base comes from the HSP the position lies furthest inside, measured to the nearer
    of that HSP's two ends, with percent identity only as a tiebreak. Where two HSPs place
-   different bases at a position at least 10 bases inside both, the position is recorded as a
-   **conflict** and the accession is flagged (tier 6). Reference positions that no HSP covers
-   are written as `-`.
+   different bases at a position at least 10 bases inside both, and at least one of them spans
+   `--min-conflict-hsp-bp` reference bases, the position is recorded as a **conflict** and the
+   accession is flagged (tier 6). Reference positions that no HSP covers are written as `-`.
+
+   The length floor is there because depth scales with the HSP: 10 bases of it fit inside a 64
+   base fragment, and a conserved gene's termini match such fragments throughout a Logan
+   assembly. A position contested only by fragments, with nothing longer over it to settle the
+   question, is not evidence of a mixed sample. One long HSP among the two is enough, because a
+   bubble branch is short and still worth hearing when a contig spanning the gene disagrees with
+   it. The floor changes only which disagreements are reported, never which base is tiled.
 
    Through 0.1.1 the rule was whole-HSP: the HSP with the higher identity *to the reference*
    won every position it touched. Logan leaves an unpopped SNP bubble as two separate contigs,
@@ -320,6 +327,7 @@ and also removes an earlier run's MSA and tree.
 | `--max-internal-stops <N>` | `0` | premature stops tolerated in the clean tiers |
 | `--allow-frameshift-alts` | off | let accessions with a frameshift into the clean tiers instead of `FLAGGED_FRAMESHIFT` |
 | `--allow-mixed` | off | let accessions whose own HSPs disagree about a base into the clean tiers instead of `FLAGGED_MIXED_HSPS` |
+| `--min-conflict-hsp-bp <N>` | `100` | a disagreement counts only if at least one of the two HSPs spans this many reference bases, capped at a tenth of the reference; `0` lets every pair count, as before 0.2.0 |
 | `--samples-per-haplotype <N>` | `10` | representative accessions per haplotype in the TSV |
 | `--max-records <N>` | | stop after N input rows (for previews); the accession in progress is finished, so the last row of a preview is not mis-tiered |
 | `--no-a2m` | off | skip the A2M output |

@@ -286,6 +286,30 @@ INDEL_EDGE_WINDOW = 10
 # this bounds the ledger cell and the summary record (docs/summaries.md, 1 KB per record).
 CONFLICT_REPORT_LIMIT = 10
 
+# A disagreement counts only if **at least one** of the two HSPs spans this many reference bases.
+# A conserved gene's termini match short fragments all over a Logan assembly, and two such
+# fragments disagreeing with each other say nothing about the allele the sample carries. The depth
+# rule does not stop them, because 10 bases of depth fit inside a 64-base scrap.
+#
+# At least one, not both, and the difference matters. An unpopped Logan SNP bubble is a short
+# branch by nature (the regression fixture's is 61 bases, over LexicMap's -l 50), so requiring
+# both to be long would silence the case this tier exists for. What it must silence is a position
+# contested *only* by fragments, with no HSP over it long enough to settle the question.
+#
+# Measured on C. auris EF1A, where all 6,502 accessions were flagged: the conflicts sat on four
+# reference positions out of 1,377, two near each end, 99.9% lay outside the accession's own
+# longest HSP, and the contesting pair was 64 and 84 bases. At 100 this leaves **6 of 6,502**
+# flagged, while H. pylori babA keeps **all 1,576** of its accessions and 100% of its 15,098
+# conflicting positions, where the disagreement is real babA/babB paralog mixing inside a
+# 3,873-base alignment. Requiring both to be long instead costs babA 126 accessions and 9% of its
+# positions and buys 4 accessions on EF1A, which is the wrong trade. 50 is too low either way: the
+# EF1A scraps clear it.
+CONFLICT_MIN_HSP_BP = 100
+# ...but never more than a tenth of the reference, so a short reference is not silenced outright.
+# The floor is CONFLICT_MIN_HSP_BP for any reference of 1 kb or more, which is every coding gene
+# in the shipped panels.
+CONFLICT_MIN_HSP_REF_FRACTION = 10
+
 # A shift of the reading frame counts as a frameshift only if it lasts this many reference bases,
 # or never ends. Indels that cancel each other sooner (net length a multiple of 3) are usually how
 # an aligner writes a divergent stretch: on H. pylori babA, sabA and vacA most such clusters close
@@ -547,14 +571,16 @@ def resolve_out_prefix(out_prefix, ref_name: str) -> str:
     return str(out_prefix)
 
 
-def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverage: float) -> Tiling:
+def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverage: float,
+                        min_conflict_hsp_bp: int = CONFLICT_MIN_HSP_BP) -> Tiling:
     """
     Tiles all qualifying HSPs of an accession onto the reference coordinate system.
 
     Overlapping positions are resolved **per position**, by depth: the base comes from the HSP
     the position lies furthest inside, measured to the nearer of that HSP's two ends, then by
     `pident`, then by input order. Where two HSPs place different symbols at a position that
-    is at least INDEL_EDGE_WINDOW inside both, the position is recorded in `conflicts`.
+    is at least INDEL_EDGE_WINDOW inside both, and at least one of which spans
+    `min_conflict_hsp_bp` reference bases, the position is recorded in `conflicts`.
 
     Per position, and not per HSP. Ranking whole HSPs by identity to the reference makes the
     reference branch win every position it touches: Logan leaves an unpopped SNP bubble as two
@@ -573,6 +599,16 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
     tile them anyway. The INDEL_EDGE_WINDOW requirement on *both* sides keeps an ordinary
     ragged overlap at an HSP end, where one aligner simply ran out of sequence, from being
     read as two contigs disagreeing.
+
+    `min_conflict_hsp_bp` is the second half of that guard and the reason the length of an HSP
+    matters here and nowhere else in the tiler. Depth scales with the HSP, so 10 bases of it fit
+    inside a 64-base fragment, and a conserved gene's termini match such fragments throughout an
+    assembly. A position contested only by fragments, with nothing longer over it to settle the
+    question, is not evidence of a mixed sample. One long HSP among the two is enough, because a
+    bubble branch is short and still worth hearing when something spanning disagrees with it.
+
+    The base each position *takes* is unaffected. The floor decides only whether a disagreement is
+    recorded, never which symbol wins.
 
     Indels are read from the aligned qseq/sseq: a run of '-' in qseq is an insertion in the
     sample (its bases have no reference position, so they are left out of `seq`), and a run of
@@ -619,6 +655,14 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
         pid_of[k] = pident
         firsts[k] = spans[k][0]
         lasts[k] = spans[k][1] - 1
+
+    # Which HSPs are long enough to contest a position, as a flat list indexed by HSP number:
+    # `own[p]` holds an HSP index, and this is read once per contested position in the hot loop
+    # below, so it cannot be a set lookup.
+    conflict_floor = min(min_conflict_hsp_bp, ref_len // CONFLICT_MIN_HSP_REF_FRACTION)
+    long_enough = [False] * len(hsps)
+    for k, (a, b) in spans.items():
+        long_enough[k] = (b - a) >= conflict_floor
 
     def depth_at(p, k):
         first, end = spans[k]
@@ -667,7 +711,8 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
             chars[p], own[p] = ch, k
         else:
             d_new, d_old = depth_at(p, k), depth_at(p, ex)
-            if (chars[p] != ch and d_new >= INDEL_EDGE_WINDOW
+            if (chars[p] != ch and (long_enough[k] or long_enough[ex])
+                    and d_new >= INDEL_EDGE_WINDOW
                     and d_old >= INDEL_EDGE_WINDOW):
                 conflicts.add(p)
             if (d_new, pid_of[k]) > (d_old, pid_of[ex]):
@@ -680,6 +725,7 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
     for k, (pident, qcov, qstart, qend, qseq, sseq) in qualifying:
         first, end = spans[k]
         last = end - 1
+        k_long = long_enough[k]
 
         q_pos = qstart - 1
         if '-' not in qseq and '-' not in sseq:
@@ -716,7 +762,8 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
                         d_old = p - firsts[ex]
                         if lasts[ex] - p < d_old:
                             d_old = lasts[ex] - p
-                        if (chars[p] != ch and d_new >= INDEL_EDGE_WINDOW
+                        if (chars[p] != ch and (k_long or long_enough[ex])
+                                and d_new >= INDEL_EDGE_WINDOW
                                 and d_old >= INDEL_EDGE_WINDOW):
                             conflicts.add(p)
                         if (d_new, pident) > (d_old, pid_of[ex]):
@@ -773,6 +820,8 @@ def tile_accession_hsps(hsps: list, ref_len: int, min_pident: float, min_coverag
             continue
         for j, (jf, je) in spans.items():
             if j == k or pos - 1 < jf or pos >= je:
+                continue
+            if not (long_enough[k] or long_enough[j]):
                 continue
             if min(pos - 1 - jf, je - pos) < INDEL_EDGE_WINDOW:
                 continue
@@ -1043,6 +1092,7 @@ def stream_lexicmap_to_msa(
     max_internal_stops: int = 0,
     allow_frameshifts: bool = False,
     allow_mixed: bool = False,
+    min_conflict_hsp_bp: int = CONFLICT_MIN_HSP_BP,
     genetic_code: int = 11,
     non_coding: bool = False,
     full_length_only: bool = False,
@@ -1310,7 +1360,8 @@ def stream_lexicmap_to_msa(
 
         total_accessions += 1
 
-        tiling = tile_accession_hsps(hsps, ref_len, min_pident, full_cov)
+        tiling = tile_accession_hsps(hsps, ref_len, min_pident, full_cov,
+                                     min_conflict_hsp_bp)
         merged_seq, mean_pid = tiling.seq, tiling.mean_pident
         single_ge_cov, single_full = tiling.single_ge_min_cov, tiling.single_full
 
@@ -1919,6 +1970,7 @@ def stream_lexicmap_to_msa(
             "max_internal_stops": max_internal_stops,
             "allow_frameshifts": allow_frameshifts,
             "allow_mixed": allow_mixed,
+            "min_conflict_hsp_bp": min_conflict_hsp_bp,
             "genetic_code": genetic_code,
             "non_coding": non_coding,
             "reference_is_cds": ref_is_cds,
@@ -2061,6 +2113,18 @@ def add_parser(subparsers):
     parser.add_argument("--non-coding", action="store_true", help="Treat the reference as non-coding: no stop scan, no frame rule, and haplotypes are classed NonCoding_*. A length that is not a multiple of 3 already implies this; pass it for a non-coding target whose length happens to be one, which is one target in three.")
     parser.add_argument("--allow-mixed", action="store_true",
                         help="Let accessions whose own HSPs disagree about a base into the clean tiers instead of FLAGGED_MIXED_HSPS. Logan leaves an unpopped SNP bubble as two contigs, both of which align; the tiler picks the one each position lies deeper inside and records the disagreement, because which allele the sample carries is not something it can know. Off by default.")
+    parser.add_argument("--min-conflict-hsp-bp", type=non_negative_int,
+                        default=CONFLICT_MIN_HSP_BP,
+                        help="Record a conflict only when at least one of the two disagreeing "
+                             "HSPs spans this many reference bases "
+                             f"(default: {CONFLICT_MIN_HSP_BP}; capped at a tenth of the "
+                             "reference, so a reference under 1 kb uses less). A conserved "
+                             "gene's termini match short fragments throughout a Logan assembly, "
+                             "and two such fragments disagreeing say nothing about the sample's "
+                             "allele. A short Logan bubble branch is still heard, because the "
+                             "contig spanning the gene is the other voter. 0 lets every pair "
+                             "count, which is the pre-0.2.0 behaviour. This changes only which "
+                             "disagreements are reported, never which base is tiled.")
     parser.add_argument("--require-full-length", action="store_true",
                         help="Require 100%% reference coverage (every position tiled) for the "
                              "clean full-length tier, instead of the --min-cov threshold. "
@@ -2137,6 +2201,7 @@ def _write_failed_summary(out_prefix: str, args, started: float, error: str) -> 
                 "max_internal_stops": args.max_internal_stops,
                 "allow_frameshifts": args.allow_frameshift_alts,
                 "allow_mixed": args.allow_mixed,
+                "min_conflict_hsp_bp": args.min_conflict_hsp_bp,
                 "genetic_code": args.genetic_code,
                 "non_coding": args.non_coding,
                 "require_full_length": args.require_full_length,
@@ -2215,6 +2280,7 @@ def run(args) -> int:
             max_internal_stops=args.max_internal_stops,
             allow_frameshifts=args.allow_frameshift_alts,
             allow_mixed=args.allow_mixed,
+            min_conflict_hsp_bp=args.min_conflict_hsp_bp,
             genetic_code=args.genetic_code,
             non_coding=args.non_coding,
             full_length_only=args.require_full_length,
