@@ -111,7 +111,7 @@ class TestMsaCoverageGate(unittest.TestCase):
         return rc, out.getvalue() + err.getvalue(), rows
 
     def test_aligned_rows_are_published_exactly_as_given(self):
-        """A lexicmap row carries every base at the reference position its HSP gave
+        """A tiler row carries every base at the reference position its HSP gave
         it, and `-` where no HSP reached, so the cohort is already an alignment. MAFFT
         discards those gaps and places the bases again, and where several placements score
         the same it slides bases across the uncovered stretch: on real HIV-1 pol rows a

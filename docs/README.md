@@ -12,7 +12,7 @@ defaults rest on. The project overview is in the [top-level README](../README.md
 | reconstruct haplotypes from SRA accessions | [`walker.md`](walker.md) |
 | look up a walker flag, output file or exit code | [`walker_reference.md`](walker_reference.md) |
 | find candidate accessions with kmindex first | [`kmindex.md`](kmindex.md) |
-| work from a LexicMap search instead of unitig graphs | [`lexicmap.md`](lexicmap.md) |
+| work from a LexicMap search instead of unitig graphs | [`tiler.md`](tiler.md) |
 | thin a cohort of near-duplicates before the tree | [`sieve.md`](sieve.md) |
 | align and build a tree, or run the whole pipeline | [`codon_msa.md`](codon_msa.md) |
 | parse any stage's output programmatically | [`summaries.md`](summaries.md) |
@@ -28,7 +28,7 @@ A first pass through the suite reads naturally as `walker.md`, then `summaries.m
 - [`walker_reference.md`](walker_reference.md): every flag, every output file, the exit
   statuses, and the memory and disk model.
 - [`kmindex.md`](kmindex.md): `harvest`, `stratify` and `from-kmindex`.
-- [`lexicmap.md`](lexicmap.md): the LexicMap route, its six tiers and `from-lexicmap`.
+- [`tiler.md`](tiler.md): the tiler route, its six tiers and `from-lexicmap`.
 - [`sieve.md`](sieve.md): diversity thinning, and how to choose its threshold.
 - [`codon_msa.md`](codon_msa.md): the codon MSA and tree, and `reconstruct`.
 - [`summaries.md`](summaries.md): the summary JSON contract every stage writes, and its

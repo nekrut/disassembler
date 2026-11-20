@@ -41,7 +41,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "only the flags a routine user tunes per run; walker internals and a few "
             "flags with special handling live behind the `--` passthrough (see the "
             "Walker and Pass-through groups below for the exact list and rationale). "
-            "`disassembler walker -h` shows the full walker CLI."
+            "`disassembler walk -h` shows the full walker CLI."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Pass extra logan-walker flags after a literal `--`.",
@@ -75,10 +75,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "      -f/--out-fasta         hardcoded so sieve/MSA can find the FASTA\n"
             "      -t/--threads           kept at 1 for GraphAligner reproducibility\n"
             "      --min-cov              would clash with MSA's --msa-min-cov\n"
-            "      --allow-frameshift-alts   name owned by lexicmap for a different\n"
+            "      --allow-frameshift-alts   name owned by the tiler for a different\n"
             "                                meaning\n"
             "\n"
-            "  See `disassembler walker -h` for the full walker CLI.\n"
+            "  See `disassembler walk -h` for the full walker CLI.\n"
         ),
     )
     g_walker.add_argument("-q", "--query", required=True, action="append",
@@ -202,7 +202,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "\n"
             "    disassembler reconstruct ... -- --primary-metric pident --hops 7\n"
             "\n"
-            "  See `disassembler walker -h` for the full CLI.\n"
+            "  See `disassembler walk -h` for the full CLI.\n"
         ),
     )
     g_pass.add_argument("walker_args", nargs=argparse.REMAINDER,
@@ -262,15 +262,15 @@ COMPOSITE_OWNED_WALKER_FLAGS = {
 WALKER_FLAGS_WITH_NO_OUTPUT = {
     "--fetch-only": "it makes the walker exit without writing a reconstruction, and this "
                     "composite needs one. To warm a cache, run `disassembler fetch` or "
-                    "`disassembler walker --fetch-only`",
+                    "`disassembler walk --fetch-only`",
     "-h": "it prints the walker's help instead of running it; "
-          "run `disassembler walker -h`",
+          "run `disassembler walk -h`",
     "--help": "it prints the walker's help instead of running it; "
-              "run `disassembler walker --help`",
+              "run `disassembler walk --help`",
     "-V": "it prints the walker's version instead of running it; "
-          "run `disassembler walker --version`",
+          "run `disassembler walk --version`",
     "--version": "it prints the walker's version instead of running it; "
-                 "run `disassembler walker --version`",
+                 "run `disassembler walk --version`",
 }
 
 
@@ -431,7 +431,7 @@ def _run(args, stages) -> int:
 
     _walker = resolve_walker(args.walker_bin)
     if not _walker:
-        # The same message the `walker` stage prints, and the same exit code.
+        # The same message the `walk` subcommand prints, and the same exit code.
         return _die(not_found_message("walker", "reconstruct"), EX_TOOL_NOT_FOUND)
     # Refuse an old walker in the preflight, before the fetch and the walk.
     _ver_err = walker_version_error(_walker)

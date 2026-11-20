@@ -26,7 +26,7 @@ class _Gunzip(io.RawIOBase):
 
     `gzip.GzipFile` raises `EOFError` for a truncated member and `zlib.error` for a
     corrupt one. Neither is caught by `except (OSError, ValueError)`, which is what
-    `lexicmap`, `msa`, `sieve`, `stratify`, `reconstruct` and `from-lexicmap` all use, so a
+    `tile`, `msa`, `sieve`, `stratify`, `reconstruct` and `from-lexicmap` all use, so a
     half-downloaded `.gz` ended in a traceback from every one of them. Fixed here rather than
     in six `except` clauses, because here is where the cause is known.
 

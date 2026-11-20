@@ -26,7 +26,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from disassembler.cmd import lexicmap as lms
+from disassembler.cmd import tiler as lms
 from disassembler.stage import stage_args
 
 REF = ">gene\nATGGCTGAATAA\n"
@@ -112,7 +112,7 @@ class TestTruncatedGalaxyDownload(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_lexicmap(self, mode, **kw):
+    def run_tiler(self, mode, **kw):
         type(self).server.mode = mode
         ns = stage_args(
             lms,
@@ -133,7 +133,7 @@ class TestTruncatedGalaxyDownload(unittest.TestCase):
         return json.loads(p.read_text()) if p.is_file() else None
 
     def test_a_complete_download_is_read_in_full(self):
-        rc, err = self.run_lexicmap("complete")
+        rc, err = self.run_tiler("complete")
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.summary()["run"]["status"], "ok")
         self.assertEqual(self.summary()["cohort"]["clean_full_length"], 200)
@@ -141,7 +141,7 @@ class TestTruncatedGalaxyDownload(unittest.TestCase):
     def test_a_body_cut_short_of_content_length_is_refused(self):
         # The defect: this used to exit 0 with a biased prefix of the cohort and
         # "status": "ok", with nothing in any output saying the table was half a table.
-        rc, err = self.run_lexicmap("short")
+        rc, err = self.run_tiler("short")
         self.assertEqual(rc, 1, err)
         self.assertIn("short of its Content-Length", err)
         self.assertEqual(self.summary()["run"]["status"], "failed")
@@ -151,13 +151,13 @@ class TestTruncatedGalaxyDownload(unittest.TestCase):
         self.assertIn("short of its Content-Length", self.summary()["run"]["error"])
 
     def test_a_chunked_body_without_its_terminator_is_refused(self):
-        rc, err = self.run_lexicmap("chunked_cut")
+        rc, err = self.run_tiler("chunked_cut")
         self.assertEqual(rc, 1, err)
         self.assertIn("IncompleteRead", err)
         self.assertNotIn("Traceback", err)
 
     def test_a_cut_gzip_body_is_refused(self):
-        rc, err = self.run_lexicmap("gzip_cut")
+        rc, err = self.run_tiler("gzip_cut")
         self.assertEqual(rc, 1, err)
         self.assertIn("Compressed file ended", err)
         self.assertNotIn("Traceback", err)
@@ -165,7 +165,7 @@ class TestTruncatedGalaxyDownload(unittest.TestCase):
     def test_max_records_stops_the_loop_without_tripping_the_check(self):
         # A preview deliberately leaves bytes unread, so owing bytes is expected here and
         # must not be reported as a truncated download.
-        rc, err = self.run_lexicmap("complete", max_records=10)
+        rc, err = self.run_tiler("complete", max_records=10)
         self.assertEqual(rc, 0, err)
         self.assertNotIn("Content-Length", err)
 

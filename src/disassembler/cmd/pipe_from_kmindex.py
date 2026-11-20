@@ -52,7 +52,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "only the flags a routine user tunes per run; walker internals and a few "
             "flags with special handling live behind the `--` passthrough (see the "
             "Walker and Pass-through groups below for the exact list and rationale). "
-            "`disassembler walker -h` shows the full walker CLI."
+            "`disassembler walk -h` shows the full walker CLI."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Pass extra logan-walker flags after a literal `--`.",
@@ -138,10 +138,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "      -f/--out-fasta         hardcoded so downstream stages find the FASTA\n"
             "      -t/--threads           kept at 1 for GraphAligner reproducibility\n"
             "      --min-cov              would clash with MSA's --msa-min-cov\n"
-            "      --allow-frameshift-alts   name owned by lexicmap for a different\n"
+            "      --allow-frameshift-alts   name owned by the tiler for a different\n"
             "                                meaning\n"
             "\n"
-            "  See `disassembler walker -h` for the full walker CLI.\n"
+            "  See `disassembler walk -h` for the full walker CLI.\n"
         ),
     )
     g_walker.add_argument("-q", "--query", required=True, action="append",
@@ -255,7 +255,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "\n"
             "    disassembler from-kmindex ... -- --primary-metric pident --hops 7\n"
             "\n"
-            "  See `disassembler walker -h` for the full CLI.\n"
+            "  See `disassembler walk -h` for the full CLI.\n"
         ),
     )
     g_pass.add_argument("walker_args", nargs=argparse.REMAINDER,

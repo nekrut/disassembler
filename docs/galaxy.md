@@ -17,7 +17,7 @@ overrides, output paths) are not exposed; they stay on the command line.
 | `disassembler_harvest` | `harvest --shards-dir` | the shard collection from the IUC `kmindex_query` tool, in either `json` or `json_vec` format | outputs per-target accession lists and score files as collections |
 | `disassembler_stratify` | `stratify` | harvest's per-target scores collection | score bins as a repeat; the upper bound defaults to 1.01 so a perfect score is included |
 | `disassembler_walker` | `logan-walker` | an accession list dataset or a single accession, plus the reference CDS | see below |
-| `disassembler_lexicmap` | `lexicmap -f` | a LexicMap search table with all columns, plus the reference CDS | |
+| `disassembler_tiler` | `tile -f` | a LexicMap search table with all columns, plus the reference CDS | |
 | `disassembler_sieve` | `sieve` | a FASTA, plus a reference or an explicit length gate | gene-scale defaults come from the subcommand |
 | `disassembler_msa` | `msa` | haplotypes FASTA, plus the reference CDS | pins MAFFT 7.526 (7.525 has a bug in `--addfragments`, the path `msa` uses) |
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_lexicmap.py: Unit and integration tests for the lexicmap subcommand.
+"""test_tiler.py: Unit and integration tests for the `tile` subcommand.
 
 Tests:
   - Multi-HSP coordinate tiling & overlap resolution
@@ -19,9 +19,9 @@ import tempfile
 from pathlib import Path
 
 try:
-    from disassembler.cmd import lexicmap as lms
+    from disassembler.cmd import tiler as lms
 except ImportError as e:  # pragma: no cover - environment-dependent
-    print(f"SKIP: disassembler.cmd.lexicmap not importable ({e})")
+    print(f"SKIP: disassembler.cmd.tiler not importable ({e})")
     sys.exit(0)
 
 
@@ -169,14 +169,14 @@ class TestLexicMapStreamer(unittest.TestCase):
             "query\tqlen\thits\tsgenome\tsseqid\tqcovGnm\tcls\thsp\tqcovHSP\talenHSP\tpident\tgaps\tqstart\tqend\tsstart\tsend\tqseq\tsseq\n"
             "test_cds\t12\t1\tSRR002\tu3\t100.0\t1\t1\t100.0\t12\t100.0\t0\t1\t12\t1\t12\tATGGCTGAATAA\tATGGCTGAATAA\n")
         out = self.dir_path / "out" / "new"
-        rc = cli.main(["lexicmap", "-q", str(self.ref_fasta), "-f", str(tsv),
+        rc = cli.main(["tile", "-q", str(self.ref_fasta), "-f", str(tsv),
                        "--out-dir", str(out)])
         self.assertEqual(rc, 0)
         self.assertTrue(out.is_dir())
         self.assertTrue(any(p.name.endswith(".clean.msa.fasta") for p in out.iterdir()))
         self.assertFalse((self.dir_path / "out" / "new.clean.msa.fasta").exists())
         # -o keeps its prefix meaning.
-        rc = cli.main(["lexicmap", "-q", str(self.ref_fasta), "-f", str(tsv),
+        rc = cli.main(["tile", "-q", str(self.ref_fasta), "-f", str(tsv),
                        "-o", str(self.dir_path / "pfx")])
         self.assertEqual(rc, 0)
         self.assertTrue((self.dir_path / "pfx.clean.msa.fasta").exists())
@@ -772,7 +772,7 @@ class TestGalaxyDataset(unittest.TestCase):
         self.assertFalse((self.dir / "out").exists())
 
     def test_a_dataset_that_needs_a_person_is_an_error_not_a_retry(self):
-        # A script retrying on 75, which docs/lexicmap.md invites, looped until its own
+        # A script retrying on 75, which docs/tiler.md invites, looped until its own
         # limit: a deferred dataset is terminal and a paused job waits for a person.
         for state, word in (("deferred", "materialize"), ("paused", "resume")):
             rc, err = self.run_with_state(state)
@@ -1461,7 +1461,7 @@ class TestReferenceWhitespaceAndNaming(unittest.TestCase):
             self.assertNotIn("\\", got)
             self.assertNotIn(got, (".", "..", ""))
         self.assertEqual(len(lms.file_safe_name("x" * 300)), 200)
-        # Nothing usable left: the caller falls back to the file stem, then to "lexicmap".
+        # Nothing usable left: the caller falls back to the file stem, then to "tiler".
         self.assertEqual(lms.file_safe_name("..."), "")
         self.assertEqual(lms.file_safe_name(".."), "")
         # Separators alone still leave a usable, harmless component.
@@ -1795,7 +1795,7 @@ class TestStreamHandling(unittest.TestCase):
 
     def test_a_truncated_gzip_names_the_file_instead_of_raising_eoferror(self):
         # gzip.GzipFile raises EOFError for a truncated member and zlib.error for a corrupt
-        # one, and neither is caught by the `except (OSError, ValueError)` that lexicmap,
+        # one, and neither is caught by the `except (OSError, ValueError)` that the tiler,
         # msa, sieve, stratify, reconstruct and from-lexicmap all use.
         from disassembler.textio import open_text
         blob = gzip.compress(self.table.encode())
@@ -1959,7 +1959,7 @@ class TestSharedHelpers(unittest.TestCase):
         self.assertIsNone(summary_io.quantiles_from_counts(Counter()))
 
     def test_one_galaxy_api_key_implementation(self):
-        # `get_galaxy_api_key` existed in both harvest and lexicmap and had drifted.
+        # `get_galaxy_api_key` existed in both harvest and the tiler and had drifted.
         # harvest's copy took no api_key argument, so --api-key was honoured by one command
         # and quietly ignored by the other.
         from disassembler.cmd import harvest as hv

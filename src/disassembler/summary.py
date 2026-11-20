@@ -48,9 +48,9 @@ def seq_sha256(seq: str | bytes) -> str:
 def quantiles(values) -> dict | None:
     """`p10`, `p25`, `p50`, `p75`, `p90`, `mean`, to 4 decimals, or None when empty.
 
-    The same five quantiles under the same names everywhere. 0.1.x `lexicmap` called the
-    median `p50_median` and the walker reported no quantiles at all, so neither of a pair of
-    summaries could be read with the other's parser.
+    The same five quantiles under the same names everywhere. 0.1.x `lexicmap` (now `tile`)
+    called the median `p50_median` and the walker reported no quantiles at all, so neither of
+    a pair of summaries could be read with the other's parser.
     """
     v = sorted(float(x) for x in values)
     if not v:
@@ -61,7 +61,7 @@ def quantiles(values) -> dict | None:
 
         This used to be `v[round((n - 1) * q)]`, which with banker's rounding returned
         one of the two middle values of an even cohort, sometimes the lower and sometimes the
-        upper. The p50s drive lexicmap's divergent-regime call, so coverages of 0.55 and 0.65
+        upper. The p50s drive the tiler's divergent-regime call, so coverages of 0.55 and 0.65
         (true median 0.60) reported 0.55 and `divergent`, while 0.50/0.55/0.65/0.70 reported
         0.65 and `conserved`. This is numpy's "linear" and
         `statistics.quantiles(method="inclusive")`.
@@ -236,7 +236,7 @@ def write(
 class Records:
     """Records collected on disk while a stage streams, for `write(records_file=...)`.
 
-    The point of the LexicMap route is that it does not hold its input, so holding one record
+    The point of the tiler route is that it does not hold its input, so holding one record
     per accession in memory to write at the end would undo that on a cohort of millions. Each
     record is appended as one JSON line and spliced into the summary at the end.
 

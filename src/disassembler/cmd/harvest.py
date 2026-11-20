@@ -45,7 +45,7 @@ ATTEMPTS = 5
 
 def get_galaxy_api_key(key_file: str | None = None, api_key: str | None = None) -> str:
     """The Galaxy API key. One implementation, in `disassembler.galaxy`. This copy
-    took no `api_key` argument, so `--api-key` worked for `lexicmap` and not for `harvest`."""
+    took no `api_key` argument, so `--api-key` worked for `tile` and not for `harvest`."""
     return galaxy.api_key(api_key, key_file)
 
 

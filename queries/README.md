@@ -1,11 +1,11 @@
 # Reference queries
 
 The reference CDSs the suite ships with. Every file here is a query: the `-q` of the walker and
-`reconstruct`, or the `--ref` of `lexicmap` and `sieve`. Multi-strain panels for the walker's
+`reconstruct`, or the `--ref` of `tile` and `sieve`. Multi-strain panels for the walker's
 multi-anchor mode live in [`../panels/`](../panels/README.md) instead.
 
 Every record is a coding sequence in frame from its first base, so the codon MSA and the
-lexicmap route's stop scan can be run against it without preparation. Anchoring is
+tiler route's stop scan can be run against it without preparation. Anchoring is
 exact-k-mer, so an ambiguous base is not a base that matches several things, it is a hole in
 the anchor that matches nothing; prefer an unambiguous allele when adding one.
 

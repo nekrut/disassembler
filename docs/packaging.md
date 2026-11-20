@@ -59,7 +59,7 @@ conda create --dry-run --platform osx-64 -c conda-forge -c bioconda disassembler
 
 The walker floor is enforced at run time as well as by the recipe: the package runs
 `logan-walker --version` before using it and refuses anything below `MIN_WALKER_VERSION`
-(`src/disassembler/resolve.py`), in the `walker` passthrough and in the composites' preflight.
+(`src/disassembler/resolve.py`), in the `walk` passthrough and in the composites' preflight.
 That catches a stale conda environment, a `--walker-bin` pointed at an old build and a
 hand-built binary on `PATH`, none of which a recipe floor constrains. Raise the constant and the
 recipe floor together.

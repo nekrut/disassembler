@@ -79,7 +79,7 @@ class TestWalkerVersionFloor(unittest.TestCase):
                                 f"enforces at run time")
 
     def test_the_walker_passthrough_refuses_an_old_binary(self):
-        # `run_walker` is the entry the composites use; the top-level `walker` subcommand
+        # `run_walker` is the entry the composites use; the top-level `walk` subcommand
         # execv's through the same resolver.
         from disassembler.cmd import walker as walker_cmd
         old = stub(self.dir, '#!/bin/sh\necho "logan-walker 0.1.0"\n')

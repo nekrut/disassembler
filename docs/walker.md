@@ -2,7 +2,8 @@
 
 `logan-walker` reconstructs the coding sequence of one gene in each of a list of SRA runs, from
 Logan's unitig graphs. It is a Rust binary (`walker/`), packaged on Bioconda as `logan-walker`.
-`disassembler walker` passes its arguments straight to it, and `disassembler reconstruct` and
+`disassembler walk` (`disassembler walker` through 0.1.x, which still works) passes its
+arguments straight to it, and `disassembler reconstruct` and
 `from-kmindex` run it as a stage.
 
 This page is the guide: what the walker does, how to run it, and how it behaves. Every flag,
@@ -53,7 +54,7 @@ outputs are written in input order whatever order the work finishes in.
 
 ```bash
 logan-walker -a SRR8209082 -q queries/query_hiv1_pol.fasta -o out -f out/hiv1_pol.fasta
-disassembler walker -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika --emit-snv-table
+disassembler walk -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika --emit-snv-table
 ```
 
 GraphAligner 1.0.17b must be on `PATH`, or named with `--graphaligner <PATH>` (see
@@ -265,7 +266,7 @@ one it stays. So the cache trades disk for network, and it keeps everything it d
 disassembler fetch -l accessions.txt --unitigs-cache ./unitigs/
 
 # Then run as often as needed with no network
-disassembler walker -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/run1 \
+disassembler walk -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/run1 \
     --unitigs-cache ./unitigs/ --offline
 ```
 

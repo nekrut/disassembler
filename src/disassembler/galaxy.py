@@ -1,6 +1,6 @@
 """Galaxy access shared by the stages that read a dataset.
 
-`get_galaxy_api_key` existed twice, in `harvest` and in `lexicmap`, and had already
+`get_galaxy_api_key` existed twice, in `harvest` and in `tile`, and had already
 drifted: harvest's copy took no `api_key` argument at all, so `--api-key` was honoured by one
 command and not the other, and both were pinned by their own tests, which is how the drift
 survived. One implementation, in the order the help documents.

@@ -5,7 +5,7 @@ accession into `<cache-dir>/<ACC>.unitigs.fa.zst` (byte-identical to the S3 payl
 exits. Skip-existing is implicit: the walker's own cache wedge returns the on-disk file
 when present, so an already-cached accession is a fast no-op.
 
-After a `fetch`, an offline `walker --unitigs-cache DIR --offline` run hits zero network.
+After a `fetch`, an offline `walk --unitigs-cache DIR --offline` run hits zero network.
 
 The walker writes `fetch.summary.json` recording the size, sha256 and (for anything it
 downloaded) the S3 ETag and Last-Modified of every object. That file goes into the cache
@@ -30,7 +30,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         description=(
             "Pre-populates a `--unitigs-cache DIR` with the compressed unitig payloads for "
             "every requested accession, then exits. Feed the same cache dir to "
-            "`disassembler walker --unitigs-cache DIR --offline` (or the composites) to run "
+            "`disassembler walk --unitigs-cache DIR --offline` (or the composites) to run "
             "as many local analyses as you want against zero network."
         ),
     )

@@ -334,7 +334,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
             "Intended for walker output, which is per-accession reconstructions in their own "
             "coordinates. MAFFT does not reverse-complement, so each row is oriented to the "
             "reference by shared 15-mers first, and the alignment is checked for identity to "
-            "the reference after. lexicmap output is ALREADY on the reference grid: pass "
+            "the reference after. Tiler output is ALREADY on the reference grid: pass "
             "--aligned for it and MAFFT is skipped, because re-placing those bases can move "
             "a SNV across an uncovered stretch. See docs/codon_msa.md."
         ),
@@ -342,7 +342,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--ref", "-r", required=True, help="Reference in-frame CDS FASTA")
     p.add_argument(
         "--input", "-i", required=True,
-        help="Haplotypes FASTA (walker output, or a lexicmap clean cohort FASTA). Rows on "
+        help="Haplotypes FASTA (walker output, or a tiler clean cohort FASTA). Rows on "
              "the reference's other strand are reverse-complemented. See the subcommand "
              "description.",
     )
@@ -354,7 +354,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                         "have it. Exactly one of --out-tree and --no-tree is required.")
     p.add_argument("--aligned", action="store_true",
                    help="The input rows are already on the reference grid, one character "
-                        "per reference position, as a lexicmap cohort is. MAFFT is not run "
+                        "per reference position, as a tiler cohort is. MAFFT is not run "
                         "or looked up: it would discard the input's gaps and place the "
                         "bases again, which moves SNVs across an uncovered stretch or a "
                         "deletion. A row of any other length is an error. Every other check "
@@ -364,7 +364,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--msa-min-cov", type=fraction, default=0.70,
                    help="Minimum coverage to enter the MSA: a sequence's A/C/G/T bases, as a "
                         "fraction of the reference length (default 0.70). Gaps ('-') and N "
-                        "do not count, so a gapped lexicmap row is measured by what it covers.")
+                        "do not count, so a gapped tiler row is measured by what it covers.")
     p.add_argument("--min-identity", type=fraction, default=0.60,
                    help="Identity check after alignment: warn about every sequence that "
                         "matches the reference at less than this, and fail without writing "
@@ -587,7 +587,7 @@ def _run(args, state) -> int:
         off_grid = []
         for raw_id, raw_seq in input_records:
             seq = raw_seq.upper()
-            # Count bases, not characters: a lexicmap row is reference-length with '-'
+            # Count bases, not characters: a tiler row is reference-length with '-'
             # where no HSP reached, so its length passed this gate whatever its coverage.
             if real_bases(seq) < ref_len * args.msa_min_cov:
                 continue

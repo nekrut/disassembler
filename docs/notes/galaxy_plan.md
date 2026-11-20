@@ -10,7 +10,7 @@ Three workflows are planned, one per composite:
 ```text
 from-kmindex:   kmindex_query -> harvest -> stratify (optional) -> walker (scattered)
                 -> sieve (optional) -> msa
-from-lexicmap:  LexicMap search -> lexicmap -> sieve (optional) -> msa
+from-lexicmap:  LexicMap search -> tile -> sieve (optional) -> msa
 reconstruct:    accession list -> walker (scattered) -> sieve (optional) -> msa
 ```
 

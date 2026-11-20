@@ -11,14 +11,14 @@ It is normative. A new stage implements this; it does not invent a shape.
 Three findings from the 0.2.0 audit, each verified in code:
 
 **The machine-readable summary was a strict subset of stdout, and the part dropped was the part
-about what went wrong.** `lexicmap` counts `n_malformed`, `n_other_query` and
+about what went wrong.** `tile` counts `n_malformed`, `n_other_query` and
 `n_qlen_mismatch`, prints all three and records none. `harvest` counts `n_failed`, `n_empty`
 and `n_bad_target`, prints all three and records none. The walker prints a full variant
 rejection breakdown and a majority-correction count and records neither. A run that silently
 discarded most of its input and a clean run produced summaries that looked the same.
 
 **The two pathways disagreed arbitrarily.** The walker summary carried full provenance
-(versions, references, 19 settings) and no population statistics. The LexicMap summary carried
+(versions, references, 19 settings) and no population statistics. The tiler summary carried
 quantiles, tiers and entropy and no provenance at all: not its own version, not the input
 identity, not one of the eight flags that change its answer. Neither difference was a
 considered decision.
@@ -274,7 +274,7 @@ bump, so the gate does not catch a version regression on its own; the version fl
 | `harvest` | one target | score quantiles | `failed`, `empty`, `bad_target` |
 | `stratify` | one target | selection rate | under-filled bins |
 | `walker` | one accession | cov and pident quantiles, distinct primaries, singleton rate | three groups: `accessions` (eight outcomes), `alleles` (seven reasons an alternative was rejected) and `minority_sites` (nine reasons the primary still carries the rarer allele) |
-| `lexicmap` | one accession (the former ledger row) | tiers, quantiles, entropy (raw, full-coverage and folded), top N | `malformed`, `other_query`, `qlen_mismatch`, and the flagged tiers |
+| `tiler` | one accession (the former ledger row) | tiers, quantiles, entropy (raw, full-coverage and folded), top N | `malformed`, `other_query`, `qlen_mismatch`, and the flagged tiers |
 | `sieve` | one output haplotype | dedup ratio, admission rate | dedup drops, completeness-gate drops, table saturation |
 | `msa` | one row | rows in and out, length agreement | rows dropped or lengthened by MAFFT |
 | composites | one stage | none | which stage failed |
@@ -311,10 +311,16 @@ at another summary, and it points by relative path so the set can be moved toget
   `two_allele_sites` and `min_site_vaf`; `cohort` gained `mixed` and `bias_uncorrected`;
   `records[]` gained `abundance_missing` (written only when non-zero), `majority_corrections`
   and `minority_rescues`; haplotypes gained `ref_cov` and `ref_span`; the walker's `settings`
-  gained `prune_min_abund` and the lexicmap `settings` gained `min_conflict_hsp_bp`.
+  gained `prune_min_abund` and the tiler `settings` gained `min_conflict_hsp_bp`.
 
 ## Migration from the 0.1.x summaries
 
+- **The `lexicmap` stage is `tiler`.** The subcommand was renamed to `disassembler tile`
+  because LexicMap is the program that made its input, not the stage itself. `tool.name` is
+  `tiler`, the entry in a `from-lexicmap` manifest is `{"stage": "tiler"}`, and the files
+  `from-lexicmap` writes are `tiler.*` (`tiler.summary.json`, `tiler.clean.accessions.fasta`)
+  where they were `lexicmap.*`. The walker's `tool.name` and `stage` are unchanged, although
+  its subcommand is now `disassembler walk`.
 - **`seq` becomes `seq_sha256`.** Scripts that compared sequences between runs compare hashes
   instead; scripts that took `len(p["seq"])` use the existing `length` field. `--summary-seqs`
   restores the old field. Known consumers live in the `disassembler-dump` analyses.

@@ -454,7 +454,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--max-gap-frac", type=fraction, default=DEFAULT_MAX_GAP_FRAC,
                    help="Completeness gate: drop a sequence whose share of gaps ('-') or "
                         "other non-ACGT characters exceeds this (default 0.05). Walker rows "
-                        "have no gaps. For a LexicMap cohort, whose rows carry '-' where no "
+                        "have no gaps. For a tiler cohort, whose rows carry '-' where no "
                         "HSP reached, use 1 - the cohort's coverage gate + 0.05, as "
                         "from-lexicmap does.")
     p.add_argument("--threshold", type=fraction, default=0.005,

@@ -19,8 +19,9 @@ gene's sequence in each run, and aligns the results in frame. It has two routes:
   The sequence it publishes is a majority-consensus path, not a phased haplotype: where a
   sample holds two strains differing at sites the graph does not link, the walker says so with
   `mixed=1` in the FASTA header rather than presenting the combination as clonal.
-- **The LexicMap route.** A [LexicMap](https://github.com/IndexThePlanet/LexicMap) search of
-  Logan's contigs is tiled onto the reference, checked for premature stop codons, sorted into
+- **The tiler route** (LexicMap, then the tiler). A
+  [LexicMap](https://github.com/IndexThePlanet/LexicMap) search of Logan's contigs is tiled
+  onto the reference, checked for premature stop codons, sorted into
   clean and flagged tiers, and collapsed into unique haplotypes. It is much faster, because it
   never downloads a unitig graph, but it projects each run onto the reference rather than
   walking a haplotype, and it has no intra-host variants.
@@ -59,7 +60,7 @@ and `DISASSEMBLER_SIEVE_BIN`, or in the source tree's build locations.
 
 ```bash
 # One accession through the walker
-disassembler walker -a SRR8209082 -q queries/query_hiv1_pol.fasta -o out -f out/hiv1_pol.fasta
+disassembler walk -a SRR8209082 -q queries/query_hiv1_pol.fasta -o out -f out/hiv1_pol.fasta
 
 # Accessions to a codon alignment and tree, with intra-host SNVs
 disassembler reconstruct -l accessions.txt -q queries/markers/zika_ns5.fasta -o out/zika \
@@ -130,13 +131,13 @@ failed. A worked cohort, from VCFs to a site-by-accession matrix, is in
 | `harvest` | merge kmindex shard JSONs into per-target accession lists and scores | [`kmindex.md`](docs/kmindex.md) |
 | `stratify` | sample a cohort from a harvest by score bin | [`kmindex.md`](docs/kmindex.md) |
 | `fetch` | download unitig files into a local cache for offline runs | [`walker.md`](docs/walker.md#offline-cache) |
-| `walker` | run `logan-walker`: reconstruct haplotypes from Logan unitigs | [`walker.md`](docs/walker.md) |
-| `lexicmap` | tile a LexicMap search into a codon-checked cohort | [`lexicmap.md`](docs/lexicmap.md) |
+| `walk` | run `logan-walker`: reconstruct haplotypes from Logan unitigs | [`walker.md`](docs/walker.md) |
+| `tile` | tile a LexicMap search into a codon-checked cohort | [`tiler.md`](docs/tiler.md) |
 | `sieve` | thin near-duplicate haplotypes | [`sieve.md`](docs/sieve.md) |
 | `msa` | reference-guided codon MSA and FastTree tree | [`codon_msa.md`](docs/codon_msa.md) |
-| `reconstruct` | walker, then optional sieve, then msa | [`codon_msa.md`](docs/codon_msa.md#disassembler-reconstruct) |
+| `reconstruct` | walk, then optional sieve, then msa | [`codon_msa.md`](docs/codon_msa.md#disassembler-reconstruct) |
 | `from-kmindex` | harvest, optional stratify, then reconstruct | [`kmindex.md`](docs/kmindex.md#disassembler-from-kmindex) |
-| `from-lexicmap` | lexicmap, then optional sieve, then msa | [`lexicmap.md`](docs/lexicmap.md#from-lexicmap) |
+| `from-lexicmap` | tile, then optional sieve, then msa | [`tiler.md`](docs/tiler.md#from-lexicmap) |
 
 Every command has `--help`. The composites group their options by stage and pass anything after
 a literal `--` to the walker.
@@ -156,7 +157,7 @@ How to use it:
   mode and offline caching, with every flag, output and exit code in
   [`docs/walker_reference.md`](docs/walker_reference.md)
 - [`docs/kmindex.md`](docs/kmindex.md): `harvest`, `stratify` and `from-kmindex`
-- [`docs/lexicmap.md`](docs/lexicmap.md): the LexicMap route
+- [`docs/tiler.md`](docs/tiler.md): the tiler route
 - [`docs/sieve.md`](docs/sieve.md): diversity thinning and how to choose its threshold
 - [`docs/codon_msa.md`](docs/codon_msa.md): the codon MSA and tree, and `reconstruct`
 - [`docs/examples/vcf_example.md`](docs/examples/vcf_example.md): intra-host SNVs on a Zika

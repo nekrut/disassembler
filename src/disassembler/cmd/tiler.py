@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""lexicmap: streaming multi-HSP coordinate tiling, codon QC, and haplotype collapsing.
+"""tiler (`disassembler tile`): streaming multi-HSP coordinate tiling, codon QC, and haplotype collapsing.
 
 Reads a LexicMap tabular search from a Galaxy dataset, a local TSV or stdin, and writes a
-codon-checked cohort. The user documentation is docs/lexicmap.md; this is the contract.
+codon-checked cohort. The user documentation is docs/tiler.md; this is the contract.
 
 What it does, in order:
 
@@ -547,7 +547,7 @@ def output_stem(ref_name: str, ref_path: str) -> str:
     `ref_name` itself is unchanged and keeps driving the query-name filter, the FASTA headers
     and `summary.json`, because that is the name the search used and it has to keep matching.
     """
-    return (file_safe_name(ref_name) or file_safe_name(Path(ref_path).stem) or "lexicmap")
+    return (file_safe_name(ref_name) or file_safe_name(Path(ref_path).stem) or "tiler")
 
 
 def resolve_out_prefix(out_prefix, ref_name: str) -> str:
@@ -1956,7 +1956,7 @@ def stream_lexicmap_to_msa(
     n_clean = count_clean_full + count_clean_partial
     summary_data = {
         "schema": summary_io.SCHEMA,
-        "tool": summary_io.tool("lexicmap", __version__),
+        "tool": summary_io.tool("tiler", __version__),
         "inputs": {
             "references": [
                 {"id": ref_name, "length": ref_len, "sha256": summary_io.seq_sha256(ref_seq)}
@@ -2062,7 +2062,7 @@ def stream_lexicmap_to_msa(
 
 def add_parser(subparsers):
     parser = subparsers.add_parser(
-        "lexicmap",
+        "tile",
         help="Stream LexicMap tabular hits into a tiled cohort + collapsed haplotypes.",
         description="Stream LexicMap search results, tile multi-HSP alignments, stratify cohorts, and collapse haplotypes.",
     )
@@ -2139,7 +2139,7 @@ def add_parser(subparsers):
                              "the .accessions.fasta outputs.")
     out = parser.add_mutually_exclusive_group()
     out.add_argument("-o", "--out-prefix", dest="out_prefix", type=str, default=None,
-                     help="Output prefix: all lexicmap outputs land at <prefix>.*. An existing "
+                     help="Output prefix: all tiler outputs land at <prefix>.*. An existing "
                           "directory, or a path ending in '/', is taken as --out-dir "
                           "(default: msa/<ref_name>).")
     # `--out-dir` was once a third spelling of --out-prefix, so a directory that did not
@@ -2159,7 +2159,7 @@ def add_parser(subparsers):
                         help="Exit 0 even if the clean cohort is empty. Off by default: "
                              "an empty cohort exits non-zero so a wrapping workflow does "
                              "not mistake a whole-target miss for a good run. Mirrors "
-                             "`disassembler walker --allow-empty`.")
+                             "`disassembler walk --allow-empty`.")
     parser.set_defaults(func=run)
 
 
@@ -2185,14 +2185,14 @@ def _write_failed_summary(out_prefix: str, args, started: float, error: str) -> 
         out_prefix = resolve_out_prefix(
             out_prefix, output_stem(load_reference(args.ref)[0], args.ref))
     except (OSError, ValueError, IndexError):
-        out_prefix = resolve_out_prefix(out_prefix, "lexicmap")
+        out_prefix = resolve_out_prefix(out_prefix, "tiler")
     # Nothing half-written outlives a failed run.
     StagedOutputs.clear(out_prefix)
     summary_io.discard_records(out_prefix)
     try:
         summary_io.write(
             f"{out_prefix}.summary.json",
-            tool=summary_io.tool("lexicmap", __version__),
+            tool=summary_io.tool("tiler", __version__),
             inputs={"references": None, "source": summary_io.source(src_kind, src_id, 0)},
             settings={
                 "min_coverage": args.min_cov,
@@ -2219,7 +2219,7 @@ def _write_failed_summary(out_prefix: str, args, started: float, error: str) -> 
         pass
 
 
-def validate_args(args, prog: str = "lexicmap"):
+def validate_args(args, prog: str = "tile"):
     """The argument checks both front ends make. `None` when they pass, else an exit code.
 
     `from-lexicmap` had its own copy, which had already drifted in wording, and a
@@ -2295,7 +2295,7 @@ def run(args) -> int:
         # caller should retry; no run was attempted, so there is nothing to summarise, and
         # creating the output directory would make an unstarted run look like a failed one.
         # This is the one exception to rule 4 in docs/summaries.md.
-        print(f"lexicmap: {e}", file=sys.stderr)
+        print(f"tile: {e}", file=sys.stderr)
         return EX_TEMPFAIL
     # Input problems (a missing or empty file, a bad table, an unreadable Galaxy dataset, a
     # missing API key) end in one line naming the cause, not a traceback.
@@ -2304,7 +2304,7 @@ def run(args) -> int:
     # `repr`, not `str`, so an IncompleteRead would otherwise print as an empty message.
     except (ValueError, OSError, RuntimeError, EOFError, http.client.HTTPException) as e:
         detail = repr(e) if isinstance(e, http.client.HTTPException) else str(e)
-        print(f"lexicmap: {detail}", file=sys.stderr)
+        print(f"tile: {detail}", file=sys.stderr)
         _write_failed_summary(out_prefix, args, started, detail)
         return 1
 
@@ -2314,7 +2314,7 @@ def run(args) -> int:
     if isinstance(summary, dict) and summary.get("run", {}).get("status") != "failed":
         n_clean = int(summary.get("cohort", {}).get("combined_clean_cohort", 0))
         if n_clean == 0 and not args.allow_empty:
-            print(f"lexicmap: clean cohort is empty (0 full-length + 0 partial). "
+            print(f"tile: clean cohort is empty (0 full-length + 0 partial). "
                   f"Exiting non-zero. Pass --allow-empty to accept this as a good "
                   f"run.", file=sys.stderr)
             return 1

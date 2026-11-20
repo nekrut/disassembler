@@ -29,7 +29,7 @@ Bioconda as `logan-walker`.
 logan-walker -a SRR8209082 -q ../queries/query_hiv1_pol.fasta -o out -f out/reconstructed.fasta
 ```
 
-`disassembler walker` passes its arguments straight to this binary, and `disassembler
+`disassembler walk` passes its arguments straight to this binary, and `disassembler
 reconstruct` runs it as its first stage.
 
 ## Source map

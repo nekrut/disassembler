@@ -1,9 +1,13 @@
-# The LexicMap route
+# The tiler route
 
-`disassembler lexicmap` turns a [LexicMap](https://github.com/IndexThePlanet/LexicMap) search of
+`disassembler tile` turns a [LexicMap](https://github.com/IndexThePlanet/LexicMap) search of
 a reference CDS against Logan into a codon-checked cohort: one tiled sequence per accession,
 sorted into six tiers, with the clean full-length sequences collapsed into unique haplotypes.
 `disassembler from-lexicmap` adds the optional sieve and the codon MSA and tree.
+
+Through 0.1.x this subcommand was `disassembler lexicmap`, which read as if it ran LexicMap.
+The old name still works and prints a notice. The files `from-lexicmap` writes moved with it,
+from `lexicmap.*` to `tiler.*`.
 
 This route is fast, because it never downloads unitig graphs, but it reconstructs a projection
 of each accession onto the reference rather than walking a haplotype. For haplotypes, intra-host
@@ -172,9 +176,9 @@ columns* in Galaxy) so that `qseq` and `sseq` are present. It can come from:
 
 Any of them can be plain or gzip-compressed; gzip is detected from the content, not the name.
 A zstd-compressed table is refused with a message, so decompress it first
-(`zstd -dc hits.tsv.zst | disassembler lexicmap -f - ...`).
+(`zstd -dc hits.tsv.zst | disassembler tile -f - ...`).
 
-All rows for one accession must be contiguous in the input; `lexicmap` stops with an error
+All rows for one accession must be contiguous in the input; `tile` stops with an error
 naming the accession if one reappears later.
 
 Only the first record of `-q` is read, and its length defines the coordinate grid.
@@ -183,27 +187,27 @@ Only the first record of `-q` is read, and its length defines the coordinate gri
 
 ```bash
 # From a Galaxy dataset
-disassembler lexicmap -q queries/markers/zika_ns5.fasta -d <DATASET_ID> -o out/zika_lexicmap
+disassembler tile -q queries/markers/zika_ns5.fasta -d <DATASET_ID> -o out/zika_lexicmap
 
 # From a local table (plain or gzipped)
-disassembler lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.tsv.gz -o out/hiv1_pol
+disassembler tile -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.tsv.gz -o out/hiv1_pol
 
 # From standard input
-zcat hiv1_pol_lexicmap.tsv.gz | disassembler lexicmap -q queries/query_hiv1_pol.fasta -f - -o out/hiv1_pol
+zcat hiv1_pol_lexicmap.tsv.gz | disassembler tile -q queries/query_hiv1_pol.fasta -f - -o out/hiv1_pol
 
-# Composite: lexicmap -> optional sieve -> codon MSA + tree
+# Composite: tile -> optional sieve -> codon MSA + tree
 disassembler from-lexicmap -q queries/query_hiv1_pol.fasta -f hiv1_pol_lexicmap.tsv.gz \
     -o out/hiv1_pol --sieve
 ```
 
 `-o` is an output prefix: `-o out/hiv1_pol` writes `out/hiv1_pol.*`. An existing directory, or
 a path ending in `/`, writes `<dir>/<reference stem>.*`, as `--out-dir <dir>` does whether or not
-the directory exists yet. `from-lexicmap -o DIR` writes the lexicmap files as
-`DIR/lexicmap.*` and the MSA and tree alongside. `DIR/lexicmap` must therefore not itself be a
-directory: lexicmap would write inside it as `DIR/lexicmap/<reference stem>.*` while the
-composite went on reading `DIR/lexicmap.clean.accessions.fasta`, which with an earlier run's
+the directory exists yet. `from-lexicmap -o DIR` writes the tiler files as
+`DIR/tiler.*` and the MSA and tree alongside. `DIR/tiler` must therefore not itself be a
+directory: the tiler would write inside it as `DIR/tiler/<reference stem>.*` while the
+composite went on reading `DIR/tiler.clean.accessions.fasta`, which with an earlier run's
 file at that path meant aligning the old cohort. `from-lexicmap` refuses that case, and removes
-the cohort files it is about to read before lexicmap runs.
+the cohort files it is about to read before the tiler runs.
 
 ## Outputs
 
@@ -288,22 +292,22 @@ row per accession), not `clean.msa.fasta` (one row per haplotype, whatever its c
 
 ## `from-lexicmap`
 
-Runs `lexicmap`, then (with `--sieve`) the sieve, then `msa`, on
-`lexicmap.clean.accessions.fasta`, or on `lexicmap.clean_expanded.accessions.fasta` with
-`--include-partials`. It takes every `lexicmap` option, the `--sieve-*` options (see
+Runs `tile`, then (with `--sieve`) the sieve, then `msa`, on
+`tiler.clean.accessions.fasta`, or on `tiler.clean_expanded.accessions.fasta` with
+`--include-partials`. It takes every `tile` option, the `--sieve-*` options (see
 [`sieve.md`](sieve.md)), and `--mafft-threads` / `--msa-min-cov` for the MSA stage (see
-[`codon_msa.md`](codon_msa.md#lexicmap-cohorts)). The sieve's gap limit and the MSA's coverage
+[`codon_msa.md`](codon_msa.md#tiler-cohorts)). The sieve's gap limit and the MSA's coverage
 gate default to values derived from the cohort's own coverage gate, and from the cohort's worst
-row, so neither stage drops rows for coverage that lexicmap already accepted. The MSA stage
+row, so neither stage drops rows for coverage that the tiler already accepted. The MSA stage
 runs with `--aligned`, because this cohort is already on the reference grid: the rows are
 written into the alignment as they are, rather than being re-placed by MAFFT, which could move
-a base across an uncovered stretch (see [`codon_msa.md`](codon_msa.md#lexicmap-cohorts)). That
-second floor is what makes the promise true for a long in-frame deletion: lexicmap counts a
+a base across an uncovered stretch (see [`codon_msa.md`](codon_msa.md#tiler-cohorts)). That
+second floor is what makes the promise true for a long in-frame deletion: the tiler counts a
 trusted deletion
 as covered with no limit, while the row keeps `-` there.
 
 Each run removes the sieved cohorts an earlier run left in `-o`, since they no longer match the
-cohorts lexicmap has just rewritten; with `--sieve`, this run's is written again. An empty cohort
+cohorts the tiler has just rewritten; with `--sieve`, this run's is written again. An empty cohort
 fails the run unless `--allow-empty` is given. With it, `from-lexicmap` exits 0 without aligning
 and also removes an earlier run's MSA and tree.
 

@@ -73,10 +73,10 @@ none.
 
 **The completeness gate.** The binary drops a sequence shorter than `--min-len`, or one in
 which more than `--max-gap-frac` of the characters are not A, C, G or T. Gaps (`-`) count.
-Walker haplotypes have no gaps, so for them this is a check on N. LexicMap rows are on the
+Walker haplotypes have no gaps, so for them this is a check on N. Tiler rows are on the
 reference grid, with `-` wherever no hit reached, so the same limit acts as a second coverage
 gate: at 5% it dropped 22% of a default C. auris FKS1 cohort, and a third of the distinct
-haplotypes in a SARS-CoV-2 spike cohort, all rows lexicmap had already accepted.
+haplotypes in a SARS-CoV-2 spike cohort, all rows the tiler had already accepted.
 `from-lexicmap` therefore derives the limit from the cohort's own coverage gate, as
 `1 - gate + 0.05`:
 
@@ -87,12 +87,12 @@ haplotypes in a SARS-CoV-2 spike cohort, all rows lexicmap had already accepted.
 | `--include-partials` | `--min-cov-partial` (`0.50`) | `0.55` |
 
 The extra 0.05 leaves room for in-frame deletions, which count as covered but are `-` in the
-row, **and the derived value is never set below the cohort's own worst row**. lexicmap counts a
+row, **and the derived value is never set below the cohort's own worst row**. The tiler counts a
 trusted deletion as covered with no limit, so a clean, full-length row whose deletion is longer
 than 5% of the gene (45 nt in 900) used to be dropped here, by a step documented as
 near-duplicate thinning, with exit 0 and a `6 -> 5 haplotypes` line. Indel alleles are often
 what a cohort is for. The run prints the worst row's share beside the gate it derived. To run
-the atomic `sieve` on a LexicMap cohort, set `--max-gap-frac` the same way. Either way, the log
+the atomic `sieve` on a tiler cohort, set `--max-gap-frac` the same way. Either way, the log
 says how many sequences the gate dropped, and for which reason.
 
 Keeping partial rows has a cost. The sieve compares k-mer sets, so a partial row looks novel

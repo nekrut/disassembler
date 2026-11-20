@@ -103,4 +103,4 @@ are removed on a clean finish, so finding them means a run is in flight or one d
   whose major branch is clipped reports every minor allele as more frequent than it is. Those
   rows carry `KaSat` in the VCF FILTER column and `ka_saturated` in `snvs.tsv`.
 - **The sieve dropped most of the cohort.** Its threshold is a divergence, not a count, and on
-  LexicMap rows the gap limit acts as a second coverage gate. See [`sieve.md`](sieve.md).
+  tiler rows the gap limit acts as a second coverage gate. See [`sieve.md`](sieve.md).

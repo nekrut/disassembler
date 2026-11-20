@@ -42,7 +42,7 @@ directory, where `<gene>` is the reference file's stem.
   `<out-aln>.ids.tsv` records `aligned_id`, `original_header` and `reverse_complemented`.
 - **Coverage gate, twice.** A haplotype with fewer A/C/G/T bases than `--msa-min-cov`
   (default `0.70`) of the reference length is dropped before alignment rather than aligned as
-  a fragment. Gaps and N do not count, so a LexicMap row, which is reference-length with `-`
+  a fragment. Gaps and N do not count, so a tiler row, which is reference-length with `-`
   wherever no hit reached, is measured by what it covers. It is **measured again on the
   aligned row**, with a two-point tolerance, because a contig carrying part of the gene plus
   flanking sequence passes the first gate on its raw base count and `--keeplength` then trims
@@ -96,7 +96,7 @@ disassembler msa \
 
 ## `disassembler reconstruct`
 
-`reconstruct` chains `walker`, an optional `sieve` (see [`sieve.md`](sieve.md)) and `msa`. It
+`reconstruct` chains `walk`, an optional `sieve` (see [`sieve.md`](sieve.md)) and `msa`. It
 needs `GraphAligner`, `MAFFT` and `FastTree` on `PATH`.
 
 | flag | default | meaning |
@@ -123,8 +123,8 @@ reproducible with more threads).
 
 Five flags are refused there, because each makes the walker exit 0 without writing a
 reconstruction for the next stage to align: `--fetch-only`, `-h`, `--help`, `-V` and
-`--version`. Use `disassembler fetch` or `disassembler walker --fetch-only` to warm a cache,
-and `disassembler walker -h` or `--version` for the walker's own help. The composite also
+`--version`. Use `disassembler fetch` or `disassembler walk --fetch-only` to warm a cache,
+and `disassembler walk -h` or `--version` for the walker's own help. The composite also
 removes the reconstruction before the walker runs, so a walker that writes nothing fails the
 run rather than leaving an earlier run's cohort to be aligned as this one's.
 
@@ -164,10 +164,10 @@ that decides which reconstructions exist at all, and `reconstruct` never sets it
 pass it through with `-- --min-cov <F>`. The same split applies to `--mafft-threads` (MAFFT)
 versus the walker's `-t` (GraphAligner).
 
-## LexicMap cohorts
+## Tiler cohorts
 
-`disassembler lexicmap` writes its clean cohort on the reference's coordinate grid already
-(see [`lexicmap.md`](lexicmap.md#outputs)): every base sits at the reference position its HSP
+`disassembler tile` writes its clean cohort on the reference's coordinate grid already
+(see [`tiler.md`](tiler.md#outputs)): every base sits at the reference position its HSP
 gives it, and `-` marks a position no HSP reached. **That cohort is an alignment, so `msa`
 takes it as one.** `from-lexicmap` passes `--aligned`, and `msa --aligned` writes the rows out
 unchanged rather than calling MAFFT at all. The run is about twice as fast, and
@@ -191,8 +191,8 @@ character, on three cohorts of 27 to 14,594 sequences, which is why this went un
 cohorts where it bites are the ones with an internal hole, which is what tiling is for.
 
 In `from-lexicmap`, `--msa-min-cov` defaults to `0.70` or the cohort's coverage gate minus
-0.05, whichever is lower (`0.45` with `--include-partials`), so the MSA keeps the rows lexicmap
-admitted. The gate measures covered bases rather than row length, which every LexicMap row
+0.05, whichever is lower (`0.45` with `--include-partials`), so the MSA keeps the rows the tiler
+admitted. The gate measures covered bases rather than row length, which every tiler row
 passes by construction.
 
 ## A worked cohort

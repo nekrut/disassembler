@@ -551,7 +551,7 @@ fn write_tool(w: &mut impl Write, run: &RunInfo) -> Result<()> {
     writeln!(w, "  \"tool\": {{")?;
     writeln!(w, "    \"name\": \"logan-walker\",")?;
     writeln!(w, "    \"version\": \"{}\",", env!("CARGO_PKG_VERSION"))?;
-    // Set by `disassembler walker`; absent when the binary is run directly.
+    // Set by `disassembler walk`; absent when the binary is run directly.
     match std::env::var("DISASSEMBLER_VERSION") {
         Ok(v) if !v.is_empty() => writeln!(w, "    \"disassembler\": \"{}\",", esc(&v))?,
         _ => writeln!(w, "    \"disassembler\": null,")?,
@@ -766,7 +766,7 @@ fn write_discards(w: &mut impl Write, s: &Summary, run: &RunInfo) -> Result<()> 
 /// What the run produced, as a population rather than a list.
 ///
 /// None of this was in a walker summary before 0.2.0: every population-level number had to be
-/// computed by the consumer, while the LexicMap pathway reported its own. `distinct_primaries`
+/// computed by the consumer, while the tiler pathway reported its own. `distinct_primaries`
 /// is the one that matters most for a cohort, and it is why `seq_sha256` is a record field.
 fn write_cohort(w: &mut impl Write, s: &Summary) -> Result<()> {
     let mut hashes: Vec<String> = Vec::new();

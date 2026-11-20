@@ -23,7 +23,7 @@ from disassembler import __version__
 from disassembler.cmd import (
     fetch,
     harvest,
-    lexicmap,
+    tiler,
     msa,
     pipe_from_kmindex,
     pipe_from_lexicmap,
@@ -34,8 +34,11 @@ from disassembler.cmd import (
 )
 
 # Order controls `--help` presentation: atomics first, then composites.
-_ATOMIC = [harvest, stratify, fetch, walker, lexicmap, sieve, msa]
+_ATOMIC = [harvest, stratify, fetch, walker, tiler, sieve, msa]
 _COMPOSITE = [pipe_reconstruct, pipe_from_kmindex, pipe_from_lexicmap]
+
+# Subcommand names from 0.1.x, mapped to what they are called now. See `main`.
+_RENAMED = {"walker": "walk", "lexicmap": "tile"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,11 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         prog="disassembler",
         description=(
             "Reconstruct coding haplotypes from planetary sequence indexes. "
-            "Seven atomic subcommands (harvest, stratify, fetch, walker, lexicmap, sieve, msa) "
+            "Seven atomic subcommands (harvest, stratify, fetch, walk, tile, sieve, msa) "
             "and three composite pipelines (reconstruct, from-kmindex, from-lexicmap)."
         ),
     )
-    # The walker binary versions separately: `disassembler walker --version`.
+    # The walker binary versions separately: `disassembler walk --version`.
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="<subcommand>")
     for mod in _ATOMIC + _COMPOSITE:
@@ -70,11 +73,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv = sys.argv[1:]
     argv = list(argv)
 
-    # `walker` is a passthrough to a foreign binary. argparse's REMAINDER refuses to
-    # collect a leading `--help`/`-h`, so a plain `disassembler walker --help` would
+    # 0.1.x named two subcommands after things rather than actions, and one of those
+    # things (`lexicmap`) is somebody else's program. The old names still run, with a
+    # notice on stderr, and are kept out of `--help`.
+    if argv and argv[0] in _RENAMED:
+        new = _RENAMED[argv[0]]
+        print(f"disassembler: `{argv[0]}` is now `{new}`; the old name still works but "
+              f"will be removed in a later release.", file=sys.stderr)
+        argv[0] = new
+
+    # `walk` is a passthrough to a foreign binary. argparse's REMAINDER refuses to
+    # collect a leading `--help`/`-h`, so a plain `disassembler walk --help` would
     # bounce off the top-level parser as "unrecognized arguments". Bypass argparse
-    # entirely for that subcommand: hand every argument after `walker` to walker.run.
-    if argv and argv[0] == "walker":
+    # entirely for that subcommand: hand every argument after `walk` to walker.run.
+    if argv and argv[0] == "walk":
         from disassembler.cmd import walker as walker_mod
         ns = argparse.Namespace(passthrough=argv[1:])
         rc = walker_mod.run(ns)

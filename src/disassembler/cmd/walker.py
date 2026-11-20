@@ -1,6 +1,6 @@
 """walker: run the Rust `logan-walker` binary.
 
-Every argument after `disassembler walker` is forwarded to `logan-walker` verbatim,
+Every argument after `disassembler walk` is forwarded to `logan-walker` verbatim,
 including `--help`. The only intercepted flag is `--walker-bin <PATH>`, which the
 Rust binary does not accept and which lets a caller override the resolution search.
 
@@ -31,11 +31,11 @@ from disassembler.resolve import resolve_walker, not_found_message, EX_TOOL_NOT_
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
-        "walker",
+        "walk",
         help="Walk Logan unitigs into coding haplotypes (Rust binary passthrough).",
         description=(
             "Forwards every argument to the `logan-walker` Rust binary. "
-            "Run `disassembler walker --help` to see the walker's own CLI. "
+            "Run `disassembler walk --help` to see the walker's own CLI. "
             "The only intercepted flag is `--walker-bin <PATH>`."
         ),
         add_help=False,  # let the walker print its own --help
@@ -48,14 +48,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 def _resolved_or_report(walker_bin: str | None) -> str | None:
     resolved = resolve_walker(walker_bin)
     if not resolved:
-        print(not_found_message("walker", "walker"), file=sys.stderr)
+        print(not_found_message("walker", "walk"), file=sys.stderr)
         return None
     # A binary that exists is not enough. The published 0.1.1 container pairs this
     # package with logan-walker 0.1.0, whose multi-anchor primary is chosen by `cov` instead
     # of `matched` and which has no prune-span guard, and nothing in the outputs says so.
     err = walker_version_error(resolved)
     if err:
-        print(f"walker: {err}", file=sys.stderr)
+        print(f"walk: {err}", file=sys.stderr)
         return None
     return resolved
 
@@ -64,7 +64,7 @@ def run_walker(argv: list[str], walker_bin: str | None = None) -> int:
     """Run logan-walker as a subprocess. Returns its exit code.
 
     Composites use this so subsequent stages still get to run. The top-level
-    `walker` subcommand execv's instead (see `run`) so signals reach the caller
+    `walk` subcommand execv's instead (see `run`) so signals reach the caller
     unmodified.
     """
     resolved = _resolved_or_report(walker_bin)
@@ -79,7 +79,7 @@ def run(args) -> int:
     if "--walker-bin" in argv:
         i = argv.index("--walker-bin")
         if i + 1 >= len(argv):
-            print("walker: --walker-bin needs a value", file=sys.stderr)
+            print("walk: --walker-bin needs a value", file=sys.stderr)
             return 2
         walker_bin = argv[i + 1]
         del argv[i:i + 2]

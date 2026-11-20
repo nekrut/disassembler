@@ -403,17 +403,17 @@ class TestAutoMinLen(unittest.TestCase):
 class TestFromLexicmapGates(unittest.TestCase):
     """from-lexicmap derives the sieve's gap limit and the MSA gate from its cohort gate.
 
-    Every stage is stubbed: lexicmap writes a two-row cohort, and the sieve and MSA record
+    Every stage is stubbed: the tiler writes a two-row cohort, and the sieve and MSA record
     the values they were given.
     """
 
     def setUp(self):
-        from disassembler.cmd import lexicmap as lexicmap_cmd
+        from disassembler.cmd import tiler as tiler_cmd
         from disassembler.cmd import msa as msa_cmd
         from disassembler.cmd import pipe_from_lexicmap
         from disassembler.cmd import sieve as sieve_cmd
-        self.mods = (lexicmap_cmd, msa_cmd, sieve_cmd)
-        self.real = (lexicmap_cmd.run, msa_cmd.run, sieve_cmd.sieve_run)
+        self.mods = (tiler_cmd, msa_cmd, sieve_cmd)
+        self.real = (tiler_cmd.run, msa_cmd.run, sieve_cmd.sieve_run)
         self.pipe = pipe_from_lexicmap
         self.work = Path(tempfile.mkdtemp())
         self.seen = {}
@@ -423,7 +423,7 @@ class TestFromLexicmapGates(unittest.TestCase):
         # fixture full of gaps would hide; `self.rows` lets one test exercise that floor.
         self.rows = [("a", "ACGTAC"), ("b", "ACGTAG")]
 
-        def fake_lexicmap(ns):
+        def fake_tiler(ns):
             for name in ("clean", "clean_expanded"):
                 _write(Path(f"{ns.out_prefix}.{name}.accessions.fasta"), self.rows)
             return 0
@@ -438,11 +438,11 @@ class TestFromLexicmapGates(unittest.TestCase):
             self.seen["msa_min_cov"] = ns.msa_min_cov
             return 0
 
-        lexicmap_cmd.run, msa_cmd.run, sieve_cmd.sieve_run = fake_lexicmap, fake_msa, fake_sieve
+        tiler_cmd.run, msa_cmd.run, sieve_cmd.sieve_run = fake_tiler, fake_msa, fake_sieve
 
     def tearDown(self):
-        lexicmap_cmd, msa_cmd, sieve_cmd = self.mods
-        lexicmap_cmd.run, msa_cmd.run, sieve_cmd.sieve_run = self.real
+        tiler_cmd, msa_cmd, sieve_cmd = self.mods
+        tiler_cmd.run, msa_cmd.run, sieve_cmd.sieve_run = self.real
         shutil.rmtree(self.work, ignore_errors=True)
 
     def _run(self, *extra):
@@ -458,7 +458,7 @@ class TestFromLexicmapGates(unittest.TestCase):
 
     def test_default_cohort(self):
         seen = self._run()
-        self.assertEqual(seen["sieve_input"], "lexicmap.clean.accessions.fasta")
+        self.assertEqual(seen["sieve_input"], "tiler.clean.accessions.fasta")
         self.assertEqual((seen["max_gap_frac"], seen["msa_min_cov"]), (0.25, 0.70))
 
     def test_full_length_cohort(self):
@@ -467,7 +467,7 @@ class TestFromLexicmapGates(unittest.TestCase):
 
     def test_partials_cohort(self):
         seen = self._run("--include-partials")
-        self.assertEqual(seen["sieve_input"], "lexicmap.clean_expanded.accessions.fasta")
+        self.assertEqual(seen["sieve_input"], "tiler.clean_expanded.accessions.fasta")
         self.assertEqual((seen["max_gap_frac"], seen["msa_min_cov"]), (0.55, 0.45))
 
     def test_lower_min_cov_moves_both_gates(self):
@@ -478,14 +478,14 @@ class TestFromLexicmapGates(unittest.TestCase):
         seen = self._run("--sieve-max-gap-frac", "0.1", "--msa-min-cov", "0.9")
         self.assertEqual((seen["max_gap_frac"], seen["msa_min_cov"]), (0.1, 0.9))
 
-    def test_a_long_deletion_lexicmap_admitted_is_not_dropped_by_the_derived_gates(self):
-        """Lexicmap counts a trusted deletion as covered with no limit and leaves
+    def test_a_long_deletion_the_tiler_admitted_is_not_dropped_by_the_derived_gates(self):
+        """The tiler counts a trusted deletion as covered with no limit and leaves
         `-` in the row. The derived allowance was a flat 5% over the gate, so a clean,
         full-length row whose in-frame deletion exceeded 5% of the reference was dropped
         by the sieve's completeness gate, with exit 0 and a line that reads as thinning.
-        Both this module's docstring and `docs/lexicmap.md` promised the opposite.
+        Both this module's docstring and `docs/tiler.md` promised the opposite.
         """
-        # Two thirds of this row is a deletion lexicmap trusted: far past the 5% margin.
+        # Two thirds of this row is a deletion the tiler trusted: far past the 5% margin.
         self.rows = [("a", "ACGTACGTAC"), ("deleted", "ACG-------")]
         seen = self._run("--require-full-length")
         self.assertGreaterEqual(

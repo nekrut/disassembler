@@ -426,11 +426,11 @@ class TestReconstruct(_Stubs):
 class TestFromLexicmap(_Stubs):
 
     def test_the_cohort_reaches_the_msa_unmoved(self):
-        """Lexicmap writes each base at the reference position its HSP gives it, so
+        """The tiler writes each base at the reference position its HSP gives it, so
         the cohort is already an alignment. It used to go through MAFFT anyway, which
         discards the gaps and places the bases again; where several placements score the
         same, a SNV slides across an uncovered stretch and the codon MSA and tree disagree
-        with lexicmap's own haplotype table, at exit 0.
+        with the tiler's own haplotype table, at exit 0.
 
         The MAFFT stub on PATH here concatenates whatever it is given, so a run that still
         called it would pass a naive row-count check. This asserts the rows themselves.
@@ -458,19 +458,19 @@ class TestFromLexicmap(_Stubs):
                     out_rows[rid] = out_rows.get(rid, "") + line.strip()
             return out_rows
 
-        cohort = rows(out / "lexicmap.clean.accessions.fasta")
+        cohort = rows(out / "tiler.clean.accessions.fasta")
         msa = rows(out / "gene_codon_msa.fasta")
         for rid, seq in cohort.items():
             self.assertEqual(msa[rid], seq,
                              f"{rid} moved between the cohort and the MSA")
 
-    def test_a_lexicmap_directory_in_the_way_is_refused_not_worked_around(self):
-        """`lexicmap` turns a prefix that is an existing directory into
-        `<dir>/<ref>.*`, so the cohort lands inside `out/lexicmap/` while this composite
-        goes on reading `out/lexicmap.clean.accessions.fasta`. With an earlier run's file
+    def test_a_tiler_directory_in_the_way_is_refused_not_worked_around(self):
+        """`tile` turns a prefix that is an existing directory into
+        `<dir>/<ref>.*`, so the cohort lands inside `out/tiler/` while this composite
+        goes on reading `out/tiler.clean.accessions.fasta`. With an earlier run's file
         at that path, the MSA and tree were built from the old cohort, with exit 0.
 
-        The shape that gets a user here is `disassembler lexicmap --out-dir results/lexicmap`
+        The shape that gets a user here is `disassembler tile --out-dir results/tiler`
         followed by `from-lexicmap -o results`.
         """
         table = self.work / "hits.tsv"
@@ -480,8 +480,8 @@ class TestFromLexicmap(_Stubs):
         )
         out = self.work / "out"
         out.mkdir()
-        (out / "lexicmap").mkdir()
-        stale = out / "lexicmap.clean.accessions.fasta"
+        (out / "tiler").mkdir()
+        stale = out / "tiler.clean.accessions.fasta"
         stale.write_text(f">OLD1\n{REF}\n")
         rc, log = _run(["from-lexicmap", "-q", str(self.ref), "-f", str(table),
                         "-o", str(out)])
@@ -491,12 +491,12 @@ class TestFromLexicmap(_Stubs):
 
     def test_a_cohort_this_run_did_not_write_is_not_aligned(self):
         """The cohort files this run reads are removed before
-        lexicmap runs, so one left by an earlier run cannot stand in for this run's.
+        the tiler runs, so one left by an earlier run cannot stand in for this run's.
 
-        lexicmap is stubbed to the exact shape that caused it: exit 0 having written no
+        the tiler is stubbed to the exact shape that caused it: exit 0 having written no
         cohort, which is what a prefix-is-a-directory run does.
         """
-        from disassembler.cmd import lexicmap as lexicmap_cmd
+        from disassembler.cmd import tiler as tiler_cmd
         table = self.work / "hits.tsv"
         table.write_text(
             "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
@@ -504,15 +504,15 @@ class TestFromLexicmap(_Stubs):
         )
         out = self.work / "out"
         out.mkdir()
-        stale = out / "lexicmap.clean.accessions.fasta"
+        stale = out / "tiler.clean.accessions.fasta"
         stale.write_text(f">OLD1\n{REF}\n>OLD2\n{REF}\n")
-        real = lexicmap_cmd.run
-        lexicmap_cmd.run = lambda ns: 0
+        real = tiler_cmd.run
+        tiler_cmd.run = lambda ns: 0
         try:
             rc, log = _run(["from-lexicmap", "-q", str(self.ref), "-f", str(table),
                             "-o", str(out)])
         finally:
-            lexicmap_cmd.run = real
+            tiler_cmd.run = real
         self.assertEqual(rc, 1, log)
         self.assertIn("not found", log)
         msa = out / "gene_codon_msa.fasta"
@@ -539,23 +539,23 @@ class TestFromLexicmap(_Stubs):
         manifest = json.loads((out / "from-lexicmap.summary.json").read_text())
         self.assertEqual(manifest["run"]["status"], "ok")
         self.assertEqual([r["stage"] for r in manifest["records"]],
-                         ["lexicmap", "sieve", "msa"])
+                         ["tiler", "sieve", "msa"])
         by_stage = {r["stage"]: r for r in manifest["records"]}
         self.assertEqual(by_stage["sieve"]["status"], "skipped")
         # Each stage that wrote a summary names it, and the file is really there.
         for record in manifest["records"]:
             if "summary" in record:
                 self.assertTrue((out / record["summary"]).is_file(), record)
-        self.assertIn("summary", by_stage["lexicmap"])
+        self.assertIn("summary", by_stage["tiler"])
         self.assertIn("summary", by_stage["msa"])
 
     def test_a_run_without_sieve_removes_an_earlier_runs_sieved_cohorts(self):
-        # lexicmap rewrites both cohorts every run, so sieved copies an earlier --sieve run
+        # the tiler rewrites both cohorts every run, so sieved copies an earlier --sieve run
         # left are stale; they used to stay beside the fresh MSA.
         out = self.work / "out"
         out.mkdir()
-        stale = [out / "lexicmap.clean.accessions.sieved.fasta",
-                 out / "lexicmap.clean_expanded.accessions.sieved.fasta"]
+        stale = [out / "tiler.clean.accessions.sieved.fasta",
+                 out / "tiler.clean_expanded.accessions.sieved.fasta"]
         for p in stale:
             p.write_text(f">old\n{REF}\n")
         table = self.work / "hits.tsv"
@@ -581,7 +581,7 @@ class TestFromLexicmap(_Stubs):
         rc, log = _run(argv)
         self.assertEqual(rc, 0, log)
         self.assertTrue((out / "gene_codon_msa.fasta").is_file())
-        # Now one partial sequence: lexicmap's clean cohort (full + partial) is not empty, but
+        # Now one partial sequence: the tiler's clean cohort (full + partial) is not empty, but
         # the full-length cohort from-lexicmap aligns is. --allow-empty used to exit 1 anyway.
         table.write_text(
             "sgenome\tpident\tqcovHSP\tqstart\tqend\tqseq\tsseq\n"
@@ -598,20 +598,20 @@ class TestFromLexicmap(_Stubs):
         self.assertFalse((out / "gene_fasttree.nwk").exists())
 
     def test_a_queued_dataset_stops_before_a_stale_cohort(self):
-        # lexicmap used to return 0 for a queued dataset having written nothing, and
+        # the tiler used to return 0 for a queued dataset having written nothing, and
         # from-lexicmap then aligned whatever cohort an earlier run had left.
-        from disassembler.cmd import lexicmap
+        from disassembler.cmd import tiler
         out = self.work / "out"
         out.mkdir()
-        (out / "lexicmap.clean.accessions.fasta").write_text(f">stale\n{REF}\n")
-        real = lexicmap.resolve_dataset_state
-        lexicmap.resolve_dataset_state = lambda *a, **k: "queued"
+        (out / "tiler.clean.accessions.fasta").write_text(f">stale\n{REF}\n")
+        real = tiler.resolve_dataset_state
+        tiler.resolve_dataset_state = lambda *a, **k: "queued"
         try:
             rc, log = _run(["from-lexicmap", "-q", str(self.ref), "-d", "f2db41e1fa331b3e",
                             "-o", str(out)])
         finally:
-            lexicmap.resolve_dataset_state = real
-        self.assertEqual(rc, lexicmap.EX_TEMPFAIL, log)
+            tiler.resolve_dataset_state = real
+        self.assertEqual(rc, tiler.EX_TEMPFAIL, log)
         self.assertIn("is 'queued', not finished yet", log)
         self.assertFalse((out / "gene_codon_msa.fasta").exists())
 

@@ -1,19 +1,19 @@
 """from-lexicmap: LexicMap tabular stream -> (sieve opt) -> codon MSA + tree.
 
-Composite: lexicmap -> sieve (optional) -> msa. Lexicmap already writes its cohort on the
+Composite: tile -> sieve (optional) -> msa. The tiler already writes its cohort on the
 reference grid (`<prefix>.clean.msa.fasta` and friends), with '-' at reference positions no
 HSP covers and at in-frame deletions. Under --require-full-length the only gaps are those
 deletions and MAFFT reproduces the rows unchanged, so the MSA stage mostly adds the tree;
 with the default --min-cov 0.80 a row can be a fifth '-' and MAFFT may place those gaps
 differently. The stage is kept so both routes produce the same codon MSA and Newick tree
-shape. See docs/lexicmap.md and docs/codon_msa.md.
+shape. See docs/tiler.md and docs/codon_msa.md.
 
 Sieve/MSA input defaults to `<prefix>.clean.accessions.fasta` (uncollapsed
 clean cohort, one seq per accession); pass --include-partials to feed
 `<prefix>.clean_expanded.accessions.fasta` instead (adds >=50% partials).
 
 The sieve's gap limit and the MSA's coverage gate default to values derived from that
-cohort's own coverage gate, so neither stage silently drops rows lexicmap admitted.
+cohort's own coverage gate, so neither stage silently drops rows the tiler admitted.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ import time
 import sys
 from pathlib import Path
 
-from disassembler.cmd import lexicmap as lexicmap_cmd
+from disassembler.cmd import tiler as tiler_cmd
 from disassembler.cmd import msa as msa_cmd
 from disassembler.cmd import sieve as sieve_cmd
 from disassembler.resolve import resolve_sieve, not_found_message, EX_TOOL_NOT_FOUND
@@ -43,7 +43,7 @@ from disassembler.validators import (
 from disassembler import summary as summary_io
 
 
-# Slack between lexicmap's coverage gate and the downstream gates derived from it. A trusted
+# Slack between the tiler's coverage gate and the downstream gates derived from it. A trusted
 # deletion counts as covered but is '-' in the row, and an assembly can carry an N, so a row
 # can have slightly fewer real bases than its coverage says.
 GATE_MARGIN = 0.05
@@ -53,7 +53,7 @@ def _cohort_shape(path):
     """Records in the cohort, and the largest share of non-ACGT in any one of them.
 
     One pass, where the records were already being counted. The second number is what
-    keeps the derived sieve and MSA gates from dropping a row lexicmap itself admitted
+    keeps the derived sieve and MSA gates from dropping a row the tiler itself admitted
 .
     """
     n = 0
@@ -84,12 +84,12 @@ def _cohort_shape(path):
 def _derived_gap_limit(gate, worst_gap):
     """The sieve's non-ACGT allowance, never below the cohort's own worst row.
 
-    Lexicmap counts a trusted deletion as covered with no limit, and leaves `-` in
+    The tiler counts a trusted deletion as covered with no limit, and leaves `-` in
     the row where it was. The derived allowance was a flat `1 - gate + 0.05`, so a clean,
     full-length row whose in-frame deletion exceeded 5% of the reference (45 nt in 900)
     was dropped by the sieve's completeness gate, with exit 0 and a `6 -> 5 haplotypes`
-    line that reads as thinning. Both the module docstring here and `docs/lexicmap.md`
-    promised that neither stage drops rows for coverage lexicmap already accepted. Indel
+    line that reads as thinning. Both the module docstring here and `docs/tiler.md`
+    promised that neither stage drops rows for coverage the tiler already accepted. Indel
     alleles are often the thing a study is after.
 
     Rounded UP, so the limit can never land a hair below the row that set it.
@@ -99,7 +99,7 @@ def _derived_gap_limit(gate, worst_gap):
 
 
 def cohort_coverage_gate(args) -> float:
-    """The coverage floor of the cohort fed to the sieve and MSA (lexicmap's tier gate)."""
+    """The coverage floor of the cohort fed to the sieve and MSA (the tiler's tier gate)."""
     if args.include_partials:
         return args.min_cov_partial
     return 1.0 if args.require_full_length else args.min_cov
@@ -111,7 +111,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="LexicMap tabular stream -> codon MSA + tree (with optional sieve).",
         description=(
             "Composite from a LexicMap tabular stream. Chains three atomic stages:\n"
-            "  1. lexicmap : tile multi-HSP hits into a clean per-accession cohort\n"
+            "  1. tile     : tile multi-HSP hits into a clean per-accession cohort\n"
             "  2. sieve    : optional diversity thinning (opt-in with --sieve)\n"
             "  3. msa      : codon MSA + FastTree GTR tree\n\n"
             "Options are grouped by pipeline stage below."
@@ -119,12 +119,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # ---- Stage 1: lexicmap (input + cohort gating) ------------------------
+    # ---- Stage 1: tile (input + cohort gating) ------------------------
     g_lex = p.add_argument_group(
         "LexicMap: input & gating",
-        description="Options for the lexicmap streaming stage. Exactly one of "
+        description="Options for the tiler streaming stage. Exactly one of "
                     "-d/--dataset and -f/-i/--file is required. See "
-                    "`disassembler lexicmap -h` for the underlying atomic.",
+                    "`disassembler tile -h` for the underlying atomic.",
     )
     g_lex.add_argument("-q", "-r", "--query", "--ref", dest="ref", required=True,
                        help="Reference in-frame CDS FASTA. Only the first record is read; "
@@ -149,13 +149,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     g_lex.add_argument("--min-cov", type=fraction, default=0.80,
                        help="Clean full-length cohort gate: minimum fraction of the "
                             "reference an accession's merged HSPs must cover "
-                            "(default: 0.80). Applied at the lexicmap stage; distinct "
+                            "(default: 0.80). Applied at the tiler stage; distinct "
                             "from --msa-min-cov below.")
     g_lex.add_argument("--min-cov-partial", type=fraction, default=0.50,
                        help="Clean partial cohort gate: minimum coverage fraction for the "
                             "expanded clean cohort (default: 0.50). Must be <= --min-cov. "
                             "Anything below this is filed as a low-coverage fragment. "
-                            "Applied at the lexicmap stage.")
+                            "Applied at the tiler stage.")
     g_lex.add_argument("--min-pident", type=percentage, default=60.0,
                        help="Minimum percent identity for an HSP to contribute to the "
                             "tiled reconstruction (default: 60.0). HSPs below this are "
@@ -174,10 +174,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     g_lex.add_argument("--allow-mixed", action="store_true",
                        help="Let accessions whose own HSPs disagree about a base into the clean tiers instead of FLAGGED_MIXED_HSPS. Logan leaves an unpopped SNP bubble as two contigs, both of which align; the tiler picks the one each position lies deeper inside and records the disagreement, because which allele the sample carries is not something it can know. Off by default.")
     g_lex.add_argument("--min-conflict-hsp-bp", type=non_negative_int,
-                       default=lexicmap_cmd.CONFLICT_MIN_HSP_BP,
+                       default=tiler_cmd.CONFLICT_MIN_HSP_BP,
                        help="Record a conflict only when at least one of the two disagreeing "
                             "HSPs spans this many reference bases "
-                            f"(default: {lexicmap_cmd.CONFLICT_MIN_HSP_BP}; capped at a tenth "
+                            f"(default: {tiler_cmd.CONFLICT_MIN_HSP_BP}; capped at a tenth "
                             "of the reference, so a reference under 1 kb uses less). A "
                             "conserved gene's termini match short fragments throughout a Logan "
                             "assembly, and two such fragments disagreeing say nothing about the "
@@ -214,12 +214,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     # ---- Cohort selection into sieve/MSA ----------------------------------
     g_cohort = p.add_argument_group(
         "Cohort selection",
-        description="Where lexicmap writes and which of its two clean cohort FASTAs "
+        description="Where the tiler writes and which of its two clean cohort FASTAs "
                     "is fed to the downstream sieve/MSA stages.",
     )
     g_cohort.add_argument("-o", "--out-dir", required=True,
-                          help="Output directory. Lexicmap writes here under the prefix "
-                               "`lexicmap`; the MSA and tree land alongside.")
+                          help="Output directory. The tiler writes here under the prefix "
+                               "`tiler`; the MSA and tree land alongside.")
     g_cohort.add_argument("--include-partials", action="store_true",
                           dest="include_partials",
                           help="Feed <prefix>.clean_expanded.accessions.fasta (adds >=50%% "
@@ -229,7 +229,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     # ---- Stage 2: sieve (optional diversity thinning) ---------------------
     g_sieve = p.add_argument_group(
         "Sieve: optional diversity thinning",
-        description="Optional pass between lexicmap and MSA, delegated to "
+        description="Optional pass between the tiler and MSA, delegated to "
                     "`disassembler sieve`. Haplotype/lineage-level MinHash/LSH reducer; "
                     "all --sieve-* flags are ignored unless --sieve is passed.",
     )
@@ -253,7 +253,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                               "0.80, 0.05 with --require-full-length, 0.55 with "
                               "--include-partials), and never below the largest non-ACGT "
                               "share in the cohort, so the sieve does not drop rows for the "
-                              "coverage lexicmap already accepted.")
+                              "coverage the tiler already accepted.")
     g_sieve.add_argument("--sieve-bin", default=None,
                          help="Explicit path to the kmer-diversity-sieve l1_pipeline_serial "
                               "binary (auto-discovered otherwise).")
@@ -265,15 +265,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
                     "`disassembler msa -h`.",
     )
     g_msa.add_argument("--mafft-threads", type=positive_int, default=8,
-                       help="Accepted for compatibility and ignored: a lexicmap cohort is "
+                       help="Accepted for compatibility and ignored: a tiler cohort is "
                             "already on the reference grid, so the MSA stage runs with "
                             "--aligned and does not call MAFFT at all.")
     g_msa.add_argument("--msa-min-cov", type=fraction, default=None,
                        help="Minimum fraction of the reference a row must cover in A/C/G/T "
                             "bases to enter the MSA. Default: 0.70, or the cohort's coverage "
                             "gate - 0.05 if that is lower (0.45 with --include-partials), so "
-                            "the MSA keeps the rows lexicmap admitted. Distinct from "
-                            "lexicmap's --min-cov / --min-cov-partial above; those gate which "
+                            "the MSA keeps the rows the tiler admitted. Distinct from "
+                            "the tiler's --min-cov / --min-cov-partial above; those gate which "
                             "accessions reach the clean cohort at all.")
     p.set_defaults(func=run)
 
@@ -310,9 +310,9 @@ def _write_manifest(args, stages, started, status=None, error=None) -> None:
 
 
 def _run(args, stages) -> int:
-    # One copy of the checks, in `lexicmap`, so one added there reaches both. It runs
+    # One copy of the checks, in `tile`, so one added there reaches both. It runs
     # before --out-dir is created, which is why it is not left to the stage itself.
-    bad = lexicmap_cmd.validate_args(args, "from-lexicmap")
+    bad = tiler_cmd.validate_args(args, "from-lexicmap")
     if bad is not None:
         return bad
 
@@ -331,7 +331,7 @@ def _run(args, stages) -> int:
         return 1
 
     # Galaxy API key file: only validate when streaming from a dataset and the file is the
-    # key that will be used (get_galaxy_api_key in lexicmap.py: --api-key > file > env var).
+    # key that will be used (get_galaxy_api_key in tiler.py: --api-key > file > env var).
     if args.dataset and not args.api_key:
         key_err = validate_api_key_file(args.api_key_file)
         if key_err:
@@ -340,18 +340,18 @@ def _run(args, stages) -> int:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    prefix = out_dir / "lexicmap"
+    prefix = out_dir / "tiler"
 
-    # `lexicmap` turns a prefix that is an existing DIRECTORY into `<dir>/<ref>.*`,
-    # so its cohort would land inside `out/lexicmap/` while this composite goes on reading
-    # `out/lexicmap.clean.accessions.fasta`. With an earlier run's file at that path, the
+    # `tile` turns a prefix that is an existing DIRECTORY into `<dir>/<ref>.*`,
+    # so its cohort would land inside `out/tiler/` while this composite goes on reading
+    # `out/tiler.clean.accessions.fasta`. With an earlier run's file at that path, the
     # MSA and the tree are built from the old cohort and reported as this run's.
     if prefix.is_dir():
-        print(f"from-lexicmap: {prefix} is a directory, so lexicmap would write inside it "
+        print(f"from-lexicmap: {prefix} is a directory, so the tiler would write inside it "
               f"rather than at {prefix}.*. Remove it or choose another --out-dir.",
               file=sys.stderr)
         return 1
-    # And the cohorts this run is about to read are removed first, so that a lexicmap run
+    # And the cohorts this run is about to read are removed first, so that a tiler run
     # which exits 0 without writing one cannot be mistaken for a cohort.
     for sfx in (".clean.accessions.fasta", ".clean_expanded.accessions.fasta"):
         Path(f"{prefix}{sfx}").unlink(missing_ok=True)
@@ -383,14 +383,14 @@ def _run(args, stages) -> int:
     # The MSA stage runs with --aligned here, so there is no MAFFT to give threads to.
     if args.mafft_threads != 8:
         print(f"[from-lexicmap] warn: --mafft-threads {args.mafft_threads} is inert. A "
-              f"lexicmap cohort is already on the reference grid, so the MSA stage takes "
+              f"tiler cohort is already on the reference grid, so the MSA stage takes "
               f"the rows as they are rather than re-placing them with MAFFT.",
               file=sys.stderr)
 
-    # ---- 1/3 lexicmap ------------------------------------------------------
-    print(f"[from-lexicmap] 1/3 lexicmap -> {prefix}.*", flush=True)
+    # ---- 1/3 tile ------------------------------------------------------
+    print(f"[from-lexicmap] 1/3 tile -> {prefix}.*", flush=True)
     lex_ns = stage_args(
-        lexicmap_cmd,
+        tiler_cmd,
         ref=args.ref,
         dataset=args.dataset,
         file=args.file,
@@ -415,7 +415,7 @@ def _run(args, stages) -> int:
         allow_empty=args.allow_empty,
     )
     t0 = time.time()
-    rc = summary_io.stage_entry(stages, "lexicmap", t0, lexicmap_cmd.run(lex_ns),
+    rc = summary_io.stage_entry(stages, "tiler", t0, tiler_cmd.run(lex_ns),
                                 Path(f"{prefix}.summary.json"))
     if rc != 0:
         return rc
@@ -423,13 +423,13 @@ def _run(args, stages) -> int:
     full, expanded = (Path(f"{prefix}.clean.accessions.fasta"),
                       Path(f"{prefix}.clean_expanded.accessions.fasta"))
     cohort = expanded if args.include_partials else full
-    # lexicmap has just rewritten both cohorts, so a sieved copy of either that an earlier run
+    # the tiler has just rewritten both cohorts, so a sieved copy of either that an earlier run
     # left in this --out-dir no longer matches it. This run writes at most one of them again
     # (with --sieve); kept, the other sat beside fresh results as if this run had made it.
     for c in (full, expanded):
         (out_dir / f"{c.stem}.sieved.fasta").unlink(missing_ok=True)
     if not cohort.is_file():
-        print(f"from-lexicmap: expected lexicmap cohort not found: {cohort}",
+        print(f"from-lexicmap: expected tiler cohort not found: {cohort}",
               file=sys.stderr)
         return 1
     sieved = out_dir / f"{cohort.stem}.sieved.fasta"
@@ -440,7 +440,7 @@ def _run(args, stages) -> int:
     n_cohort, worst_gap = _cohort_shape(cohort)
     print(f"[from-lexicmap] cohort: {n_cohort} sequences from {cohort.name}", flush=True)
     if n_cohort == 0:
-        # lexicmap's own check counts full-length and partial sequences together, so a cohort
+        # the tiler's own check counts full-length and partial sequences together, so a cohort
         # of partials alone passes it and is empty here unless --include-partials is given.
         # This used to exit 1 even with --allow-empty.
         if args.allow_empty:
@@ -462,7 +462,7 @@ def _run(args, stages) -> int:
     if args.sieve:
         # Rows are on the reference grid, '-' wherever no HSP reached, and the sieve's
         # completeness gate counts '-' as a bad base. At the binary's 5% it dropped up to
-        # 22% of a default cohort and 34% of a SARS-CoV-2 spike cohort lexicmap had admitted.
+        # 22% of a default cohort and 34% of a SARS-CoV-2 spike cohort the tiler had admitted.
         max_gap_frac = args.sieve_max_gap_frac
         if max_gap_frac is None:
             max_gap_frac = _derived_gap_limit(gate, worst_gap)
@@ -495,11 +495,11 @@ def _run(args, stages) -> int:
         # ACGT, so it must not ask for more than the cohort's worst row has.
         msa_min_cov = min(round(min(0.70, gate - GATE_MARGIN), 6),
                           math.floor((1.0 - worst_gap) * 1e6) / 1e6)
-    # Lexicmap writes every base at the reference position its HSP gives it and `-`
+    # The tiler writes every base at the reference position its HSP gives it and `-`
     # where no HSP reached, so this cohort IS an alignment on the reference grid. Handing it
     # to MAFFT discarded those gaps and placed the bases again, and where several placements
     # score the same it slides bases across an uncovered stretch or a deletion: the codon MSA
-    # and the tree could then disagree with lexicmap's own haplotype table and ledger, with
+    # and the tree could then disagree with the tiler's own haplotype table and ledger, with
     # exit 0 and the identity check passing.
     msa_ns = stage_args(
         msa_cmd,
